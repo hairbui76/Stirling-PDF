@@ -1,11 +1,16 @@
+pub mod comic_book;
+mod ghostscript;
+pub mod image_to_pdf;
 mod page_selection;
 pub mod pdf_analysis;
 pub mod pdf_attachments;
 pub mod pdf_auto_rename;
+pub mod pdf_auto_split;
 pub mod pdf_blank_pages;
 pub mod pdf_booklet;
 mod pdf_bookmarks;
 pub mod pdf_comments;
+pub mod pdf_compress;
 pub mod pdf_crop;
 pub mod pdf_document_ops;
 pub mod pdf_extract_images;
@@ -16,6 +21,8 @@ pub mod pdf_form_mutation;
 mod pdf_form_transform;
 mod pdf_forms;
 pub mod pdf_geometry_ops;
+pub mod pdf_image_overlay;
+pub mod pdf_info;
 pub mod pdf_javascript;
 pub mod pdf_merge;
 pub mod pdf_metadata;
@@ -23,17 +30,26 @@ pub mod pdf_overlay;
 mod pdf_page_geometry;
 pub mod pdf_page_numbers;
 pub mod pdf_password;
+pub mod pdf_poster;
 pub mod pdf_rearrange;
 pub mod pdf_remove;
 pub mod pdf_rotate;
 pub mod pdf_sanitize;
+pub mod pdf_signature_validation;
 mod pdf_signatures;
 pub mod pdf_split;
 pub mod pdf_split_by_size;
 pub mod pdf_split_chapters;
 pub mod pdf_split_sections;
+pub mod pdf_stamp;
 pub mod pdf_table_of_contents;
+pub mod pdf_text;
+pub mod pdf_to_image;
+pub mod pdf_verification;
+pub mod pdf_watermark;
 mod pdfium_backend;
+pub mod svg_to_pdf;
+pub mod vector_conversion;
 
 use std::{
     cmp::Reverse,
@@ -61,15 +77,19 @@ use crate::pdf_merge::{
     MergeError, MergeInput, MergeOptions, merge_pdf_paths_to_file, read_pdf_sort_metadata,
 };
 use crate::{
+    comic_book::{ComicBookError, cbz_to_pdf_file, pdf_to_cbz_file},
+    image_to_pdf::{ImageInput, ImageToPdfError, ImageToPdfOptions, images_to_pdf_file},
     pdf_analysis::AnalysisError,
     pdf_attachments::{
         AttachmentError, AttachmentInput, add_attachments_to_file, delete_attachment_to_file,
         extract_attachments_to_zip, list_attachments, rename_attachment_to_file,
     },
     pdf_auto_rename::{AutoRenameError, auto_rename_to_file},
+    pdf_auto_split::{AutoSplitError, auto_split_pdf_to_zip},
     pdf_blank_pages::{BlankPagesError, remove_blank_pages_to_zip},
     pdf_booklet::{BookletError, BookletOptions, impose_booklet_to_file},
     pdf_comments::{CommentError, add_comments_to_file},
+    pdf_compress::{CompressError, CompressOptions, compress_pdf_to_file},
     pdf_crop::{CropError, CropOptions, crop_pdf_to_file},
     pdf_document_ops::{
         DocumentOperationError, decompress_pdf_to_file, remove_cert_sign_to_file,
@@ -86,6 +106,8 @@ use crate::{
         GeometryError, MultiPageLayoutOptions, multi_page_layout, pdf_to_single_page,
         scale_pdf_pages,
     },
+    pdf_image_overlay::{ImageOverlayError, ImageOverlayOptions, overlay_image_to_file},
+    pdf_info::pdf_info_report,
     pdf_javascript::{JavascriptError, extract_javascript},
     pdf_metadata::{MetadataError, MetadataOptions, update_metadata_to_file},
     pdf_overlay::{OverlayError, OverlayInput, OverlayOptions, overlay_pdf_paths_to_file},
@@ -94,18 +116,32 @@ use crate::{
         AddPasswordOptions, PasswordError, PasswordPermissions, add_password_to_file,
         remove_password_to_file,
     },
+    pdf_poster::{PosterError, PosterOptions, split_pdf_for_poster_to_zip},
     pdf_rearrange::{RearrangePagesError, rearrange_pdf_pages_to_file},
     pdf_remove::{RemovePagesError, remove_pdf_pages_to_file},
     pdf_rotate::{RotateError, rotate_pdf_path_to_file},
     pdf_sanitize::{SanitizeError, SanitizeOptions, sanitize_pdf_to_file},
+    pdf_signature_validation::{SignatureValidationError, validate_pdf_signatures},
     pdf_split::{SplitPdfError, split_pdf_to_zip},
     pdf_split_by_size::{SplitBySizeError, split_pdf_by_size_or_count_to_zip},
     pdf_split_chapters::{SplitChaptersError, split_pdf_by_chapters_to_zip},
     pdf_split_sections::{SectionsOutput, SplitSectionsError, split_pdf_by_sections},
+    pdf_stamp::{StampError, StampOptions, add_stamp_to_file},
     pdf_table_of_contents::{
         TableOfContentsError, edit_table_of_contents_to_file, extract_bookmarks,
     },
-    pdfium_backend::{PdfiumAutoCropError, PdfiumMergeError, PdfiumRemoveError, PdfiumRotateError},
+    pdf_text::{PdfTextError, pdf_to_text_file},
+    pdf_to_image::{PdfToImageError, PdfToImageOptions, PdfToImageOutput, convert_pdf_to_images},
+    pdf_verification::{VerificationError, verify_pdf},
+    pdf_watermark::{WatermarkError, WatermarkOptions, add_watermark_to_file},
+    pdfium_backend::{
+        PdfiumAutoCropError, PdfiumAutoSplitError, PdfiumMergeError, PdfiumRemoveError,
+        PdfiumRotateError, PdfiumToImageError,
+    },
+    svg_to_pdf::{SvgConversionOutput, SvgInput, SvgToPdfError, convert_svg_files},
+    vector_conversion::{
+        VectorConversionError, VectorFormat, pdf_to_vector_file, vector_to_pdf_file,
+    },
 };
 
 const ANALYSIS_ANNOTATION_INFO_PATH: &str = "/api/v1/analysis/annotation-info";
@@ -117,12 +153,19 @@ const ANALYSIS_PAGE_COUNT_PATH: &str = "/api/v1/analysis/page-count";
 const ANALYSIS_PAGE_DIMENSIONS_PATH: &str = "/api/v1/analysis/page-dimensions";
 const ANALYSIS_SECURITY_INFO_PATH: &str = "/api/v1/analysis/security-info";
 const AUTO_RENAME_PATH: &str = "/api/v1/misc/auto-rename";
+const AUTO_SPLIT_PATH: &str = "/api/v1/misc/auto-split-pdf";
 const BOOKLET_IMPOSITION_PATH: &str = "/api/v1/general/booklet-imposition";
+const POSTER_PRINT_PATH: &str = "/api/v1/general/split-for-poster-print";
 const ADD_ATTACHMENTS_PATH: &str = "/api/v1/misc/add-attachments";
 const ADD_COMMENTS_PATH: &str = "/api/v1/misc/add-comments";
+const ADD_IMAGE_PATH: &str = "/api/v1/misc/add-image";
 const ADD_PAGE_NUMBERS_PATH: &str = "/api/v1/misc/add-page-numbers";
+const ADD_STAMP_PATH: &str = "/api/v1/misc/add-stamp";
+const ADD_WATERMARK_PATH: &str = "/api/v1/security/add-watermark";
 const ADD_PASSWORD_PATH: &str = "/api/v1/security/add-password";
 const CROP_PATH: &str = "/api/v1/general/crop";
+const CBZ_TO_PDF_PATH: &str = "/api/v1/convert/cbz/pdf";
+const COMPRESS_PDF_PATH: &str = "/api/v1/misc/compress-pdf";
 const DECOMPRESS_PDF_PATH: &str = "/api/v1/misc/decompress-pdf";
 const DELETE_ATTACHMENT_PATH: &str = "/api/v1/misc/delete-attachment";
 const EDIT_TABLE_OF_CONTENTS_PATH: &str = "/api/v1/general/edit-table-of-contents";
@@ -138,6 +181,7 @@ const FILTER_PAGE_ROTATION_PATH: &str = "/api/v1/filter/filter-page-rotation";
 const FILTER_PAGE_SIZE_PATH: &str = "/api/v1/filter/filter-page-size";
 const FORM_FIELDS_PATH: &str = "/api/v1/form/fields";
 const FORM_FIELDS_WITH_COORDINATES_PATH: &str = "/api/v1/form/fields-with-coordinates";
+const GET_INFO_ON_PDF_PATH: &str = "/api/v1/security/get-info-on-pdf";
 const FORM_DELETE_FIELDS_PATH: &str = "/api/v1/form/delete-fields";
 const FORM_EXTRACT_CSV_PATH: &str = "/api/v1/form/extract-csv";
 const FORM_EXTRACT_XLSX_PATH: &str = "/api/v1/form/extract-xlsx";
@@ -148,6 +192,10 @@ const MERGE_PATH: &str = "/api/v1/general/merge-pdfs";
 const MULTI_PAGE_LAYOUT_PATH: &str = "/api/v1/general/multi-page-layout";
 const OVERLAY_PDFS_PATH: &str = "/api/v1/general/overlay-pdfs";
 const PDF_TO_SINGLE_PAGE_PATH: &str = "/api/v1/general/pdf-to-single-page";
+const PDF_TO_IMAGE_PATH: &str = "/api/v1/convert/pdf/img";
+const PDF_TO_CBZ_PATH: &str = "/api/v1/convert/pdf/cbz";
+const PDF_TO_TEXT_PATH: &str = "/api/v1/convert/pdf/text";
+const PDF_TO_VECTOR_PATH: &str = "/api/v1/convert/pdf/vector";
 const REMOVE_PAGES_PATH: &str = "/api/v1/general/remove-pages";
 const REMOVE_BLANKS_PATH: &str = "/api/v1/misc/remove-blanks";
 const REPAIR_PDF_PATH: &str = "/api/v1/misc/repair";
@@ -164,13 +212,19 @@ const SPLIT_PATH: &str = "/api/v1/general/split-pages";
 const SPLIT_BY_SIZE_PATH: &str = "/api/v1/general/split-by-size-or-count";
 const SPLIT_CHAPTERS_PATH: &str = "/api/v1/general/split-pdf-by-chapters";
 const SPLIT_SECTIONS_PATH: &str = "/api/v1/general/split-pdf-by-sections";
+const SVG_TO_PDF_PATH: &str = "/api/v1/convert/svg/pdf";
+const VECTOR_TO_PDF_PATH: &str = "/api/v1/convert/vector/pdf";
+const VERIFY_PDF_PATH: &str = "/api/v1/security/verify-pdf";
+const VALIDATE_SIGNATURE_PATH: &str = "/api/v1/security/validate-signature";
 const UNLOCK_FORMS_PATH: &str = "/api/v1/misc/unlock-pdf-forms";
 const UPDATE_METADATA_PATH: &str = "/api/v1/misc/update-metadata";
 const FORM_VALUE_LIMIT_BYTES: usize = 8 * 1024;
+const IMAGE_TO_PDF_PATH: &str = "/api/v1/convert/img/pdf";
 const BOOKMARK_DATA_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const COMMENTS_DATA_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const FORM_DATA_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_BYTES: usize = 2_000 * 1024 * 1024;
+const PDF_INFO_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct MergeQuery {
@@ -372,6 +426,13 @@ struct UploadedBookletRequest {
 }
 
 #[derive(Debug)]
+struct UploadedPosterRequest {
+    file: UploadedPdf,
+    options: PosterOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
 struct UploadedAutoRenameRequest {
     file: UploadedPdf,
     use_first_text_as_fallback: bool,
@@ -379,9 +440,97 @@ struct UploadedAutoRenameRequest {
 }
 
 #[derive(Debug)]
+struct UploadedAutoSplitRequest {
+    file: UploadedPdf,
+    duplex_mode: bool,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
 struct UploadedExtractImagesRequest {
     file: UploadedPdf,
     format: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToImageRequest {
+    file: UploadedPdf,
+    options: PdfToImageOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedImageToPdfRequest {
+    files: Vec<ImageInput>,
+    options: ImageToPdfOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedCbzToPdfRequest {
+    file: UploadedPdf,
+    optimize_for_ebook: bool,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToCbzRequest {
+    file: UploadedPdf,
+    dpi: i32,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToTextRequest {
+    file: UploadedPdf,
+    output_format: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedCompressRequest {
+    file: UploadedPdf,
+    options: CompressOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedImageOverlayRequest {
+    file: UploadedPdf,
+    image_path: PathBuf,
+    options: ImageOverlayOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedStampRequest {
+    file: UploadedPdf,
+    stamp_image_path: Option<PathBuf>,
+    options: StampOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedWatermarkRequest {
+    file: UploadedPdf,
+    watermark_image_path: Option<PathBuf>,
+    options: WatermarkOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedSvgToPdfRequest {
+    files: Vec<SvgInput>,
+    combine: bool,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedVectorConversionRequest {
+    file: UploadedPdf,
+    output_format: String,
+    prepress: bool,
     temp_dir: TempDir,
 }
 
@@ -498,7 +647,10 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route("/health", get(health))
         .route(ADD_ATTACHMENTS_PATH, post(add_attachments))
         .route(ADD_COMMENTS_PATH, post(add_comments))
+        .route(ADD_IMAGE_PATH, post(add_image))
         .route(ADD_PAGE_NUMBERS_PATH, post(add_page_numbers))
+        .route(ADD_STAMP_PATH, post(add_stamp))
+        .route(ADD_WATERMARK_PATH, post(add_watermark))
         .route(ADD_PASSWORD_PATH, post(add_password))
         .route(ANALYSIS_ANNOTATION_INFO_PATH, post(annotation_info))
         .route(ANALYSIS_BASIC_INFO_PATH, post(basic_info))
@@ -509,7 +661,10 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(ANALYSIS_PAGE_DIMENSIONS_PATH, post(page_dimensions))
         .route(ANALYSIS_SECURITY_INFO_PATH, post(security_info))
         .route(AUTO_RENAME_PATH, post(auto_rename))
+        .route(AUTO_SPLIT_PATH, post(auto_split_pdf))
         .route(BOOKLET_IMPOSITION_PATH, post(booklet_imposition))
+        .route(CBZ_TO_PDF_PATH, post(cbz_to_pdf))
+        .route(COMPRESS_PDF_PATH, post(compress_pdf))
         .route(CROP_PATH, post(crop_pdf))
         .route(DECOMPRESS_PDF_PATH, post(decompress_pdf))
         .route(DELETE_ATTACHMENT_PATH, post(delete_attachment))
@@ -518,6 +673,7 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(EXTRACT_BOOKMARKS_PATH, post(extract_bookmarks_route))
         .route(EXTRACT_IMAGES_PATH, post(extract_images))
         .route(FLATTEN_PATH, post(flatten_pdf))
+        .route(IMAGE_TO_PDF_PATH, post(image_to_pdf))
         .route(FILTER_CONTAINS_IMAGE_PATH, post(filter_contains_image))
         .route(FILTER_CONTAINS_TEXT_PATH, post(filter_contains_text))
         .route(FILTER_FILE_SIZE_PATH, post(filter_file_size))
@@ -534,11 +690,16 @@ pub fn app(max_upload_bytes: usize) -> Router {
             post(inspect_form_fields_with_coordinates),
         )
         .route(FORM_MODIFY_FIELDS_PATH, post(modify_form_fields))
+        .route(GET_INFO_ON_PDF_PATH, post(get_info_on_pdf))
         .route(LIST_ATTACHMENTS_PATH, post(list_attachments_route))
         .route(MERGE_PATH, post(merge_pdfs))
         .route(MULTI_PAGE_LAYOUT_PATH, post(multi_page_layout_route))
         .route(OVERLAY_PDFS_PATH, post(overlay_pdfs))
         .route(PDF_TO_SINGLE_PAGE_PATH, post(to_single_page))
+        .route(PDF_TO_IMAGE_PATH, post(pdf_to_image))
+        .route(PDF_TO_CBZ_PATH, post(pdf_to_cbz))
+        .route(PDF_TO_TEXT_PATH, post(pdf_to_text))
+        .route(PDF_TO_VECTOR_PATH, post(pdf_to_vector))
         .route(REARRANGE_PAGES_PATH, post(rearrange_pages))
         .route(REPAIR_PDF_PATH, post(repair_pdf))
         .route(RENAME_ATTACHMENT_PATH, post(rename_attachment))
@@ -554,9 +715,14 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(SPLIT_PATH, post(split_pages))
         .route(SPLIT_BY_SIZE_PATH, post(split_by_size_or_count))
         .route(SPLIT_CHAPTERS_PATH, post(split_chapters))
+        .route(POSTER_PRINT_PATH, post(split_for_poster_print))
         .route(SPLIT_SECTIONS_PATH, post(split_sections))
+        .route(SVG_TO_PDF_PATH, post(svg_to_pdf))
+        .route(VECTOR_TO_PDF_PATH, post(vector_to_pdf))
+        .route(VERIFY_PDF_PATH, post(verify_pdf_route))
         .route(UNLOCK_FORMS_PATH, post(unlock_pdf_forms))
         .route(UPDATE_METADATA_PATH, post(update_metadata))
+        .route(VALIDATE_SIGNATURE_PATH, post(validate_signature_route))
         .layer(DefaultBodyLimit::max(max_upload_bytes))
         .layer(TraceLayer::new_for_http())
 }
@@ -678,6 +844,111 @@ async fn add_comments(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
+async fn add_image(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_image_overlay_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_overlayed.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let image_path = request.image_path;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("image-overlay.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        overlay_image_to_file(
+            &input_path,
+            &filename,
+            &image_path,
+            options,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(ADD_IMAGE_PATH, format!("add image task failed: {error}"))
+    })?
+    .map_err(|error| map_image_overlay_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        ADD_IMAGE_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn add_stamp(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_stamp_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_stamped.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let stamp_image_path = request.stamp_image_path;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("stamped.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        add_stamp_to_file(
+            &input_path,
+            &filename,
+            stamp_image_path.as_deref(),
+            &options,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(ADD_STAMP_PATH, format!("add stamp task failed: {error}"))
+    })?
+    .map_err(|error| map_stamp_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        ADD_STAMP_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn add_watermark(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_watermark_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_watermarked.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let watermark_image_path = request.watermark_image_path;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("watermarked.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        add_watermark_to_file(
+            &input_path,
+            &filename,
+            watermark_image_path.as_deref(),
+            &options,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            ADD_WATERMARK_PATH,
+            format!("add watermark task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_watermark_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        ADD_WATERMARK_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
 async fn add_page_numbers(multipart: Multipart) -> Result<Response, ApiError> {
     let request = read_add_page_numbers_request(multipart).await?;
     let output_filename = suffixed_filename(&request.file.filename, "_page_numbers_added.pdf");
@@ -738,6 +1009,379 @@ async fn auto_rename(multipart: Multipart) -> Result<Response, ApiError> {
         &output_filename,
         AUTO_RENAME_PATH,
         "application/pdf",
+    )
+    .await
+}
+
+async fn auto_split_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_auto_split_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, ".zip");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let duplex_mode = request.duplex_mode;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("auto-split.zip");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        auto_split_pdf_to_zip(&input_path, &filename, duplex_mode, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(AUTO_SPLIT_PATH, format!("auto split task failed: {error}"))
+    })?
+    .map_err(|error| map_auto_split_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        AUTO_SPLIT_PATH,
+        "application/octet-stream",
+    )
+    .await
+}
+
+async fn pdf_to_image(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_image_request(multipart).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-image-output");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let output = task::spawn_blocking(move || {
+        convert_pdf_to_images(
+            &input_path,
+            &blocking_filename,
+            &options,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_IMAGE_PATH,
+            format!("PDF-to-image task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_to_image_error(&error))?;
+    let (output_filename, content_type) = match output {
+        PdfToImageOutput::Single {
+            extension,
+            content_type,
+        } => (
+            suffixed_filename(&filename, &format!(".{extension}")),
+            content_type,
+        ),
+        PdfToImageOutput::Multiple => (
+            suffixed_filename(&filename, "_convertedToImages.zip"),
+            "application/octet-stream",
+        ),
+    };
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_IMAGE_PATH,
+        content_type,
+    )
+    .await
+}
+
+async fn image_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_image_to_pdf_request(multipart).await?;
+    let output_filename = suffixed_filename(
+        request
+            .files
+            .first()
+            .map_or("document", |input| input.filename.as_str()),
+        "_converted.pdf",
+    );
+    let files = request.files;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-images.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || images_to_pdf_file(&files, &options, &blocking_output_path))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                IMAGE_TO_PDF_PATH,
+                format!("image-to-PDF task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_image_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        IMAGE_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn svg_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_svg_to_pdf_request(multipart).await?;
+    let first_filename = request
+        .files
+        .first()
+        .map_or("document.svg", |input| input.filename.as_str())
+        .to_owned();
+    let files = request.files;
+    let combine = request.combine;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("svg-conversion-output");
+    let blocking_output_path = output_path.clone();
+    let output =
+        task::spawn_blocking(move || convert_svg_files(&files, combine, &blocking_output_path))
+            .await
+            .map_err(|error| {
+                ApiError::internal_at(SVG_TO_PDF_PATH, format!("SVG-to-PDF task failed: {error}"))
+            })?
+            .map_err(|error| map_svg_to_pdf_error(&error))?;
+    let (output_filename, content_type) = match output {
+        SvgConversionOutput::Pdf if combine => (
+            suffixed_filename(&first_filename, "_combined.pdf"),
+            "application/pdf",
+        ),
+        SvgConversionOutput::Pdf => (
+            suffixed_filename(&first_filename, ".pdf"),
+            "application/pdf",
+        ),
+        SvgConversionOutput::Zip => (
+            suffixed_filename(&first_filename, "_converted_svgs.zip"),
+            "application/zip",
+        ),
+    };
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        SVG_TO_PDF_PATH,
+        content_type,
+    )
+    .await
+}
+
+async fn vector_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_vector_conversion_request(multipart, VECTOR_TO_PDF_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_converted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let prepress = request.prepress;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-vector.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        vector_to_pdf_file(&input_path, &filename, prepress, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            VECTOR_TO_PDF_PATH,
+            format!("vector-to-PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_vector_conversion_error(&error, VECTOR_TO_PDF_PATH))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        VECTOR_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn pdf_to_vector(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_vector_conversion_request(multipart, PDF_TO_VECTOR_PATH).await?;
+    let format = if request.output_format.is_empty() {
+        VectorFormat::Eps
+    } else {
+        VectorFormat::parse(&request.output_format)
+            .map_err(|error| map_vector_conversion_error(&error, PDF_TO_VECTOR_PATH))?
+    };
+    let output_filename = suffixed_filename(
+        &request.file.filename,
+        &format!("_converted.{}", format.extension()),
+    );
+    let input_path = request.file.path;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir
+        .path()
+        .join(format!("converted.{}", format.extension()));
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || pdf_to_vector_file(&input_path, format, &blocking_output_path))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                PDF_TO_VECTOR_PATH,
+                format!("PDF-to-vector task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_vector_conversion_error(&error, PDF_TO_VECTOR_PATH))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_VECTOR_PATH,
+        format.content_type(),
+    )
+    .await
+}
+
+async fn cbz_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_cbz_to_pdf_request(multipart).await?;
+    let output_filename = comic_output_filename(&request.file.filename, "_converted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let optimize_for_ebook = request.optimize_for_ebook;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-comic.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        cbz_to_pdf_file(
+            &input_path,
+            &filename,
+            optimize_for_ebook,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(CBZ_TO_PDF_PATH, format!("CBZ-to-PDF task failed: {error}"))
+    })?
+    .map_err(|error| map_cbz_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        CBZ_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn pdf_to_cbz(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_cbz_request(multipart).await?;
+    let output_filename = comic_output_filename(&request.file.filename, "_converted.cbz");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let dpi = if request.dpi <= 0 { 300 } else { request.dpi };
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted.cbz");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        pdf_to_cbz_file(&input_path, &filename, dpi, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(PDF_TO_CBZ_PATH, format!("PDF-to-CBZ task failed: {error}"))
+    })?
+    .map_err(|error| map_pdf_to_cbz_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_CBZ_PATH,
+        "application/zip",
+    )
+    .await
+}
+
+async fn pdf_to_text(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_text_request(multipart).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let output_format = request.output_format;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-text");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let format = task::spawn_blocking(move || {
+        pdf_to_text_file(
+            &input_path,
+            &blocking_filename,
+            &output_format,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_TEXT_PATH,
+            format!("PDF-to-text task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_text_error(&error))?;
+    let output_filename = suffixed_filename(&filename, &format!(".{}", format.extension()));
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_TEXT_PATH,
+        format.content_type(),
+    )
+    .await
+}
+
+async fn booklet_imposition(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_booklet_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_booklet.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("booklet.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        impose_booklet_to_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            BOOKLET_IMPOSITION_PATH,
+            format!("booklet task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_booklet_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        BOOKLET_IMPOSITION_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn split_for_poster_print(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_poster_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_poster.zip");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("poster.zip");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        split_pdf_for_poster_to_zip(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            POSTER_PRINT_PATH,
+            format!("poster split task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_poster_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        POSTER_PRINT_PATH,
+        "application/octet-stream",
     )
     .await
 }
@@ -1580,6 +2224,191 @@ async fn sanitize_pdf(multipart: Multipart) -> Result<Response, ApiError> {
         "application/pdf",
     )
     .await
+}
+
+async fn compress_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_compress_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_Optimized.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("optimized.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        compress_pdf_to_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            COMPRESS_PDF_PATH,
+            format!("compress PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_compress_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        COMPRESS_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn verify_pdf_route(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, VERIFY_PDF_PATH).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let results = task::spawn_blocking(move || verify_pdf(&input_path, &filename))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(VERIFY_PDF_PATH, format!("verify PDF task failed: {error}"))
+        })?
+        .map_err(|error| map_verification_error(&error))?;
+    Ok(Json(results).into_response())
+}
+
+async fn validate_signature_route(mut multipart: Multipart) -> Result<Response, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(VALIDATE_SIGNATURE_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut custom_certificate = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(VALIDATE_SIGNATURE_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, VALIDATE_SIGNATURE_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "certFile" => {
+                let certificate = read_field_bytes(&mut field, VALIDATE_SIGNATURE_PATH).await?;
+                if !certificate.is_empty() {
+                    custom_certificate = Some(certificate);
+                }
+            }
+            _ => drain_field(&mut field, VALIDATE_SIGNATURE_PATH).await?,
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::bad_request_at(VALIDATE_SIGNATURE_PATH, "fileInput is required")
+    })?;
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(VALIDATE_SIGNATURE_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return Err(ApiError::bad_request_at(
+            VALIDATE_SIGNATURE_PATH,
+            "fileInput is required",
+        ));
+    }
+    let input_path = file.path;
+    let results = task::spawn_blocking(move || {
+        let _temp_dir = temp_dir;
+        validate_pdf_signatures(&input_path, custom_certificate.as_deref())
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            VALIDATE_SIGNATURE_PATH,
+            format!("signature validation task failed: {error}"),
+        )
+    })?
+    .map_err(map_signature_validation_error)?;
+    Ok(Json(results).into_response())
+}
+
+fn map_signature_validation_error(error: SignatureValidationError) -> ApiError {
+    match error {
+        SignatureValidationError::Read(error) => {
+            ApiError::internal_at(VALIDATE_SIGNATURE_PATH, error.to_string())
+        }
+        SignatureValidationError::Pdf(error) => {
+            ApiError::bad_request_at(VALIDATE_SIGNATURE_PATH, error.to_string())
+        }
+        SignatureValidationError::InvalidCertificate(error) => ApiError::bad_request_at(
+            VALIDATE_SIGNATURE_PATH,
+            format!("Invalid certificate file format: {error}"),
+        ),
+    }
+}
+
+async fn get_info_on_pdf(mut multipart: Multipart) -> Result<Response, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(GET_INFO_ON_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(GET_INFO_ON_PDF_PATH, error.body_text()))?
+    {
+        if field.name().unwrap_or_default() == "fileInput" {
+            let filename = safe_filename(field.file_name());
+            let path = temp_dir.path().join("input.pdf");
+            write_field_to_file(&mut field, &path, GET_INFO_ON_PDF_PATH).await?;
+            file = Some(UploadedPdf { filename, path });
+        } else {
+            drain_field(&mut field, GET_INFO_ON_PDF_PATH).await?;
+        }
+    }
+    let Some(file) = file else {
+        return pdf_info_error_response("Invalid PDF file: PDF file is required");
+    };
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(GET_INFO_ON_PDF_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return pdf_info_error_response("Invalid PDF file: PDF file is required");
+    }
+    if file_size > PDF_INFO_MAX_FILE_BYTES {
+        return pdf_info_error_response(&format!(
+            "Invalid PDF file: File size ({file_size} bytes) exceeds maximum allowed size ({PDF_INFO_MAX_FILE_BYTES} bytes)"
+        ));
+    }
+    let input_path = file.path;
+    let filename = file.filename;
+    let report = task::spawn_blocking(move || {
+        let _temp_dir = temp_dir;
+        pdf_info_report(&input_path, &filename, file_size)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            GET_INFO_ON_PDF_PATH,
+            format!("get PDF info task failed: {error}"),
+        )
+    })?;
+    match report {
+        Ok(report) => pdf_info_json_response(&report, "response.json"),
+        Err(error) => pdf_info_error_response(&format!("Error reading PDF file: {error}")),
+    }
+}
+
+fn pdf_info_json_response(value: &serde_json::Value, filename: &str) -> Result<Response, ApiError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        ApiError::internal_at(
+            GET_INFO_ON_PDF_PATH,
+            format!("could not serialize PDF information: {error}"),
+        )
+    })?;
+    bytes_response(bytes, filename, GET_INFO_ON_PDF_PATH, "application/json")
+}
+
+fn pdf_info_error_response(message: &str) -> Result<Response, ApiError> {
+    pdf_info_json_response(
+        &serde_json::json!({
+            "error": message,
+            "timestamp": chrono::Utc::now().timestamp_millis(),
+        }),
+        "error.json",
+    )
 }
 
 async fn decompress_pdf(multipart: Multipart) -> Result<Response, ApiError> {
@@ -2650,6 +3479,232 @@ async fn read_add_comments_request(
     })
 }
 
+async fn read_image_overlay_request(
+    mut multipart: Multipart,
+) -> Result<UploadedImageOverlayRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(ADD_IMAGE_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut image_path = None;
+    let mut options = ImageOverlayOptions {
+        x: 0.0,
+        y: 0.0,
+        every_page: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(ADD_IMAGE_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, ADD_IMAGE_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "imageFile" => {
+                let path = temp_dir.path().join("overlay-image");
+                write_field_to_file(&mut field, &path, ADD_IMAGE_PATH).await?;
+                image_path = Some(path);
+            }
+            "x" => options.x = parse_f32_form_value(&mut field, ADD_IMAGE_PATH).await?,
+            "y" => options.y = parse_f32_form_value(&mut field, ADD_IMAGE_PATH).await?,
+            "everyPage" => {
+                options.every_page = parse_bool_at(
+                    &read_form_value(&mut field, ADD_IMAGE_PATH).await?,
+                    ADD_IMAGE_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, ADD_IMAGE_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(ADD_IMAGE_PATH, "fileInput is required"))?;
+    let image_path = image_path
+        .ok_or_else(|| ApiError::bad_request_at(ADD_IMAGE_PATH, "imageFile is required"))?;
+    if !options.x.is_finite() || !options.y.is_finite() {
+        return Err(ApiError::bad_request_at(
+            ADD_IMAGE_PATH,
+            "x and y must be finite numbers",
+        ));
+    }
+    Ok(UploadedImageOverlayRequest {
+        file,
+        image_path,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_stamp_request(mut multipart: Multipart) -> Result<UploadedStampRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(ADD_STAMP_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut stamp_image_path = None;
+    let mut options = StampOptions {
+        stamp_type: String::new(),
+        stamp_text: "Stirling Software".to_owned(),
+        alphabet: "roman".to_owned(),
+        font_size: 40.0,
+        rotation: 0.0,
+        opacity: 0.5,
+        position: 8,
+        override_x: -1.0,
+        override_y: -1.0,
+        custom_margin: "medium".to_owned(),
+        custom_color: "#d3d3d3".to_owned(),
+        page_numbers: "all".to_owned(),
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(ADD_STAMP_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, ADD_STAMP_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "stampImage" => {
+                let path = temp_dir.path().join("stamp-image");
+                write_field_to_file(&mut field, &path, ADD_STAMP_PATH).await?;
+                stamp_image_path = Some(path);
+            }
+            "stampType" => {
+                options.stamp_type = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "stampText" => {
+                options.stamp_text = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "alphabet" => {
+                options.alphabet = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "fontSize" => {
+                options.font_size = parse_f32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "rotation" => {
+                options.rotation = parse_f32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "opacity" => {
+                options.opacity = parse_f32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "position" => {
+                options.position = parse_i32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "overrideX" => {
+                options.override_x = parse_f32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "overrideY" => {
+                options.override_y = parse_f32_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "customMargin" => {
+                options.custom_margin = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "customColor" => {
+                options.custom_color = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            "pageNumbers" => {
+                options.page_numbers = read_form_value(&mut field, ADD_STAMP_PATH).await?;
+            }
+            _ => drain_field(&mut field, ADD_STAMP_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(ADD_STAMP_PATH, "fileInput is required"))?;
+    Ok(UploadedStampRequest {
+        file,
+        stamp_image_path,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_watermark_request(
+    mut multipart: Multipart,
+) -> Result<UploadedWatermarkRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(ADD_WATERMARK_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut watermark_image_path = None;
+    let mut options = WatermarkOptions {
+        watermark_type: String::new(),
+        watermark_text: "Stirling Software".to_owned(),
+        alphabet: "roman".to_owned(),
+        font_size: 30.0,
+        rotation: 0.0,
+        opacity: 0.5,
+        width_spacer: 50,
+        height_spacer: 50,
+        custom_color: "#d3d3d3".to_owned(),
+        convert_pdf_to_image: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(ADD_WATERMARK_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, ADD_WATERMARK_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "watermarkImage" => {
+                let path = temp_dir.path().join("watermark-image");
+                write_field_to_file(&mut field, &path, ADD_WATERMARK_PATH).await?;
+                watermark_image_path = Some(path);
+            }
+            "watermarkType" => {
+                options.watermark_type = read_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "watermarkText" => {
+                options.watermark_text = read_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "alphabet" => {
+                options.alphabet = read_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "fontSize" => {
+                options.font_size = parse_f32_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "rotation" => {
+                options.rotation = parse_f32_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "opacity" => {
+                options.opacity = parse_f32_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "widthSpacer" => {
+                options.width_spacer = parse_i32_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "heightSpacer" => {
+                options.height_spacer =
+                    parse_i32_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "customColor" => {
+                options.custom_color = read_form_value(&mut field, ADD_WATERMARK_PATH).await?;
+            }
+            "convertPDFToImage" => {
+                options.convert_pdf_to_image = parse_bool_at(
+                    &read_form_value(&mut field, ADD_WATERMARK_PATH).await?,
+                    ADD_WATERMARK_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, ADD_WATERMARK_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(ADD_WATERMARK_PATH, "fileInput is required"))?;
+    Ok(UploadedWatermarkRequest {
+        file,
+        watermark_image_path,
+        options,
+        temp_dir,
+    })
+}
+
 async fn read_add_page_numbers_request(
     mut multipart: Multipart,
 ) -> Result<UploadedAddPageNumbersRequest, ApiError> {
@@ -2723,6 +3778,150 @@ async fn read_add_page_numbers_request(
     })
 }
 
+async fn read_booklet_request(
+    mut multipart: Multipart,
+) -> Result<UploadedBookletRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(BOOKLET_IMPOSITION_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = BookletOptions {
+        pages_per_sheet: 2,
+        add_border: false,
+        spine_location: Some("LEFT".to_owned()),
+        add_gutter: false,
+        gutter_size: 12.0,
+        double_sided: true,
+        duplex_pass: Some("BOTH".to_owned()),
+        flip_on_short_edge: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(BOOKLET_IMPOSITION_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, BOOKLET_IMPOSITION_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "pagesPerSheet" => {
+                options.pages_per_sheet =
+                    parse_i32_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?;
+            }
+            "addBorder" => {
+                options.add_border = parse_bool_at(
+                    &read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?,
+                    BOOKLET_IMPOSITION_PATH,
+                )?;
+            }
+            "spineLocation" => {
+                options.spine_location =
+                    Some(read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?);
+            }
+            "addGutter" => {
+                options.add_gutter = parse_bool_at(
+                    &read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?,
+                    BOOKLET_IMPOSITION_PATH,
+                )?;
+            }
+            "gutterSize" => {
+                options.gutter_size =
+                    parse_f32_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?;
+            }
+            "doubleSided" => {
+                options.double_sided = parse_bool_at(
+                    &read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?,
+                    BOOKLET_IMPOSITION_PATH,
+                )?;
+            }
+            "duplexPass" => {
+                options.duplex_pass =
+                    Some(read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?);
+            }
+            "flipOnShortEdge" => {
+                options.flip_on_short_edge = parse_bool_at(
+                    &read_form_value(&mut field, BOOKLET_IMPOSITION_PATH).await?,
+                    BOOKLET_IMPOSITION_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, BOOKLET_IMPOSITION_PATH).await?,
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::bad_request_at(BOOKLET_IMPOSITION_PATH, "fileInput is required")
+    })?;
+    Ok(UploadedBookletRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_poster_request(mut multipart: Multipart) -> Result<UploadedPosterRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(POSTER_PRINT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = PosterOptions {
+        page_size: "A4".to_owned(),
+        x_factor: 2,
+        y_factor: 2,
+        right_to_left: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(POSTER_PRINT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, POSTER_PRINT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "pageSize" => {
+                options.page_size = read_form_value(&mut field, POSTER_PRINT_PATH).await?;
+            }
+            "xFactor" => {
+                options.x_factor =
+                    u8::try_from(parse_i32_form_value(&mut field, POSTER_PRINT_PATH).await?)
+                        .map_err(|_| {
+                            ApiError::bad_request_at(
+                                POSTER_PRINT_PATH,
+                                "xFactor must be between 1 and 10",
+                            )
+                        })?;
+            }
+            "yFactor" => {
+                options.y_factor =
+                    u8::try_from(parse_i32_form_value(&mut field, POSTER_PRINT_PATH).await?)
+                        .map_err(|_| {
+                            ApiError::bad_request_at(
+                                POSTER_PRINT_PATH,
+                                "yFactor must be between 1 and 10",
+                            )
+                        })?;
+            }
+            "rightToLeft" => {
+                options.right_to_left = parse_bool_at(
+                    &read_form_value(&mut field, POSTER_PRINT_PATH).await?,
+                    POSTER_PRINT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, POSTER_PRINT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(POSTER_PRINT_PATH, "fileInput is required"))?;
+    Ok(UploadedPosterRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
 async fn read_auto_rename_request(
     mut multipart: Multipart,
 ) -> Result<UploadedAutoRenameRequest, ApiError> {
@@ -2756,6 +3955,425 @@ async fn read_auto_rename_request(
     Ok(UploadedAutoRenameRequest {
         file,
         use_first_text_as_fallback,
+        temp_dir,
+    })
+}
+
+async fn read_auto_split_request(
+    mut multipart: Multipart,
+) -> Result<UploadedAutoSplitRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(AUTO_SPLIT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut duplex_mode = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(AUTO_SPLIT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, AUTO_SPLIT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "duplexMode" => {
+                duplex_mode = parse_bool_at(
+                    &read_form_value(&mut field, AUTO_SPLIT_PATH).await?,
+                    AUTO_SPLIT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, AUTO_SPLIT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(AUTO_SPLIT_PATH, "fileInput is required"))?;
+    Ok(UploadedAutoSplitRequest {
+        file,
+        duplex_mode,
+        temp_dir,
+    })
+}
+
+async fn read_pdf_to_image_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToImageRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_IMAGE_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = PdfToImageOptions {
+        image_format: "png".to_owned(),
+        single_or_multiple: "multiple".to_owned(),
+        color_type: "color".to_owned(),
+        dpi: 300,
+        page_numbers: "all".to_owned(),
+        include_annotations: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_IMAGE_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_IMAGE_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "imageFormat" => {
+                options.image_format = read_form_value(&mut field, PDF_TO_IMAGE_PATH).await?;
+            }
+            "singleOrMultiple" => {
+                options.single_or_multiple = read_form_value(&mut field, PDF_TO_IMAGE_PATH).await?;
+            }
+            "colorType" => {
+                options.color_type = read_form_value(&mut field, PDF_TO_IMAGE_PATH).await?;
+            }
+            "dpi" => {
+                options.dpi = parse_i32_form_value(&mut field, PDF_TO_IMAGE_PATH).await?;
+            }
+            "pageNumbers" => {
+                options.page_numbers = read_form_value(&mut field, PDF_TO_IMAGE_PATH).await?;
+            }
+            "includeAnnotations" => {
+                options.include_annotations = parse_bool_at(
+                    &read_form_value(&mut field, PDF_TO_IMAGE_PATH).await?,
+                    PDF_TO_IMAGE_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, PDF_TO_IMAGE_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_IMAGE_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfToImageRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_image_to_pdf_request(
+    mut multipart: Multipart,
+) -> Result<UploadedImageToPdfRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(IMAGE_TO_PDF_PATH, error.to_string()))?;
+    let mut files = Vec::new();
+    let mut options = ImageToPdfOptions {
+        fit_option: "fillPage".to_owned(),
+        color_type: "color".to_owned(),
+        auto_rotate: false,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(IMAGE_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join(format!("input-{}", files.len()));
+                write_field_to_file(&mut field, &path, IMAGE_TO_PDF_PATH).await?;
+                files.push(ImageInput { filename, path });
+            }
+            "fitOption" => {
+                options.fit_option = read_form_value(&mut field, IMAGE_TO_PDF_PATH).await?;
+            }
+            "colorType" => {
+                options.color_type = read_form_value(&mut field, IMAGE_TO_PDF_PATH).await?;
+            }
+            "autoRotate" => {
+                options.auto_rotate = parse_bool_at(
+                    &read_form_value(&mut field, IMAGE_TO_PDF_PATH).await?,
+                    IMAGE_TO_PDF_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, IMAGE_TO_PDF_PATH).await?,
+        }
+    }
+    if files.is_empty() {
+        return Err(ApiError::bad_request_at(
+            IMAGE_TO_PDF_PATH,
+            "fileInput is required",
+        ));
+    }
+    Ok(UploadedImageToPdfRequest {
+        files,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_svg_to_pdf_request(
+    mut multipart: Multipart,
+) -> Result<UploadedSvgToPdfRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(SVG_TO_PDF_PATH, error.to_string()))?;
+    let mut files = Vec::new();
+    let mut combine = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(SVG_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                if !filename
+                    .rsplit_once('.')
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("svg"))
+                {
+                    drain_field(&mut field, SVG_TO_PDF_PATH).await?;
+                    continue;
+                }
+                let path = temp_dir.path().join(format!("input-{}.svg", files.len()));
+                write_field_to_file(&mut field, &path, SVG_TO_PDF_PATH).await?;
+                files.push(SvgInput { filename, path });
+            }
+            "combineIntoSinglePdf" => {
+                combine = parse_bool_at(
+                    &read_form_value(&mut field, SVG_TO_PDF_PATH).await?,
+                    SVG_TO_PDF_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, SVG_TO_PDF_PATH).await?,
+        }
+    }
+    if files.is_empty() {
+        return Err(ApiError::bad_request_at(
+            SVG_TO_PDF_PATH,
+            "No valid SVG files were found",
+        ));
+    }
+    Ok(UploadedSvgToPdfRequest {
+        files,
+        combine,
+        temp_dir,
+    })
+}
+
+async fn read_vector_conversion_request(
+    mut multipart: Multipart,
+    api_path: &'static str,
+) -> Result<UploadedVectorConversionRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+    let mut file = None;
+    let mut output_format = "eps".to_owned();
+    let mut prepress = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("vector-input");
+                write_field_to_file(&mut field, &path, api_path).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "outputFormat" => {
+                output_format = read_form_value(&mut field, api_path).await?;
+            }
+            "prepress" => {
+                prepress = parse_bool_at(&read_form_value(&mut field, api_path).await?, api_path)?;
+            }
+            _ => drain_field(&mut field, api_path).await?,
+        }
+    }
+    let file = file.ok_or_else(|| ApiError::bad_request_at(api_path, "fileInput is required"))?;
+    Ok(UploadedVectorConversionRequest {
+        file,
+        output_format,
+        prepress,
+        temp_dir,
+    })
+}
+
+async fn read_cbz_to_pdf_request(
+    mut multipart: Multipart,
+) -> Result<UploadedCbzToPdfRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(CBZ_TO_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut optimize_for_ebook = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(CBZ_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.cbz");
+                write_field_to_file(&mut field, &path, CBZ_TO_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "optimizeForEbook" => {
+                optimize_for_ebook = parse_bool_at(
+                    &read_form_value(&mut field, CBZ_TO_PDF_PATH).await?,
+                    CBZ_TO_PDF_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, CBZ_TO_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(CBZ_TO_PDF_PATH, "fileInput is required"))?;
+    Ok(UploadedCbzToPdfRequest {
+        file,
+        optimize_for_ebook,
+        temp_dir,
+    })
+}
+
+async fn read_pdf_to_cbz_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToCbzRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_CBZ_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut dpi = 150;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_CBZ_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_CBZ_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "dpi" => {
+                dpi = parse_i32_form_value(&mut field, PDF_TO_CBZ_PATH).await?;
+            }
+            _ => drain_field(&mut field, PDF_TO_CBZ_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_CBZ_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfToCbzRequest {
+        file,
+        dpi,
+        temp_dir,
+    })
+}
+
+async fn read_pdf_to_text_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToTextRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_TEXT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut output_format = String::new();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_TEXT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_TEXT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "outputFormat" => {
+                output_format = read_form_value(&mut field, PDF_TO_TEXT_PATH).await?;
+            }
+            _ => drain_field(&mut field, PDF_TO_TEXT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_TEXT_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfToTextRequest {
+        file,
+        output_format,
+        temp_dir,
+    })
+}
+
+async fn read_compress_request(
+    mut multipart: Multipart,
+) -> Result<UploadedCompressRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(COMPRESS_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = CompressOptions {
+        optimize_level: 5,
+        expected_output_size: None,
+        linearize: false,
+        normalize: false,
+        grayscale: false,
+        line_art: false,
+        line_art_threshold: 55.0,
+        line_art_edge_level: 1,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(COMPRESS_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, COMPRESS_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "optimizeLevel" => {
+                options.optimize_level =
+                    parse_i32_form_value(&mut field, COMPRESS_PDF_PATH).await?;
+            }
+            "expectedOutputSize" => {
+                options.expected_output_size =
+                    Some(read_form_value(&mut field, COMPRESS_PDF_PATH).await?);
+            }
+            "linearize" => {
+                options.linearize = parse_bool_at(
+                    &read_form_value(&mut field, COMPRESS_PDF_PATH).await?,
+                    COMPRESS_PDF_PATH,
+                )?;
+            }
+            "normalize" => {
+                options.normalize = parse_bool_at(
+                    &read_form_value(&mut field, COMPRESS_PDF_PATH).await?,
+                    COMPRESS_PDF_PATH,
+                )?;
+            }
+            "grayscale" => {
+                options.grayscale = parse_bool_at(
+                    &read_form_value(&mut field, COMPRESS_PDF_PATH).await?,
+                    COMPRESS_PDF_PATH,
+                )?;
+            }
+            "lineArt" => {
+                options.line_art = parse_bool_at(
+                    &read_form_value(&mut field, COMPRESS_PDF_PATH).await?,
+                    COMPRESS_PDF_PATH,
+                )?;
+            }
+            "lineArtThreshold" => {
+                options.line_art_threshold =
+                    parse_f64_form_value(&mut field, COMPRESS_PDF_PATH).await?;
+            }
+            "lineArtEdgeLevel" => {
+                options.line_art_edge_level =
+                    parse_i32_form_value(&mut field, COMPRESS_PDF_PATH).await?;
+            }
+            _ => drain_field(&mut field, COMPRESS_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(COMPRESS_PDF_PATH, "fileInput is required"))?;
+    Ok(UploadedCompressRequest {
+        file,
+        options,
         temp_dir,
     })
 }
@@ -4022,6 +5640,17 @@ async fn parse_f32_form_value(
         .map_err(|_| ApiError::bad_request_at(api_path, format!("'{value}' is not a float")))
 }
 
+async fn parse_f64_form_value(
+    field: &mut axum::extract::multipart::Field<'_>,
+    api_path: &'static str,
+) -> Result<f64, ApiError> {
+    let value = read_form_value(field, api_path).await?;
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| ApiError::bad_request_at(api_path, format!("'{value}' is not a float")))
+}
+
 async fn write_field_to_file(
     field: &mut axum::extract::multipart::Field<'_>,
     path: &Path,
@@ -4074,6 +5703,21 @@ async fn read_form_value_bounded(
     }
     String::from_utf8(value)
         .map_err(|_| ApiError::bad_request_at(api_path, "multipart form value is not UTF-8"))
+}
+
+async fn read_field_bytes(
+    field: &mut axum::extract::multipart::Field<'_>,
+    api_path: &'static str,
+) -> Result<Vec<u8>, ApiError> {
+    let mut value = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
+    {
+        value.extend_from_slice(&chunk);
+    }
+    Ok(value)
 }
 
 async fn drain_field(
@@ -4162,6 +5806,18 @@ fn suffixed_filename(filename: &str, suffix: &str) -> String {
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
         .map_or(filename, |(stem, _)| stem);
     format!("{base}{suffix}")
+}
+
+fn comic_output_filename(filename: &str, suffix: &str) -> String {
+    let base = filename
+        .rsplit_once('.')
+        .map_or(filename, |(stem, _)| stem)
+        .trim();
+    if base.is_empty() {
+        format!("comic{suffix}")
+    } else {
+        format!("{base}{suffix}")
+    }
 }
 
 fn attachment_header(filename: &str, api_path: &'static str) -> Result<HeaderValue, ApiError> {
@@ -4329,6 +5985,34 @@ fn map_geometry_error(error: &GeometryError, api_path: &'static str) -> ApiError
         | GeometryError::NonFiniteGeometry => ApiError::bad_request_at(api_path, error.to_string()),
         GeometryError::Pdf(_) | GeometryError::Write(_) => {
             ApiError::internal_at(api_path, error.to_string())
+        }
+    }
+}
+
+fn map_booklet_error(error: &BookletError) -> ApiError {
+    match error {
+        BookletError::InvalidPagesPerSheet
+        | BookletError::ReadPdf { .. }
+        | BookletError::NoPages
+        | BookletError::NonFiniteGutter
+        | BookletError::InvalidPageBox { .. }
+        | BookletError::Pdf(_) => {
+            ApiError::bad_request_at(BOOKLET_IMPOSITION_PATH, error.to_string())
+        }
+        BookletError::Write(_) => ApiError::internal_at(BOOKLET_IMPOSITION_PATH, error.to_string()),
+    }
+}
+
+fn map_poster_error(error: &PosterError) -> ApiError {
+    match error {
+        PosterError::InvalidPageSize(_)
+        | PosterError::InvalidGrid
+        | PosterError::ReadPdf { .. }
+        | PosterError::InvalidPageBox { .. } => {
+            ApiError::bad_request_at(POSTER_PRINT_PATH, error.to_string())
+        }
+        PosterError::Pdf(_) | PosterError::Io(_) | PosterError::Zip(_) => {
+            ApiError::internal_at(POSTER_PRINT_PATH, error.to_string())
         }
     }
 }
@@ -4501,6 +6185,296 @@ fn map_auto_rename_error(error: &AutoRenameError) -> ApiError {
         AutoRenameError::PdfiumRuntime { .. }
         | AutoRenameError::Pdfium(_)
         | AutoRenameError::Write(_) => ApiError::internal_at(AUTO_RENAME_PATH, error.to_string()),
+    }
+}
+
+fn map_auto_split_error(error: &AutoSplitError) -> ApiError {
+    match error {
+        AutoSplitError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        } => ApiError::unsupported_at(AUTO_SPLIT_PATH, error.to_string()),
+        AutoSplitError::Pdfium(PdfiumAutoSplitError::ReadPdf { .. }) => {
+            ApiError::bad_request_at(AUTO_SPLIT_PATH, error.to_string())
+        }
+        AutoSplitError::PdfiumUnavailable {
+            explicitly_configured: true,
+            ..
+        }
+        | AutoSplitError::Pdfium(_) => ApiError::internal_at(AUTO_SPLIT_PATH, error.to_string()),
+    }
+}
+
+fn map_pdf_to_image_error(error: &PdfToImageError) -> ApiError {
+    match error {
+        PdfToImageError::InvalidFormat
+        | PdfToImageError::InvalidMode
+        | PdfToImageError::InvalidColorType
+        | PdfToImageError::InvalidDpi
+        | PdfToImageError::DpiExceedsLimit { .. }
+        | PdfToImageError::Pdfium(
+            PdfiumToImageError::ReadPdf { .. }
+            | PdfiumToImageError::PageSelection(_)
+            | PdfiumToImageError::NoPages
+            | PdfiumToImageError::PageCount
+            | PdfiumToImageError::UnsafeRenderDimensions { .. }
+            | PdfiumToImageError::UnsafeCombinedDimensions { .. },
+        ) => ApiError::bad_request_at(PDF_TO_IMAGE_PATH, error.to_string()),
+        PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        } => ApiError::unsupported_at(PDF_TO_IMAGE_PATH, error.to_string()),
+        PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: true,
+            ..
+        }
+        | PdfToImageError::Pdfium(_) => ApiError::internal_at(PDF_TO_IMAGE_PATH, error.to_string()),
+    }
+}
+
+fn map_image_to_pdf_error(error: &ImageToPdfError) -> ApiError {
+    match error {
+        ImageToPdfError::NoImages
+        | ImageToPdfError::InvalidFitOption
+        | ImageToPdfError::InvalidColorType
+        | ImageToPdfError::OpenImage { .. }
+        | ImageToPdfError::DecodeImage { .. }
+        | ImageToPdfError::DecodeTiff { .. }
+        | ImageToPdfError::UnsupportedTiff { .. }
+        | ImageToPdfError::UnsafeDimensions { .. } => {
+            ApiError::bad_request_at(IMAGE_TO_PDF_PATH, error.to_string())
+        }
+        ImageToPdfError::Pdf(_) | ImageToPdfError::Write(_) => {
+            ApiError::internal_at(IMAGE_TO_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_svg_to_pdf_error(error: &SvgToPdfError) -> ApiError {
+    match error {
+        SvgToPdfError::NoInputs | SvgToPdfError::NoConvertedSvg => {
+            ApiError::bad_request_at(SVG_TO_PDF_PATH, error.to_string())
+        }
+        SvgToPdfError::ReadSvg(_)
+        | SvgToPdfError::ReadGeneratedPdf(_)
+        | SvgToPdfError::EmptyGeneratedPdf
+        | SvgToPdfError::CombinePdf(_)
+        | SvgToPdfError::Write(_)
+        | SvgToPdfError::Zip(_) => ApiError::internal_at(SVG_TO_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_vector_conversion_error(error: &VectorConversionError, api_path: &'static str) -> ApiError {
+    match error {
+        VectorConversionError::UnsupportedInputFormat(_)
+        | VectorConversionError::UnsupportedOutputFormat(_) => {
+            ApiError::bad_request_at(api_path, error.to_string())
+        }
+        VectorConversionError::GhostscriptUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(api_path, error.to_string()),
+        VectorConversionError::CopyPdf(_)
+        | VectorConversionError::GhostscriptUnavailable {
+            explicitly_configured: true,
+        }
+        | VectorConversionError::GhostscriptStart { .. }
+        | VectorConversionError::GhostscriptFailed { .. }
+        | VectorConversionError::GhostscriptNoOutput => {
+            ApiError::internal_at(api_path, error.to_string())
+        }
+    }
+}
+
+fn map_image_overlay_error(error: &ImageOverlayError) -> ApiError {
+    match error {
+        ImageOverlayError::ReadPdf { .. }
+        | ImageOverlayError::EmptyPdf { .. }
+        | ImageOverlayError::GuessImageFormat(_)
+        | ImageOverlayError::DecodeImage(_)
+        | ImageOverlayError::InvalidSvgEncoding
+        | ImageOverlayError::UnsafeSvg
+        | ImageOverlayError::ParseSvg(_)
+        | ImageOverlayError::ConvertSvg(_)
+        | ImageOverlayError::EmptySvg => {
+            ApiError::bad_request_at(ADD_IMAGE_PATH, error.to_string())
+        }
+        ImageOverlayError::ReadImage(_)
+        | ImageOverlayError::Pdf(_)
+        | ImageOverlayError::RasterPdf(_)
+        | ImageOverlayError::WritePdf(_) => {
+            ApiError::internal_at(ADD_IMAGE_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_stamp_error(error: &StampError) -> ApiError {
+    match error {
+        StampError::InvalidStampType
+        | StampError::MissingStampImage
+        | StampError::InvalidImageSize
+        | StampError::InvalidOpacity
+        | StampError::InvalidPosition
+        | StampError::InvalidCoordinates
+        | StampError::ReadPdf { .. }
+        | StampError::EmptyPdf { .. }
+        | StampError::PageSelection(_)
+        | StampError::OpenImage(_)
+        | StampError::GuessImageFormat(_)
+        | StampError::DecodeImage(_) => ApiError::bad_request_at(ADD_STAMP_PATH, error.to_string()),
+        StampError::ImagePdf(_)
+        | StampError::TextSvg(_)
+        | StampError::Pdf(_)
+        | StampError::WritePdf(_) => ApiError::internal_at(ADD_STAMP_PATH, error.to_string()),
+    }
+}
+
+fn map_watermark_error(error: &WatermarkError) -> ApiError {
+    match error {
+        WatermarkError::InvalidFontSize
+        | WatermarkError::InvalidRotation
+        | WatermarkError::InvalidOpacity
+        | WatermarkError::InvalidSpacing
+        | WatermarkError::MissingText
+        | WatermarkError::MissingImage
+        | WatermarkError::TooManyPlacements
+        | WatermarkError::ReadPdf { .. }
+        | WatermarkError::EmptyPdf { .. }
+        | WatermarkError::OpenImage(_)
+        | WatermarkError::GuessImageFormat(_)
+        | WatermarkError::DecodeImage(_) => {
+            ApiError::bad_request_at(ADD_WATERMARK_PATH, error.to_string())
+        }
+        WatermarkError::Flatten(FlattenError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        }) => ApiError::unsupported_at(ADD_WATERMARK_PATH, error.to_string()),
+        WatermarkError::ImagePdf(_)
+        | WatermarkError::TextSvg(_)
+        | WatermarkError::Pdf(_)
+        | WatermarkError::Intermediate(_)
+        | WatermarkError::WritePdf(_)
+        | WatermarkError::Flatten(_) => {
+            ApiError::internal_at(ADD_WATERMARK_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_compress_error(error: &CompressError) -> ApiError {
+    match error {
+        CompressError::InvalidOptimizeLevel
+        | CompressError::InvalidExpectedOutputSize
+        | CompressError::InvalidLineArtThreshold
+        | CompressError::InvalidLineArtEdgeLevel
+        | CompressError::ReadPdf { .. }
+        | CompressError::EmptyPdf { .. }
+        | CompressError::Image(_) => ApiError::bad_request_at(COMPRESS_PDF_PATH, error.to_string()),
+        CompressError::QpdfUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(COMPRESS_PDF_PATH, error.to_string()),
+        CompressError::QpdfUnavailable {
+            explicitly_configured: true,
+        }
+        | CompressError::ExternalFailed { .. }
+        | CompressError::ExternalStart { .. }
+        | CompressError::Pdf(_)
+        | CompressError::Io(_) => ApiError::internal_at(COMPRESS_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_verification_error(error: &VerificationError) -> ApiError {
+    match error {
+        VerificationError::ReadPdf { .. } | VerificationError::MetadataTooLarge => {
+            ApiError::bad_request_at(VERIFY_PDF_PATH, error.to_string())
+        }
+        VerificationError::VeraPdfUnavailable {
+            explicitly_configured: false,
+            ..
+        } => ApiError::unsupported_at(VERIFY_PDF_PATH, error.to_string()),
+        VerificationError::VeraPdfUnavailable {
+            explicitly_configured: true,
+            ..
+        }
+        | VerificationError::VeraPdfStart { .. }
+        | VerificationError::VeraPdfFailed { .. }
+        | VerificationError::InvalidReport(_)
+        | VerificationError::Regex(_)
+        | VerificationError::Pdf(_) => ApiError::internal_at(VERIFY_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_cbz_to_pdf_error(error: &ComicBookError) -> ApiError {
+    match error {
+        ComicBookError::InvalidCbzExtension
+        | ComicBookError::EmptyArchive
+        | ComicBookError::NoImages
+        | ComicBookError::TooManyEntries
+        | ComicBookError::ArchiveTooLarge
+        | ComicBookError::Zip(_)
+        | ComicBookError::ImageToPdf(
+            ImageToPdfError::NoImages
+            | ImageToPdfError::InvalidFitOption
+            | ImageToPdfError::InvalidColorType
+            | ImageToPdfError::OpenImage { .. }
+            | ImageToPdfError::DecodeImage { .. }
+            | ImageToPdfError::DecodeTiff { .. }
+            | ImageToPdfError::UnsupportedTiff { .. }
+            | ImageToPdfError::UnsafeDimensions { .. },
+        ) => ApiError::bad_request_at(CBZ_TO_PDF_PATH, error.to_string()),
+        ComicBookError::InvalidPdfExtension
+        | ComicBookError::Io(_)
+        | ComicBookError::ImageToPdf(_)
+        | ComicBookError::PdfToImage(_)
+        | ComicBookError::UnexpectedImageOutput => {
+            ApiError::internal_at(CBZ_TO_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_pdf_to_cbz_error(error: &ComicBookError) -> ApiError {
+    match error {
+        ComicBookError::InvalidPdfExtension
+        | ComicBookError::PdfToImage(
+            PdfToImageError::InvalidFormat
+            | PdfToImageError::InvalidMode
+            | PdfToImageError::InvalidColorType
+            | PdfToImageError::InvalidDpi
+            | PdfToImageError::DpiExceedsLimit { .. }
+            | PdfToImageError::Pdfium(
+                PdfiumToImageError::ReadPdf { .. }
+                | PdfiumToImageError::PageSelection(_)
+                | PdfiumToImageError::NoPages
+                | PdfiumToImageError::PageCount
+                | PdfiumToImageError::UnsafeRenderDimensions { .. }
+                | PdfiumToImageError::UnsafeCombinedDimensions { .. },
+            ),
+        ) => ApiError::bad_request_at(PDF_TO_CBZ_PATH, error.to_string()),
+        ComicBookError::PdfToImage(PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        }) => ApiError::unsupported_at(PDF_TO_CBZ_PATH, error.to_string()),
+        ComicBookError::InvalidCbzExtension
+        | ComicBookError::EmptyArchive
+        | ComicBookError::NoImages
+        | ComicBookError::TooManyEntries
+        | ComicBookError::ArchiveTooLarge
+        | ComicBookError::Io(_)
+        | ComicBookError::Zip(_)
+        | ComicBookError::ImageToPdf(_)
+        | ComicBookError::PdfToImage(_)
+        | ComicBookError::UnexpectedImageOutput => {
+            ApiError::internal_at(PDF_TO_CBZ_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_pdf_text_error(error: &PdfTextError) -> ApiError {
+    match error {
+        PdfTextError::InvalidFormat
+        | PdfTextError::ReadPdf { .. }
+        | PdfTextError::ExtractText { .. } => {
+            ApiError::bad_request_at(PDF_TO_TEXT_PATH, error.to_string())
+        }
+        PdfTextError::Write(_) => ApiError::internal_at(PDF_TO_TEXT_PATH, error.to_string()),
     }
 }
 

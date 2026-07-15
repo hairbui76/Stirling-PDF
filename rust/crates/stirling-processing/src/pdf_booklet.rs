@@ -8,6 +8,7 @@ use lopdf::{
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BookletOptions {
     pub pages_per_sheet: i32,
     pub add_border: bool,
@@ -48,7 +49,7 @@ struct Side {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Rectangle {
+pub(crate) struct Rectangle {
     lower_x: f32,
     lower_y: f32,
     upper_x: f32,
@@ -56,11 +57,11 @@ struct Rectangle {
 }
 
 impl Rectangle {
-    fn width(self) -> f32 {
+    pub(crate) fn width(self) -> f32 {
         self.upper_x - self.lower_x
     }
 
-    fn height(self) -> f32 {
+    pub(crate) fn height(self) -> f32 {
         self.upper_y - self.lower_y
     }
 
@@ -73,10 +74,10 @@ impl Rectangle {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ImportedPage {
-    form_id: ObjectId,
-    crop_box: Rectangle,
-    rotation: i32,
+pub(crate) struct ImportedPage {
+    pub(crate) form_id: ObjectId,
+    pub(crate) crop_box: Rectangle,
+    pub(crate) rotation: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,15 +87,15 @@ impl Matrix {
     const IDENTITY: Self = Self([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
     fn concatenate(&mut self, right: Self) {
-        let [a, b, c, d, e, f] = self.0;
-        let [ra, rb, rc, rd, re, rf] = right.0;
+        let [source_a, source_b, source_c, source_d, source_e, source_f] = self.0;
+        let [right_a, right_b, right_c, right_d, right_e, right_f] = right.0;
         self.0 = [
-            a * ra + c * rb,
-            b * ra + d * rb,
-            a * rc + c * rd,
-            b * rc + d * rd,
-            a * re + c * rf + e,
-            b * re + d * rf + f,
+            source_a * right_a + source_c * right_b,
+            source_b * right_a + source_d * right_b,
+            source_a * right_c + source_c * right_d,
+            source_b * right_c + source_d * right_d,
+            source_a * right_e + source_c * right_f + source_e,
+            source_b * right_e + source_d * right_f + source_f,
         ];
     }
 
@@ -186,6 +187,7 @@ pub fn impose_booklet_to_file(
         )?);
     }
     install_fresh_page_tree(&mut document, root_pages_id, output_pages)?;
+    document.prune_objects();
     document.save(output_path)?;
     Ok(())
 }
@@ -364,6 +366,23 @@ fn import_page_form(
     page_id: ObjectId,
 ) -> Result<ImportedPage, lopdf::Error> {
     let (media_box, crop_box) = page_boxes(document, page_id)?;
+    import_page_form_from_boxes(document, page_id, media_box, crop_box)
+}
+
+pub(crate) fn import_page_form_with_normalized_crop(
+    document: &mut Document,
+    page_id: ObjectId,
+) -> Result<ImportedPage, lopdf::Error> {
+    let (_, crop_box) = page_boxes(document, page_id)?;
+    import_page_form_from_boxes(document, page_id, crop_box, crop_box)
+}
+
+fn import_page_form_from_boxes(
+    document: &mut Document,
+    page_id: ObjectId,
+    media_box: Rectangle,
+    crop_box: Rectangle,
+) -> Result<ImportedPage, lopdf::Error> {
     let rotation = page_rotation(document, page_id);
     let resources = inherited_value(document, page_id, b"Resources")
         .unwrap_or_else(|_| Object::Dictionary(Dictionary::new()));
@@ -509,7 +528,7 @@ fn inherited_value(
     }
 }
 
-fn install_fresh_page_tree(
+pub(crate) fn install_fresh_page_tree(
     document: &mut Document,
     root_pages_id: ObjectId,
     output_pages: Vec<ObjectId>,
@@ -545,7 +564,7 @@ fn install_fresh_page_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::{Matrix, Rectangle, Side, layer_utility_matrix, saddle_stitch_sides};
+    use super::{Rectangle, Side, layer_utility_matrix, saddle_stitch_sides};
 
     #[test]
     fn matches_java_saddle_stitch_and_duplex_pass_order() {
@@ -615,9 +634,10 @@ mod tests {
             upper_x: 110.0,
             upper_y: 220.0,
         };
-        assert_eq!(
-            layer_utility_matrix(media, crop, 90).0,
-            Matrix([0.0, -2.0, 0.5, 0.0, -20.0, 200.0]).0
-        );
+        let actual = layer_utility_matrix(media, crop, 90).0;
+        let expected = [0.0, -2.0, 0.5, 0.0, -20.0, 200.0];
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
     }
 }

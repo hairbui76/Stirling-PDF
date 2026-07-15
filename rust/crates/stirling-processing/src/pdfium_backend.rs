@@ -3,16 +3,22 @@ use std::{
     env,
     fs::File,
     hash::{Hash, Hasher},
-    io::{Cursor, Write},
+    io::{self, Cursor, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
 use pdfium_render::prelude::{
-    PdfDocument, PdfPageObjectsCommon, PdfPagePaperSize, PdfPageRenderRotation, PdfPoints,
+    PdfDocument, PdfPage, PdfPageObjectsCommon, PdfPagePaperSize, PdfPageRenderRotation, PdfPoints,
     PdfRenderConfig, Pdfium, PdfiumError,
 };
+use rxing::{
+    BarcodeFormat, BinaryBitmap, DecodeHintValue, DecodeHints, Luma8LuminanceSource,
+    MultiFormatReader, Reader,
+    common::{GlobalHistogramBinarizer, HybridBinarizer},
+};
+use tempfile::tempdir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -23,6 +29,9 @@ use crate::{
 
 pub const PDFIUM_LIBRARY_PATH_ENV: &str = "STIRLING_PDFIUM_LIBRARY_PATH";
 const MAX_BOOKMARKS_PER_DOCUMENT: usize = 100_000;
+const QR_DETECTION_DPI: i32 = 150;
+const MAX_QR_IMAGE_PIXELS: u64 = 100_000_000;
+const BLANK_QR_CHECK_SAMPLES: usize = 20;
 
 static PDFIUM: OnceLock<PdfiumRuntime> = OnceLock::new();
 
@@ -115,6 +124,45 @@ pub enum PdfiumBlankDetectionAttempt {
     },
 }
 
+#[derive(Debug)]
+pub enum PdfiumAutoSplitAttempt {
+    Split,
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum PdfiumToImageAttempt {
+    Converted,
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PdfToImageFormat {
+    Png,
+    Jpeg { extension: &'static str },
+    Gif,
+    WebP,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfToImageMode {
+    Single,
+    Multiple,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PdfToImageColor {
+    Color,
+    Greyscale,
+    BlackWhite,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ExtractImageFormat {
     Png,
@@ -199,6 +247,52 @@ pub enum PdfiumRemoveError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum PdfiumToImageError {
+    #[error("could not lock the PDFium runtime because another operation panicked")]
+    RuntimePoisoned,
+    #[error("could not read '{filename}' as a PDF with PDFium: {source}")]
+    ReadPdf {
+        filename: String,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(transparent)]
+    PageSelection(#[from] PageSelectionError),
+    #[error("the selected page list is empty")]
+    NoPages,
+    #[error("the PDF page count exceeds this platform's addressable memory")]
+    PageCount,
+    #[error("could not {operation} page {page_number} with PDFium: {source}")]
+    Page {
+        operation: &'static str,
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(
+        "page {page_number} would render to unsafe dimensions {width}x{height} pixels at {dpi} DPI"
+    )]
+    UnsafeRenderDimensions {
+        page_number: usize,
+        width: u64,
+        height: u64,
+        dpi: i32,
+    },
+    #[error("the combined image would have unsafe dimensions {width}x{height} pixels")]
+    UnsafeCombinedDimensions { width: u64, height: u64 },
+    #[error("could not encode output image {image_number}: {source}")]
+    Encode {
+        image_number: usize,
+        #[source]
+        source: image::ImageError,
+    },
+    #[error("could not write converted image output: {0}")]
+    Io(#[from] io::Error),
+    #[error("could not build converted image archive: {0}")]
+    Zip(#[from] zip::result::ZipError),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum PdfiumFlattenError {
     #[error("could not lock the PDFium runtime because another operation panicked")]
     RuntimePoisoned,
@@ -260,6 +354,60 @@ pub enum PdfiumBlankDetectionError {
     },
     #[error("page {page_number} produced an invalid RGBA bitmap")]
     InvalidBitmap { page_number: usize },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PdfiumAutoSplitError {
+    #[error("could not lock the PDFium runtime because another operation panicked")]
+    RuntimePoisoned,
+    #[error("could not read '{filename}' as a PDF with PDFium: {source}")]
+    ReadPdf {
+        filename: String,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not {operation} page {page_number} with PDFium: {source}")]
+    Page {
+        operation: &'static str,
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(
+        "page {page_number} would render to unsafe dimensions {width}x{height} pixels at {dpi} DPI"
+    )]
+    UnsafeRenderDimensions {
+        page_number: usize,
+        width: u64,
+        height: u64,
+        dpi: i32,
+    },
+    #[error("page {page_number} produced an invalid RGBA bitmap")]
+    InvalidBitmap { page_number: usize },
+    #[error("could not create auto-split document {document_number} with PDFium: {source}")]
+    CreateDocument {
+        document_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not import pages into auto-split document {document_number}: {source}")]
+    ImportPages {
+        document_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not write auto-split document {document_number}: {source}")]
+    Save {
+        document_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("the auto-split page count exceeds the supported range")]
+    PageCount,
+    #[error("could not read or write the auto-split archive: {0}")]
+    Io(#[from] io::Error),
+    #[error("could not build the auto-split ZIP archive: {0}")]
+    Zip(#[from] zip::result::ZipError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -514,6 +662,582 @@ fn render_dimension(points: f32, dpi: i32) -> u64 {
 
 fn page_number(page_index: i32) -> usize {
     usize::try_from(page_index).map_or(usize::MAX, |index| index.saturating_add(1))
+}
+
+pub fn try_auto_split_pdf_to_zip(
+    input_path: &Path,
+    filename: &str,
+    duplex_mode: bool,
+    maximum_dpi: i32,
+    output_path: &Path,
+) -> Result<PdfiumAutoSplitAttempt, PdfiumAutoSplitError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium
+            .lock()
+            .map_err(|_| PdfiumAutoSplitError::RuntimePoisoned)?,
+        Err(details) => {
+            return Ok(PdfiumAutoSplitAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumAutoSplitError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let page_count = document.pages().len();
+    let mut groups = Vec::<Vec<i32>>::new();
+    let mut page_index = 0;
+    while page_index < page_count {
+        let page_number = page_number(page_index);
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumAutoSplitError::Page {
+                    operation: "read",
+                    page_number,
+                    source,
+                })?;
+        let qr_content = decode_page_qr(&page, maximum_dpi, page_number)?;
+        let is_divider = qr_content.as_deref().is_some_and(valid_split_qr);
+        add_page_to_auto_split_groups(&mut groups, page_index, is_divider);
+        page_index = page_index.saturating_add(if duplex_mode && is_divider { 2 } else { 1 });
+    }
+    groups.retain(|group| !group.is_empty());
+
+    let directory = tempdir()?;
+    let output = File::create(output_path)?;
+    let mut archive = ZipWriter::new(output);
+    let zip_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let base = filename_stem(filename);
+    for (group_index, group) in groups.iter().enumerate() {
+        let document_number = group_index.saturating_add(1);
+        let mut split =
+            pdfium
+                .create_new_pdf()
+                .map_err(|source| PdfiumAutoSplitError::CreateDocument {
+                    document_number,
+                    source,
+                })?;
+        let pages = group
+            .iter()
+            .map(|page| page.saturating_add(1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        split
+            .pages_mut()
+            .copy_pages_from_document(&document, &pages, 0)
+            .map_err(|source| PdfiumAutoSplitError::ImportPages {
+                document_number,
+                source,
+            })?;
+        let split_path = directory.path().join(format!("split-{group_index}.pdf"));
+        split
+            .save_to_file(&split_path)
+            .map_err(|source| PdfiumAutoSplitError::Save {
+                document_number,
+                source,
+            })?;
+        archive.start_file(format!("{base}_{document_number}.pdf"), zip_options)?;
+        io::copy(&mut File::open(split_path)?, &mut archive)?;
+    }
+    archive.finish()?;
+    Ok(PdfiumAutoSplitAttempt::Split)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_convert_pdf_to_images(
+    input_path: &Path,
+    filename: &str,
+    page_numbers: &str,
+    format: PdfToImageFormat,
+    mode: PdfToImageMode,
+    color: PdfToImageColor,
+    dpi: i32,
+    include_annotations: bool,
+    output_path: &Path,
+) -> Result<PdfiumToImageAttempt, PdfiumToImageError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium
+            .lock()
+            .map_err(|_| PdfiumToImageError::RuntimePoisoned)?,
+        Err(details) => {
+            return Ok(PdfiumToImageAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumToImageError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let page_count =
+        usize::try_from(document.pages().len()).map_err(|_| PdfiumToImageError::PageCount)?;
+    let selected_pages = parse_page_list(page_numbers, page_count)?;
+    if selected_pages.is_empty() {
+        return Err(PdfiumToImageError::NoPages);
+    }
+
+    match mode {
+        PdfToImageMode::Single => convert_pdf_to_single_image(
+            &document,
+            &selected_pages,
+            format,
+            color,
+            dpi,
+            include_annotations,
+            output_path,
+        )?,
+        PdfToImageMode::Multiple => convert_pdf_to_image_archive(
+            &document,
+            &selected_pages,
+            filename,
+            format,
+            color,
+            dpi,
+            include_annotations,
+            output_path,
+        )?,
+    }
+    Ok(PdfiumToImageAttempt::Converted)
+}
+
+fn convert_pdf_to_single_image(
+    document: &PdfDocument<'_>,
+    selected_pages: &[usize],
+    format: PdfToImageFormat,
+    color: PdfToImageColor,
+    dpi: i32,
+    include_annotations: bool,
+    output_path: &Path,
+) -> Result<(), PdfiumToImageError> {
+    let dimensions = selected_pages
+        .iter()
+        .map(|page_index| selected_page_dimensions(document, *page_index, dpi))
+        .collect::<Result<Vec<_>, _>>()?;
+    let maximum_width = dimensions
+        .iter()
+        .map(|(width, _)| *width)
+        .max()
+        .ok_or(PdfiumToImageError::NoPages)?;
+    let total_height = dimensions.iter().try_fold(0_u64, |total, (_, height)| {
+        total
+            .checked_add(*height)
+            .ok_or(PdfiumToImageError::UnsafeCombinedDimensions {
+                width: maximum_width,
+                height: u64::MAX,
+            })
+    })?;
+    let total_pixels = maximum_width.saturating_mul(total_height);
+    if maximum_width == 0
+        || total_height == 0
+        || maximum_width > u64::from(u32::MAX)
+        || total_height > u64::from(u32::MAX)
+        || total_pixels > u64::from(i32::MAX.unsigned_abs())
+    {
+        return Err(PdfiumToImageError::UnsafeCombinedDimensions {
+            width: maximum_width,
+            height: total_height,
+        });
+    }
+    let width =
+        u32::try_from(maximum_width).map_err(|_| PdfiumToImageError::UnsafeCombinedDimensions {
+            width: maximum_width,
+            height: total_height,
+        })?;
+    let height =
+        u32::try_from(total_height).map_err(|_| PdfiumToImageError::UnsafeCombinedDimensions {
+            width: maximum_width,
+            height: total_height,
+        })?;
+    let background = if matches!(format, PdfToImageFormat::Png | PdfToImageFormat::WebP) {
+        Rgba([0, 0, 0, 0])
+    } else {
+        Rgba([255, 255, 255, 255])
+    };
+    let mut combined = DynamicImage::ImageRgba8(RgbaImage::from_pixel(width, height, background));
+    let mut current_y = 0_i64;
+    for (page_index, (page_width, page_height)) in selected_pages.iter().zip(dimensions.iter()) {
+        let rendered = render_pdf_page(
+            document,
+            *page_index,
+            *page_width,
+            *page_height,
+            color,
+            dpi,
+            include_annotations,
+        )?;
+        let x = i64::try_from(maximum_width.saturating_sub(*page_width) / 2).map_err(|_| {
+            PdfiumToImageError::UnsafeCombinedDimensions {
+                width: maximum_width,
+                height: total_height,
+            }
+        })?;
+        imageops::overlay(&mut combined, &rendered, x, current_y);
+        current_y = current_y
+            .checked_add(i64::try_from(*page_height).map_err(|_| {
+                PdfiumToImageError::UnsafeCombinedDimensions {
+                    width: maximum_width,
+                    height: total_height,
+                }
+            })?)
+            .ok_or(PdfiumToImageError::UnsafeCombinedDimensions {
+                width: maximum_width,
+                height: total_height,
+            })?;
+    }
+    let encoded =
+        encode_pdf_image(combined, format).map_err(|source| PdfiumToImageError::Encode {
+            image_number: 1,
+            source,
+        })?;
+    std::fs::write(output_path, encoded)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_pdf_to_image_archive(
+    document: &PdfDocument<'_>,
+    selected_pages: &[usize],
+    filename: &str,
+    format: PdfToImageFormat,
+    color: PdfToImageColor,
+    dpi: i32,
+    include_annotations: bool,
+    output_path: &Path,
+) -> Result<(), PdfiumToImageError> {
+    let output = File::create(output_path)?;
+    let mut archive = ZipWriter::new(output);
+    let zip_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let base = filename_stem(filename);
+    for (output_index, page_index) in selected_pages.iter().enumerate() {
+        let image_number = output_index.saturating_add(1);
+        let (width, height) = selected_page_dimensions(document, *page_index, dpi)?;
+        let rendered = render_pdf_page(
+            document,
+            *page_index,
+            width,
+            height,
+            color,
+            dpi,
+            include_annotations,
+        )?;
+        let encoded =
+            encode_pdf_image(rendered, format).map_err(|source| PdfiumToImageError::Encode {
+                image_number,
+                source,
+            })?;
+        let entry_name = if matches!(format, PdfToImageFormat::WebP) {
+            format!("page_{image_number}.webp")
+        } else {
+            format!("{base}_{image_number}.{}", format.extension())
+        };
+        archive.start_file(entry_name, zip_options)?;
+        archive.write_all(&encoded)?;
+    }
+    archive.finish()?;
+    Ok(())
+}
+
+fn selected_page_dimensions(
+    document: &PdfDocument<'_>,
+    page_index: usize,
+    dpi: i32,
+) -> Result<(u64, u64), PdfiumToImageError> {
+    let page_number = page_index.saturating_add(1);
+    let page_index = i32::try_from(page_index).map_err(|_| PdfiumToImageError::PageCount)?;
+    let page = document
+        .pages()
+        .get(page_index)
+        .map_err(|source| PdfiumToImageError::Page {
+            operation: "read",
+            page_number,
+            source,
+        })?;
+    let width = render_dimension(page.width().value, dpi);
+    let height = render_dimension(page.height().value, dpi);
+    let maximum_dimension = u64::from(i32::MAX.unsigned_abs());
+    if width == 0
+        || height == 0
+        || width > maximum_dimension
+        || height > maximum_dimension
+        || width.saturating_mul(height) > maximum_dimension
+    {
+        return Err(PdfiumToImageError::UnsafeRenderDimensions {
+            page_number,
+            width,
+            height,
+            dpi,
+        });
+    }
+    Ok((width, height))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_pdf_page(
+    document: &PdfDocument<'_>,
+    page_index: usize,
+    width: u64,
+    height: u64,
+    color: PdfToImageColor,
+    dpi: i32,
+    include_annotations: bool,
+) -> Result<DynamicImage, PdfiumToImageError> {
+    let page_number = page_index.saturating_add(1);
+    let invalid = || PdfiumToImageError::UnsafeRenderDimensions {
+        page_number,
+        width,
+        height,
+        dpi,
+    };
+    let page_index = i32::try_from(page_index).map_err(|_| PdfiumToImageError::PageCount)?;
+    let page = document
+        .pages()
+        .get(page_index)
+        .map_err(|source| PdfiumToImageError::Page {
+            operation: "read",
+            page_number,
+            source,
+        })?;
+    let config = PdfRenderConfig::new()
+        .set_fixed_size(
+            i32::try_from(width).map_err(|_| invalid())?,
+            i32::try_from(height).map_err(|_| invalid())?,
+        )
+        .render_annotations(include_annotations)
+        .render_form_data(include_annotations);
+    let rendered = page
+        .render_with_config(&config)
+        .and_then(|bitmap| bitmap.as_image())
+        .map_err(|source| PdfiumToImageError::Page {
+            operation: "render",
+            page_number,
+            source,
+        })?;
+    Ok(apply_pdf_image_color(&rendered, color))
+}
+
+fn apply_pdf_image_color(image: &DynamicImage, color: PdfToImageColor) -> DynamicImage {
+    match color {
+        PdfToImageColor::Color => DynamicImage::ImageRgb8(image.to_rgb8()),
+        PdfToImageColor::Greyscale => DynamicImage::ImageLuma8(image.to_luma8()),
+        PdfToImageColor::BlackWhite => {
+            let mut image = image.to_luma8();
+            for pixel in image.pixels_mut() {
+                pixel.0[0] = if pixel.0[0] < 128 { 0 } else { 255 };
+            }
+            DynamicImage::ImageLuma8(image)
+        }
+    }
+}
+
+fn encode_pdf_image(
+    image: DynamicImage,
+    format: PdfToImageFormat,
+) -> Result<Vec<u8>, image::ImageError> {
+    const WEBP_MAX_DIMENSION: u32 = 16_383;
+    let image = if matches!(format, PdfToImageFormat::WebP)
+        && (image.width() > WEBP_MAX_DIMENSION || image.height() > WEBP_MAX_DIMENSION)
+    {
+        image.resize(
+            WEBP_MAX_DIMENSION,
+            WEBP_MAX_DIMENSION,
+            imageops::FilterType::Lanczos3,
+        )
+    } else {
+        image
+    };
+    let (image, image_format) = match format {
+        PdfToImageFormat::Png => (image, ImageFormat::Png),
+        PdfToImageFormat::Jpeg { .. } => {
+            (DynamicImage::ImageRgb8(image.to_rgb8()), ImageFormat::Jpeg)
+        }
+        PdfToImageFormat::Gif => (DynamicImage::ImageRgba8(image.to_rgba8()), ImageFormat::Gif),
+        PdfToImageFormat::WebP => (image, ImageFormat::WebP),
+    };
+    let mut output = Cursor::new(Vec::new());
+    image.write_to(&mut output, image_format)?;
+    Ok(output.into_inner())
+}
+
+impl PdfToImageFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg { extension } => extension,
+            Self::Gif => "gif",
+            Self::WebP => "webp",
+        }
+    }
+}
+
+fn decode_page_qr(
+    page: &PdfPage<'_>,
+    maximum_dpi: i32,
+    page_number: usize,
+) -> Result<Option<String>, PdfiumAutoSplitError> {
+    let content = render_and_decode_qr(page, QR_DETECTION_DPI, page_number)?;
+    if content.is_some() || maximum_dpi <= QR_DETECTION_DPI {
+        return Ok(content);
+    }
+    render_and_decode_qr(page, maximum_dpi, page_number)
+}
+
+fn render_and_decode_qr(
+    page: &PdfPage<'_>,
+    dpi: i32,
+    page_number: usize,
+) -> Result<Option<String>, PdfiumAutoSplitError> {
+    let (pixel_width, pixel_height) =
+        checked_qr_render_dimensions(page.width(), page.height(), dpi, page_number)?;
+    let config = PdfRenderConfig::new()
+        .set_fixed_size(pixel_width, pixel_height)
+        .render_annotations(true)
+        .render_form_data(true);
+    let bitmap = page
+        .render_with_config(&config)
+        .map_err(|source| PdfiumAutoSplitError::Page {
+            operation: "render",
+            page_number,
+            source,
+        })?;
+    let rgba = bitmap.as_rgba_bytes();
+    let expected_bytes = usize::try_from(pixel_width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(pixel_height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(PdfiumAutoSplitError::InvalidBitmap { page_number })?;
+    if rgba.len() != expected_bytes {
+        return Err(PdfiumAutoSplitError::InvalidBitmap { page_number });
+    }
+    Ok(decode_qr_rgba(
+        &rgba,
+        u32::try_from(pixel_width)
+            .map_err(|_| PdfiumAutoSplitError::InvalidBitmap { page_number })?,
+        u32::try_from(pixel_height)
+            .map_err(|_| PdfiumAutoSplitError::InvalidBitmap { page_number })?,
+    ))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn checked_qr_render_dimensions(
+    width: PdfPoints,
+    height: PdfPoints,
+    dpi: i32,
+    page_number: usize,
+) -> Result<(i32, i32), PdfiumAutoSplitError> {
+    let mut pixel_width = render_dimension(width.value, dpi);
+    let mut pixel_height = render_dimension(height.value, dpi);
+    let total_pixels = pixel_width.saturating_mul(pixel_height);
+    if total_pixels > MAX_QR_IMAGE_PIXELS {
+        let scale = (MAX_QR_IMAGE_PIXELS as f64 / total_pixels as f64).sqrt();
+        pixel_width = ((pixel_width as f64 * scale).floor() as u64).max(1);
+        pixel_height = ((pixel_height as f64 * scale).floor() as u64).max(1);
+    }
+    let invalid = || PdfiumAutoSplitError::UnsafeRenderDimensions {
+        page_number,
+        width: pixel_width,
+        height: pixel_height,
+        dpi,
+    };
+    if pixel_width == 0
+        || pixel_height == 0
+        || pixel_width.saturating_mul(pixel_height) > MAX_QR_IMAGE_PIXELS
+    {
+        return Err(invalid());
+    }
+    Ok((
+        i32::try_from(pixel_width).map_err(|_| invalid())?,
+        i32::try_from(pixel_height).map_err(|_| invalid())?,
+    ))
+}
+
+fn decode_qr_rgba(rgba: &[u8], width: u32, height: u32) -> Option<String> {
+    let total_pixels = rgba.len() / 4;
+    if total_pixels == 0 {
+        return None;
+    }
+    let first = &rgba[..4];
+    let step = (total_pixels / BLANK_QR_CHECK_SAMPLES).max(1);
+    if rgba
+        .chunks_exact(4)
+        .step_by(step)
+        .all(|pixel| pixel == first)
+    {
+        return None;
+    }
+    let luminance = rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let weighted =
+                u16::from(pixel[0]) + u16::from(pixel[1]).saturating_mul(2) + u16::from(pixel[2]);
+            u8::try_from(weighted / 4).unwrap_or(u8::MAX)
+        })
+        .collect::<Vec<_>>();
+    let source = Luma8LuminanceSource::new(luminance, width, height);
+    let hints = DecodeHints::default()
+        .with(DecodeHintValue::PossibleFormats(HashSet::from([
+            BarcodeFormat::QR_CODE,
+        ])))
+        .with(DecodeHintValue::TryHarder(true))
+        .with(DecodeHintValue::AlsoInverted(true));
+    let mut hybrid = BinaryBitmap::new(HybridBinarizer::new(source.clone()));
+    if let Ok(result) = MultiFormatReader::default().decode_with_hints(&mut hybrid, &hints) {
+        return Some(result.getText().to_owned());
+    }
+    let mut global = BinaryBitmap::new(GlobalHistogramBinarizer::new(source));
+    MultiFormatReader::default()
+        .decode_with_hints(&mut global, &hints)
+        .ok()
+        .map(|result| result.getText().to_owned())
+}
+
+fn valid_split_qr(content: &str) -> bool {
+    matches!(
+        content,
+        "https://github.com/Stirling-Tools/Stirling-PDF"
+            | "https://github.com/Frooodle/Stirling-PDF"
+            | "https://stirlingpdf.com"
+    )
+}
+
+fn add_page_to_auto_split_groups(groups: &mut Vec<Vec<i32>>, page_index: i32, is_divider: bool) {
+    if is_divider && page_index != 0 {
+        groups.push(Vec::new());
+    }
+    if !is_divider {
+        if let Some(group) = groups.last_mut() {
+            group.push(page_index);
+        } else if page_index == 0 {
+            groups.push(vec![page_index]);
+        }
+    } else if page_index == 0 {
+        groups.push(vec![page_index]);
+    }
+}
+
+fn filename_stem(filename: &str) -> &str {
+    filename
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map_or(filename, |(stem, _)| stem)
 }
 
 pub fn try_detect_blank_image_pages(
@@ -1267,7 +1991,23 @@ mod tests {
 
     use pdfium_render::prelude::Pdfium;
 
-    use super::{detect_content_bounds, is_blank_rgba, pdfium_library_path};
+    use super::{
+        add_page_to_auto_split_groups, detect_content_bounds, is_blank_rgba, pdfium_library_path,
+    };
+
+    #[test]
+    fn auto_split_keeps_a_first_page_divider_and_drops_later_dividers() {
+        let mut groups = Vec::new();
+        for (page, divider) in [true, false, true, false, false].into_iter().enumerate() {
+            add_page_to_auto_split_groups(
+                &mut groups,
+                i32::try_from(page).unwrap_or_default(),
+                divider,
+            );
+        }
+        groups.retain(|group| !group.is_empty());
+        assert_eq!(groups, [vec![0, 1], vec![3, 4]]);
+    }
 
     #[test]
     fn detects_non_white_pixel_bounds_in_pdf_coordinates() {

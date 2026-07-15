@@ -306,7 +306,7 @@ fn apply_overlay(
     Ok(())
 }
 
-fn install_xobject(
+pub(crate) fn install_xobject(
     document: &mut Document,
     page_id: ObjectId,
     name: &[u8],
@@ -331,7 +331,7 @@ fn install_xobject(
     Ok(())
 }
 
-fn append_original_contents(
+pub(crate) fn append_original_contents(
     document: &mut Document,
     contents: Option<Object>,
     output: &mut Vec<Object>,

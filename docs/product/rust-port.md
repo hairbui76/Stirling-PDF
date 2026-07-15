@@ -42,8 +42,8 @@ The deployment images and source also rely on native processing tools including
 LibreOffice/unoserver, Calibre, Ghostscript, OCRmyPDF/Tesseract, FFmpeg, and PDFium.
 Their final role is governed by the external-dependency scope decision below.
 
-As of the same checkpoint, the additive Rust processing service implements 57
-compatibility `POST /api/v1/*` routes and one health route. Its 140 Rust unit and
+As of the same checkpoint, the additive Rust processing service implements 75
+compatibility `POST /api/v1/*` routes and one health route. Its 237 Rust unit and
 HTTP integration tests pass with both the compatibility backend and the pinned
 native PDFium runtime. This is implementation progress, not cutover evidence:
 Java remains the production route owner and the much larger non-UI inventory

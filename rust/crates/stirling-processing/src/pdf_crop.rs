@@ -1,22 +1,16 @@
-use std::{
-    env,
-    io::ErrorKind,
-    path::Path,
-    process::{Command, ExitStatus},
-};
+use std::{io::ErrorKind, path::Path, process::Command};
 
 use lopdf::{Document, Stream, dictionary};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
+    ghostscript::{exit_status, ghostscript_commands},
     pdf_page_geometry::{PageForm, page_form, replace_page_tree},
     pdfium_backend::{
         DetectedCropBounds, PdfiumAutoCropAttempt, PdfiumAutoCropError, try_detect_auto_crop_bounds,
     },
 };
-
-const GHOSTSCRIPT_COMMAND_ENV: &str = "STIRLING_PROCESSING_GHOSTSCRIPT_COMMAND";
 
 #[derive(Debug, Clone, Copy)]
 pub struct CropOptions {
@@ -228,7 +222,7 @@ fn try_ghostscript_crop(
         .save(input.path())
         .map_err(CropError::GhostscriptInput)?;
 
-    for command in ghostscript_commands() {
+    for command in ghostscript_commands().candidates {
         let status = Command::new(&command)
             .arg("-sDEVICE=pdfwrite")
             .arg("-dUseCropBox")
@@ -256,32 +250,8 @@ fn try_ghostscript_crop(
     Ok(false)
 }
 
-fn ghostscript_commands() -> Vec<String> {
-    if let Ok(command) = env::var(GHOSTSCRIPT_COMMAND_ENV)
-        && !command.trim().is_empty()
-    {
-        return vec![command];
-    }
-    if cfg!(windows) {
-        vec![
-            "gswin64c".to_owned(),
-            "gswin32c".to_owned(),
-            "gs".to_owned(),
-        ]
-    } else {
-        vec!["gs".to_owned()]
-    }
-}
-
 fn output_exists(path: &Path) -> bool {
     path.metadata().is_ok_and(|metadata| metadata.len() > 0)
-}
-
-fn exit_status(status: ExitStatus) -> String {
-    status.code().map_or_else(
-        || "terminated by signal".to_owned(),
-        |code| code.to_string(),
-    )
 }
 
 fn load_document(path: &Path, filename: &str) -> Result<Document, CropError> {
