@@ -16,6 +16,9 @@ includes:
   engine:
     taskfile: .taskfiles/engine.yml
     dir: engine
+  rust:
+    taskfile: .taskfiles/rust.yml
+    dir: rust
   docker:
     taskfile: .taskfiles/docker.yml
     dir: .
@@ -56,6 +59,7 @@ tasks:
     cmds:
       - task: frontend:install
       - task: engine:install
+      - task: rust:install
 
   # ============================================================
   # Development
@@ -142,17 +146,19 @@ tasks:
     cmds:
       - task: backend:build
       - task: frontend:build
+      - task: rust:build
 
   # ============================================================
   # Test
   # ============================================================
 
   test:
-    desc: "Run ALL tests (backend + frontend + engine)"
+    desc: "Run all tests"
     cmds:
       - task: backend:test
       - task: frontend:test
       - task: engine:test
+      - task: rust:test
 
   # ============================================================
   # Lint & Format
@@ -163,6 +169,7 @@ tasks:
     cmds:
       - task: frontend:lint
       - task: engine:lint
+      - task: rust:lint
 
   fix:
     desc: "Auto-fix all components"
@@ -170,6 +177,7 @@ tasks:
       - task: backend:fix
       - task: frontend:fix
       - task: engine:fix
+      - task: rust:format
 
   format:
     desc: "Auto-fix formatting across all components"
@@ -177,6 +185,7 @@ tasks:
       - task: backend:format
       - task: frontend:format
       - task: engine:format
+      - task: rust:format
 
   format:check:
     desc: "Check formatting across all components"
@@ -184,6 +193,7 @@ tasks:
       - task: backend:format:check
       - task: frontend:format:check
       - task: engine:format:check
+      - task: rust:format:check
 
   # ============================================================
   # Code generation
@@ -205,6 +215,7 @@ tasks:
       - task: backend:check
       - task: frontend:check
       - task: engine:check
+      - task: rust:check
 
   check:all:
     desc: "Full CI quality gate"
@@ -212,6 +223,7 @@ tasks:
       - task: backend:check
       - task: frontend:check:all
       - task: engine:check
+      - task: rust:check
 
   # ============================================================
   # Clean
@@ -223,4 +235,5 @@ tasks:
       - task: backend:clean
       - task: frontend:clean
       - task: engine:clean
+      - task: rust:clean
       - task: pre-commit:clean

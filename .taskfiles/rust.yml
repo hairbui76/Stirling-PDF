@@ -1,0 +1,64 @@
+version: '3'
+
+tasks:
+  pdfium:install:
+    desc: "Install the pinned PDFium runtime"
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -File scripts/install-pdfium.ps1{{else}}bash scripts/install-pdfium.sh{{end}}'
+
+  install:
+    desc: "Fetch Rust dependencies"
+    deps:
+      - pdfium:install
+    cmds:
+      - cargo fetch --locked
+
+  run:
+    desc: "Run the Rust processing service"
+    deps:
+      - pdfium:install
+    env:
+      STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+    cmds:
+      - cargo run -p stirling-processing
+
+  build:
+    desc: "Build Rust components"
+    cmds:
+      - cargo build --workspace --locked
+
+  test:
+    desc: "Run Rust tests"
+    deps:
+      - pdfium:install
+    env:
+      STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+    cmds:
+      - cargo test --workspace --locked
+
+  lint:
+    desc: "Run Rust linting"
+    cmds:
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  format:
+    desc: "Auto-fix Rust formatting"
+    cmds:
+      - cargo fmt
+
+  format:check:
+    desc: "Check Rust formatting"
+    cmds:
+      - cargo fmt --check
+
+  check:
+    desc: "Run the Rust quality gate"
+    cmds:
+      - task: format:check
+      - task: lint
+      - task: test
+
+  clean:
+    desc: "Clean Rust build artifacts"
+    cmds:
+      - cargo clean
