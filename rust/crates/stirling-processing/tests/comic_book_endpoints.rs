@@ -100,6 +100,48 @@ async fn cbz_to_pdf_rejects_invalid_empty_and_imageless_archives()
 }
 
 #[tokio::test]
+async fn cbr_routes_validate_extensions_and_surface_missing_rar_tooling()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        post_file(
+            "/api/v1/convert/cbr/pdf",
+            "comic.zip",
+            "application/octet-stream",
+            b"not a rar",
+            &[],
+        )
+        .await?
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post_file(
+            "/api/v1/convert/pdf/cbr",
+            "document.txt",
+            "application/octet-stream",
+            b"not a pdf",
+            &[("dpi", "72")],
+        )
+        .await?
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let response = post_file(
+        "/api/v1/convert/pdf/cbr",
+        "document.pdf",
+        "application/pdf",
+        &tiny_pdf()?,
+        &[("dpi", "72")],
+    )
+    .await?;
+    assert!(matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::NOT_IMPLEMENTED
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn pdf_to_cbz_renders_numbered_rgb_png_pages() -> Result<(), Box<dyn std::error::Error>> {
     let response = post_file(
         "/api/v1/convert/pdf/cbz",

@@ -1,7 +1,24 @@
+pub mod additional_language;
+mod admin_settings;
+pub mod ai_document;
 pub mod comic_book;
+pub mod ebook_to_pdf;
+pub mod eml_to_pdf;
+pub mod extract_image_scans;
 mod ghostscript;
+pub mod hardware_signing;
+pub mod html_sanitizer;
+pub mod html_to_pdf;
 pub mod image_to_pdf;
+mod job_manager;
+mod job_queue;
+pub mod markdown_to_pdf;
+pub mod mobile_scanner;
+pub mod ocr_pdf;
+pub mod office_sanitizer;
+pub mod office_to_pdf;
 mod page_selection;
+pub mod pdf_ai_comments;
 pub mod pdf_analysis;
 pub mod pdf_attachments;
 pub mod pdf_auto_rename;
@@ -13,6 +30,7 @@ pub mod pdf_comments;
 pub mod pdf_compress;
 pub mod pdf_crop;
 pub mod pdf_document_ops;
+pub mod pdf_edit_text;
 pub mod pdf_extract_images;
 pub mod pdf_filters;
 pub mod pdf_flatten;
@@ -22,8 +40,13 @@ mod pdf_form_transform;
 mod pdf_forms;
 pub mod pdf_geometry_ops;
 pub mod pdf_image_overlay;
+pub mod pdf_incremental_signature;
 pub mod pdf_info;
 pub mod pdf_javascript;
+pub mod pdf_json;
+mod pdf_json_cache;
+pub mod pdf_markdown;
+pub mod pdf_math_audit;
 pub mod pdf_merge;
 pub mod pdf_metadata;
 pub mod pdf_overlay;
@@ -32,9 +55,12 @@ pub mod pdf_page_numbers;
 pub mod pdf_password;
 pub mod pdf_poster;
 pub mod pdf_rearrange;
+pub mod pdf_redaction;
 pub mod pdf_remove;
+pub mod pdf_replace_invert_color;
 pub mod pdf_rotate;
 pub mod pdf_sanitize;
+pub mod pdf_scanner_effect;
 pub mod pdf_signature_validation;
 mod pdf_signatures;
 pub mod pdf_split;
@@ -42,47 +68,109 @@ pub mod pdf_split_by_size;
 pub mod pdf_split_chapters;
 pub mod pdf_split_sections;
 pub mod pdf_stamp;
+pub mod pdf_table;
 pub mod pdf_table_of_contents;
 pub mod pdf_text;
+pub mod pdf_timestamp;
+pub mod pdf_to_ebook;
+pub mod pdf_to_html;
 pub mod pdf_to_image;
+pub mod pdf_to_video;
 pub mod pdf_verification;
 pub mod pdf_watermark;
+pub mod pdfa;
 mod pdfium_backend;
+mod pipeline;
+mod pipeline_directory;
+pub mod runtime_config;
+mod runtime_dependencies;
+pub mod runtime_metrics;
+pub mod security;
+pub mod security_crypto;
+pub mod security_http;
+pub mod security_jwt;
+pub mod security_policy;
+mod server_certificate;
+pub mod signature_assets;
+pub mod signing_key;
 pub mod svg_to_pdf;
+pub mod ui_data;
+pub mod url_to_pdf;
 pub mod vector_conversion;
 
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
     env,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, Query},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    body::{Body, to_bytes},
+    extract::{
+        DefaultBodyLimit, Extension, FromRequest, Multipart, Path as AxumPath, Query, Request,
+        State,
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
-use tokio::{fs::File, io::AsyncWriteExt, task};
+use tokio::{
+    fs::{File, OpenOptions},
+    io::AsyncWriteExt,
+    task,
+};
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
+use zeroize::Zeroizing;
 
 use crate::pdf_merge::{
     MergeError, MergeInput, MergeOptions, merge_pdf_paths_to_file, read_pdf_sort_metadata,
 };
 use crate::{
-    comic_book::{ComicBookError, cbz_to_pdf_file, pdf_to_cbz_file},
+    ai_document::{AiDocumentError, convert_ai_document_to_pdf},
+    comic_book::{
+        ComicBookError, cbr_to_pdf_file, cbz_to_pdf_file, pdf_to_cbr_file, pdf_to_cbz_file,
+    },
+    ebook_to_pdf::{EbookOptions, EbookOutputMode, EbookToPdfError, convert_ebook_to_pdf},
+    eml_to_pdf::{
+        EmlOptions, EmlOutputFormat, EmlRecipientDisplay, EmlToPdfError, convert_email_to_output,
+    },
+    extract_image_scans::{
+        ExtractImageScansError, ExtractImageScansOptions, ExtractImageScansOutput,
+        extract_image_scans_file,
+    },
+    hardware_signing::{
+        HardwareSigningError, Pkcs11SigningRequest, capabilities as hardware_signing_capabilities,
+        list_pkcs11_certificates as list_hardware_pkcs11_certificates,
+        list_windows_certificates as list_hardware_windows_certificates, with_pkcs11_signing_key,
+        with_windows_signing_key,
+    },
+    html_to_pdf::{HtmlToPdfError, convert_html_to_pdf},
     image_to_pdf::{ImageInput, ImageToPdfError, ImageToPdfOptions, images_to_pdf_file},
+    job_manager::{CancelJob, JobFile, JobManager, JobOwner},
+    job_queue::{JobAdmission, JobQueue, JobQueueError, QueueCancellationResult},
+    markdown_to_pdf::{MarkdownToPdfError, convert_markdown_to_pdf},
+    mobile_scanner::{
+        FileMetadata as MobileScannerFileMetadata, MobileScannerError, MobileScannerService,
+    },
+    ocr_pdf::{OcrError, OcrOptions, OcrOutput, run_ocr},
+    office_to_pdf::{
+        OfficeToPdfError, PdfToOfficeOutput, convert_office_to_pdf, convert_pdf_to_office,
+    },
+    pdf_ai_comments::{AiCommentEngineSettings, PdfAiCommentError, annotate_pdf_with_ai_comments},
     pdf_analysis::AnalysisError,
     pdf_attachments::{
-        AttachmentError, AttachmentInput, add_attachments_to_file, delete_attachment_to_file,
-        extract_attachments_to_zip, list_attachments, rename_attachment_to_file,
+        AttachmentError, AttachmentInput, add_attachments_to_file, add_attachments_to_pdfa3b_file,
+        delete_attachment_to_file, extract_attachments_to_zip, list_attachments,
+        rename_attachment_to_file,
     },
     pdf_auto_rename::{AutoRenameError, auto_rename_to_file},
     pdf_auto_split::{AutoSplitError, auto_split_pdf_to_zip},
@@ -95,6 +183,7 @@ use crate::{
         DocumentOperationError, decompress_pdf_to_file, remove_cert_sign_to_file,
         remove_images_to_file, repair_pdf_to_file, unlock_pdf_forms_to_file,
     },
+    pdf_edit_text::{PdfTextEditError, TextEdit, TextEditOptions, edit_pdf_text_to_file},
     pdf_extract_images::{ExtractImagesError, extract_images_to_zip},
     pdf_filters::{Comparator, FilterError},
     pdf_flatten::{FlattenError, flatten_pdf_to_file},
@@ -107,8 +196,21 @@ use crate::{
         scale_pdf_pages,
     },
     pdf_image_overlay::{ImageOverlayError, ImageOverlayOptions, overlay_image_to_file},
+    pdf_incremental_signature::{
+        PdfSignatureAppearance, PdfSignatureMetadata, PdfSignaturePlaceholder, PdfSigningError,
+    },
     pdf_info::pdf_info_report,
     pdf_javascript::{JavascriptError, extract_javascript},
+    pdf_json::{
+        PdfJsonDocument, PdfJsonError, PdfJsonFont, PdfJsonPage, convert_json_to_pdf,
+        json_bytes_to_pdf, pdf_bytes_to_json, pdf_to_json, pdf_to_json_metadata,
+    },
+    pdf_json_cache::{
+        PdfJsonCacheError, cache_pdf_file, clear_cached_pdf, load_cached_pdf,
+        replace_cached_pdf_file,
+    },
+    pdf_markdown::{PdfMarkdownError, pdf_to_markdown_file},
+    pdf_math_audit::{PdfMathAuditError, audit_pdf_math},
     pdf_metadata::{MetadataError, MetadataOptions, update_metadata_to_file},
     pdf_overlay::{OverlayError, OverlayInput, OverlayOptions, overlay_pdf_paths_to_file},
     pdf_page_numbers::{PageNumberError, PageNumberOptions, add_page_numbers_to_file},
@@ -118,27 +220,68 @@ use crate::{
     },
     pdf_poster::{PosterError, PosterOptions, split_pdf_for_poster_to_zip},
     pdf_rearrange::{RearrangePagesError, rearrange_pdf_pages_to_file},
+    pdf_redaction::{
+        AutoRedactionOptions, ExecuteRedactionImageBox, ExecuteRedactionOptions,
+        PdfRedactionAttempt, PdfRedactionError, RedactionBox, RedactionTextRange,
+        execute_redaction_to_raster_file, redact_matching_text_to_raster_file,
+        redact_pdf_to_raster_file,
+    },
     pdf_remove::{RemovePagesError, remove_pdf_pages_to_file},
+    pdf_replace_invert_color::{
+        HighContrastColorCombination, ReplaceAndInvert, ReplaceInvertError, ReplaceInvertOptions,
+        replace_invert_color_to_file,
+    },
     pdf_rotate::{RotateError, rotate_pdf_path_to_file},
     pdf_sanitize::{SanitizeError, SanitizeOptions, sanitize_pdf_to_file},
+    pdf_scanner_effect::{
+        Colorspace, Quality, Rotation, ScannerEffectError, ScannerEffectParams,
+        ScannerEffectRequestValues, scanner_effect_to_file,
+    },
     pdf_signature_validation::{SignatureValidationError, validate_pdf_signatures},
     pdf_split::{SplitPdfError, split_pdf_to_zip},
     pdf_split_by_size::{SplitBySizeError, split_pdf_by_size_or_count_to_zip},
     pdf_split_chapters::{SplitChaptersError, split_pdf_by_chapters_to_zip},
     pdf_split_sections::{SectionsOutput, SplitSectionsError, split_pdf_by_sections},
     pdf_stamp::{StampError, StampOptions, add_stamp_to_file},
+    pdf_table::{
+        CsvExtractionOutput, PdfTableAttempt, PdfTableError, PdfXlsxAttempt, XlsxExtractionOutput,
+        extract_pdf_tables_to_csv, extract_pdf_tables_to_xlsx,
+    },
     pdf_table_of_contents::{
         TableOfContentsError, edit_table_of_contents_to_file, extract_bookmarks,
     },
     pdf_text::{PdfTextError, pdf_to_text_file},
+    pdf_timestamp::{TimestampError, timestamp_pdf_to_file},
+    pdf_to_ebook::{
+        OutputFormat as PdfToEbookOutputFormat, PdfToEbookError, PdfToEbookOptions,
+        TargetDevice as PdfToEbookTargetDevice, convert_pdf_to_ebook,
+    },
+    pdf_to_html::{PdfToHtmlError, convert_pdf_to_html},
     pdf_to_image::{PdfToImageError, PdfToImageOptions, PdfToImageOutput, convert_pdf_to_images},
+    pdf_to_video::{PdfToVideoError, PdfToVideoOptions, VideoFormat, convert_pdf_to_video},
     pdf_verification::{VerificationError, verify_pdf},
     pdf_watermark::{WatermarkError, WatermarkOptions, add_watermark_to_file},
+    pdfa::{PdfArchiveFormat, PdfaError, convert_pdf_to_archive_file},
     pdfium_backend::{
         PdfiumAutoCropError, PdfiumAutoSplitError, PdfiumMergeError, PdfiumRemoveError,
         PdfiumRotateError, PdfiumToImageError,
     },
+    pipeline::{PIPELINE_PATH, PipelineDispatcher},
+    pipeline_directory::PipelineDirectoryWatcher,
+    runtime_config::RuntimeConfig,
+    runtime_metrics::{RuntimeMetrics, application_version},
+    security::AuthContext,
+    security_http::{
+        SecurityHttpConfig, SecurityStartupError, initialize_security_store,
+        secure_router_with_config,
+    },
+    security_jwt::SupabaseJwtVerifier,
+    server_certificate::{ServerCertificateError, ServerCertificateService},
+    signing_key::{
+        JksSigningKey, PemSigningKey, Pkcs12SigningKey, SigningKey, SigningKeyError, SigningSecret,
+    },
     svg_to_pdf::{SvgConversionOutput, SvgInput, SvgToPdfError, convert_svg_files},
+    url_to_pdf::{UrlToPdfError, convert_url_to_pdf, output_filename as url_output_filename},
     vector_conversion::{
         VectorConversionError, VectorFormat, pdf_to_vector_file, vector_to_pdf_file,
     },
@@ -152,12 +295,38 @@ const ANALYSIS_FORM_FIELDS_PATH: &str = "/api/v1/analysis/form-fields";
 const ANALYSIS_PAGE_COUNT_PATH: &str = "/api/v1/analysis/page-count";
 const ANALYSIS_PAGE_DIMENSIONS_PATH: &str = "/api/v1/analysis/page-dimensions";
 const ANALYSIS_SECURITY_INFO_PATH: &str = "/api/v1/analysis/security-info";
+const APP_CONFIG_PATH: &str = "/api/v1/config/app-config";
+const ADDITIONAL_LANGUAGE_JS_PATH: &str = "/js/additionalLanguageCode.js";
+const ROBOTS_TXT_PATH: &str = "/robots.txt";
+const LOGIN_DISCLAIMER_PATH: &str = "/api/v1/config/login-disclaimer";
+const JOB_STATUS_PATH: &str = "/api/v1/general/job/{job_id}";
+const JOB_RESULT_PATH: &str = "/api/v1/general/job/{job_id}/result";
+const JOB_RESULT_FILES_PATH: &str = "/api/v1/general/job/{job_id}/result/files";
+const JOB_FILE_METADATA_PATH: &str = "/api/v1/general/files/{file_id}/metadata";
+const JOB_FILE_DOWNLOAD_PATH: &str = "/api/v1/general/files/{file_id}";
+const INFO_HEALTH_PATH: &str = "/api/v1/info/health";
+const INFO_LOAD_ALL_PATH: &str = "/api/v1/info/load/all";
+const INFO_LOAD_ALL_UNIQUE_PATH: &str = "/api/v1/info/load/all/unique";
+const INFO_LOAD_PATH: &str = "/api/v1/info/load";
+const INFO_LOAD_UNIQUE_PATH: &str = "/api/v1/info/load/unique";
+const INFO_REQUESTS_ALL_PATH: &str = "/api/v1/info/requests/all";
+const INFO_REQUESTS_ALL_UNIQUE_PATH: &str = "/api/v1/info/requests/all/unique";
+const INFO_REQUESTS_PATH: &str = "/api/v1/info/requests";
+const INFO_REQUESTS_UNIQUE_PATH: &str = "/api/v1/info/requests/unique";
+const INFO_STATUS_PATH: &str = "/api/v1/info/status";
+const INFO_UPTIME_PATH: &str = "/api/v1/info/uptime";
+const INFO_WAU_PATH: &str = "/api/v1/info/wau";
 const AUTO_RENAME_PATH: &str = "/api/v1/misc/auto-rename";
+const AUTO_REDACT_PATH: &str = "/api/v1/security/auto-redact";
+const REDACT_EXECUTE_PATH: &str = "/api/v1/security/redact-execute";
 const AUTO_SPLIT_PATH: &str = "/api/v1/misc/auto-split-pdf";
 const BOOKLET_IMPOSITION_PATH: &str = "/api/v1/general/booklet-imposition";
 const POSTER_PRINT_PATH: &str = "/api/v1/general/split-for-poster-print";
 const ADD_ATTACHMENTS_PATH: &str = "/api/v1/misc/add-attachments";
 const ADD_COMMENTS_PATH: &str = "/api/v1/misc/add-comments";
+const PDF_COMMENT_AGENT_PATH: &str = "/api/v1/ai/tools/pdf-comment-agent";
+const CREATE_PDF_AGENT_PATH: &str = "/api/v1/ai/tools/create-pdf-from-html-agent";
+const MATH_AUDITOR_AGENT_PATH: &str = "/api/v1/ai/tools/math-auditor-agent";
 const ADD_IMAGE_PATH: &str = "/api/v1/misc/add-image";
 const ADD_PAGE_NUMBERS_PATH: &str = "/api/v1/misc/add-page-numbers";
 const ADD_STAMP_PATH: &str = "/api/v1/misc/add-stamp";
@@ -165,13 +334,16 @@ const ADD_WATERMARK_PATH: &str = "/api/v1/security/add-watermark";
 const ADD_PASSWORD_PATH: &str = "/api/v1/security/add-password";
 const CROP_PATH: &str = "/api/v1/general/crop";
 const CBZ_TO_PDF_PATH: &str = "/api/v1/convert/cbz/pdf";
+const CBR_TO_PDF_PATH: &str = "/api/v1/convert/cbr/pdf";
 const COMPRESS_PDF_PATH: &str = "/api/v1/misc/compress-pdf";
 const DECOMPRESS_PDF_PATH: &str = "/api/v1/misc/decompress-pdf";
 const DELETE_ATTACHMENT_PATH: &str = "/api/v1/misc/delete-attachment";
+const EDIT_TEXT_PATH: &str = "/api/v1/general/edit-text";
 const EDIT_TABLE_OF_CONTENTS_PATH: &str = "/api/v1/general/edit-table-of-contents";
 const EXTRACT_ATTACHMENTS_PATH: &str = "/api/v1/misc/extract-attachments";
 const EXTRACT_BOOKMARKS_PATH: &str = "/api/v1/general/extract-bookmarks";
 const EXTRACT_IMAGES_PATH: &str = "/api/v1/misc/extract-images";
+const EXTRACT_IMAGE_SCANS_PATH: &str = "/api/v1/misc/extract-image-scans";
 const FLATTEN_PATH: &str = "/api/v1/misc/flatten";
 const FILTER_CONTAINS_IMAGE_PATH: &str = "/api/v1/filter/filter-contains-image";
 const FILTER_CONTAINS_TEXT_PATH: &str = "/api/v1/filter/filter-contains-text";
@@ -190,24 +362,52 @@ const FORM_MODIFY_FIELDS_PATH: &str = "/api/v1/form/modify-fields";
 const LIST_ATTACHMENTS_PATH: &str = "/api/v1/misc/list-attachments";
 const MERGE_PATH: &str = "/api/v1/general/merge-pdfs";
 const MULTI_PAGE_LAYOUT_PATH: &str = "/api/v1/general/multi-page-layout";
+const MOBILE_SCANNER_CREATE_SESSION_PATH: &str =
+    "/api/v1/mobile-scanner/create-session/{session_id}";
+const MOBILE_SCANNER_DELETE_SESSION_PATH: &str = "/api/v1/mobile-scanner/session/{session_id}";
+const MOBILE_SCANNER_DOWNLOAD_PATH: &str =
+    "/api/v1/mobile-scanner/download/{session_id}/{filename}";
+const MOBILE_SCANNER_FILES_PATH: &str = "/api/v1/mobile-scanner/files/{session_id}";
+const MOBILE_SCANNER_UPLOAD_PATH: &str = "/api/v1/mobile-scanner/upload/{session_id}";
+const MOBILE_SCANNER_VALIDATE_SESSION_PATH: &str =
+    "/api/v1/mobile-scanner/validate-session/{session_id}";
 const OVERLAY_PDFS_PATH: &str = "/api/v1/general/overlay-pdfs";
 const PDF_TO_SINGLE_PAGE_PATH: &str = "/api/v1/general/pdf-to-single-page";
 const PDF_TO_IMAGE_PATH: &str = "/api/v1/convert/pdf/img";
+const PDF_TO_CSV_PATH: &str = "/api/v1/convert/pdf/csv";
+const PDF_TO_EPUB_PATH: &str = "/api/v1/convert/pdf/epub";
+const PDF_TO_XLSX_PATH: &str = "/api/v1/convert/pdf/xlsx";
+const PDF_TO_VIDEO_PATH: &str = "/api/v1/convert/pdf/video";
 const PDF_TO_CBZ_PATH: &str = "/api/v1/convert/pdf/cbz";
+const PDF_TO_CBR_PATH: &str = "/api/v1/convert/pdf/cbr";
+const PDF_TO_PDFA_PATH: &str = "/api/v1/convert/pdf/pdfa";
 const PDF_TO_TEXT_PATH: &str = "/api/v1/convert/pdf/text";
+const PDF_TO_MARKDOWN_PATH: &str = "/api/v1/convert/pdf/markdown";
 const PDF_TO_VECTOR_PATH: &str = "/api/v1/convert/pdf/vector";
+const REDACT_PATH: &str = "/api/v1/security/redact";
 const REMOVE_PAGES_PATH: &str = "/api/v1/general/remove-pages";
 const REMOVE_BLANKS_PATH: &str = "/api/v1/misc/remove-blanks";
 const REPAIR_PDF_PATH: &str = "/api/v1/misc/repair";
+const REPLACE_INVERT_PDF_PATH: &str = "/api/v1/misc/replace-invert-pdf";
 const REMOVE_PASSWORD_PATH: &str = "/api/v1/security/remove-password";
 const REARRANGE_PAGES_PATH: &str = "/api/v1/general/rearrange-pages";
 const RENAME_ATTACHMENT_PATH: &str = "/api/v1/misc/rename-attachment";
 const REMOVE_CERT_SIGN_PATH: &str = "/api/v1/security/remove-cert-sign";
+const CERT_SIGN_PATH: &str = "/api/v1/security/cert-sign";
+const HARDWARE_SIGNING_CAPABILITIES_PATH: &str = "/api/v1/security/cert-sign/hardware/capabilities";
+const HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH: &str =
+    "/api/v1/security/cert-sign/hardware/windows-certificates";
+const HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH: &str =
+    "/api/v1/security/cert-sign/hardware/pkcs11-certificates";
 const REMOVE_IMAGE_PATH: &str = "/api/v1/general/remove-image-pdf";
 const ROTATE_PATH: &str = "/api/v1/general/rotate-pdf";
 const SCALE_PAGES_PATH: &str = "/api/v1/general/scale-pages";
 const SANITIZE_PDF_PATH: &str = "/api/v1/security/sanitize-pdf";
+const SCANNER_EFFECT_PATH: &str = "/api/v1/misc/scanner-effect";
+const SETTINGS_ENDPOINT_STATUS_PATH: &str = "/api/v1/settings/get-endpoints-status";
+const SETTINGS_UPDATE_ANALYTICS_PATH: &str = "/api/v1/settings/update-enable-analytics";
 const SHOW_JAVASCRIPT_PATH: &str = "/api/v1/misc/show-javascript";
+const SIGNATURE_IMAGE_PATH: &str = "/api/v1/general/signatures/{filename}";
 const SPLIT_PATH: &str = "/api/v1/general/split-pages";
 const SPLIT_BY_SIZE_PATH: &str = "/api/v1/general/split-by-size-or-count";
 const SPLIT_CHAPTERS_PATH: &str = "/api/v1/general/split-pdf-by-chapters";
@@ -216,20 +416,111 @@ const SVG_TO_PDF_PATH: &str = "/api/v1/convert/svg/pdf";
 const VECTOR_TO_PDF_PATH: &str = "/api/v1/convert/vector/pdf";
 const VERIFY_PDF_PATH: &str = "/api/v1/security/verify-pdf";
 const VALIDATE_SIGNATURE_PATH: &str = "/api/v1/security/validate-signature";
+const TIMESTAMP_PDF_PATH: &str = "/api/v1/security/timestamp-pdf";
 const UNLOCK_FORMS_PATH: &str = "/api/v1/misc/unlock-pdf-forms";
 const UPDATE_METADATA_PATH: &str = "/api/v1/misc/update-metadata";
+const UI_DATA_FOOTER_INFO_PATH: &str = "/api/v1/ui-data/footer-info";
+const UI_DATA_HOME_PATH: &str = "/api/v1/ui-data/home";
+const UI_DATA_LICENSES_PATH: &str = "/api/v1/ui-data/licenses";
+const UI_DATA_OCR_PDF_PATH: &str = "/api/v1/ui-data/ocr-pdf";
+const UI_DATA_PIPELINE_PATH: &str = "/api/v1/ui-data/pipeline";
+const UI_DATA_SIGN_PATH: &str = "/api/v1/ui-data/sign";
 const FORM_VALUE_LIMIT_BYTES: usize = 8 * 1024;
+const AI_DOCUMENT_LIMIT_BYTES: usize = 1024 * 1024;
+const SIGNING_MATERIAL_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_CERT_SIGN_RESERVATION_BYTES: usize = 128 * 1024;
+const SETTINGS_FORM_LIMIT_BYTES: usize = 8 * 1024;
 const IMAGE_TO_PDF_PATH: &str = "/api/v1/convert/img/pdf";
+const FILE_TO_PDF_PATH: &str = "/api/v1/convert/file/pdf";
+const HTML_TO_PDF_PATH: &str = "/api/v1/convert/html/pdf";
+const MARKDOWN_TO_PDF_PATH: &str = "/api/v1/convert/markdown/pdf";
+const EBOOK_TO_PDF_PATH: &str = "/api/v1/convert/ebook/pdf";
+const EML_TO_PDF_PATH: &str = "/api/v1/convert/eml/pdf";
+const ENDPOINT_ENABLED_PATH: &str = "/api/v1/config/endpoint-enabled";
+const ENDPOINTS_AVAILABILITY_PATH: &str = "/api/v1/config/endpoints-availability";
+const ENDPOINTS_ENABLED_PATH: &str = "/api/v1/config/endpoints-enabled";
+const GROUP_ENABLED_PATH: &str = "/api/v1/config/group-enabled";
+const URL_TO_PDF_PATH: &str = "/api/v1/convert/url/pdf";
+const OCR_PDF_PATH: &str = "/api/v1/misc/ocr-pdf";
+const PDF_TO_WORD_PATH: &str = "/api/v1/convert/pdf/word";
+const PDF_TO_PRESENTATION_PATH: &str = "/api/v1/convert/pdf/presentation";
+const PDF_TO_XML_PATH: &str = "/api/v1/convert/pdf/xml";
+const PDF_TO_HTML_PATH: &str = "/api/v1/convert/pdf/html";
+const PDF_TEXT_EDITOR_METADATA_PATH: &str = "/api/v1/convert/pdf/text-editor/metadata";
+const TEXT_EDITOR_TO_PDF_PATH: &str = "/api/v1/convert/text-editor/pdf";
+const PDF_TEXT_EDITOR_PATH: &str = "/api/v1/convert/pdf/text-editor";
+const PDF_TEXT_EDITOR_PARTIAL_PATH: &str = "/api/v1/convert/pdf/text-editor/partial/{job_id}";
+const PDF_TEXT_EDITOR_PAGE_PATH: &str =
+    "/api/v1/convert/pdf/text-editor/page/{job_id}/{page_number}";
+const PDF_TEXT_EDITOR_FONTS_PATH: &str =
+    "/api/v1/convert/pdf/text-editor/fonts/{job_id}/{page_number}";
+const PDF_TEXT_EDITOR_CLEAR_CACHE_PATH: &str =
+    "/api/v1/convert/pdf/text-editor/clear-cache/{job_id}";
 const BOOKMARK_DATA_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const COMMENTS_DATA_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const AI_TOOL_MAX_INPUT_BYTES: usize = 50 * 1024 * 1024;
+const AI_TOOL_PROMPT_LIMIT_BYTES: usize = 16 * 1024;
 const FORM_DATA_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_BYTES: usize = 2_000 * 1024 * 1024;
 const PDF_INFO_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const ASYNC_JOB_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+struct AsyncJobSettings {
+    job_manager: Arc<JobManager>,
+    job_queue: Arc<JobQueue>,
+    max_upload_bytes: usize,
+}
+
+#[derive(Debug)]
+enum AsyncJobBodyError {
+    BodyTooLarge,
+    Read(String),
+    Write(std::io::Error),
+}
 
 #[derive(Debug, Deserialize)]
 struct MergeQuery {
     #[serde(rename = "fileOrder")]
     file_order: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointQuery {
+    endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricsEndpointQuery {
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndpointsQuery {
+    endpoints: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupQuery {
+    group: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginDisclaimerQuery {
+    lang: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextEditorQuery {
+    #[serde(default)]
+    lightweight: bool,
+    #[serde(default, rename = "async")]
+    asynchronous: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextEditorPartialQuery {
+    filename: Option<String>,
 }
 
 #[derive(Debug)]
@@ -304,6 +595,170 @@ struct UploadedSinglePdfRequest {
 }
 
 #[derive(Debug)]
+struct UploadedEbookRequest {
+    file: UploadedPdf,
+    options: EbookOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToEbookRequest {
+    file: UploadedPdf,
+    options: PdfToEbookOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedEmlRequest {
+    file: UploadedPdf,
+    options: EmlOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedTimestampRequest {
+    file: UploadedPdf,
+    tsa_url: Option<String>,
+    temp_dir: TempDir,
+}
+
+struct UploadedCertSignRequest {
+    file: UploadedPdf,
+    signing_material: UploadedSigningMaterial,
+    appearance: Option<UploadedSignatureAppearance>,
+    name: Option<String>,
+    location: Option<String>,
+    reason: Option<String>,
+    temp_dir: TempDir,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UploadedSignatureAppearance {
+    page_number: usize,
+    show_logo: bool,
+}
+
+enum UploadedSigningMaterial {
+    Software(UploadedSoftwareSigningMaterial),
+    Pkcs11(Pkcs11SigningRequest),
+    WindowsStore { alias: String },
+    ManagedServer,
+}
+
+enum UploadedSoftwareSigningMaterial {
+    Pem {
+        private_key: SigningSecret,
+        password: Option<SigningSecret>,
+        certificate_chain: Vec<u8>,
+    },
+    Pkcs12 {
+        archive: SigningSecret,
+        password: SigningSecret,
+        alias: Option<String>,
+    },
+    Jks {
+        archive: SigningSecret,
+        password: SigningSecret,
+        alias: Option<String>,
+    },
+}
+
+#[derive(Default)]
+struct CertSignForm {
+    cert_type: Option<String>,
+    file: Option<UploadedPdf>,
+    private_key: Option<SigningSecret>,
+    certificate_chain: Option<Vec<u8>>,
+    p12_file: Option<SigningSecret>,
+    jks_file: Option<SigningSecret>,
+    password: Option<SigningSecret>,
+    alias: Option<String>,
+    pkcs11_library_path: Option<String>,
+    pkcs11_slot: Option<u64>,
+    show_signature: bool,
+    page_number: Option<i32>,
+    show_logo: Option<bool>,
+    name: Option<String>,
+    location: Option<String>,
+    reason: Option<String>,
+}
+
+/// Security timestamp settings available before the general settings.yml
+/// migration is complete.
+#[derive(Debug, Clone)]
+pub struct TimestampSettings {
+    pub default_tsa_url: String,
+    pub custom_tsa_urls: Vec<String>,
+}
+
+impl Default for TimestampSettings {
+    fn default() -> Self {
+        Self {
+            default_tsa_url: "http://timestamp.digicert.com".to_owned(),
+            custom_tsa_urls: Vec::new(),
+        }
+    }
+}
+
+impl TimestampSettings {
+    #[must_use]
+    pub fn from_environment() -> Self {
+        let default_tsa_url = timestamp_environment_value(&[
+            "SECURITY_TIMESTAMP_DEFAULTTSAURL",
+            "SECURITY_TIMESTAMP_DEFAULT_TSA_URL",
+            "STIRLING_SECURITY_TIMESTAMP_DEFAULT_TSA_URL",
+        ])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Self::default().default_tsa_url);
+        let custom_tsa_urls = timestamp_environment_value(&[
+            "SECURITY_TIMESTAMP_CUSTOMTSAURLS",
+            "SECURITY_TIMESTAMP_CUSTOM_TSA_URLS",
+            "STIRLING_SECURITY_TIMESTAMP_CUSTOM_TSA_URLS",
+        ])
+        .map(|urls| {
+            urls.split(',')
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+        Self {
+            default_tsa_url,
+            custom_tsa_urls,
+        }
+    }
+
+    fn from_runtime_config(runtime_config: &RuntimeConfig) -> Self {
+        let (configured_default_tsa_url, configured_custom_tsa_urls) =
+            runtime_config.timestamp_settings();
+        let default_tsa_url = timestamp_environment_value(&[
+            "SECURITY_TIMESTAMP_DEFAULTTSAURL",
+            "SECURITY_TIMESTAMP_DEFAULT_TSA_URL",
+            "STIRLING_SECURITY_TIMESTAMP_DEFAULT_TSA_URL",
+        ])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(configured_default_tsa_url);
+        let custom_tsa_urls = timestamp_environment_value(&[
+            "SECURITY_TIMESTAMP_CUSTOMTSAURLS",
+            "SECURITY_TIMESTAMP_CUSTOM_TSA_URLS",
+            "STIRLING_SECURITY_TIMESTAMP_CUSTOM_TSA_URLS",
+        ])
+        .map_or(configured_custom_tsa_urls, |urls| {
+            urls.split(',')
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        });
+        Self {
+            default_tsa_url,
+            custom_tsa_urls,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct UploadedScalePagesRequest {
     file: UploadedPdf,
     page_size: String,
@@ -350,6 +805,12 @@ struct UploadedAddAttachmentsRequest {
 }
 
 #[derive(Debug)]
+enum AddAttachmentsWorkflowError {
+    Attachment(AttachmentError),
+    Pdfa(PdfaError),
+}
+
+#[derive(Debug)]
 struct UploadedNamedAttachmentRequest {
     file: UploadedPdf,
     attachment_name: String,
@@ -381,6 +842,27 @@ struct UploadedFilterRequest {
 }
 
 #[derive(Debug)]
+struct UploadedOcrRequest {
+    file: UploadedPdf,
+    options: OcrOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToOfficeRequest {
+    file: UploadedPdf,
+    output_format: Option<String>,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedScannerEffectRequest {
+    file: UploadedPdf,
+    params: ScannerEffectParams,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
 struct UploadedSanitizeRequest {
     file: UploadedPdf,
     options: SanitizeOptions,
@@ -408,6 +890,27 @@ struct UploadedEditTableOfContentsRequest {
 struct UploadedAddCommentsRequest {
     file: UploadedPdf,
     comments: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfAiCommentRequest {
+    file: UploadedPdf,
+    prompt: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedAiDocumentRequest {
+    document: String,
+    filename: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedMathAuditRequest {
+    file: UploadedPdf,
+    tolerance: String,
     temp_dir: TempDir,
 }
 
@@ -454,9 +957,103 @@ struct UploadedExtractImagesRequest {
 }
 
 #[derive(Debug)]
+struct UploadedExtractImageScansRequest {
+    file: UploadedPdf,
+    options: ExtractImageScansOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
 struct UploadedPdfToImageRequest {
     file: UploadedPdf,
     options: PdfToImageOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfTableRequest {
+    file: UploadedPdf,
+    page_numbers: String,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedManualRedactRequest {
+    file: UploadedPdf,
+    boxes: Vec<RedactionBox>,
+    page_numbers: String,
+    page_redaction_color: [u8; 3],
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedAutoRedactRequest {
+    file: UploadedPdf,
+    options: AutoRedactionOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedExecuteRedactRequest {
+    file: UploadedPdf,
+    options: ExecuteRedactionOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedEditTextRequest {
+    file: UploadedPdf,
+    options: TextEditOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditTextInput {
+    find: Option<String>,
+    #[serde(rename = "replace")]
+    replacement: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualRedactionArea {
+    x: Option<f32>,
+    y: Option<f32>,
+    width: Option<f32>,
+    height: Option<f32>,
+    #[serde(alias = "pageNumber")]
+    page: Option<usize>,
+    color: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecuteRedactionRangeInput {
+    #[serde(alias = "startString")]
+    start_string: String,
+    #[serde(alias = "endString", default)]
+    end_string: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecuteRedactionImageBoxInput {
+    #[serde(alias = "pageIndex")]
+    page_index: usize,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExecuteRedactionStyleInput {
+    color: Option<String>,
+    padding: Option<f32>,
+    strategy: Option<String>,
+}
+
+#[derive(Debug)]
+struct UploadedPdfToVideoRequest {
+    file: UploadedPdf,
+    options: PdfToVideoOptions,
     temp_dir: TempDir,
 }
 
@@ -478,6 +1075,14 @@ struct UploadedCbzToPdfRequest {
 struct UploadedPdfToCbzRequest {
     file: UploadedPdf,
     dpi: i32,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct UploadedPdfArchiveRequest {
+    file: UploadedPdf,
+    output_format: String,
+    strict: bool,
     temp_dir: TempDir,
 }
 
@@ -543,6 +1148,13 @@ struct UploadedFlattenRequest {
 }
 
 #[derive(Debug)]
+struct UploadedReplaceInvertRequest {
+    file: UploadedPdf,
+    options: ReplaceInvertOptions,
+    temp_dir: TempDir,
+}
+
+#[derive(Debug)]
 struct UploadedRemoveBlanksRequest {
     file: UploadedPdf,
     threshold: i32,
@@ -593,6 +1205,22 @@ struct ApiError {
     path: &'static str,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum CertSignError {
+    #[error("could not read the input PDF: {0}")]
+    Read(#[source] std::io::Error),
+    #[error(transparent)]
+    Signing(#[from] SigningKeyError),
+    #[error(transparent)]
+    Pdf(#[from] PdfSigningError),
+    #[error(transparent)]
+    Hardware(#[from] HardwareSigningError),
+    #[error(transparent)]
+    ServerCertificate(#[from] ServerCertificateError),
+    #[error("could not write the signed PDF: {0}")]
+    Write(#[source] std::io::Error),
+}
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self::bad_request_at(MERGE_PATH, message)
@@ -629,6 +1257,30 @@ impl ApiError {
             path,
         }
     }
+
+    fn payload_too_large_at(path: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            path,
+        }
+    }
+
+    fn service_unavailable_at(path: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            path,
+        }
+    }
+
+    fn gateway_timeout_at(path: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: message.into(),
+            path,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -642,9 +1294,219 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Runtime-owned application resources.
+///
+/// The router stays side-effect free. Background filesystem automation is only
+/// started when the executable explicitly calls
+/// [`ProcessingRuntime::spawn_pipeline_directory_watcher`].
+pub struct ProcessingRuntime {
+    router: Router,
+    pipeline_directory_watcher: PipelineDirectoryWatcher,
+}
+
+impl ProcessingRuntime {
+    #[must_use]
+    pub fn from_environment(max_upload_bytes: usize) -> Self {
+        let runtime_config = RuntimeConfig::from_environment();
+        let timestamp_settings = TimestampSettings::from_runtime_config(&runtime_config);
+        Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config)
+    }
+
+    /// Builds the standalone service and probes optional native dependencies.
+    ///
+    /// Router-only callers can keep using [`Self::from_environment`] without
+    /// starting child processes. The executable uses this constructor once so
+    /// endpoint availability includes dependency failures before it begins
+    /// accepting requests.
+    #[must_use]
+    pub fn from_environment_with_dependency_discovery(max_upload_bytes: usize) -> Self {
+        let runtime_config = RuntimeConfig::from_environment().with_dependency_discovery();
+        let timestamp_settings = TimestampSettings::from_runtime_config(&runtime_config);
+        Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config)
+    }
+
+    #[must_use]
+    pub fn with_runtime_config(
+        max_upload_bytes: usize,
+        timestamp_settings: TimestampSettings,
+        runtime_config: RuntimeConfig,
+    ) -> Self {
+        let pipeline_directory_config = runtime_config.pipeline_directory_config();
+        let job_queue_config = runtime_config.job_queue_config();
+        let job_result_ttl = runtime_config.job_result_ttl();
+        let runtime_config = Arc::new(runtime_config);
+        let runtime_metrics = Arc::new(RuntimeMetrics::new(
+            runtime_config.metrics_enabled(),
+            !runtime_config.login_disclaimer_requires_authentication(),
+        ));
+        let ai_comment_engine_settings = Arc::new(AiCommentEngineSettings::from_runtime_config(
+            &runtime_config,
+        ));
+        let job_manager = Arc::new(JobManager::with_result_ttl(job_result_ttl));
+        let job_queue = Arc::new(JobQueue::new(job_queue_config));
+        let async_job_settings = Arc::new(AsyncJobSettings {
+            job_manager: Arc::clone(&job_manager),
+            job_queue: Arc::clone(&job_queue),
+            max_upload_bytes,
+        });
+        let mobile_scanner = MobileScannerService::new().ok().map(Arc::new);
+        let pipeline_dispatcher = PipelineDispatcher::new(
+            processing_routes()
+                .layer(DefaultBodyLimit::max(max_upload_bytes))
+                .layer(Extension(timestamp_settings.clone()))
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&async_job_settings),
+                    submit_async_job,
+                ))
+                .layer(middleware::from_fn(enforce_endpoint_availability))
+                .layer(Extension(Arc::clone(&runtime_config)))
+                .layer(Extension(Arc::clone(&ai_comment_engine_settings)))
+                .layer(Extension(Arc::clone(&runtime_metrics)))
+                .layer(Extension(Arc::clone(&job_manager)))
+                .layer(Extension(Arc::clone(&job_queue)))
+                .layer(Extension(mobile_scanner.clone()))
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&runtime_metrics),
+                    record_runtime_metrics,
+                )),
+        );
+        let pipeline_directory_watcher =
+            PipelineDirectoryWatcher::new(pipeline_dispatcher.clone(), pipeline_directory_config);
+        let router = processing_routes()
+            .merge(pipeline_routes())
+            .layer(DefaultBodyLimit::max(max_upload_bytes))
+            .layer(TraceLayer::new_for_http())
+            .layer(Extension(timestamp_settings))
+            .layer(middleware::from_fn_with_state(
+                async_job_settings,
+                submit_async_job,
+            ))
+            .layer(middleware::from_fn(enforce_endpoint_availability))
+            .layer(Extension(runtime_config))
+            .layer(Extension(ai_comment_engine_settings))
+            .layer(Extension(Arc::clone(&runtime_metrics)))
+            .layer(Extension(job_manager))
+            .layer(Extension(job_queue))
+            .layer(Extension(mobile_scanner))
+            .layer(Extension(pipeline_dispatcher))
+            .layer(middleware::from_fn_with_state(
+                runtime_metrics,
+                record_runtime_metrics,
+            ));
+        Self {
+            router,
+            pipeline_directory_watcher,
+        }
+    }
+
+    /// Builds the standalone router behind the reviewed local authentication
+    /// boundary. The production executable remains fail-closed until the
+    /// remaining secured-mode capabilities have completed their review gates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable security state cannot be initialized or an
+    /// empty repository has no explicitly configured first administrator.
+    pub fn with_reviewed_security(
+        max_upload_bytes: usize,
+        timestamp_settings: TimestampSettings,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, SecurityStartupError> {
+        let security_store = initialize_security_store(&runtime_config)?;
+        let external_jwt = runtime_config
+            .security_supabase_jwt_config()
+            .map(SupabaseJwtVerifier::new)
+            .transpose()
+            .map_err(SecurityStartupError::ExternalJwt)?
+            .map(Arc::new);
+        let security_http_config = SecurityHttpConfig {
+            totp_issuer: runtime_config.security_totp_issuer(),
+            invites_enabled: runtime_config.security_invites_enabled(),
+            invite_expiry_hours: runtime_config.security_invite_expiry_hours(),
+            frontend_url: runtime_config.security_frontend_url(),
+            external_jwt,
+        };
+        let admin_settings = Arc::new(admin_settings::AdminSettingsService::new(
+            runtime_config.settings_path().to_path_buf(),
+            runtime_config.settings_snapshot(),
+        ));
+        let server_certificate = Arc::new(
+            ServerCertificateService::new(runtime_config.server_certificate_config())
+                .map_err(|error| SecurityStartupError::ServerCertificate(Box::new(error)))?,
+        );
+        server_certificate
+            .initialize()
+            .map_err(|error| SecurityStartupError::ServerCertificate(Box::new(error)))?;
+        let mut runtime =
+            Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
+        runtime.router = runtime
+            .router
+            .merge(admin_settings::routes().layer(Extension(admin_settings)))
+            .merge(server_certificate::routes())
+            .layer(Extension(server_certificate));
+        runtime.router =
+            secure_router_with_config(runtime.router, security_store, security_http_config);
+        Ok(runtime)
+    }
+
+    pub fn spawn_pipeline_directory_watcher(&self) {
+        let watcher = self.pipeline_directory_watcher.clone();
+        tokio::spawn(async move { watcher.run_forever().await });
+    }
+
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+}
+
 pub fn app(max_upload_bytes: usize) -> Router {
+    ProcessingRuntime::from_environment(max_upload_bytes).into_router()
+}
+
+pub fn app_with_timestamp_settings(
+    max_upload_bytes: usize,
+    timestamp_settings: TimestampSettings,
+) -> Router {
+    app_with_runtime_config(
+        max_upload_bytes,
+        timestamp_settings,
+        RuntimeConfig::from_environment(),
+    )
+}
+
+pub fn app_with_runtime_config(
+    max_upload_bytes: usize,
+    timestamp_settings: TimestampSettings,
+    runtime_config: RuntimeConfig,
+) -> Router {
+    ProcessingRuntime::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config)
+        .into_router()
+}
+
+/// Constructs an opt-in secured router for integration tests and security
+/// review. The production executable does not call this entry point yet.
+///
+/// # Errors
+///
+/// Returns an error when the durable security repository cannot start safely.
+pub fn app_with_reviewed_security(
+    max_upload_bytes: usize,
+    timestamp_settings: TimestampSettings,
+    runtime_config: RuntimeConfig,
+) -> Result<Router, SecurityStartupError> {
+    ProcessingRuntime::with_reviewed_security(max_upload_bytes, timestamp_settings, runtime_config)
+        .map(ProcessingRuntime::into_router)
+}
+
+fn processing_routes() -> Router {
     Router::new()
         .route("/health", get(health))
+        .merge(config_routes())
+        .merge(info_routes())
+        .merge(job_routes())
+        .merge(mobile_scanner_routes())
+        .merge(ui_data_routes())
+        .merge(ai_tool_routes())
         .route(ADD_ATTACHMENTS_PATH, post(add_attachments))
         .route(ADD_COMMENTS_PATH, post(add_comments))
         .route(ADD_IMAGE_PATH, post(add_image))
@@ -661,19 +1523,30 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(ANALYSIS_PAGE_DIMENSIONS_PATH, post(page_dimensions))
         .route(ANALYSIS_SECURITY_INFO_PATH, post(security_info))
         .route(AUTO_RENAME_PATH, post(auto_rename))
+        .route(AUTO_REDACT_PATH, post(auto_redact_pdf))
         .route(AUTO_SPLIT_PATH, post(auto_split_pdf))
         .route(BOOKLET_IMPOSITION_PATH, post(booklet_imposition))
+        .route(CBR_TO_PDF_PATH, post(cbr_to_pdf))
         .route(CBZ_TO_PDF_PATH, post(cbz_to_pdf))
         .route(COMPRESS_PDF_PATH, post(compress_pdf))
         .route(CROP_PATH, post(crop_pdf))
         .route(DECOMPRESS_PDF_PATH, post(decompress_pdf))
         .route(DELETE_ATTACHMENT_PATH, post(delete_attachment))
+        .route(EDIT_TEXT_PATH, post(edit_text))
         .route(EDIT_TABLE_OF_CONTENTS_PATH, post(edit_table_of_contents))
         .route(EXTRACT_ATTACHMENTS_PATH, post(extract_attachments))
         .route(EXTRACT_BOOKMARKS_PATH, post(extract_bookmarks_route))
-        .route(EXTRACT_IMAGES_PATH, post(extract_images))
+        .merge(image_extraction_routes())
         .route(FLATTEN_PATH, post(flatten_pdf))
         .route(IMAGE_TO_PDF_PATH, post(image_to_pdf))
+        .merge(document_conversion_routes())
+        .route(FILE_TO_PDF_PATH, post(convert_file_to_pdf))
+        .route(OCR_PDF_PATH, post(ocr_pdf))
+        .route(PDF_TO_WORD_PATH, post(pdf_to_word))
+        .route(PDF_TO_PRESENTATION_PATH, post(pdf_to_presentation))
+        .route(PDF_TO_XML_PATH, post(pdf_to_xml))
+        .route(PDF_TO_HTML_PATH, post(pdf_to_html))
+        .merge(pdf_text_editor_routes())
         .route(FILTER_CONTAINS_IMAGE_PATH, post(filter_contains_image))
         .route(FILTER_CONTAINS_TEXT_PATH, post(filter_contains_text))
         .route(FILTER_FILE_SIZE_PATH, post(filter_file_size))
@@ -696,14 +1569,14 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(MULTI_PAGE_LAYOUT_PATH, post(multi_page_layout_route))
         .route(OVERLAY_PDFS_PATH, post(overlay_pdfs))
         .route(PDF_TO_SINGLE_PAGE_PATH, post(to_single_page))
-        .route(PDF_TO_IMAGE_PATH, post(pdf_to_image))
-        .route(PDF_TO_CBZ_PATH, post(pdf_to_cbz))
-        .route(PDF_TO_TEXT_PATH, post(pdf_to_text))
-        .route(PDF_TO_VECTOR_PATH, post(pdf_to_vector))
+        .merge(pdf_conversion_routes())
         .route(REARRANGE_PAGES_PATH, post(rearrange_pages))
         .route(REPAIR_PDF_PATH, post(repair_pdf))
+        .route(REDACT_EXECUTE_PATH, post(execute_redaction))
+        .route(REDACT_PATH, post(redact_pdf_manually))
+        .route(REPLACE_INVERT_PDF_PATH, post(replace_invert_pdf))
         .route(RENAME_ATTACHMENT_PATH, post(rename_attachment))
-        .route(REMOVE_CERT_SIGN_PATH, post(remove_cert_sign))
+        .merge(certificate_signing_routes())
         .route(REMOVE_BLANKS_PATH, post(remove_blank_pages))
         .route(REMOVE_IMAGE_PATH, post(remove_images))
         .route(REMOVE_PAGES_PATH, post(remove_pages))
@@ -711,6 +1584,8 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(ROTATE_PATH, post(rotate_pdf))
         .route(SCALE_PAGES_PATH, post(scale_pages))
         .route(SANITIZE_PDF_PATH, post(sanitize_pdf))
+        .route(SCANNER_EFFECT_PATH, post(scanner_effect))
+        .route(SIGNATURE_IMAGE_PATH, get(shared_signature_image))
         .route(SHOW_JAVASCRIPT_PATH, post(show_javascript))
         .route(SPLIT_PATH, post(split_pages))
         .route(SPLIT_BY_SIZE_PATH, post(split_by_size_or_count))
@@ -723,8 +1598,164 @@ pub fn app(max_upload_bytes: usize) -> Router {
         .route(UNLOCK_FORMS_PATH, post(unlock_pdf_forms))
         .route(UPDATE_METADATA_PATH, post(update_metadata))
         .route(VALIDATE_SIGNATURE_PATH, post(validate_signature_route))
-        .layer(DefaultBodyLimit::max(max_upload_bytes))
-        .layer(TraceLayer::new_for_http())
+        .route(TIMESTAMP_PDF_PATH, post(timestamp_pdf))
+}
+
+fn pipeline_routes() -> Router {
+    Router::new().route(PIPELINE_PATH, post(handle_pipeline))
+}
+
+fn certificate_signing_routes() -> Router {
+    Router::new()
+        .route(CERT_SIGN_PATH, post(cert_sign_pdf))
+        .route(
+            HARDWARE_SIGNING_CAPABILITIES_PATH,
+            get(hardware_signing_capabilities_route),
+        )
+        .route(
+            HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
+            get(hardware_signing_windows_certificates_route),
+        )
+        .route(
+            HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH,
+            post(hardware_signing_pkcs11_certificates_route),
+        )
+        .route(REMOVE_CERT_SIGN_PATH, post(remove_cert_sign))
+}
+
+fn config_routes() -> Router {
+    Router::new()
+        .route(
+            ADDITIONAL_LANGUAGE_JS_PATH,
+            get(additional_language_javascript),
+        )
+        .route(APP_CONFIG_PATH, get(app_config))
+        .route(ROBOTS_TXT_PATH, get(robots_txt))
+        .route(LOGIN_DISCLAIMER_PATH, get(login_disclaimer))
+        .route(ENDPOINT_ENABLED_PATH, get(endpoint_enabled))
+        .route(ENDPOINTS_ENABLED_PATH, get(endpoints_enabled))
+        .route(ENDPOINTS_AVAILABILITY_PATH, get(endpoint_availability))
+        .route(GROUP_ENABLED_PATH, get(group_enabled))
+        .route(SETTINGS_ENDPOINT_STATUS_PATH, get(settings_endpoint_status))
+        .route(
+            SETTINGS_UPDATE_ANALYTICS_PATH,
+            post(update_enable_analytics),
+        )
+}
+
+fn mobile_scanner_routes() -> Router {
+    Router::new()
+        .route(
+            MOBILE_SCANNER_CREATE_SESSION_PATH,
+            post(mobile_scanner_create_session),
+        )
+        .route(
+            MOBILE_SCANNER_VALIDATE_SESSION_PATH,
+            get(mobile_scanner_validate_session),
+        )
+        .route(MOBILE_SCANNER_UPLOAD_PATH, post(mobile_scanner_upload))
+        .route(MOBILE_SCANNER_FILES_PATH, get(mobile_scanner_files))
+        .route(MOBILE_SCANNER_DOWNLOAD_PATH, get(mobile_scanner_download))
+        .route(
+            MOBILE_SCANNER_DELETE_SESSION_PATH,
+            axum::routing::delete(mobile_scanner_delete_session),
+        )
+}
+
+fn job_routes() -> Router {
+    Router::new()
+        .route(JOB_RESULT_FILES_PATH, get(job_result_files))
+        .route(JOB_RESULT_PATH, get(job_result))
+        .route(JOB_STATUS_PATH, get(job_status).delete(cancel_job))
+        .route(JOB_FILE_METADATA_PATH, get(job_file_metadata))
+        .route(JOB_FILE_DOWNLOAD_PATH, get(download_job_file))
+        .route("/api/v1/admin/job/stats", get(admin_job_stats))
+        .route("/api/v1/admin/job/queue/stats", get(admin_job_queue_stats))
+        .route("/api/v1/admin/job/cleanup", post(admin_job_cleanup))
+}
+
+fn ui_data_routes() -> Router {
+    Router::new()
+        .route(UI_DATA_FOOTER_INFO_PATH, get(ui_data_footer_info))
+        .route(UI_DATA_HOME_PATH, get(ui_data_home))
+        .route(UI_DATA_LICENSES_PATH, get(ui_data_licenses))
+        .route(UI_DATA_OCR_PDF_PATH, get(ui_data_ocr_pdf))
+        .route(UI_DATA_PIPELINE_PATH, get(ui_data_pipeline))
+        .route(UI_DATA_SIGN_PATH, get(ui_data_sign))
+}
+
+fn pdf_text_editor_routes() -> Router {
+    Router::new()
+        .route(
+            PDF_TEXT_EDITOR_METADATA_PATH,
+            post(pdf_text_editor_metadata),
+        )
+        .route(PDF_TEXT_EDITOR_PARTIAL_PATH, post(pdf_text_editor_partial))
+        .route(PDF_TEXT_EDITOR_PAGE_PATH, get(pdf_text_editor_page))
+        .route(PDF_TEXT_EDITOR_FONTS_PATH, get(pdf_text_editor_page_fonts))
+        .route(
+            PDF_TEXT_EDITOR_CLEAR_CACHE_PATH,
+            post(pdf_text_editor_clear_cache),
+        )
+        .route(TEXT_EDITOR_TO_PDF_PATH, post(text_editor_to_pdf))
+        .route(PDF_TEXT_EDITOR_PATH, post(pdf_text_editor))
+}
+
+fn document_conversion_routes() -> Router {
+    Router::new()
+        .route(HTML_TO_PDF_PATH, post(html_to_pdf))
+        .route(MARKDOWN_TO_PDF_PATH, post(markdown_to_pdf))
+        .route(EBOOK_TO_PDF_PATH, post(ebook_to_pdf))
+        .route(EML_TO_PDF_PATH, post(eml_to_pdf))
+        .route(URL_TO_PDF_PATH, post(url_to_pdf))
+}
+
+fn ai_tool_routes() -> Router {
+    Router::new()
+        .route(PDF_COMMENT_AGENT_PATH, post(pdf_comment_agent))
+        .route(CREATE_PDF_AGENT_PATH, post(create_pdf_from_html_agent))
+        .route(MATH_AUDITOR_AGENT_PATH, post(math_auditor_agent))
+}
+
+fn image_extraction_routes() -> Router {
+    Router::new()
+        .route(EXTRACT_IMAGES_PATH, post(extract_images))
+        .route(EXTRACT_IMAGE_SCANS_PATH, post(extract_image_scans))
+}
+
+fn pdf_video_routes() -> Router {
+    Router::new().route(PDF_TO_VIDEO_PATH, post(pdf_to_video))
+}
+
+fn pdf_conversion_routes() -> Router {
+    Router::new()
+        .route(PDF_TO_IMAGE_PATH, post(pdf_to_image))
+        .route(PDF_TO_CSV_PATH, post(pdf_to_csv))
+        .route(PDF_TO_EPUB_PATH, post(pdf_to_ebook))
+        .route(PDF_TO_XLSX_PATH, post(pdf_to_xlsx))
+        .merge(pdf_video_routes())
+        .route(PDF_TO_CBZ_PATH, post(pdf_to_cbz))
+        .route(PDF_TO_CBR_PATH, post(pdf_to_cbr))
+        .route(PDF_TO_PDFA_PATH, post(pdf_to_pdfa))
+        .route(PDF_TO_TEXT_PATH, post(pdf_to_text))
+        .route(PDF_TO_MARKDOWN_PATH, post(pdf_to_markdown))
+        .route(PDF_TO_VECTOR_PATH, post(pdf_to_vector))
+}
+
+fn info_routes() -> Router {
+    Router::new()
+        .route(INFO_STATUS_PATH, get(info_status))
+        .route(INFO_HEALTH_PATH, get(info_status))
+        .route(INFO_LOAD_PATH, get(info_load))
+        .route(INFO_LOAD_UNIQUE_PATH, get(info_load_unique))
+        .route(INFO_LOAD_ALL_PATH, get(info_load_all))
+        .route(INFO_LOAD_ALL_UNIQUE_PATH, get(info_load_all_unique))
+        .route(INFO_REQUESTS_PATH, get(info_requests))
+        .route(INFO_REQUESTS_UNIQUE_PATH, get(info_requests_unique))
+        .route(INFO_REQUESTS_ALL_PATH, get(info_requests_all))
+        .route(INFO_REQUESTS_ALL_UNIQUE_PATH, get(info_requests_all_unique))
+        .route(INFO_UPTIME_PATH, get(info_uptime))
+        .route(INFO_WAU_PATH, get(info_weekly_active_users))
 }
 
 #[must_use]
@@ -753,6 +1784,10 @@ pub fn max_upload_bytes_from_environment() -> usize {
         .unwrap_or(DEFAULT_MAX_UPLOAD_BYTES)
 }
 
+fn timestamp_environment_value(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| env::var(name).ok())
+}
+
 fn parse_data_size(value: &str) -> Option<usize> {
     let value = value.trim().to_ascii_uppercase();
     let suffix_start = value
@@ -778,23 +1813,1250 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn handle_pipeline(
+    Extension(dispatcher): Extension<PipelineDispatcher>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = pipeline::read_request(multipart)
+        .await
+        .map_err(pipeline::PipelineFailure::into_api_error)?;
+    let output = pipeline::run(&dispatcher, request)
+        .await
+        .map_err(pipeline::PipelineFailure::into_api_error)?;
+    file_response(
+        output.path,
+        output.temp_dir,
+        &output.filename,
+        PIPELINE_PATH,
+        output.content_type,
+    )
+    .await
+}
+
+async fn record_runtime_metrics(
+    State(runtime_metrics): State<Arc<RuntimeMetrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    runtime_metrics.record_request(&method, &path, request.headers());
+    next.run(request).await
+}
+
+async fn enforce_endpoint_availability(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if path.starts_with("/api/") && !runtime_config.is_endpoint_enabled_for_uri(&path) {
+        let mut response = (StatusCode::FORBIDDEN, "This endpoint is disabled").into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return response;
+    }
+    let mut response = next.run(request).await;
+    if path.starts_with("/api/") {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
+}
+
+/// Persists the original multipart request before returning a job identifier.
+///
+/// The Java `AutoJobPostMapping` aspect does not retain an HTTP request after
+/// it is answered: it stores uploaded files first, then invokes the operation
+/// in the background.  Retaining the exact encoded body here gives every
+/// supported Rust processing endpoint the same extractor contract while
+/// keeping potentially large uploads and responses off the heap.
+async fn submit_async_job(
+    State(settings): State<Arc<AsyncJobSettings>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_async_job_request(&request) {
+        return next.run(request).await;
+    }
+
+    let endpoint_path = request.uri().path().to_owned();
+    let owner = JobOwner::from_auth_context(request.extensions().get::<AuthContext>());
+    let submission = match settings.job_manager.create_job(owner) {
+        Ok(submission) => submission,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not create asynchronous job: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let request_path = submission.directory.join("request.body");
+    let (parts, body) = request.into_parts();
+    if let Err(error) =
+        write_body_to_job_file(body, &request_path, Some(settings.max_upload_bytes)).await
+    {
+        let _ = settings.job_manager.discard(&submission.job_id);
+        return match error {
+            AsyncJobBodyError::BodyTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body exceeds the upload limit",
+            )
+                .into_response(),
+            AsyncJobBodyError::Read(error) => (
+                StatusCode::BAD_REQUEST,
+                format!("Could not read request body: {error}"),
+            )
+                .into_response(),
+            AsyncJobBodyError::Write(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not persist asynchronous job input: {error}"),
+            )
+                .into_response(),
+        };
+    }
+
+    let request_body = match File::open(&request_path).await {
+        Ok(file) => Body::from_stream(ReaderStream::new(file)),
+        Err(error) => {
+            let _ = settings.job_manager.discard(&submission.job_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not reopen asynchronous job input: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let request = Request::from_parts(parts, request_body);
+    let job_id = submission.job_id.clone();
+    let admission = match settings
+        .job_queue
+        .admit(&job_id, async_job_resource_weight(&endpoint_path))
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            let _ = settings.job_manager.discard(&job_id);
+            return job_queue_rejection_response(&error);
+        }
+    };
+    spawn_async_job(
+        Arc::clone(&settings.job_manager),
+        admission,
+        job_id.clone(),
+        submission.directory,
+        request,
+        next,
+    );
+    Json(serde_json::json!({ "jobId": job_id })).into_response()
+}
+
+fn spawn_async_job(
+    job_manager: Arc<JobManager>,
+    admission: JobAdmission,
+    worker_job_id: String,
+    directory: PathBuf,
+    request: Request,
+    next: Next,
+) {
+    tokio::spawn(async move {
+        let lease = match admission.wait().await {
+            Ok(lease) => lease,
+            Err(JobQueueError::Cancelled) => return,
+            Err(error) => {
+                let _ = job_manager.fail(&worker_job_id, error.to_string());
+                return;
+            }
+        };
+        if lease.waited_over_limit() {
+            let _ = job_manager.update_progress(
+                &worker_job_id,
+                1,
+                "queued-timeout",
+                "Job exceeded the configured queue wait target and is starting now",
+            );
+        }
+        let _lease = lease;
+        let _ = job_manager.update_progress(
+            &worker_job_id,
+            5,
+            "processing",
+            "Processing asynchronous request",
+        );
+        let response = next.run(request).await;
+        if let Err(error) =
+            persist_async_job_response(&job_manager, &worker_job_id, &directory, response).await
+        {
+            let _ = job_manager.fail(&worker_job_id, error);
+        }
+    });
+}
+
+fn job_queue_rejection_response(error: &JobQueueError) -> Response {
+    let status = match error {
+        JobQueueError::Full => StatusCode::SERVICE_UNAVAILABLE,
+        JobQueueError::Closed | JobQueueError::Invalid | JobQueueError::Poisoned => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        JobQueueError::Cancelled => StatusCode::CONFLICT,
+    };
+    let mut response = (status, error.to_string()).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    response
+}
+
+fn async_job_resource_weight(path: &str) -> u32 {
+    if path.contains("ocr")
+        || path.contains("ai-")
+        || path.contains("math-audit")
+        || path.contains("pdf-to-video")
+        || path.contains("scanner-effect")
+    {
+        10
+    } else if path.contains("compress")
+        || path.contains("repair")
+        || path.contains("pdfa")
+        || path.contains("file-to-pdf")
+        || path.contains("pdf-to-word")
+        || path.contains("pdf-to-presentation")
+        || path.contains("pdf-to-image")
+        || path.contains("pdf-to-img")
+        || path.contains("img-to-pdf")
+        || path.contains("html-to-pdf")
+        || path.contains("url-to-pdf")
+        || path.contains("vector")
+        || path.contains("ebook")
+        || path.contains("epub")
+    {
+        5
+    } else if path.contains("merge")
+        || path.contains("split")
+        || path.contains("overlay")
+        || path.contains("multi-page")
+        || path.contains("booklet")
+        || path.contains("attachments")
+    {
+        3
+    } else {
+        1
+    }
+}
+
+fn is_async_job_request(request: &Request) -> bool {
+    request.method() == Method::POST
+        && supports_async_jobs(request.uri().path())
+        && request.uri().query().is_some_and(|query| {
+            query.split('&').any(|parameter| {
+                let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+                urlencoding::decode(name).is_ok_and(|name| name == "async")
+                    && urlencoding::decode(value)
+                        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+            })
+        })
+}
+
+const ASYNC_JOB_PROCESSING_PATHS: &[&str] = &[
+    ADD_ATTACHMENTS_PATH,
+    ADD_COMMENTS_PATH,
+    CREATE_PDF_AGENT_PATH,
+    MATH_AUDITOR_AGENT_PATH,
+    ADD_IMAGE_PATH,
+    ADD_PAGE_NUMBERS_PATH,
+    ADD_PASSWORD_PATH,
+    ADD_STAMP_PATH,
+    ADD_WATERMARK_PATH,
+    ANALYSIS_ANNOTATION_INFO_PATH,
+    ANALYSIS_BASIC_INFO_PATH,
+    ANALYSIS_DOCUMENT_PROPERTIES_PATH,
+    ANALYSIS_FONT_INFO_PATH,
+    ANALYSIS_FORM_FIELDS_PATH,
+    ANALYSIS_PAGE_COUNT_PATH,
+    ANALYSIS_PAGE_DIMENSIONS_PATH,
+    ANALYSIS_SECURITY_INFO_PATH,
+    AUTO_REDACT_PATH,
+    AUTO_RENAME_PATH,
+    AUTO_SPLIT_PATH,
+    BOOKLET_IMPOSITION_PATH,
+    CBR_TO_PDF_PATH,
+    CBZ_TO_PDF_PATH,
+    CERT_SIGN_PATH,
+    COMPRESS_PDF_PATH,
+    CROP_PATH,
+    DECOMPRESS_PDF_PATH,
+    DELETE_ATTACHMENT_PATH,
+    EDIT_TABLE_OF_CONTENTS_PATH,
+    EDIT_TEXT_PATH,
+    EBOOK_TO_PDF_PATH,
+    EML_TO_PDF_PATH,
+    EXTRACT_ATTACHMENTS_PATH,
+    EXTRACT_BOOKMARKS_PATH,
+    EXTRACT_IMAGES_PATH,
+    EXTRACT_IMAGE_SCANS_PATH,
+    FILE_TO_PDF_PATH,
+    FILTER_CONTAINS_IMAGE_PATH,
+    FILTER_CONTAINS_TEXT_PATH,
+    FILTER_FILE_SIZE_PATH,
+    FILTER_PAGE_COUNT_PATH,
+    FILTER_PAGE_ROTATION_PATH,
+    FILTER_PAGE_SIZE_PATH,
+    FLATTEN_PATH,
+    FORM_DELETE_FIELDS_PATH,
+    FORM_EXTRACT_CSV_PATH,
+    FORM_EXTRACT_XLSX_PATH,
+    FORM_FIELDS_PATH,
+    FORM_FIELDS_WITH_COORDINATES_PATH,
+    FORM_FILL_PATH,
+    FORM_MODIFY_FIELDS_PATH,
+    GET_INFO_ON_PDF_PATH,
+    HTML_TO_PDF_PATH,
+    IMAGE_TO_PDF_PATH,
+    LIST_ATTACHMENTS_PATH,
+    MARKDOWN_TO_PDF_PATH,
+    MERGE_PATH,
+    MULTI_PAGE_LAYOUT_PATH,
+    OCR_PDF_PATH,
+    OVERLAY_PDFS_PATH,
+    PDF_TEXT_EDITOR_METADATA_PATH,
+    PDF_TO_CBZ_PATH,
+    PDF_TO_CBR_PATH,
+    PDF_TO_CSV_PATH,
+    PDF_TO_EPUB_PATH,
+    PDF_TO_HTML_PATH,
+    PDF_TO_IMAGE_PATH,
+    PDF_TO_MARKDOWN_PATH,
+    PDF_TO_PDFA_PATH,
+    PDF_TO_PRESENTATION_PATH,
+    PDF_TO_SINGLE_PAGE_PATH,
+    PDF_TO_TEXT_PATH,
+    PDF_TO_VECTOR_PATH,
+    PDF_TO_VIDEO_PATH,
+    PDF_TO_WORD_PATH,
+    PDF_TO_XLSX_PATH,
+    PDF_TO_XML_PATH,
+    POSTER_PRINT_PATH,
+    REDACT_EXECUTE_PATH,
+    REDACT_PATH,
+    REARRANGE_PAGES_PATH,
+    REMOVE_BLANKS_PATH,
+    REMOVE_CERT_SIGN_PATH,
+    REMOVE_IMAGE_PATH,
+    REMOVE_PAGES_PATH,
+    REMOVE_PASSWORD_PATH,
+    RENAME_ATTACHMENT_PATH,
+    REPAIR_PDF_PATH,
+    REPLACE_INVERT_PDF_PATH,
+    ROTATE_PATH,
+    SANITIZE_PDF_PATH,
+    SCALE_PAGES_PATH,
+    SCANNER_EFFECT_PATH,
+    SHOW_JAVASCRIPT_PATH,
+    SPLIT_BY_SIZE_PATH,
+    SPLIT_CHAPTERS_PATH,
+    SPLIT_PATH,
+    SPLIT_SECTIONS_PATH,
+    SVG_TO_PDF_PATH,
+    TEXT_EDITOR_TO_PDF_PATH,
+    TIMESTAMP_PDF_PATH,
+    UNLOCK_FORMS_PATH,
+    UPDATE_METADATA_PATH,
+    URL_TO_PDF_PATH,
+    VALIDATE_SIGNATURE_PATH,
+    VECTOR_TO_PDF_PATH,
+    VERIFY_PDF_PATH,
+];
+
+fn supports_async_jobs(path: &str) -> bool {
+    ASYNC_JOB_PROCESSING_PATHS.contains(&path)
+}
+
+async fn persist_async_job_response(
+    job_manager: &JobManager,
+    job_id: &str,
+    directory: &Path,
+    response: Response,
+) -> Result<(), String> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if !status.is_success() {
+        let error = async_job_response_error(status, response.into_body()).await;
+        return Err(error);
+    }
+
+    job_manager
+        .update_progress(job_id, 90, "finalizing", "Saving asynchronous job result")
+        .map_err(|error| error.to_string())?;
+    let output_path = directory.join("result.bin");
+    write_body_to_job_file(response.into_body(), &output_path, None)
+        .await
+        .map_err(async_job_body_error_message)?;
+    job_manager
+        .complete_file(
+            job_id,
+            &output_path,
+            async_job_response_filename(&headers),
+            async_job_response_content_type(&headers),
+        )
+        .map_err(|error| error.to_string())
+}
+
+async fn async_job_response_error(status: StatusCode, body: Body) -> String {
+    let detail = to_bytes(body, ASYNC_JOB_ERROR_BODY_LIMIT_BYTES)
+        .await
+        .ok()
+        .and_then(|bytes| {
+            let detail = String::from_utf8_lossy(&bytes).trim().to_owned();
+            (!detail.is_empty()).then_some(detail)
+        });
+    detail.map_or_else(
+        || format!("Processing endpoint returned HTTP {status}"),
+        |detail| format!("Processing endpoint returned HTTP {status}: {detail}"),
+    )
+}
+
+async fn write_body_to_job_file(
+    body: Body,
+    path: &Path,
+    max_bytes: Option<usize>,
+) -> Result<u64, AsyncJobBodyError> {
+    let mut output = File::create(path).await.map_err(AsyncJobBodyError::Write)?;
+    let mut stream = body.into_data_stream();
+    let mut bytes_written = 0_u64;
+    let max_bytes = max_bytes.map_or(u64::MAX, |max_bytes| max_bytes as u64);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AsyncJobBodyError::Read(error.to_string()))?;
+        bytes_written = bytes_written
+            .checked_add(chunk.len() as u64)
+            .ok_or(AsyncJobBodyError::BodyTooLarge)?;
+        if bytes_written > max_bytes {
+            return Err(AsyncJobBodyError::BodyTooLarge);
+        }
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(AsyncJobBodyError::Write)?;
+    }
+    output.flush().await.map_err(AsyncJobBodyError::Write)?;
+    Ok(bytes_written)
+}
+
+fn async_job_body_error_message(error: AsyncJobBodyError) -> String {
+    match error {
+        AsyncJobBodyError::BodyTooLarge => "Processing response exceeded storage limit".to_owned(),
+        AsyncJobBodyError::Read(error) => format!("Could not read processing response: {error}"),
+        AsyncJobBodyError::Write(error) => format!("Could not store processing result: {error}"),
+    }
+}
+
+fn async_job_response_content_type(headers: &HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned()
+}
+
+fn async_job_response_filename(headers: &HeaderMap) -> String {
+    let fallback = match async_job_response_content_type(headers).split(';').next() {
+        Some("application/pdf") => "document.pdf",
+        Some("application/json") => "result.json",
+        Some("application/zip") => "result.zip",
+        _ => "result.bin",
+    };
+    headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|disposition| {
+            disposition.split(';').map(str::trim).find_map(|segment| {
+                segment
+                    .strip_prefix("filename=")
+                    .map(|filename| filename.trim_matches('"'))
+            })
+        })
+        .filter(|filename| !filename.is_empty())
+        .map_or_else(
+            || fallback.to_owned(),
+            |filename| safe_filename(Some(filename)),
+        )
+}
+
+async fn info_status() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "UP",
+        "version": application_version(),
+    }))
+}
+
+async fn info_load(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+    Query(query): Query<MetricsEndpointQuery>,
+) -> Response {
+    metrics_count_response(&runtime_metrics, "GET", query.endpoint.as_deref(), false)
+}
+
+async fn info_load_unique(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+    Query(query): Query<MetricsEndpointQuery>,
+) -> Response {
+    metrics_count_response(&runtime_metrics, "GET", query.endpoint.as_deref(), true)
+}
+
+async fn info_load_all(Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>) -> Response {
+    metrics_all_response(&runtime_metrics, "GET", false)
+}
+
+async fn info_load_all_unique(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+) -> Response {
+    metrics_all_response(&runtime_metrics, "GET", true)
+}
+
+async fn info_requests(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+    Query(query): Query<MetricsEndpointQuery>,
+) -> Response {
+    metrics_count_response(&runtime_metrics, "POST", query.endpoint.as_deref(), false)
+}
+
+async fn info_requests_unique(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+    Query(query): Query<MetricsEndpointQuery>,
+) -> Response {
+    metrics_count_response(&runtime_metrics, "POST", query.endpoint.as_deref(), true)
+}
+
+async fn info_requests_all(Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>) -> Response {
+    metrics_all_response(&runtime_metrics, "POST", false)
+}
+
+async fn info_requests_all_unique(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+) -> Response {
+    metrics_all_response(&runtime_metrics, "POST", true)
+}
+
+async fn info_uptime(Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>) -> Response {
+    if !runtime_metrics.enabled() {
+        return metrics_disabled_response();
+    }
+    runtime_metrics.uptime().into_response()
+}
+
+async fn info_weekly_active_users(
+    Extension(runtime_metrics): Extension<Arc<RuntimeMetrics>>,
+) -> Response {
+    if !runtime_metrics.enabled() {
+        return metrics_disabled_response();
+    }
+    if !runtime_metrics.weekly_active_users_enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            "WAU tracking is only available when security is disabled (no-login mode)",
+        )
+            .into_response();
+    }
+    runtime_metrics.weekly_active_users().map_or_else(
+        || StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        |stats| Json(stats).into_response(),
+    )
+}
+
+fn metrics_count_response(
+    runtime_metrics: &RuntimeMetrics,
+    method: &str,
+    endpoint: Option<&str>,
+    unique: bool,
+) -> Response {
+    if !runtime_metrics.enabled() {
+        return metrics_disabled_response();
+    }
+    let count = if unique {
+        runtime_metrics.unique_user_count(method, endpoint)
+    } else {
+        runtime_metrics.request_count(method, endpoint)
+    };
+    count.map_or_else(
+        || {
+            if method == "POST" {
+                Json(-1.0).into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
+        |count| Json(count).into_response(),
+    )
+}
+
+fn metrics_all_response(runtime_metrics: &RuntimeMetrics, method: &str, unique: bool) -> Response {
+    if !runtime_metrics.enabled() {
+        return metrics_disabled_response();
+    }
+    runtime_metrics.endpoint_counts(method, unique).map_or_else(
+        || StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        |counts| Json(counts).into_response(),
+    )
+}
+
+fn metrics_disabled_response() -> Response {
+    (StatusCode::FORBIDDEN, "This endpoint is disabled.").into_response()
+}
+
+async fn mobile_scanner_create_session(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let Some(service) = mobile_scanner_service_response(&runtime_config, service) else {
+        return mobile_scanner_disabled_response();
+    };
+    match service.create_session(&session_id) {
+        Ok(info) => Json(serde_json::json!({
+            "success": true,
+            "sessionId": info.session_id,
+            "createdAt": info.created_at,
+            "expiresAt": info.expires_at,
+            "timeoutMs": info.timeout_millis,
+        }))
+        .into_response(),
+        Err(error) => mobile_scanner_error_response(&error, MOBILE_SCANNER_CREATE_SESSION_PATH),
+    }
+}
+
+async fn mobile_scanner_validate_session(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let Some(service) = mobile_scanner_service_response(&runtime_config, service) else {
+        return mobile_scanner_disabled_response();
+    };
+    service.validate_session(&session_id).map_or_else(
+        || {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "valid": false,
+                    "error": "Session not found or expired",
+                })),
+            )
+                .into_response()
+        },
+        |info| {
+            Json(serde_json::json!({
+                "valid": true,
+                "sessionId": info.session_id,
+                "createdAt": info.created_at,
+                "expiresAt": info.expires_at,
+                "timeoutMs": info.timeout_millis,
+            }))
+            .into_response()
+        },
+    )
+}
+
+async fn mobile_scanner_upload(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath(session_id): AxumPath<String>,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(service) = mobile_scanner_service_response(&runtime_config, service) else {
+        return mobile_scanner_disabled_response();
+    };
+    let directory = match service.upload_directory(&session_id) {
+        Ok(directory) => directory,
+        Err(error) => return mobile_scanner_error_response(&error, MOBILE_SCANNER_UPLOAD_PATH),
+    };
+    let mut files_uploaded = 0_usize;
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return ApiError::bad_request_at(MOBILE_SCANNER_UPLOAD_PATH, error.body_text())
+                    .into_response();
+            }
+        };
+        if field.name() != Some("files") {
+            if let Err(error) = drain_field(&mut field, MOBILE_SCANNER_UPLOAD_PATH).await {
+                return error.into_response();
+            }
+            continue;
+        }
+        files_uploaded += 1;
+        let filename = MobileScannerService::sanitize_upload_filename(field.file_name());
+        let content_type = field.content_type().map(ToString::to_string);
+        let (mut output, path, stored_filename) =
+            match create_mobile_scanner_upload_file(&directory, &filename).await {
+                Ok(file) => file,
+                Err(error) => {
+                    return ApiError::internal_at(MOBILE_SCANNER_UPLOAD_PATH, error.to_string())
+                        .into_response();
+                }
+            };
+        let mut size = 0_u64;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return ApiError::bad_request_at(MOBILE_SCANNER_UPLOAD_PATH, error.body_text())
+                        .into_response();
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if let Err(error) = output.write_all(&chunk).await {
+                let _ = tokio::fs::remove_file(&path).await;
+                return ApiError::internal_at(MOBILE_SCANNER_UPLOAD_PATH, error.to_string())
+                    .into_response();
+            }
+            size = size.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        }
+        if let Err(error) = output.flush().await {
+            let _ = tokio::fs::remove_file(&path).await;
+            return ApiError::internal_at(MOBILE_SCANNER_UPLOAD_PATH, error.to_string())
+                .into_response();
+        }
+        if size == 0 {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
+        if let Err(error) = service.record_upload(
+            &session_id,
+            MobileScannerFileMetadata {
+                filename: stored_filename,
+                size,
+                content_type,
+            },
+        ) {
+            let _ = tokio::fs::remove_file(&path).await;
+            return mobile_scanner_error_response(&error, MOBILE_SCANNER_UPLOAD_PATH);
+        }
+    }
+    if files_uploaded == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "No files provided" })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "sessionId": session_id,
+        "filesUploaded": files_uploaded,
+        "message": "Files uploaded successfully",
+    }))
+    .into_response()
+}
+
+async fn mobile_scanner_files(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let Some(service) = mobile_scanner_service_response(&runtime_config, service) else {
+        return mobile_scanner_disabled_response();
+    };
+    let files = service.files(&session_id);
+    Json(serde_json::json!({
+        "sessionId": session_id,
+        "count": files.len(),
+        "files": files,
+    }))
+    .into_response()
+}
+
+async fn mobile_scanner_download(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath((session_id, filename)): AxumPath<(String, String)>,
+) -> Response {
+    if !runtime_config.mobile_scanner_enabled() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(service) = service else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok((path, content_type)) = service.download_path(&session_id, &filename) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    service.complete_download(&session_id, &filename);
+    let mut headers = HeaderMap::new();
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    let Ok(disposition) = HeaderValue::from_str(&disposition) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+    let content_type = HeaderValue::from_str(&content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    headers.insert(header::CONTENT_TYPE, content_type);
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+async fn mobile_scanner_delete_session(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(service): Extension<Option<Arc<MobileScannerService>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let Some(service) = mobile_scanner_service_response(&runtime_config, service) else {
+        return mobile_scanner_disabled_response();
+    };
+    service.delete_session(&session_id);
+    Json(serde_json::json!({
+        "success": true,
+        "sessionId": session_id,
+        "message": "Session deleted",
+    }))
+    .into_response()
+}
+
+fn mobile_scanner_service_response(
+    runtime_config: &RuntimeConfig,
+    service: Option<Arc<MobileScannerService>>,
+) -> Option<Arc<MobileScannerService>> {
+    if runtime_config.mobile_scanner_enabled() {
+        service
+    } else {
+        None
+    }
+}
+
+fn mobile_scanner_disabled_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Mobile scanner feature is not enabled",
+            "enabled": false,
+        })),
+    )
+        .into_response()
+}
+
+fn mobile_scanner_error_response(error: &MobileScannerError, api_path: &'static str) -> Response {
+    match error {
+        MobileScannerError::EmptySessionId
+        | MobileScannerError::InvalidSessionId
+        | MobileScannerError::EmptyFilename
+        | MobileScannerError::UnsafeFilename => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        MobileScannerError::SessionNotFound(_) | MobileScannerError::FileNotFound(_) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        MobileScannerError::StateUnavailable | MobileScannerError::Io(_) => {
+            ApiError::internal_at(api_path, error.to_string()).into_response()
+        }
+    }
+}
+
+async fn create_mobile_scanner_upload_file(
+    directory: &Path,
+    filename: &str,
+) -> Result<(File, PathBuf, String), std::io::Error> {
+    for number in 0_u16..=u16::MAX {
+        let candidate = mobile_scanner_unique_filename(filename, number);
+        let path = directory.join(&candidate);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => return Ok((file, path, candidate)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "too many uploads with the same filename",
+    ))
+}
+
+fn mobile_scanner_unique_filename(filename: &str, number: u16) -> String {
+    if number == 0 {
+        return filename.to_owned();
+    }
+    let (stem, extension) = filename
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map_or((filename, ""), |(stem, extension)| (stem, extension));
+    if extension.is_empty() {
+        format!("{stem}-{number}")
+    } else {
+        format!("{stem}-{number}.{extension}")
+    }
+}
+
+async fn app_config(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok());
+    Json(runtime_config.app_config(host, forwarded_proto))
+}
+
+async fn hardware_signing_capabilities_route() -> Json<hardware_signing::HardwareSigningCapabilities>
+{
+    Json(hardware_signing_capabilities())
+}
+
+async fn hardware_signing_windows_certificates_route()
+-> Result<Json<Vec<hardware_signing::HardwareCertificateInfo>>, ApiError> {
+    let certificates = task::spawn_blocking(list_hardware_windows_certificates)
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
+                format!("Windows certificate enumeration task failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            ApiError::bad_request_at(
+                HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
+                error.to_string(),
+            )
+        })?;
+    Ok(Json(certificates))
+}
+
+async fn hardware_signing_pkcs11_certificates_route(
+    Json(request): Json<hardware_signing::Pkcs11CertificatesRequest>,
+) -> Result<Json<Vec<hardware_signing::HardwareCertificateInfo>>, ApiError> {
+    let certificates = task::spawn_blocking(move || list_hardware_pkcs11_certificates(request))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH,
+                format!("PKCS#11 certificate enumeration task failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            ApiError::bad_request_at(HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH, error.to_string())
+        })?;
+    Ok(Json(certificates))
+}
+
+async fn ui_data_footer_info(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Json<ui_data::FooterData> {
+    Json(ui_data::footer_data(&runtime_config))
+}
+
+async fn ui_data_home() -> Json<ui_data::HomeData> {
+    Json(ui_data::home_data())
+}
+
+async fn ui_data_licenses() -> Json<ui_data::LicensesData> {
+    Json(ui_data::licenses_data())
+}
+
+async fn ui_data_pipeline(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Json<ui_data::PipelineData> {
+    Json(ui_data::pipeline_data(&runtime_config))
+}
+
+async fn ui_data_ocr_pdf(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Json<ui_data::OcrData> {
+    Json(ui_data::ocr_data(&runtime_config))
+}
+
+async fn ui_data_sign(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Json<ui_data::SignData> {
+    Json(ui_data::sign_data(&runtime_config))
+}
+
+async fn shared_signature_image(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    AxumPath(filename): AxumPath<String>,
+) -> Response {
+    match signature_assets::read_shared_signature(
+        &runtime_config.shared_signatures_dir(),
+        &filename,
+    ) {
+        Ok(asset) => ([(header::CONTENT_TYPE, asset.media_type)], asset.bytes).into_response(),
+        Err(signature_assets::SignatureAssetError::InvalidFilename) => {
+            ApiError::bad_request_at(SIGNATURE_IMAGE_PATH, "signature filename is invalid")
+                .into_response()
+        }
+        Err(signature_assets::SignatureAssetError::NotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(signature_assets::SignatureAssetError::Read(error)) => ApiError::internal_at(
+            SIGNATURE_IMAGE_PATH,
+            format!("could not read shared signature image: {error}"),
+        )
+        .into_response(),
+    }
+}
+
+async fn additional_language_javascript(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/javascript"),
+        )],
+        additional_language::javascript(&runtime_config.ui_languages()),
+    )
+        .into_response()
+}
+
+async fn robots_txt(Extension(runtime_config): Extension<Arc<RuntimeConfig>>) -> Response {
+    let policy = if runtime_config.google_visibility() {
+        "Allow: /\n"
+    } else {
+        "Disallow: /\n"
+    };
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+        format!("User-agent: *\n{policy}"),
+    )
+        .into_response()
+}
+
+async fn login_disclaimer(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Query(query): Query<LoginDisclaimerQuery>,
+) -> Response {
+    if runtime_config.login_disclaimer_requires_authentication() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(runtime_config.login_disclaimer(query.lang.as_deref())).into_response()
+}
+
+async fn endpoint_enabled(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Query(query): Query<EndpointQuery>,
+) -> Json<bool> {
+    Json(runtime_config.is_endpoint_enabled(&query.endpoint))
+}
+
+async fn endpoints_enabled(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Query(query): Query<EndpointsQuery>,
+) -> Json<BTreeMap<String, bool>> {
+    Json(
+        parse_endpoint_list(query.endpoints.as_deref())
+            .into_iter()
+            .map(|endpoint| {
+                let enabled = runtime_config.is_endpoint_enabled(&endpoint);
+                (endpoint, enabled)
+            })
+            .collect(),
+    )
+}
+
+async fn endpoint_availability(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Query(query): Query<EndpointsQuery>,
+) -> Json<BTreeMap<String, runtime_config::EndpointAvailability>> {
+    Json(runtime_config.endpoint_availability(&parse_endpoint_list(query.endpoints.as_deref())))
+}
+
+async fn group_enabled(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Query(query): Query<GroupQuery>,
+) -> Json<bool> {
+    Json(runtime_config.is_group_enabled(&query.group))
+}
+
+async fn settings_endpoint_status(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+) -> Json<BTreeMap<String, bool>> {
+    Json(runtime_config.disabled_endpoint_statuses())
+}
+
+async fn update_enable_analytics(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    request: Request,
+) -> Response {
+    let enabled = match read_analytics_enabled(request).await {
+        Ok(enabled) => enabled,
+        Err(error) => return error.into_response(),
+    };
+    match runtime_config.update_analytics_enabled(enabled) {
+        Ok(true) => Json(serde_json::json!({ "message": "Updated" })).into_response(),
+        Ok(false) => {
+            let message = format!(
+                "Setting has already been set, To adjust please edit {}",
+                runtime_config.settings_path().display()
+            );
+            (
+                StatusCode::ALREADY_REPORTED,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response()
+        }
+        Err(error) => ApiError::internal_at(SETTINGS_UPDATE_ANALYTICS_PATH, error).into_response(),
+    }
+}
+
+async fn read_analytics_enabled(request: Request) -> Result<bool, ApiError> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let value = if content_type.starts_with("multipart/form-data") {
+        read_analytics_enabled_multipart(request).await?
+    } else if content_type.starts_with("application/x-www-form-urlencoded") {
+        let bytes = to_bytes(request.into_body(), SETTINGS_FORM_LIMIT_BYTES)
+            .await
+            .map_err(|error| {
+                ApiError::bad_request_at(
+                    SETTINGS_UPDATE_ANALYTICS_PATH,
+                    format!("could not read settings form: {error}"),
+                )
+            })?;
+        read_urlencoded_field(&bytes, "enabled").ok_or_else(|| {
+            ApiError::bad_request_at(
+                SETTINGS_UPDATE_ANALYTICS_PATH,
+                "enabled parameter is required",
+            )
+        })?
+    } else {
+        return Err(ApiError::bad_request_at(
+            SETTINGS_UPDATE_ANALYTICS_PATH,
+            "enabled must be sent as multipart form data or URL-encoded form data",
+        ));
+    };
+    parse_settings_boolean(&value).ok_or_else(|| {
+        ApiError::bad_request_at(
+            SETTINGS_UPDATE_ANALYTICS_PATH,
+            "enabled must be a boolean value",
+        )
+    })
+}
+
+async fn read_analytics_enabled_multipart(request: Request) -> Result<String, ApiError> {
+    let mut multipart = Multipart::from_request(request, &())
+        .await
+        .map_err(|error| {
+            ApiError::bad_request_at(
+                SETTINGS_UPDATE_ANALYTICS_PATH,
+                format!("could not read settings form: {error}"),
+            )
+        })?;
+    loop {
+        let field = multipart.next_field().await.map_err(|error| {
+            ApiError::bad_request_at(
+                SETTINGS_UPDATE_ANALYTICS_PATH,
+                format!("could not read settings form: {error}"),
+            )
+        })?;
+        let Some(field) = field else {
+            return Err(ApiError::bad_request_at(
+                SETTINGS_UPDATE_ANALYTICS_PATH,
+                "enabled parameter is required",
+            ));
+        };
+        if field.name() != Some("enabled") {
+            continue;
+        }
+        return field.text().await.map_err(|error| {
+            ApiError::bad_request_at(
+                SETTINGS_UPDATE_ANALYTICS_PATH,
+                format!("could not read enabled parameter: {error}"),
+            )
+        });
+    }
+}
+
+fn read_urlencoded_field(bytes: &[u8], name: &str) -> Option<String> {
+    let form = std::str::from_utf8(bytes).ok()?;
+    form.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        let key = urlencoding::decode(key).ok()?;
+        (key == name)
+            .then(|| {
+                urlencoding::decode(value)
+                    .ok()
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .flatten()
+    })
+}
+
+fn parse_settings_boolean(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Some(true),
+        "false" | "off" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_endpoint_list(endpoints: Option<&str>) -> Vec<String> {
+    endpoints
+        .into_iter()
+        .flat_map(|endpoints| endpoints.split(','))
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 async fn add_attachments(multipart: Multipart) -> Result<Response, ApiError> {
     let request = read_add_attachments_request(multipart).await?;
-    if request.convert_to_pdfa_3b {
-        return Err(ApiError::unsupported_at(
-            ADD_ATTACHMENTS_PATH,
-            "convertToPdfA3b requires the PDF/A conversion slice, which is not ported yet",
-        ));
-    }
-    let output_filename = suffixed_filename(&request.file.filename, "_with_attachments.pdf");
+    let output_filename = if request.convert_to_pdfa_3b {
+        suffixed_filename(&request.file.filename, "_with_attachments_PDFA-3b.pdf")
+    } else {
+        suffixed_filename(&request.file.filename, "_with_attachments.pdf")
+    };
     let input_path = request.file.path;
     let filename = request.file.filename;
     let attachments = request.attachments;
+    let convert_to_pdfa_3b = request.convert_to_pdfa_3b;
     let temp_dir = request.temp_dir;
     let output_path = temp_dir.path().join("with-attachments.pdf");
     let blocking_output_path = output_path.clone();
+    let pdfa_input_path = temp_dir.path().join("with-attachments-pdfa3b-input.pdf");
     task::spawn_blocking(move || {
-        add_attachments_to_file(&input_path, &filename, &attachments, &blocking_output_path)
+        if convert_to_pdfa_3b {
+            convert_pdf_to_archive_file(
+                &input_path,
+                &filename,
+                PdfArchiveFormat::PdfA3b,
+                false,
+                &pdfa_input_path,
+            )
+            .map_err(AddAttachmentsWorkflowError::Pdfa)?;
+            add_attachments_to_pdfa3b_file(
+                &pdfa_input_path,
+                &filename,
+                &attachments,
+                &blocking_output_path,
+            )
+            .map_err(AddAttachmentsWorkflowError::Attachment)
+        } else {
+            add_attachments_to_file(&input_path, &filename, &attachments, &blocking_output_path)
+                .map_err(AddAttachmentsWorkflowError::Attachment)
+        }
     })
     .await
     .map_err(|error| {
@@ -803,7 +3065,12 @@ async fn add_attachments(multipart: Multipart) -> Result<Response, ApiError> {
             format!("add attachments task failed: {error}"),
         )
     })?
-    .map_err(|error| map_attachment_error(&error, ADD_ATTACHMENTS_PATH))?;
+    .map_err(|error| match error {
+        AddAttachmentsWorkflowError::Attachment(error) => {
+            map_attachment_error(&error, ADD_ATTACHMENTS_PATH)
+        }
+        AddAttachmentsWorkflowError::Pdfa(error) => map_pdfa_error_at(&error, ADD_ATTACHMENTS_PATH),
+    })?;
     file_response(
         output_path,
         temp_dir,
@@ -842,6 +3109,135 @@ async fn add_comments(multipart: Multipart) -> Result<Response, ApiError> {
         "application/pdf",
     )
     .await
+}
+
+async fn pdf_comment_agent(
+    Extension(settings): Extension<Arc<AiCommentEngineSettings>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_pdf_ai_comment_request(multipart).await?;
+    if !settings.enabled() {
+        return Err(ApiError::service_unavailable_at(
+            PDF_COMMENT_AGENT_PATH,
+            "AI engine is not enabled",
+        ));
+    }
+    let output_filename = suffixed_filename(&request.file.filename, "-commented.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let prompt = request.prompt;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("ai-commented.pdf");
+    let blocking_output_path = output_path.clone();
+    let blocking_settings = (*settings).clone();
+    let report = task::spawn_blocking(move || {
+        annotate_pdf_with_ai_comments(
+            &input_path,
+            &filename,
+            &prompt,
+            &blocking_settings,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_COMMENT_AGENT_PATH,
+            format!("PDF comment agent task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_ai_comment_error(&error))?;
+    let report_header = serde_json::to_string(&report).map_err(|error| {
+        ApiError::internal_at(
+            PDF_COMMENT_AGENT_PATH,
+            format!("could not serialize PDF comment report: {error}"),
+        )
+    })?;
+    let mut response = file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_COMMENT_AGENT_PATH,
+        "application/pdf",
+    )
+    .await?;
+    let report_header = HeaderValue::from_str(&report_header).map_err(|_| {
+        ApiError::internal_at(
+            PDF_COMMENT_AGENT_PATH,
+            "could not encode PDF comment report header",
+        )
+    })?;
+    response
+        .headers_mut()
+        .insert("X-Stirling-Tool-Report", report_header);
+    Ok(response)
+}
+
+async fn create_pdf_from_html_agent(
+    Extension(settings): Extension<Arc<AiCommentEngineSettings>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_ai_document_request(multipart).await?;
+    if !settings.enabled() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "AI engine is not enabled".to_owned(),
+            path: CREATE_PDF_AGENT_PATH,
+        });
+    }
+    let output_filename = ai_document_output_filename(&request.filename);
+    let document = request.document;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("ai-generated-document.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || convert_ai_document_to_pdf(&document, &blocking_output_path))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                CREATE_PDF_AGENT_PATH,
+                format!("AI document rendering task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_ai_document_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        CREATE_PDF_AGENT_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn math_auditor_agent(
+    Extension(settings): Extension<Arc<AiCommentEngineSettings>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_math_audit_request(multipart).await?;
+    if !settings.enabled() {
+        return Err(ApiError::service_unavailable_at(
+            MATH_AUDITOR_AGENT_PATH,
+            "AI engine is not enabled",
+        ));
+    }
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let tolerance = request.tolerance;
+    let temp_dir = request.temp_dir;
+    let blocking_settings = (*settings).clone();
+    let verdict = task::spawn_blocking(move || {
+        audit_pdf_math(&input_path, &filename, &tolerance, &blocking_settings)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            MATH_AUDITOR_AGENT_PATH,
+            format!("Math Auditor task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_math_audit_error(&error))?;
+    drop(temp_dir);
+    Ok(Json(verdict).into_response())
 }
 
 async fn add_image(multipart: Multipart) -> Result<Response, ApiError> {
@@ -1088,6 +3484,356 @@ async fn pdf_to_image(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
+async fn pdf_to_csv(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_table_request(multipart, PDF_TO_CSV_PATH).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let page_numbers = request.page_numbers;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("extracted.csv");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let output = task::spawn_blocking(move || {
+        extract_pdf_tables_to_csv(
+            &input_path,
+            &blocking_filename,
+            &page_numbers,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(PDF_TO_CSV_PATH, format!("PDF-to-CSV task failed: {error}"))
+    })?
+    .map_err(|error| map_pdf_table_error(&error, PDF_TO_CSV_PATH))?;
+    match output {
+        PdfTableAttempt::Unavailable { details, .. } => {
+            Err(ApiError::unsupported_at(PDF_TO_CSV_PATH, details))
+        }
+        PdfTableAttempt::Extracted(CsvExtractionOutput::NoTables) => {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        PdfTableAttempt::Extracted(CsvExtractionOutput::Single) => {
+            let output_filename = suffixed_filename(&filename, "_extracted.csv");
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                PDF_TO_CSV_PATH,
+                "text/csv",
+            )
+            .await
+        }
+        PdfTableAttempt::Extracted(CsvExtractionOutput::Archive) => {
+            let output_filename = suffixed_filename(&filename, "_extracted.zip");
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                PDF_TO_CSV_PATH,
+                "application/octet-stream",
+            )
+            .await
+        }
+    }
+}
+
+async fn pdf_to_xlsx(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_table_request(multipart, PDF_TO_XLSX_PATH).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let page_numbers = request.page_numbers;
+    let temp_dir = request.temp_dir;
+    let output_filename = suffixed_filename(&filename, ".xlsx");
+    let output_path = temp_dir.path().join("extracted.xlsx");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let output = task::spawn_blocking(move || {
+        extract_pdf_tables_to_xlsx(
+            &input_path,
+            &blocking_filename,
+            &page_numbers,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_XLSX_PATH,
+            format!("PDF-to-XLSX task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_table_error(&error, PDF_TO_XLSX_PATH))?;
+    match output {
+        PdfXlsxAttempt::Unavailable { details, .. } => {
+            Err(ApiError::unsupported_at(PDF_TO_XLSX_PATH, details))
+        }
+        PdfXlsxAttempt::Extracted(XlsxExtractionOutput::NoTables) => {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        PdfXlsxAttempt::Extracted(XlsxExtractionOutput::Workbook) => {
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                PDF_TO_XLSX_PATH,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            .await
+        }
+    }
+}
+
+async fn pdf_to_ebook(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_ebook_request(multipart).await?;
+    let output_format = request.options.output_format;
+    let output_filename = suffixed_filename(
+        &request.file.filename,
+        &format!(
+            "_convertedTo{}.{}",
+            output_format.java_name(),
+            output_format.extension()
+        ),
+    );
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir
+        .path()
+        .join(format!("converted.{}", output_format.extension()));
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_pdf_to_ebook(&input_path, &filename, options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_EPUB_PATH,
+            format!("PDF-to-eBook task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_to_ebook_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_EPUB_PATH,
+        output_format.media_type(),
+    )
+    .await
+}
+
+async fn redact_pdf_manually(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_manual_redact_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_redacted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let boxes = request.boxes;
+    let page_numbers = request.page_numbers;
+    let page_redaction_color = request.page_redaction_color;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("redacted.pdf");
+    let blocking_output_path = output_path.clone();
+    let outcome = task::spawn_blocking(move || {
+        redact_pdf_to_raster_file(
+            &input_path,
+            &filename,
+            &boxes,
+            &page_numbers,
+            page_redaction_color,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            REDACT_PATH,
+            format!("manual redaction task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_redaction_error(&error, REDACT_PATH))?;
+    match outcome {
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: false,
+        } => Err(ApiError::unsupported_at(
+            REDACT_PATH,
+            "PDFium is unavailable; configure STIRLING_PDFIUM_LIBRARY_PATH to enable secure redaction",
+        )),
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: true,
+        } => Err(ApiError::internal_at(
+            REDACT_PATH,
+            "the configured PDFium runtime could not be initialized",
+        )),
+        PdfRedactionAttempt::Redacted => {
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                REDACT_PATH,
+                "application/pdf",
+            )
+            .await
+        }
+    }
+}
+
+async fn auto_redact_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_auto_redact_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_redacted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("auto-redacted.pdf");
+    let blocking_output_path = output_path.clone();
+    let outcome = task::spawn_blocking(move || {
+        redact_matching_text_to_raster_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            AUTO_REDACT_PATH,
+            format!("automatic redaction task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_redaction_error(&error, AUTO_REDACT_PATH))?;
+    match outcome {
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: false,
+        } => Err(ApiError::unsupported_at(
+            AUTO_REDACT_PATH,
+            "PDFium is unavailable; configure STIRLING_PDFIUM_LIBRARY_PATH to enable secure redaction",
+        )),
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: true,
+        } => Err(ApiError::internal_at(
+            AUTO_REDACT_PATH,
+            "the configured PDFium runtime could not be initialized",
+        )),
+        PdfRedactionAttempt::Redacted => {
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                AUTO_REDACT_PATH,
+                "application/pdf",
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_redaction(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_execute_redact_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_redacted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("executed-redaction.pdf");
+    let blocking_output_path = output_path.clone();
+    let outcome = task::spawn_blocking(move || {
+        execute_redaction_to_raster_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            REDACT_EXECUTE_PATH,
+            format!("redaction execution task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_redaction_error(&error, REDACT_EXECUTE_PATH))?;
+    match outcome {
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: false,
+        } => Err(ApiError::unsupported_at(
+            REDACT_EXECUTE_PATH,
+            "PDFium is unavailable; configure STIRLING_PDFIUM_LIBRARY_PATH to enable secure redaction",
+        )),
+        PdfRedactionAttempt::Unavailable {
+            explicitly_configured: true,
+        } => Err(ApiError::internal_at(
+            REDACT_EXECUTE_PATH,
+            "the configured PDFium runtime could not be initialized",
+        )),
+        PdfRedactionAttempt::Redacted => {
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                REDACT_EXECUTE_PATH,
+                "application/pdf",
+            )
+            .await
+        }
+    }
+}
+
+async fn edit_text(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_edit_text_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_edited.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("edited-text.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        edit_pdf_text_to_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(EDIT_TEXT_PATH, format!("text editing task failed: {error}"))
+    })?
+    .map_err(|error| map_pdf_text_edit_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        EDIT_TEXT_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn pdf_to_video(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_video_request(multipart).await?;
+    let output_format = VideoFormat::from_requested(&request.options.video_format);
+    let output_filename = suffixed_filename(
+        &request.file.filename,
+        &format!("-video.{}", output_format.extension()),
+    );
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir
+        .path()
+        .join(format!("converted-video.{}", output_format.extension()));
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_pdf_to_video(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_VIDEO_PATH,
+            format!("PDF-to-video task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_to_video_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_VIDEO_PATH,
+        output_format.content_type(),
+    )
+    .await
+}
+
 async fn image_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
     let request = read_image_to_pdf_request(multipart).await?;
     let output_filename = suffixed_filename(
@@ -1117,6 +3863,913 @@ async fn image_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
         &output_filename,
         IMAGE_TO_PDF_PATH,
         "application/pdf",
+    )
+    .await
+}
+
+async fn pdf_text_editor_metadata(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, PDF_TEXT_EDITOR_METADATA_PATH).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let metadata_input_path = input_path.clone();
+    let (metadata, job_id) = task::spawn_blocking(move || {
+        let _temp_dir = temp_dir;
+        let metadata = pdf_to_json_metadata(&metadata_input_path, &filename)?;
+        let job_id = cache_pdf_file(&input_path, &filename)
+            .map_err(|error| PdfJsonError::Write(std::io::Error::other(error.to_string())))?;
+        Ok::<_, PdfJsonError>((metadata, job_id))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TEXT_EDITOR_METADATA_PATH,
+            format!("PDF metadata task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_json_error(&error, PDF_TEXT_EDITOR_METADATA_PATH))?;
+    let mut response = Json(metadata).into_response();
+    let job_id = HeaderValue::from_str(&job_id)
+        .map_err(|error| ApiError::internal_at(PDF_TEXT_EDITOR_METADATA_PATH, error.to_string()))?;
+    response.headers_mut().insert("x-job-id", job_id);
+    Ok(response)
+}
+
+async fn pdf_text_editor(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    Extension(job_queue): Extension<Arc<JobQueue>>,
+    Query(query): Query<TextEditorQuery>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, PDF_TEXT_EDITOR_PATH).await?;
+    if query.asynchronous {
+        let owner =
+            JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+        return submit_pdf_text_editor_job(
+            job_manager,
+            job_queue,
+            owner,
+            request,
+            query.lightweight,
+        )
+        .await;
+    }
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let lightweight = query.lightweight;
+    let document = task::spawn_blocking(move || {
+        let _temp_dir = temp_dir;
+        pdf_to_json(&input_path, &filename, lightweight)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TEXT_EDITOR_PATH,
+            format!("PDF-to-JSON task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_json_error(&error, PDF_TEXT_EDITOR_PATH))?;
+    Ok(Json(document).into_response())
+}
+
+async fn submit_pdf_text_editor_job(
+    job_manager: Arc<JobManager>,
+    job_queue: Arc<JobQueue>,
+    owner: JobOwner,
+    request: UploadedSinglePdfRequest,
+    lightweight: bool,
+) -> Result<Response, ApiError> {
+    let submission = job_manager
+        .create_job(owner)
+        .map_err(|error| ApiError::internal_at(PDF_TEXT_EDITOR_PATH, error.to_string()))?;
+    let input_path = submission.directory.join("input.pdf");
+    tokio::fs::copy(&request.file.path, &input_path)
+        .await
+        .map_err(|error| {
+            let _ = job_manager.fail(&submission.job_id, "Could not persist the uploaded PDF");
+            ApiError::internal_at(PDF_TEXT_EDITOR_PATH, error.to_string())
+        })?;
+
+    let job_id = submission.job_id;
+    let admission = match job_queue.admit(&job_id, 5) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let _ = job_manager.discard(&job_id);
+            return Err(ApiError::service_unavailable_at(
+                PDF_TEXT_EDITOR_PATH,
+                error.to_string(),
+            ));
+        }
+    };
+    let output_path = submission.directory.join("result.json");
+    let output_filename = replace_extension(&request.file.filename, "json");
+    let worker_manager = Arc::clone(&job_manager);
+    let worker_job_id = job_id.clone();
+    let failure_job_id = worker_job_id.clone();
+    let response_job_id = job_id.clone();
+    tokio::spawn(async move {
+        let lease = match admission.wait().await {
+            Ok(lease) => lease,
+            Err(JobQueueError::Cancelled) => return,
+            Err(error) => {
+                let _ = worker_manager.fail(&failure_job_id, error.to_string());
+                return;
+            }
+        };
+        if lease.waited_over_limit() {
+            let _ = worker_manager.update_progress(
+                &worker_job_id,
+                1,
+                "queued-timeout",
+                "Job exceeded the configured queue wait target and is starting now",
+            );
+        }
+        let _lease = lease;
+        let job_manager = Arc::clone(&worker_manager);
+        let result = task::spawn_blocking(move || -> Result<(), String> {
+            job_manager
+                .update_progress(&worker_job_id, 5, "processing", "Converting PDF to JSON")
+                .map_err(|error| error.to_string())?;
+            let document = pdf_to_json(&input_path, &output_filename, lightweight)
+                .map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+            std::fs::write(&output_path, bytes).map_err(|error| error.to_string())?;
+            job_manager
+                .complete_file(
+                    &worker_job_id,
+                    &output_path,
+                    &output_filename,
+                    "application/json",
+                )
+                .map_err(|error| error.to_string())
+        })
+        .await;
+
+        let failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!("PDF-to-JSON task failed: {error}")),
+        };
+        if let Some(error) = failure {
+            let _ = worker_manager.fail(&failure_job_id, error);
+        }
+    });
+
+    Ok(Json(serde_json::json!({ "jobId": response_job_id })).into_response())
+}
+
+async fn job_status(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    Extension(job_queue): Extension<Arc<JobQueue>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    match job_manager.status(owner, &job_id) {
+        Ok(Some(status)) => {
+            if !status.complete
+                && let Some(position) = job_queue.position(&job_id)
+            {
+                return Json(serde_json::json!({
+                    "jobResult": status,
+                    "queueInfo": {
+                        "inQueue": true,
+                        "position": position,
+                    },
+                }))
+                .into_response();
+            }
+            Json(status).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn job_result(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    let status = match job_manager.status(owner, &job_id) {
+        Ok(Some(status)) => status,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if !status.complete {
+        return (StatusCode::BAD_REQUEST, "Job is not complete yet").into_response();
+    }
+    if let Some(error) = status.error {
+        return (StatusCode::BAD_REQUEST, format!("Job failed: {error}")).into_response();
+    }
+    match job_manager.result_file(owner, &job_id) {
+        Ok(Some(file)) => job_file_response(file).await,
+        Ok(None) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn job_result_files(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    let status = match job_manager.status(owner, &job_id) {
+        Ok(Some(status)) => status,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if !status.complete {
+        return (StatusCode::BAD_REQUEST, "Job is not complete yet").into_response();
+    }
+    if let Some(error) = status.error {
+        return (StatusCode::BAD_REQUEST, format!("Job failed: {error}")).into_response();
+    }
+    match job_manager.result_file(owner, &job_id) {
+        Ok(Some(file)) => Json(serde_json::json!({
+            "jobId": job_id,
+            "fileCount": 1,
+            "files": [file],
+        }))
+        .into_response(),
+        Ok(None) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn job_file_metadata(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    AxumPath(file_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    match job_manager.job_file(owner, &file_id) {
+        Ok(Some((_, file))) => Json(file).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn download_job_file(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    AxumPath(file_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    match job_manager.job_file(owner, &file_id) {
+        Ok(Some((_, file))) => job_file_response(file).await,
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn cancel_job(
+    auth_context: Option<Extension<AuthContext>>,
+    Extension(job_manager): Extension<Arc<JobManager>>,
+    Extension(job_queue): Extension<Arc<JobQueue>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let owner = JobOwner::from_auth_context(auth_context.as_ref().map(|extension| &extension.0));
+    match job_manager.status(owner, &job_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let queue_cancellation = job_queue.cancel(&job_id);
+    match job_manager.cancel(owner, &job_id) {
+        Ok(CancelJob::Cancelled) => Json(serde_json::json!({
+            "message": "Job cancelled successfully",
+            "wasQueued": matches!(queue_cancellation, QueueCancellationResult::Waiting { .. }),
+            "queuePosition": match queue_cancellation {
+                QueueCancellationResult::Waiting { position } => serde_json::json!(position),
+                QueueCancellationResult::Running | QueueCancellationResult::Missing => serde_json::json!("n/a"),
+            },
+        }))
+        .into_response(),
+        Ok(CancelJob::Complete) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Cannot cancel job that is already complete" })),
+        )
+            .into_response(),
+        Ok(CancelJob::Missing) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn admin_job_queue_stats(Extension(job_queue): Extension<Arc<JobQueue>>) -> Response {
+    Json(job_queue.stats()).into_response()
+}
+
+async fn admin_job_stats(Extension(job_manager): Extension<Arc<JobManager>>) -> Response {
+    match job_manager.stats() {
+        Ok(stats) => Json(stats).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn admin_job_cleanup(Extension(job_manager): Extension<Arc<JobManager>>) -> Response {
+    match job_manager.cleanup_expired() {
+        Ok(removed_jobs) => {
+            let remaining_jobs = job_manager.stats().map_or(0, |stats| stats.total_jobs);
+            Json(serde_json::json!({
+                "message": "Cleanup complete",
+                "removedJobs": removed_jobs,
+                "remainingJobs": remaining_jobs,
+            }))
+            .into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn job_file_response(file: JobFile) -> Response {
+    let Ok(bytes) = tokio::fs::read(&file.path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut headers = HeaderMap::new();
+    let content_type = HeaderValue::from_str(&file.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let encoded_filename = urlencoding::encode(&file.file_name).replace('+', "%20");
+    let content_disposition = HeaderValue::from_str(&format!(
+        "attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(header::CONTENT_DISPOSITION, content_disposition);
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+async fn pdf_text_editor_page(
+    AxumPath((job_id, page_number)): AxumPath<(String, i32)>,
+) -> Result<Response, ApiError> {
+    let cached = load_pdf_text_editor_job(job_id, PDF_TEXT_EDITOR_PAGE_PATH).await?;
+    let filename = cached.filename;
+    let document = task::spawn_blocking(move || pdf_bytes_to_json(&cached.bytes, &filename, true))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                PDF_TEXT_EDITOR_PAGE_PATH,
+                format!("cached PDF page task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_pdf_json_error(&error, PDF_TEXT_EDITOR_PAGE_PATH))?;
+    let page_count = document.pages.len();
+    let page = document
+        .pages
+        .into_iter()
+        .find(|page| page.page_number == Some(page_number))
+        .ok_or_else(|| {
+            ApiError::bad_request_at(
+                PDF_TEXT_EDITOR_PAGE_PATH,
+                format!("pageNumber must be between 1 and {page_count}"),
+            )
+        })?;
+    Ok(Json(page).into_response())
+}
+
+async fn pdf_text_editor_page_fonts(
+    AxumPath((job_id, page_number)): AxumPath<(String, i32)>,
+) -> Result<Response, ApiError> {
+    let cached = load_pdf_text_editor_job(job_id, PDF_TEXT_EDITOR_FONTS_PATH).await?;
+    let filename = cached.filename;
+    let document = task::spawn_blocking(move || pdf_bytes_to_json(&cached.bytes, &filename, true))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                PDF_TEXT_EDITOR_FONTS_PATH,
+                format!("cached PDF font task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_pdf_json_error(&error, PDF_TEXT_EDITOR_FONTS_PATH))?;
+    let page_count = document.pages.len();
+    let Ok(page_number) = usize::try_from(page_number) else {
+        return Err(ApiError::bad_request_at(
+            PDF_TEXT_EDITOR_FONTS_PATH,
+            format!("pageNumber must be between 1 and {page_count}"),
+        ));
+    };
+    if page_number == 0 || page_number > page_count {
+        return Err(ApiError::bad_request_at(
+            PDF_TEXT_EDITOR_FONTS_PATH,
+            format!("pageNumber must be between 1 and {page_count}"),
+        ));
+    }
+    let page_number = i32::try_from(page_number).map_err(|_| {
+        ApiError::bad_request_at(
+            PDF_TEXT_EDITOR_FONTS_PATH,
+            format!("pageNumber must be between 1 and {page_count}"),
+        )
+    })?;
+    let fonts: Vec<PdfJsonFont> = document
+        .fonts
+        .into_iter()
+        .filter(|font| font.page_number == Some(page_number))
+        .collect();
+    Ok(Json(fonts).into_response())
+}
+
+async fn pdf_text_editor_partial(
+    AxumPath(job_id): AxumPath<String>,
+    Query(query): Query<TextEditorPartialQuery>,
+    Json(updates): Json<PdfJsonDocument>,
+) -> Result<Response, ApiError> {
+    let cached = load_pdf_text_editor_job(job_id.clone(), PDF_TEXT_EDITOR_PARTIAL_PATH).await?;
+    let output_filename = suffixed_filename(
+        query.filename.as_deref().unwrap_or(&cached.filename),
+        ".pdf",
+    );
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TEXT_EDITOR_PARTIAL_PATH, error.to_string()))?;
+    let output_path = temp_dir.path().join("partial-text-editor.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        if updates.pages.is_empty() {
+            std::fs::write(&blocking_output_path, &cached.bytes)
+                .map_err(|error| error.to_string())?;
+        } else {
+            let original = pdf_bytes_to_json(&cached.bytes, &cached.filename, false)
+                .map_err(|error| error.to_string())?;
+            let merged = merge_partial_pdf_json(original, updates);
+            convert_json_to_pdf(&merged, &blocking_output_path)
+                .map_err(|error| error.to_string())?;
+        }
+        replace_cached_pdf_file(&job_id, &blocking_output_path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TEXT_EDITOR_PARTIAL_PATH,
+            format!("partial text-editor task failed: {error}"),
+        )
+    })?
+    .map_err(|error| ApiError::internal_at(PDF_TEXT_EDITOR_PARTIAL_PATH, error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TEXT_EDITOR_PARTIAL_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn pdf_text_editor_clear_cache(
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    task::spawn_blocking(move || clear_cached_pdf(&job_id))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                PDF_TEXT_EDITOR_CLEAR_CACHE_PATH,
+                format!("clear cached PDF task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_pdf_json_cache_error(&error, PDF_TEXT_EDITOR_CLEAR_CACHE_PATH))?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn load_pdf_text_editor_job(
+    job_id: String,
+    api_path: &'static str,
+) -> Result<crate::pdf_json_cache::CachedPdf, ApiError> {
+    task::spawn_blocking(move || load_cached_pdf(&job_id))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(api_path, format!("cached PDF task failed: {error}"))
+        })?
+        .map_err(|error| map_pdf_json_cache_error(&error, api_path))
+}
+
+fn merge_partial_pdf_json(
+    mut original: PdfJsonDocument,
+    updates: PdfJsonDocument,
+) -> PdfJsonDocument {
+    if updates.metadata.is_some() {
+        original.metadata = updates.metadata;
+    }
+    if updates.xmp_metadata.is_some() {
+        original.xmp_metadata = updates.xmp_metadata;
+    }
+    if !updates.fonts.is_empty() {
+        original.fonts = updates.fonts;
+    }
+    for update in updates.pages {
+        let Some(page_number) = update.page_number else {
+            continue;
+        };
+        let Some(original_page) = original
+            .pages
+            .iter_mut()
+            .find(|page| page.page_number == Some(page_number))
+        else {
+            continue;
+        };
+        merge_partial_pdf_page(original_page, update);
+    }
+    original
+}
+
+fn merge_partial_pdf_page(original: &mut PdfJsonPage, update: PdfJsonPage) {
+    if update.width.is_some() {
+        original.width = update.width;
+    }
+    if update.height.is_some() {
+        original.height = update.height;
+    }
+    if update.rotation.is_some() {
+        original.rotation = update.rotation;
+    }
+    if update.resources.is_some() {
+        original.resources = update.resources;
+    }
+    if !update.content_streams.is_empty() {
+        original.content_streams = update.content_streams;
+    }
+    if !update.text_elements.is_empty() {
+        original.text_elements = update.text_elements;
+    }
+    if !update.image_elements.is_empty() {
+        original.image_elements = update.image_elements;
+    }
+    if !update.annotations.is_empty() {
+        original.annotations = update.annotations;
+    }
+}
+
+async fn text_editor_to_pdf(mut multipart: Multipart) -> Result<Response, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(TEXT_EDITOR_TO_PDF_PATH, error.to_string()))?;
+    let mut json_bytes = None;
+    let mut filename = "document".to_owned();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(TEXT_EDITOR_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                filename = safe_filename(field.file_name());
+                json_bytes = Some(read_field_bytes(&mut field, TEXT_EDITOR_TO_PDF_PATH).await?);
+            }
+            _ => drain_field(&mut field, TEXT_EDITOR_TO_PDF_PATH).await?,
+        }
+    }
+    let json_bytes = json_bytes.ok_or_else(|| {
+        ApiError::bad_request_at(TEXT_EDITOR_TO_PDF_PATH, "fileInput is required")
+    })?;
+    let output_filename = suffixed_filename(&filename, ".pdf");
+    let output_path = temp_dir.path().join("text-editor.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || json_bytes_to_pdf(&json_bytes, &blocking_output_path))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(
+                TEXT_EDITOR_TO_PDF_PATH,
+                format!("JSON-to-PDF task failed: {error}"),
+            )
+        })?
+        .map_err(|error| map_pdf_json_error(&error, TEXT_EDITOR_TO_PDF_PATH))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        TEXT_EDITOR_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn convert_file_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, FILE_TO_PDF_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_convertedToPDF.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-file.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_office_to_pdf(&input_path, &filename, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            FILE_TO_PDF_PATH,
+            format!("office-to-PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_office_to_pdf_error(&error, FILE_TO_PDF_PATH))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        FILE_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn ebook_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_ebook_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_convertedToPDF.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-ebook.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_ebook_to_pdf(&input_path, &filename, options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            EBOOK_TO_PDF_PATH,
+            format!("eBook-to-PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_ebook_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        EBOOK_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn eml_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_eml_request(multipart).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let is_html = options.output == EmlOutputFormat::Html;
+    let output_filename = suffixed_filename(&filename, if is_html { ".html" } else { ".pdf" });
+    let output_path = temp_dir.path().join(if is_html {
+        "converted-email.html"
+    } else {
+        "converted-email.pdf"
+    });
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_email_to_output(&input_path, &filename, options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            EML_TO_PDF_PATH,
+            format!("email-to-output task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_eml_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        EML_TO_PDF_PATH,
+        if is_html {
+            "text/html"
+        } else {
+            "application/pdf"
+        },
+    )
+    .await
+}
+
+async fn url_to_pdf(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let url_input = read_url_to_pdf_request(multipart).await?;
+    if !runtime_config.is_endpoint_enabled("url-to-pdf") {
+        return url_to_pdf_redirect("error.endpointDisabled");
+    }
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(URL_TO_PDF_PATH, error.to_string()))?;
+    let output_path = temp_dir.path().join("converted-website.pdf");
+    let blocking_output_path = output_path.clone();
+    let blocking_url_input = url_input.clone();
+    let conversion = task::spawn_blocking(move || {
+        convert_url_to_pdf(&blocking_url_input, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(URL_TO_PDF_PATH, format!("URL-to-PDF task failed: {error}"))
+    })?;
+    match conversion {
+        Ok(()) => {
+            let output_filename = url_output_filename(&url_input);
+            file_response(
+                output_path,
+                temp_dir,
+                &output_filename,
+                URL_TO_PDF_PATH,
+                "application/pdf",
+            )
+            .await
+        }
+        Err(error) => map_url_to_pdf_error(&error),
+    }
+}
+
+async fn html_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, HTML_TO_PDF_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, ".pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-html.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_html_to_pdf(&input_path, &filename, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            HTML_TO_PDF_PATH,
+            format!("HTML-to-PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_html_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        HTML_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn markdown_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, MARKDOWN_TO_PDF_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, ".pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-markdown.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_markdown_to_pdf(&input_path, &filename, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            MARKDOWN_TO_PDF_PATH,
+            format!("Markdown-to-PDF task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_markdown_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        MARKDOWN_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn ocr_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_ocr_request(multipart).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("ocr-output");
+    let blocking_output_path = output_path.clone();
+    let output =
+        task::spawn_blocking(move || run_ocr(&input_path, &blocking_output_path, &options))
+            .await
+            .map_err(|error| {
+                ApiError::internal_at(OCR_PDF_PATH, format!("OCR task failed: {error}"))
+            })?
+            .map_err(|error| map_ocr_error(&error))?;
+    let (output_filename, content_type) = match output {
+        OcrOutput::Pdf => (suffixed_filename(&filename, "_OCR.pdf"), "application/pdf"),
+        OcrOutput::Zip => (
+            suffixed_filename(&filename, "_OCR.zip"),
+            "application/octet-stream",
+        ),
+    };
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        OCR_PDF_PATH,
+        content_type,
+    )
+    .await
+}
+
+async fn pdf_to_word(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_office_request(multipart, PDF_TO_WORD_PATH).await?;
+    let format = request
+        .output_format
+        .clone()
+        .unwrap_or_else(|| "docx".to_owned());
+    pdf_to_office_response(request, format, "writer_pdf_import", PDF_TO_WORD_PATH).await
+}
+
+async fn pdf_to_presentation(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_office_request(multipart, PDF_TO_PRESENTATION_PATH).await?;
+    let format = request
+        .output_format
+        .clone()
+        .unwrap_or_else(|| "pptx".to_owned());
+    pdf_to_office_response(
+        request,
+        format,
+        "impress_pdf_import",
+        PDF_TO_PRESENTATION_PATH,
+    )
+    .await
+}
+
+async fn pdf_to_xml(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_office_request(multipart, PDF_TO_XML_PATH).await?;
+    pdf_to_office_response(
+        request,
+        "xml".to_owned(),
+        "writer_pdf_import",
+        PDF_TO_XML_PATH,
+    )
+    .await
+}
+
+async fn pdf_to_html(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, PDF_TO_HTML_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "ToHtml.zip");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-html.zip");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_pdf_to_html(&input_path, &filename, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_HTML_PATH,
+            format!("PDF-to-HTML task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_to_html_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_HTML_PATH,
+        "application/octet-stream",
+    )
+    .await
+}
+
+async fn pdf_to_office_response(
+    request: UploadedPdfToOfficeRequest,
+    output_format: String,
+    filter: &'static str,
+    api_path: &'static str,
+) -> Result<Response, ApiError> {
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-office-output");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let blocking_format = output_format.clone();
+    let output = task::spawn_blocking(move || {
+        convert_pdf_to_office(
+            &input_path,
+            &blocking_filename,
+            &blocking_format,
+            filter,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(api_path, format!("PDF-to-office task failed: {error}"))
+    })?
+    .map_err(|error| map_office_to_pdf_error(&error, api_path))?;
+    let output_filename = match output {
+        PdfToOfficeOutput::Single { extension } => {
+            suffixed_filename(&filename, &format!(".{extension}"))
+        }
+        PdfToOfficeOutput::Zip => {
+            format!("{}To{output_format}.zip", suffixed_filename(&filename, ""))
+        }
+    };
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        api_path,
+        "application/octet-stream",
     )
     .await
 }
@@ -1263,6 +4916,38 @@ async fn cbz_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
+async fn cbr_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_cbr_to_pdf_request(multipart).await?;
+    let output_filename = comic_output_filename(&request.file.filename, "_converted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let optimize_for_ebook = request.optimize_for_ebook;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-cbr.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        cbr_to_pdf_file(
+            &input_path,
+            &filename,
+            optimize_for_ebook,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(CBR_TO_PDF_PATH, format!("CBR-to-PDF task failed: {error}"))
+    })?
+    .map_err(|error| map_cbr_to_pdf_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        CBR_TO_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
 async fn pdf_to_cbz(multipart: Multipart) -> Result<Response, ApiError> {
     let request = read_pdf_to_cbz_request(multipart).await?;
     let output_filename = comic_output_filename(&request.file.filename, "_converted.cbz");
@@ -1286,6 +4971,67 @@ async fn pdf_to_cbz(multipart: Multipart) -> Result<Response, ApiError> {
         &output_filename,
         PDF_TO_CBZ_PATH,
         "application/zip",
+    )
+    .await
+}
+
+async fn pdf_to_cbr(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_to_cbr_request(multipart).await?;
+    let output_filename = comic_output_filename(&request.file.filename, "_converted.cbr");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let dpi = if request.dpi <= 0 { 300 } else { request.dpi };
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted.cbr");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        pdf_to_cbr_file(&input_path, &filename, dpi, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(PDF_TO_CBR_PATH, format!("PDF-to-CBR task failed: {error}"))
+    })?
+    .map_err(|error| map_pdf_to_cbr_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_CBR_PATH,
+        "application/octet-stream",
+    )
+    .await
+}
+
+async fn pdf_to_pdfa(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_pdf_archive_request(multipart).await?;
+    let format = PdfArchiveFormat::from_output_format(&request.output_format);
+    let output_filename = suffixed_filename(&request.file.filename, format.output_suffix());
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let strict = request.strict;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted-archive.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        convert_pdf_to_archive_file(
+            &input_path,
+            &filename,
+            format,
+            strict,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(PDF_TO_PDFA_PATH, format!("PDF/A task failed: {error}"))
+    })?
+    .map_err(|error| map_pdfa_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_PDFA_PATH,
+        "application/pdf",
     )
     .await
 }
@@ -1322,6 +5068,36 @@ async fn pdf_to_text(multipart: Multipart) -> Result<Response, ApiError> {
         &output_filename,
         PDF_TO_TEXT_PATH,
         format.content_type(),
+    )
+    .await
+}
+
+async fn pdf_to_markdown(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, PDF_TO_MARKDOWN_PATH).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let output_filename = replace_extension(&filename, "md");
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("converted.md");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    task::spawn_blocking(move || {
+        pdf_to_markdown_file(&input_path, &blocking_filename, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            PDF_TO_MARKDOWN_PATH,
+            format!("PDF-to-Markdown task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_pdf_markdown_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        PDF_TO_MARKDOWN_PATH,
+        "text/markdown",
     )
     .await
 }
@@ -1445,6 +5221,48 @@ async fn extract_images(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
+async fn extract_image_scans(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_extract_image_scans_request(multipart).await?;
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("processed-image-scans");
+    let blocking_output_path = output_path.clone();
+    let blocking_filename = filename.clone();
+    let output = task::spawn_blocking(move || {
+        extract_image_scans_file(
+            &input_path,
+            &blocking_filename,
+            options,
+            &blocking_output_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            EXTRACT_IMAGE_SCANS_PATH,
+            format!("Image-scan extraction task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_extract_image_scans_error(&error))?;
+    let (output_filename, content_type) = match output {
+        ExtractImageScansOutput::Png => (suffixed_filename(&filename, ".png"), "image/png"),
+        ExtractImageScansOutput::Zip => (
+            suffixed_filename(&filename, "_processed.zip"),
+            "application/zip",
+        ),
+    };
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        EXTRACT_IMAGE_SCANS_PATH,
+        content_type,
+    )
+    .await
+}
+
 async fn flatten_pdf(multipart: Multipart) -> Result<Response, ApiError> {
     let request = read_flatten_request(multipart).await?;
     let input_path = request.file.path;
@@ -1474,6 +5292,66 @@ async fn flatten_pdf(multipart: Multipart) -> Result<Response, ApiError> {
         temp_dir,
         &output_filename,
         FLATTEN_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn replace_invert_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_replace_invert_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_inverted.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let options = request.options;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("inverted.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        replace_invert_color_to_file(&input_path, &filename, &options, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            REPLACE_INVERT_PDF_PATH,
+            format!("replace-invert task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_replace_invert_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        REPLACE_INVERT_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+async fn scanner_effect(multipart: Multipart) -> Result<Response, ApiError> {
+    let request = read_scanner_effect_request(multipart).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_scanner_effect.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let params = request.params;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("scanner-effect.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        scanner_effect_to_file(&input_path, &filename, &params, &blocking_output_path)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            SCANNER_EFFECT_PATH,
+            format!("scanner effect task failed: {error}"),
+        )
+    })?
+    .map_err(|error| map_scanner_effect_error(&error))?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        SCANNER_EFFECT_PATH,
         "application/pdf",
     )
     .await
@@ -2337,6 +6215,350 @@ fn map_signature_validation_error(error: SignatureValidationError) -> ApiError {
             format!("Invalid certificate file format: {error}"),
         ),
     }
+}
+
+async fn cert_sign_pdf(
+    server_certificate: Option<Extension<Arc<ServerCertificateService>>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let UploadedCertSignRequest {
+        file,
+        signing_material,
+        appearance,
+        name,
+        location,
+        reason,
+        temp_dir,
+    } = read_cert_sign_request(multipart).await?;
+    let output_filename = suffixed_filename(&file.filename, "_signed.pdf");
+    let input_path = file.path;
+    let output_path = temp_dir.path().join("signed.pdf");
+    let blocking_output_path = output_path.clone();
+    let server_certificate = server_certificate.map(|Extension(service)| service);
+    task::spawn_blocking(move || {
+        sign_pdf_with_uploaded_material(
+            &input_path,
+            &blocking_output_path,
+            signing_material,
+            server_certificate.as_deref(),
+            appearance,
+            PdfSignatureMetadata {
+                name: name.as_deref(),
+                location: location.as_deref(),
+                reason: reason.as_deref(),
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            CERT_SIGN_PATH,
+            format!("certificate signing task failed: {error}"),
+        )
+    })?
+    .map_err(map_cert_sign_error)?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        CERT_SIGN_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+enum UploadedSoftwareSigningKey {
+    Pem(PemSigningKey),
+    Pkcs12(Pkcs12SigningKey),
+    Jks(JksSigningKey),
+}
+
+impl UploadedSoftwareSigningKey {
+    fn from_uploaded(material: UploadedSoftwareSigningMaterial) -> Result<Self, SigningKeyError> {
+        match material {
+            UploadedSoftwareSigningMaterial::Pem {
+                private_key,
+                password,
+                certificate_chain,
+            } => Ok(Self::Pem(PemSigningKey::from_pem(
+                private_key,
+                password,
+                &certificate_chain,
+            )?)),
+            UploadedSoftwareSigningMaterial::Pkcs12 {
+                archive,
+                password,
+                alias,
+            } => Ok(Self::Pkcs12(Pkcs12SigningKey::from_archive(
+                archive,
+                password,
+                alias.as_deref(),
+            )?)),
+            UploadedSoftwareSigningMaterial::Jks {
+                archive,
+                password,
+                alias,
+            } => Ok(Self::Jks(JksSigningKey::from_archive(
+                archive,
+                password,
+                alias.as_deref(),
+            )?)),
+        }
+    }
+
+    fn detached_cms_der(&self, signed_bytes: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
+        match self {
+            Self::Pem(key) => key.detached_cms_der(signed_bytes),
+            Self::Pkcs12(key) => key.detached_cms_der(signed_bytes),
+            Self::Jks(key) => key.detached_cms_der(signed_bytes),
+        }
+    }
+
+    fn leaf_certificate_der(&self) -> Option<&[u8]> {
+        let chain = match self {
+            Self::Pem(key) => key.certificate_chain(),
+            Self::Pkcs12(key) => key.certificate_chain(),
+            Self::Jks(key) => key.certificate_chain(),
+        };
+        chain.as_der().first().map(Vec::as_slice)
+    }
+}
+
+fn signing_certificate_common_name(certificate_der: &[u8]) -> Option<String> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(certificate_der).ok()?;
+    certificate
+        .subject()
+        .iter_common_name()
+        .find_map(|attribute| attribute.as_str().ok().map(ToOwned::to_owned))
+}
+
+fn sign_pdf_with_uploaded_material(
+    input_path: &Path,
+    output_path: &Path,
+    signing_material: UploadedSigningMaterial,
+    server_certificate: Option<&ServerCertificateService>,
+    appearance: Option<UploadedSignatureAppearance>,
+    metadata: PdfSignatureMetadata<'_>,
+) -> Result<(), CertSignError> {
+    let input = std::fs::read(input_path).map_err(CertSignError::Read)?;
+    match signing_material {
+        UploadedSigningMaterial::Software(material) => {
+            let signing_key = UploadedSoftwareSigningKey::from_uploaded(material)?;
+            complete_pdf_signature(
+                &input,
+                output_path,
+                appearance,
+                metadata,
+                signing_key.leaf_certificate_der(),
+                |signed_bytes| Ok(signing_key.detached_cms_der(signed_bytes)?),
+            )
+        }
+        UploadedSigningMaterial::Pkcs11(request) => {
+            with_pkcs11_signing_key(request, |signing_key| {
+                let certificate_der = signing_key.certificate_der();
+                complete_pdf_signature(
+                    &input,
+                    output_path,
+                    appearance,
+                    metadata,
+                    Some(&certificate_der),
+                    |signed_bytes| Ok(signing_key.detached_cms_der(signed_bytes)?),
+                )
+            })
+            .map_err(CertSignError::Hardware)?
+        }
+        UploadedSigningMaterial::WindowsStore { alias } => {
+            with_windows_signing_key(&alias, |signing_key| {
+                let certificate_der = signing_key.certificate_der();
+                complete_pdf_signature(
+                    &input,
+                    output_path,
+                    appearance,
+                    metadata,
+                    Some(&certificate_der),
+                    |signed_bytes| Ok(signing_key.detached_cms_der(signed_bytes)?),
+                )
+            })
+            .map_err(CertSignError::Hardware)?
+        }
+        UploadedSigningMaterial::ManagedServer => {
+            let service = server_certificate.ok_or(ServerCertificateError::Missing)?;
+            let signing_key = service.signing_key()?;
+            complete_pdf_signature(
+                &input,
+                output_path,
+                appearance,
+                metadata,
+                signing_key
+                    .certificate_chain()
+                    .as_der()
+                    .first()
+                    .map(Vec::as_slice),
+                |signed_bytes| Ok(signing_key.detached_cms_der(signed_bytes)?),
+            )
+        }
+    }
+}
+
+fn complete_pdf_signature(
+    input: &[u8],
+    output_path: &Path,
+    appearance: Option<UploadedSignatureAppearance>,
+    metadata: PdfSignatureMetadata<'_>,
+    certificate_der: Option<&[u8]>,
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, CertSignError>,
+) -> Result<(), CertSignError> {
+    let signer_name = certificate_der
+        .and_then(signing_certificate_common_name)
+        .or_else(|| metadata.name.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "Stirling PDF".to_owned());
+    let pdf_appearance = appearance.map(|appearance| PdfSignatureAppearance {
+        page_number: appearance.page_number,
+        signer_name: &signer_name,
+        show_logo: appearance.show_logo,
+    });
+    let placeholder = PdfSignaturePlaceholder::prepare_with_metadata_and_appearance(
+        input,
+        DEFAULT_CERT_SIGN_RESERVATION_BYTES,
+        metadata,
+        pdf_appearance,
+    )?;
+    let signed_bytes = placeholder.signed_bytes();
+    let cms = sign(&signed_bytes)?;
+    let signed_pdf = placeholder.complete(&cms)?;
+    std::fs::write(output_path, signed_pdf).map_err(CertSignError::Write)
+}
+
+fn map_cert_sign_error(error: CertSignError) -> ApiError {
+    match error {
+        CertSignError::Signing(error) => {
+            ApiError::bad_request_at(CERT_SIGN_PATH, error.to_string())
+        }
+        CertSignError::Pdf(error) => ApiError::bad_request_at(CERT_SIGN_PATH, error.to_string()),
+        CertSignError::Hardware(error) => {
+            ApiError::bad_request_at(CERT_SIGN_PATH, error.to_string())
+        }
+        CertSignError::ServerCertificate(error) => {
+            ApiError::bad_request_at(CERT_SIGN_PATH, error.to_string())
+        }
+        CertSignError::Read(error) | CertSignError::Write(error) => {
+            ApiError::internal_at(CERT_SIGN_PATH, error.to_string())
+        }
+    }
+}
+
+async fn timestamp_pdf(
+    Extension(settings): Extension<TimestampSettings>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_timestamp_request(multipart).await?;
+    let tsa_url = allowed_timestamp_url(&settings, request.tsa_url.as_deref())
+        .map_err(map_timestamp_error)?;
+    let output_filename = suffixed_filename(&request.file.filename, "_timestamped.pdf");
+    let input_path = request.file.path;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("timestamped.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || {
+        timestamp_pdf_to_file(&input_path, &blocking_output_path, &tsa_url)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_at(
+            TIMESTAMP_PDF_PATH,
+            format!("timestamp PDF task failed: {error}"),
+        )
+    })?
+    .map_err(map_timestamp_error)?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
+        TIMESTAMP_PDF_PATH,
+        "application/pdf",
+    )
+    .await
+}
+
+fn map_timestamp_error(error: TimestampError) -> ApiError {
+    match error {
+        TimestampError::InvalidTsaUrl(_) => {
+            ApiError::bad_request_at(TIMESTAMP_PDF_PATH, error.to_string())
+        }
+        TimestampError::Read(error) => ApiError::internal_at(TIMESTAMP_PDF_PATH, error.to_string()),
+        TimestampError::Pdf(error) => {
+            ApiError::bad_request_at(TIMESTAMP_PDF_PATH, error.to_string())
+        }
+        TimestampError::EmptyDocument
+        | TimestampError::Placeholder(_)
+        | TimestampError::ByteRangeTooLarge
+        | TimestampError::TsaRequest(_)
+        | TimestampError::TsaResponseTooLarge
+        | TimestampError::TsaHttp { .. }
+        | TimestampError::TsaResponse(_)
+        | TimestampError::TimestampTooLarge => {
+            ApiError::internal_at(TIMESTAMP_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn allowed_timestamp_url(
+    settings: &TimestampSettings,
+    requested_url: Option<&str>,
+) -> Result<String, TimestampError> {
+    let effective_url = requested_url
+        .filter(|url| !url.trim().is_empty())
+        .map_or(settings.default_tsa_url.trim(), str::trim);
+    let mut allowed_urls = vec![
+        "http://timestamp.digicert.com",
+        "http://timestamp.sectigo.com",
+        "http://ts.ssl.com",
+        "https://freetsa.org/tsr",
+        "http://tsa.mesign.com",
+    ];
+    if is_valid_tsa_url(&settings.default_tsa_url) {
+        allowed_urls.push(settings.default_tsa_url.as_str());
+    }
+    allowed_urls.extend(
+        settings
+            .custom_tsa_urls
+            .iter()
+            .filter(|url| is_valid_tsa_url(url))
+            .map(String::as_str),
+    );
+    let normalized_effective = normalize_tsa_url(effective_url);
+    if allowed_urls
+        .iter()
+        .map(|url| normalize_tsa_url(url))
+        .any(|url| url == normalized_effective)
+    {
+        return Ok(effective_url.to_owned());
+    }
+    Err(TimestampError::InvalidTsaUrl(
+        "TSA URL is not in the allowed list. Contact your administrator to add it via settings.yml (security.timestamp.customTsaUrls).".to_owned(),
+    ))
+}
+
+fn is_valid_tsa_url(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn normalize_tsa_url(value: &str) -> String {
+    reqwest::Url::parse(value.trim()).map_or_else(
+        |_| value.trim().to_ascii_lowercase(),
+        |url| {
+            let port = url
+                .port()
+                .map_or_else(String::new, |port| format!(":{port}"));
+            format!(
+                "{}://{}{}{}",
+                url.scheme().to_ascii_lowercase(),
+                url.host_str().unwrap_or_default().to_ascii_lowercase(),
+                port,
+                url.path()
+            )
+        },
+    )
 }
 
 async fn get_info_on_pdf(mut multipart: Multipart) -> Result<Response, ApiError> {
@@ -3435,6 +7657,555 @@ async fn read_single_pdf_request(
     read_named_single_pdf_request(multipart, api_path, "fileInput").await
 }
 
+async fn read_pdf_to_ebook_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToEbookRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_EPUB_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = PdfToEbookOptions::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_EPUB_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_EPUB_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "detectChapters" => {
+                options.detect_chapters = parse_bool_at(
+                    &read_form_value(&mut field, PDF_TO_EPUB_PATH).await?,
+                    PDF_TO_EPUB_PATH,
+                )?;
+            }
+            "targetDevice" => {
+                let value = read_form_value(&mut field, PDF_TO_EPUB_PATH).await?;
+                options.target_device = parse_pdf_to_ebook_target_device(&value)?;
+            }
+            "outputFormat" => {
+                let value = read_form_value(&mut field, PDF_TO_EPUB_PATH).await?;
+                options.output_format = parse_pdf_to_ebook_output_format(&value)?;
+            }
+            _ => drain_field(&mut field, PDF_TO_EPUB_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_EPUB_PATH, "fileInput is required"))?;
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(PDF_TO_EPUB_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return Err(ApiError::bad_request_at(
+            PDF_TO_EPUB_PATH,
+            "fileInput is required",
+        ));
+    }
+    Ok(UploadedPdfToEbookRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_ebook_request(mut multipart: Multipart) -> Result<UploadedEbookRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(EBOOK_TO_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = EbookOptions::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(EBOOK_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input-ebook");
+                write_field_to_file(&mut field, &path, EBOOK_TO_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "embedAllFonts" => {
+                options.rendering.embed_all_fonts = parse_bool_at(
+                    &read_form_value(&mut field, EBOOK_TO_PDF_PATH).await?,
+                    EBOOK_TO_PDF_PATH,
+                )?;
+            }
+            "includeTableOfContents" => {
+                options.rendering.include_table_of_contents = parse_bool_at(
+                    &read_form_value(&mut field, EBOOK_TO_PDF_PATH).await?,
+                    EBOOK_TO_PDF_PATH,
+                )?;
+            }
+            "includePageNumbers" => {
+                options.rendering.include_page_numbers = parse_bool_at(
+                    &read_form_value(&mut field, EBOOK_TO_PDF_PATH).await?,
+                    EBOOK_TO_PDF_PATH,
+                )?;
+            }
+            "optimizeForEbook" => {
+                options.output_mode = if parse_bool_at(
+                    &read_form_value(&mut field, EBOOK_TO_PDF_PATH).await?,
+                    EBOOK_TO_PDF_PATH,
+                )? {
+                    EbookOutputMode::OptimizedForEbook
+                } else {
+                    EbookOutputMode::Standard
+                };
+            }
+            _ => drain_field(&mut field, EBOOK_TO_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(EBOOK_TO_PDF_PATH, "fileInput is required"))?;
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(EBOOK_TO_PDF_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return Err(ApiError::bad_request_at(
+            EBOOK_TO_PDF_PATH,
+            "fileInput is required",
+        ));
+    }
+    Ok(UploadedEbookRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_eml_request(mut multipart: Multipart) -> Result<UploadedEmlRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(EML_TO_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = EmlOptions::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(EML_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input-email");
+                write_field_to_file(&mut field, &path, EML_TO_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "includeAttachments" => {
+                options.attachments.include = parse_bool_at(
+                    &read_form_value(&mut field, EML_TO_PDF_PATH).await?,
+                    EML_TO_PDF_PATH,
+                )?;
+            }
+            "maxAttachmentSizeMB" => {
+                let value = read_form_value(&mut field, EML_TO_PDF_PATH).await?;
+                let max_size_megabytes = value.trim().parse::<u8>().map_err(|_| {
+                    ApiError::bad_request_at(
+                        EML_TO_PDF_PATH,
+                        "maxAttachmentSizeMB must be an integer between 1 and 100",
+                    )
+                })?;
+                if !(1..=100).contains(&max_size_megabytes) {
+                    return Err(ApiError::bad_request_at(
+                        EML_TO_PDF_PATH,
+                        "maxAttachmentSizeMB must be between 1 and 100",
+                    ));
+                }
+                options.attachments.max_size_megabytes = max_size_megabytes;
+            }
+            "downloadHtml" => {
+                options.output = if parse_bool_at(
+                    &read_form_value(&mut field, EML_TO_PDF_PATH).await?,
+                    EML_TO_PDF_PATH,
+                )? {
+                    EmlOutputFormat::Html
+                } else {
+                    EmlOutputFormat::Pdf
+                };
+            }
+            "includeAllRecipients" => {
+                options.recipients = if parse_bool_at(
+                    &read_form_value(&mut field, EML_TO_PDF_PATH).await?,
+                    EML_TO_PDF_PATH,
+                )? {
+                    EmlRecipientDisplay::All
+                } else {
+                    EmlRecipientDisplay::PrimaryOnly
+                };
+            }
+            _ => drain_field(&mut field, EML_TO_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(EML_TO_PDF_PATH, "fileInput is required"))?;
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(EML_TO_PDF_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return Err(ApiError::bad_request_at(
+            EML_TO_PDF_PATH,
+            "fileInput is required",
+        ));
+    }
+    Ok(UploadedEmlRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_url_to_pdf_request(mut multipart: Multipart) -> Result<String, ApiError> {
+    let mut url_input = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(URL_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "urlInput" => url_input = Some(read_form_value(&mut field, URL_TO_PDF_PATH).await?),
+            _ => drain_field(&mut field, URL_TO_PDF_PATH).await?,
+        }
+    }
+    url_input
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request_at(URL_TO_PDF_PATH, "urlInput is required"))
+}
+
+async fn read_timestamp_request(
+    mut multipart: Multipart,
+) -> Result<UploadedTimestampRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(TIMESTAMP_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut tsa_url = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(TIMESTAMP_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, TIMESTAMP_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "tsaUrl" => tsa_url = Some(read_form_value(&mut field, TIMESTAMP_PDF_PATH).await?),
+            _ => drain_field(&mut field, TIMESTAMP_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(TIMESTAMP_PDF_PATH, "fileInput is required"))?;
+    let file_size = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|error| ApiError::internal_at(TIMESTAMP_PDF_PATH, error.to_string()))?
+        .len();
+    if file_size == 0 {
+        return Err(ApiError::bad_request_at(
+            TIMESTAMP_PDF_PATH,
+            "fileInput is required",
+        ));
+    }
+    Ok(UploadedTimestampRequest {
+        file,
+        tsa_url,
+        temp_dir,
+    })
+}
+
+async fn read_cert_sign_request(
+    mut multipart: Multipart,
+) -> Result<UploadedCertSignRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(CERT_SIGN_PATH, error.to_string()))?;
+    let mut form = CertSignForm::default();
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(CERT_SIGN_PATH, error.body_text()))?
+    {
+        form.read_field(&mut field, &temp_dir).await?;
+    }
+    form.into_request(temp_dir)
+}
+
+async fn read_signing_secret_field(
+    destination: &mut Option<SigningSecret>,
+    field: &mut axum::extract::multipart::Field<'_>,
+    field_name: &str,
+) -> Result<(), ApiError> {
+    if destination.is_some() {
+        return Err(ApiError::bad_request_at(
+            CERT_SIGN_PATH,
+            format!("{field_name} must be supplied exactly once"),
+        ));
+    }
+    let value =
+        read_field_bytes_bounded(field, CERT_SIGN_PATH, SIGNING_MATERIAL_LIMIT_BYTES).await?;
+    if !value.is_empty() {
+        *destination = Some(SigningSecret::new(value));
+    }
+    Ok(())
+}
+
+impl CertSignForm {
+    async fn read_field(
+        &mut self,
+        field: &mut axum::extract::multipart::Field<'_>,
+        temp_dir: &TempDir,
+    ) -> Result<(), ApiError> {
+        let field_name = field.name().unwrap_or_default().to_owned();
+        match field_name.as_str() {
+            "certType" => {
+                self.cert_type = Some(read_form_value(field, CERT_SIGN_PATH).await?);
+            }
+            "fileInput" => {
+                if self.file.is_some() {
+                    return Err(ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "fileInput must be supplied exactly once",
+                    ));
+                }
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(field, &path, CERT_SIGN_PATH).await?;
+                self.file = Some(UploadedPdf { filename, path });
+            }
+            "privateKeyFile" => {
+                read_signing_secret_field(&mut self.private_key, field, "privateKeyFile").await?;
+            }
+            "certFile" => {
+                if self.certificate_chain.is_some() {
+                    return Err(ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "certFile must be supplied exactly once",
+                    ));
+                }
+                let value =
+                    read_field_bytes_bounded(field, CERT_SIGN_PATH, SIGNING_MATERIAL_LIMIT_BYTES)
+                        .await?;
+                if !value.is_empty() {
+                    self.certificate_chain = Some(value);
+                }
+            }
+            "p12File" => {
+                read_signing_secret_field(&mut self.p12_file, field, "p12File").await?;
+            }
+            "jksFile" => {
+                read_signing_secret_field(&mut self.jks_file, field, "jksFile").await?;
+            }
+            "password" => {
+                if self.password.is_some() {
+                    return Err(ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "password must be supplied at most once",
+                    ));
+                }
+                let value =
+                    read_field_bytes_bounded(field, CERT_SIGN_PATH, FORM_VALUE_LIMIT_BYTES).await?;
+                self.password = Some(SigningSecret::new(value));
+            }
+            "alias" => {
+                self.alias = Some(
+                    read_form_value_bounded(field, CERT_SIGN_PATH, FORM_VALUE_LIMIT_BYTES).await?,
+                );
+            }
+            "pkcs11LibraryPath" => {
+                self.pkcs11_library_path = Some(
+                    read_form_value_bounded(field, CERT_SIGN_PATH, FORM_VALUE_LIMIT_BYTES).await?,
+                );
+            }
+            "pkcs11Slot" => {
+                let value =
+                    read_form_value_bounded(field, CERT_SIGN_PATH, FORM_VALUE_LIMIT_BYTES).await?;
+                self.pkcs11_slot = Some(value.trim().parse::<u64>().map_err(|_| {
+                    ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        format!("'{value}' is not a valid PKCS#11 slot identifier"),
+                    )
+                })?);
+            }
+            "showSignature" => {
+                self.show_signature = parse_bool(&read_form_value(field, CERT_SIGN_PATH).await?)?;
+            }
+            "pageNumber" => {
+                self.page_number = Some(parse_i32_form_value(field, CERT_SIGN_PATH).await?);
+            }
+            "showLogo" => {
+                self.show_logo = Some(parse_bool(&read_form_value(field, CERT_SIGN_PATH).await?)?);
+            }
+            "name" => self.name = Some(read_form_value(field, CERT_SIGN_PATH).await?),
+            "location" => self.location = Some(read_form_value(field, CERT_SIGN_PATH).await?),
+            "reason" => self.reason = Some(read_form_value(field, CERT_SIGN_PATH).await?),
+            _ => drain_field(field, CERT_SIGN_PATH).await?,
+        }
+        Ok(())
+    }
+
+    fn into_request(self, temp_dir: TempDir) -> Result<UploadedCertSignRequest, ApiError> {
+        let appearance = self.signature_appearance()?;
+        let cert_type = validated_cert_sign_type(self.cert_type)?;
+        let file = self
+            .file
+            .ok_or_else(|| ApiError::bad_request_at(CERT_SIGN_PATH, "fileInput is required"))?;
+        let signing_material = match cert_type.as_str() {
+            "PEM" => {
+                let private_key = self.private_key.ok_or_else(|| {
+                    ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "privateKeyFile is required for certType=PEM",
+                    )
+                })?;
+                let certificate_chain = self.certificate_chain.ok_or_else(|| {
+                    ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "certFile is required for certType=PEM",
+                    )
+                })?;
+                UploadedSigningMaterial::Software(UploadedSoftwareSigningMaterial::Pem {
+                    private_key,
+                    password: self.password,
+                    certificate_chain,
+                })
+            }
+            "PKCS12" | "PFX" => {
+                let archive = self.p12_file.ok_or_else(|| {
+                    ApiError::bad_request_at(
+                        CERT_SIGN_PATH,
+                        "p12File is required for certType=PKCS12 or PFX",
+                    )
+                })?;
+                UploadedSigningMaterial::Software(UploadedSoftwareSigningMaterial::Pkcs12 {
+                    archive,
+                    password: self
+                        .password
+                        .unwrap_or_else(|| SigningSecret::new(Vec::new())),
+                    alias: self.alias,
+                })
+            }
+            "JKS" => {
+                let archive = self.jks_file.ok_or_else(|| {
+                    ApiError::bad_request_at(CERT_SIGN_PATH, "jksFile is required for certType=JKS")
+                })?;
+                UploadedSigningMaterial::Software(UploadedSoftwareSigningMaterial::Jks {
+                    archive,
+                    password: self
+                        .password
+                        .unwrap_or_else(|| SigningSecret::new(Vec::new())),
+                    alias: self.alias,
+                })
+            }
+            "PKCS11" => pkcs11_signing_material(
+                self.pkcs11_library_path,
+                self.pkcs11_slot,
+                self.password,
+                self.alias,
+            )?,
+            "WINDOWS_STORE" => windows_store_signing_material(self.alias)?,
+            "SERVER" => UploadedSigningMaterial::ManagedServer,
+            _ => unreachable!("certificate type was validated above"),
+        };
+        Ok(UploadedCertSignRequest {
+            file,
+            signing_material,
+            appearance,
+            name: self.name,
+            location: self.location,
+            reason: self.reason,
+            temp_dir,
+        })
+    }
+
+    fn signature_appearance(&self) -> Result<Option<UploadedSignatureAppearance>, ApiError> {
+        if !self.show_signature {
+            return Ok(None);
+        }
+        let requested_page = self.page_number.unwrap_or(1);
+        let page_number = usize::try_from(requested_page).map_err(|_| {
+            ApiError::bad_request_at(CERT_SIGN_PATH, "pageNumber must be greater than zero")
+        })?;
+        if page_number == 0 {
+            return Err(ApiError::bad_request_at(
+                CERT_SIGN_PATH,
+                "pageNumber must be greater than zero",
+            ));
+        }
+        Ok(Some(UploadedSignatureAppearance {
+            page_number,
+            show_logo: self.show_logo.unwrap_or(true),
+        }))
+    }
+}
+
+fn pkcs11_signing_material(
+    library_path: Option<String>,
+    slot: Option<u64>,
+    password: Option<SigningSecret>,
+    alias: Option<String>,
+) -> Result<UploadedSigningMaterial, ApiError> {
+    let library_path = library_path
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request_at(
+                CERT_SIGN_PATH,
+                "pkcs11LibraryPath is required for certType=PKCS11",
+            )
+        })?;
+    let alias = alias
+        .filter(|alias| !alias.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request_at(CERT_SIGN_PATH, "alias is required for certType=PKCS11")
+        })?;
+    let pin = password
+        .map(|password| String::from_utf8(password.as_bytes().to_vec()).map(Zeroizing::new))
+        .transpose()
+        .map_err(|_| ApiError::bad_request_at(CERT_SIGN_PATH, "password must be valid UTF-8"))?;
+    Ok(UploadedSigningMaterial::Pkcs11(Pkcs11SigningRequest::new(
+        library_path,
+        slot,
+        pin,
+        alias,
+    )))
+}
+
+fn windows_store_signing_material(
+    alias: Option<String>,
+) -> Result<UploadedSigningMaterial, ApiError> {
+    let alias = alias
+        .filter(|alias| !alias.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request_at(
+                CERT_SIGN_PATH,
+                "alias is required for certType=WINDOWS_STORE",
+            )
+        })?;
+    Ok(UploadedSigningMaterial::WindowsStore { alias })
+}
+
+fn validated_cert_sign_type(cert_type: Option<String>) -> Result<String, ApiError> {
+    let cert_type = cert_type
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request_at(CERT_SIGN_PATH, "certType is required"))?;
+    if matches!(
+        cert_type.as_str(),
+        "PEM" | "PKCS12" | "PFX" | "JKS" | "PKCS11" | "WINDOWS_STORE" | "SERVER"
+    ) {
+        Ok(cert_type)
+    } else {
+        Err(ApiError::unsupported_at(
+            CERT_SIGN_PATH,
+            "certType must be PEM, PKCS12, PFX, JKS, PKCS11, WINDOWS_STORE, or SERVER in the Rust runtime",
+        ))
+    }
+}
+
 async fn read_add_comments_request(
     mut multipart: Multipart,
 ) -> Result<UploadedAddCommentsRequest, ApiError> {
@@ -3476,6 +8247,193 @@ async fn read_add_comments_request(
         file,
         comments,
         temp_dir,
+    })
+}
+
+async fn read_pdf_ai_comment_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfAiCommentRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_COMMENT_AGENT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut prompt = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_COMMENT_AGENT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let is_pdf = field.content_type().is_some_and(|content_type| {
+                    content_type.eq_ignore_ascii_case("application/pdf")
+                });
+                if !is_pdf {
+                    drain_field(&mut field, PDF_COMMENT_AGENT_PATH).await?;
+                    return Err(ApiError::bad_request_at(
+                        PDF_COMMENT_AGENT_PATH,
+                        "Only application/pdf uploads are supported",
+                    ));
+                }
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file_bounded(
+                    &mut field,
+                    &path,
+                    PDF_COMMENT_AGENT_PATH,
+                    AI_TOOL_MAX_INPUT_BYTES,
+                )
+                .await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "prompt" => {
+                prompt = Some(
+                    read_form_value_bounded(
+                        &mut field,
+                        PDF_COMMENT_AGENT_PATH,
+                        AI_TOOL_PROMPT_LIMIT_BYTES,
+                    )
+                    .await?,
+                );
+            }
+            _ => drain_field(&mut field, PDF_COMMENT_AGENT_PATH).await?,
+        }
+    }
+    let file = file
+        .ok_or_else(|| ApiError::bad_request_at(PDF_COMMENT_AGENT_PATH, "fileInput is required"))?;
+    let prompt = prompt.unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return Err(ApiError::bad_request_at(
+            PDF_COMMENT_AGENT_PATH,
+            "Prompt is required",
+        ));
+    }
+    if prompt.trim().encode_utf16().count() > 4_000 {
+        return Err(ApiError::bad_request_at(
+            PDF_COMMENT_AGENT_PATH,
+            "Prompt exceeds maximum length of 4000 characters",
+        ));
+    }
+    Ok(UploadedPdfAiCommentRequest {
+        file,
+        prompt,
+        temp_dir,
+    })
+}
+
+async fn read_ai_document_request(
+    mut multipart: Multipart,
+) -> Result<UploadedAiDocumentRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(CREATE_PDF_AGENT_PATH, error.to_string()))?;
+    let mut document = None;
+    let mut filename = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(CREATE_PDF_AGENT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "document" => {
+                document = Some(
+                    read_form_value_bounded(
+                        &mut field,
+                        CREATE_PDF_AGENT_PATH,
+                        AI_DOCUMENT_LIMIT_BYTES,
+                    )
+                    .await?,
+                );
+            }
+            "filename" => {
+                filename = Some(
+                    read_form_value_bounded(
+                        &mut field,
+                        CREATE_PDF_AGENT_PATH,
+                        FORM_VALUE_LIMIT_BYTES,
+                    )
+                    .await?,
+                );
+            }
+            _ => drain_field(&mut field, CREATE_PDF_AGENT_PATH).await?,
+        }
+    }
+    let document = document
+        .ok_or_else(|| ApiError::bad_request_at(CREATE_PDF_AGENT_PATH, "document is required"))?;
+    let filename = filename
+        .ok_or_else(|| ApiError::bad_request_at(CREATE_PDF_AGENT_PATH, "filename is required"))?;
+    Ok(UploadedAiDocumentRequest {
+        document,
+        filename,
+        temp_dir,
+    })
+}
+
+async fn read_math_audit_request(
+    mut multipart: Multipart,
+) -> Result<UploadedMathAuditRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(MATH_AUDITOR_AGENT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut tolerance = "0.01".to_owned();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(MATH_AUDITOR_AGENT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let is_pdf = field.content_type().is_some_and(|content_type| {
+                    content_type.eq_ignore_ascii_case("application/pdf")
+                });
+                if !is_pdf {
+                    drain_field(&mut field, MATH_AUDITOR_AGENT_PATH).await?;
+                    return Err(ApiError::bad_request_at(
+                        MATH_AUDITOR_AGENT_PATH,
+                        "Only application/pdf uploads are supported",
+                    ));
+                }
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file_bounded(
+                    &mut field,
+                    &path,
+                    MATH_AUDITOR_AGENT_PATH,
+                    AI_TOOL_MAX_INPUT_BYTES,
+                )
+                .await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "tolerance" => {
+                tolerance = read_form_value_bounded(
+                    &mut field,
+                    MATH_AUDITOR_AGENT_PATH,
+                    FORM_VALUE_LIMIT_BYTES,
+                )
+                .await?;
+            }
+            _ => drain_field(&mut field, MATH_AUDITOR_AGENT_PATH).await?,
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::bad_request_at(MATH_AUDITOR_AGENT_PATH, "fileInput is required")
+    })?;
+    if tolerance.trim().is_empty() || is_negative_nonzero_decimal(&tolerance) {
+        return Err(ApiError::bad_request_at(
+            MATH_AUDITOR_AGENT_PATH,
+            "tolerance must be a non-negative decimal",
+        ));
+    }
+    Ok(UploadedMathAuditRequest {
+        file,
+        tolerance,
+        temp_dir,
+    })
+}
+
+fn is_negative_nonzero_decimal(value: &str) -> bool {
+    value.trim().strip_prefix('-').is_some_and(|magnitude| {
+        magnitude
+            .chars()
+            .any(|character| character.is_ascii_digit() && character != '0')
     })
 }
 
@@ -4055,6 +9013,556 @@ async fn read_pdf_to_image_request(
     })
 }
 
+async fn read_pdf_table_request(
+    mut multipart: Multipart,
+    api_path: &'static str,
+) -> Result<UploadedPdfTableRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+    let mut file = None;
+    let mut page_numbers = "all".to_owned();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, api_path).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "pageNumbers" => {
+                page_numbers = read_form_value(&mut field, api_path).await?;
+            }
+            _ => drain_field(&mut field, api_path).await?,
+        }
+    }
+    let file = file.ok_or_else(|| ApiError::bad_request_at(api_path, "fileInput is required"))?;
+    Ok(UploadedPdfTableRequest {
+        file,
+        page_numbers,
+        temp_dir,
+    })
+}
+
+async fn read_manual_redact_request(
+    mut multipart: Multipart,
+) -> Result<UploadedManualRedactRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(REDACT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut boxes = Vec::new();
+    let mut page_numbers = String::new();
+    let mut page_redaction_color = [0, 0, 0];
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(REDACT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, REDACT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "redactions" => {
+                let value = read_form_value(&mut field, REDACT_PATH).await?;
+                boxes = parse_manual_redaction_areas(&value)?;
+            }
+            "pageNumbers" => {
+                page_numbers = read_form_value(&mut field, REDACT_PATH).await?;
+            }
+            "pageRedactionColor" => {
+                page_redaction_color = decode_redaction_color_or_black(
+                    &read_form_value(&mut field, REDACT_PATH).await?,
+                );
+            }
+            "convertPDFToImage" => {
+                parse_bool_at(
+                    &read_form_value(&mut field, REDACT_PATH).await?,
+                    REDACT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, REDACT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(REDACT_PATH, "fileInput is required"))?;
+    Ok(UploadedManualRedactRequest {
+        file,
+        boxes,
+        page_numbers,
+        page_redaction_color,
+        temp_dir,
+    })
+}
+
+async fn read_auto_redact_request(
+    mut multipart: Multipart,
+) -> Result<UploadedAutoRedactRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(AUTO_REDACT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = AutoRedactionOptions {
+        terms: Vec::new(),
+        use_regex: false,
+        whole_word: false,
+        color: [0, 0, 0],
+        custom_padding: 0.0,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(AUTO_REDACT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, AUTO_REDACT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "listOfText" => {
+                options.terms = read_form_value(&mut field, AUTO_REDACT_PATH)
+                    .await?
+                    .lines()
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
+            "useRegex" => {
+                options.use_regex = parse_bool_at(
+                    &read_form_value(&mut field, AUTO_REDACT_PATH).await?,
+                    AUTO_REDACT_PATH,
+                )?;
+            }
+            "wholeWordSearch" => {
+                options.whole_word = parse_bool_at(
+                    &read_form_value(&mut field, AUTO_REDACT_PATH).await?,
+                    AUTO_REDACT_PATH,
+                )?;
+            }
+            "redactColor" => {
+                options.color = decode_redaction_color_or_black(
+                    &read_form_value(&mut field, AUTO_REDACT_PATH).await?,
+                );
+            }
+            "customPadding" => {
+                options.custom_padding = parse_f32_form_value(&mut field, AUTO_REDACT_PATH).await?;
+            }
+            "convertPDFToImage" => {
+                parse_bool_at(
+                    &read_form_value(&mut field, AUTO_REDACT_PATH).await?,
+                    AUTO_REDACT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, AUTO_REDACT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(AUTO_REDACT_PATH, "fileInput is required"))?;
+    Ok(UploadedAutoRedactRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_execute_redact_request(
+    mut multipart: Multipart,
+) -> Result<UploadedExecuteRedactRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(REDACT_EXECUTE_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = ExecuteRedactionOptions {
+        text_values: Vec::new(),
+        regex_patterns: Vec::new(),
+        wipe_pages: Vec::new(),
+        ranges: Vec::new(),
+        image_boxes: Vec::new(),
+        redact_image_pages: None,
+        color: [0, 0, 0],
+        custom_padding: 0.0,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(REDACT_EXECUTE_PATH, error.body_text()))?
+    {
+        if field.name().unwrap_or_default() == "fileInput" {
+            let filename = safe_filename(field.file_name());
+            let path = temp_dir.path().join("input.pdf");
+            write_field_to_file(&mut field, &path, REDACT_EXECUTE_PATH).await?;
+            file = Some(UploadedPdf { filename, path });
+        } else {
+            read_execute_redact_form_field(&mut field, &mut options).await?;
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(REDACT_EXECUTE_PATH, "fileInput is required"))?;
+    Ok(UploadedExecuteRedactRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
+async fn read_edit_text_request(
+    mut multipart: Multipart,
+) -> Result<UploadedEditTextRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(EDIT_TEXT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut edits = None;
+    let mut page_numbers = "all".to_owned();
+    let mut whole_word_search = false;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(EDIT_TEXT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, EDIT_TEXT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "edits" => {
+                let value = read_form_value(&mut field, EDIT_TEXT_PATH).await?;
+                let parsed: Vec<Option<EditTextInput>> =
+                    serde_json::from_str(&value).map_err(|error| {
+                        ApiError::bad_request_at(
+                            EDIT_TEXT_PATH,
+                            format!("edits must be a JSON array: {error}"),
+                        )
+                    })?;
+                edits = Some(
+                    parsed
+                        .into_iter()
+                        .map(|edit| {
+                            let edit = edit.unwrap_or(EditTextInput {
+                                find: None,
+                                replacement: None,
+                            });
+                            TextEdit {
+                                find: edit.find.unwrap_or_default(),
+                                replace: edit.replacement.unwrap_or_default(),
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            "pageNumbers" => {
+                page_numbers = read_form_value(&mut field, EDIT_TEXT_PATH).await?;
+            }
+            "wholeWordSearch" => {
+                whole_word_search = parse_bool_at(
+                    &read_form_value(&mut field, EDIT_TEXT_PATH).await?,
+                    EDIT_TEXT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, EDIT_TEXT_PATH).await?,
+        }
+    }
+
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(EDIT_TEXT_PATH, "fileInput is required"))?;
+    Ok(UploadedEditTextRequest {
+        file,
+        options: TextEditOptions {
+            edits: edits.unwrap_or_default(),
+            page_numbers,
+            whole_word_search,
+        },
+        temp_dir,
+    })
+}
+
+async fn read_execute_redact_form_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    options: &mut ExecuteRedactionOptions,
+) -> Result<(), ApiError> {
+    match field.name().unwrap_or_default() {
+        "textValues" => options.text_values.extend(parse_execute_string_values(
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+            "textValues",
+        )?),
+        "regexPatterns" => options.regex_patterns.extend(parse_execute_string_values(
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+            "regexPatterns",
+        )?),
+        "wipePages" => options.wipe_pages.extend(parse_execute_page_numbers(
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+            "wipePages",
+        )?),
+        "redactImagePages" => options
+            .redact_image_pages
+            .get_or_insert_with(Vec::new)
+            .extend(parse_execute_page_numbers(
+                &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+                "redactImagePages",
+            )?),
+        "ranges" => append_execute_redaction_ranges(
+            options,
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+        )?,
+        "imageBoxes" => append_execute_redaction_image_boxes(
+            options,
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+        )?,
+        "style" => {
+            let value = read_form_value(field, REDACT_EXECUTE_PATH).await?;
+            let style: ExecuteRedactionStyleInput =
+                serde_json::from_str(&value).map_err(|error| {
+                    ApiError::bad_request_at(
+                        REDACT_EXECUTE_PATH,
+                        format!("style must be a JSON object: {error}"),
+                    )
+                })?;
+            apply_execute_redaction_style(options, style)?;
+        }
+        "style.color" => {
+            options.color = decode_redaction_color_or_black(
+                &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+            );
+        }
+        "style.padding" => {
+            options.custom_padding = parse_f32_form_value(field, REDACT_EXECUTE_PATH).await?;
+        }
+        "style.convertToImage" | "convertToImage" => {
+            parse_bool_at(
+                &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+                REDACT_EXECUTE_PATH,
+            )?;
+        }
+        "style.strategy" => validate_execute_redaction_strategy(
+            &read_form_value(field, REDACT_EXECUTE_PATH).await?,
+        )?,
+        _ => drain_field(field, REDACT_EXECUTE_PATH).await?,
+    }
+    Ok(())
+}
+
+fn append_execute_redaction_ranges(
+    options: &mut ExecuteRedactionOptions,
+    value: &str,
+) -> Result<(), ApiError> {
+    let ranges: Vec<ExecuteRedactionRangeInput> = serde_json::from_str(value).map_err(|error| {
+        ApiError::bad_request_at(
+            REDACT_EXECUTE_PATH,
+            format!("ranges must be a JSON array: {error}"),
+        )
+    })?;
+    options
+        .ranges
+        .extend(ranges.into_iter().map(|range| RedactionTextRange {
+            start_string: range.start_string,
+            end_string: range.end_string,
+        }));
+    Ok(())
+}
+
+fn append_execute_redaction_image_boxes(
+    options: &mut ExecuteRedactionOptions,
+    value: &str,
+) -> Result<(), ApiError> {
+    let image_boxes: Vec<ExecuteRedactionImageBoxInput> =
+        serde_json::from_str(value).map_err(|error| {
+            ApiError::bad_request_at(
+                REDACT_EXECUTE_PATH,
+                format!("imageBoxes must be a JSON array: {error}"),
+            )
+        })?;
+    options.image_boxes.extend(
+        image_boxes
+            .into_iter()
+            .map(|box_| ExecuteRedactionImageBox {
+                page_index: box_.page_index,
+                x1: box_.x1,
+                y1: box_.y1,
+                x2: box_.x2,
+                y2: box_.y2,
+            }),
+    );
+    Ok(())
+}
+
+fn parse_execute_string_values(value: &str, field: &str) -> Result<Vec<String>, ApiError> {
+    if value.trim_start().starts_with('[') {
+        return serde_json::from_str(value).map_err(|error| {
+            ApiError::bad_request_at(
+                REDACT_EXECUTE_PATH,
+                format!("{field} must be a JSON string array: {error}"),
+            )
+        });
+    }
+    Ok(vec![value.to_owned()])
+}
+
+fn parse_execute_page_numbers(value: &str, field: &str) -> Result<Vec<usize>, ApiError> {
+    if value.trim_start().starts_with('[') {
+        return serde_json::from_str(value).map_err(|error| {
+            ApiError::bad_request_at(
+                REDACT_EXECUTE_PATH,
+                format!("{field} must be a JSON integer array: {error}"),
+            )
+        });
+    }
+    value.trim().parse::<usize>().map_or_else(
+        |_| {
+            Err(ApiError::bad_request_at(
+                REDACT_EXECUTE_PATH,
+                format!("'{value}' is not a valid {field} page number"),
+            ))
+        },
+        |page_number| Ok(vec![page_number]),
+    )
+}
+
+fn apply_execute_redaction_style(
+    options: &mut ExecuteRedactionOptions,
+    style: ExecuteRedactionStyleInput,
+) -> Result<(), ApiError> {
+    if let Some(color) = style.color {
+        options.color = decode_redaction_color_or_black(&color);
+    }
+    if let Some(padding) = style.padding {
+        options.custom_padding = padding;
+    }
+    if let Some(strategy) = style.strategy {
+        validate_execute_redaction_strategy(&strategy)?;
+    }
+    Ok(())
+}
+
+fn validate_execute_redaction_strategy(strategy: &str) -> Result<(), ApiError> {
+    match strategy.trim() {
+        "AUTO" | "OVERLAY_ONLY" | "IMAGE_FINALIZE" => Ok(()),
+        _ => Err(ApiError::bad_request_at(
+            REDACT_EXECUTE_PATH,
+            format!("unsupported redaction strategy '{strategy}'"),
+        )),
+    }
+}
+
+fn parse_manual_redaction_areas(value: &str) -> Result<Vec<RedactionBox>, ApiError> {
+    let areas: Vec<ManualRedactionArea> = serde_json::from_str(value).map_err(|error| {
+        ApiError::bad_request_at(
+            REDACT_PATH,
+            format!("redactions must be a JSON array: {error}"),
+        )
+    })?;
+    Ok(areas
+        .into_iter()
+        .filter_map(|area| {
+            let (Some(page_number), Some(x), Some(y), Some(width), Some(height)) =
+                (area.page, area.x, area.y, area.width, area.height)
+            else {
+                return None;
+            };
+            (page_number > 0
+                && x.is_finite()
+                && y.is_finite()
+                && width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0)
+                .then_some(RedactionBox {
+                    page_number,
+                    x,
+                    y,
+                    width,
+                    height,
+                    color: decode_redaction_color_or_black(&area.color.unwrap_or_default()),
+                })
+        })
+        .collect())
+}
+
+fn decode_redaction_color_or_black(value: &str) -> [u8; 3] {
+    let value = value.trim();
+    let decoded = if let Some(hex) = value.strip_prefix('#') {
+        i32::from_str_radix(hex, 16).ok()
+    } else if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        i32::from_str_radix(hex, 16).ok()
+    } else if value.len() > 1 && value.starts_with('0') {
+        i32::from_str_radix(&value[1..], 8).ok()
+    } else {
+        value.parse::<i32>().ok()
+    };
+    let Some(decoded) = decoded else {
+        return [0, 0, 0];
+    };
+    let bytes = u32::from_ne_bytes(decoded.to_ne_bytes()).to_be_bytes();
+    [bytes[1], bytes[2], bytes[3]]
+}
+
+async fn read_pdf_to_video_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToVideoRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_VIDEO_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = PdfToVideoOptions::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_VIDEO_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let is_pdf = field.content_type().is_some_and(|content_type| {
+                    content_type.eq_ignore_ascii_case("application/pdf")
+                });
+                if !is_pdf {
+                    drain_field(&mut field, PDF_TO_VIDEO_PATH).await?;
+                    return Err(ApiError::bad_request_at(
+                        PDF_TO_VIDEO_PATH,
+                        "fileInput must have content type application/pdf",
+                    ));
+                }
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_VIDEO_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "videoFormat" => {
+                options.video_format = read_form_value(&mut field, PDF_TO_VIDEO_PATH).await?;
+            }
+            "secondsPerPage" => {
+                options.seconds_per_page =
+                    parse_i32_form_value(&mut field, PDF_TO_VIDEO_PATH).await?;
+            }
+            "resolution" => {
+                options.resolution = read_form_value(&mut field, PDF_TO_VIDEO_PATH).await?;
+            }
+            "dpi" => options.dpi = parse_i32_form_value(&mut field, PDF_TO_VIDEO_PATH).await?,
+            "opacity" => {
+                options.opacity = parse_f32_form_value(&mut field, PDF_TO_VIDEO_PATH).await?;
+            }
+            "watermarkText" => {
+                options.watermark_text =
+                    Some(read_form_value(&mut field, PDF_TO_VIDEO_PATH).await?);
+            }
+            _ => drain_field(&mut field, PDF_TO_VIDEO_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_VIDEO_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfToVideoRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
 async fn read_image_to_pdf_request(
     mut multipart: Multipart,
 ) -> Result<UploadedImageToPdfRequest, ApiError> {
@@ -4230,6 +9738,43 @@ async fn read_cbz_to_pdf_request(
     })
 }
 
+async fn read_cbr_to_pdf_request(
+    mut multipart: Multipart,
+) -> Result<UploadedCbzToPdfRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(CBR_TO_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut optimize_for_ebook = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(CBR_TO_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.cbr");
+                write_field_to_file(&mut field, &path, CBR_TO_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "optimizeForEbook" => {
+                optimize_for_ebook = parse_bool_at(
+                    &read_form_value(&mut field, CBR_TO_PDF_PATH).await?,
+                    CBR_TO_PDF_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, CBR_TO_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(CBR_TO_PDF_PATH, "fileInput is required"))?;
+    Ok(UploadedCbzToPdfRequest {
+        file,
+        optimize_for_ebook,
+        temp_dir,
+    })
+}
+
 async fn read_pdf_to_cbz_request(
     mut multipart: Multipart,
 ) -> Result<UploadedPdfToCbzRequest, ApiError> {
@@ -4260,6 +9805,97 @@ async fn read_pdf_to_cbz_request(
     Ok(UploadedPdfToCbzRequest {
         file,
         dpi,
+        temp_dir,
+    })
+}
+
+async fn read_pdf_to_cbr_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfToCbzRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_CBR_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut dpi = 150;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_CBR_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_CBR_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "dpi" => dpi = parse_i32_form_value(&mut field, PDF_TO_CBR_PATH).await?,
+            _ => drain_field(&mut field, PDF_TO_CBR_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_CBR_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfToCbzRequest {
+        file,
+        dpi,
+        temp_dir,
+    })
+}
+
+async fn read_pdf_archive_request(
+    mut multipart: Multipart,
+) -> Result<UploadedPdfArchiveRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(PDF_TO_PDFA_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut output_format = "pdfa".to_owned();
+    let mut strict = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(PDF_TO_PDFA_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let is_pdf = field.content_type().is_some_and(|content_type| {
+                    content_type.eq_ignore_ascii_case("application/pdf")
+                });
+                if !is_pdf {
+                    drain_field(&mut field, PDF_TO_PDFA_PATH).await?;
+                    return Err(ApiError::bad_request_at(
+                        PDF_TO_PDFA_PATH,
+                        "fileInput must have content type application/pdf",
+                    ));
+                }
+                let filename = field
+                    .file_name()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map_or_else(
+                        || "output.pdf".to_owned(),
+                        |value| safe_filename(Some(value)),
+                    );
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, PDF_TO_PDFA_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "outputFormat" => {
+                output_format = read_form_value(&mut field, PDF_TO_PDFA_PATH).await?;
+            }
+            "strict" => {
+                strict = parse_bool_at(
+                    &read_form_value(&mut field, PDF_TO_PDFA_PATH).await?,
+                    PDF_TO_PDFA_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, PDF_TO_PDFA_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(PDF_TO_PDFA_PATH, "fileInput is required"))?;
+    Ok(UploadedPdfArchiveRequest {
+        file,
+        output_format,
+        strict,
         temp_dir,
     })
 }
@@ -4412,6 +10048,64 @@ async fn read_extract_images_request(
     })
 }
 
+async fn read_extract_image_scans_request(
+    mut multipart: Multipart,
+) -> Result<UploadedExtractImageScansRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut options = ExtractImageScansOptions {
+        angle_threshold: 0,
+        tolerance: 0,
+        min_area: 0,
+        min_contour_area: 0,
+        border_size: 0,
+    };
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(EXTRACT_IMAGE_SCANS_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input");
+                write_field_to_file(&mut field, &path, EXTRACT_IMAGE_SCANS_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "angleThreshold" => {
+                options.angle_threshold =
+                    parse_i32_form_value(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?;
+            }
+            "tolerance" => {
+                options.tolerance =
+                    parse_i32_form_value(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?;
+            }
+            "minArea" => {
+                options.min_area =
+                    parse_i32_form_value(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?;
+            }
+            "minContourArea" => {
+                options.min_contour_area =
+                    parse_i32_form_value(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?;
+            }
+            "borderSize" => {
+                options.border_size =
+                    parse_i32_form_value(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?;
+            }
+            _ => drain_field(&mut field, EXTRACT_IMAGE_SCANS_PATH).await?,
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::bad_request_at(EXTRACT_IMAGE_SCANS_PATH, "fileInput is required")
+    })?;
+    Ok(UploadedExtractImageScansRequest {
+        file,
+        options,
+        temp_dir,
+    })
+}
+
 async fn read_flatten_request(
     mut multipart: Multipart,
 ) -> Result<UploadedFlattenRequest, ApiError> {
@@ -4450,6 +10144,288 @@ async fn read_flatten_request(
         file,
         flatten_only_forms,
         render_dpi,
+        temp_dir,
+    })
+}
+
+async fn read_replace_invert_request(
+    mut multipart: Multipart,
+) -> Result<UploadedReplaceInvertRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(REPLACE_INVERT_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut option = None;
+    let mut high_contrast_combination = HighContrastColorCombination::WhiteTextOnBlack;
+    let mut background_color = None;
+    let mut text_color = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(REPLACE_INVERT_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, REPLACE_INVERT_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "replaceAndInvertOption" => {
+                let value = read_form_value(&mut field, REPLACE_INVERT_PDF_PATH).await?;
+                option = Some(ReplaceAndInvert::parse(&value).map_err(|error| {
+                    ApiError::bad_request_at(REPLACE_INVERT_PDF_PATH, error.to_string())
+                })?);
+            }
+            "highContrastColorCombination" => {
+                let value = read_form_value(&mut field, REPLACE_INVERT_PDF_PATH).await?;
+                high_contrast_combination =
+                    HighContrastColorCombination::parse(&value).map_err(|error| {
+                        ApiError::bad_request_at(REPLACE_INVERT_PDF_PATH, error.to_string())
+                    })?;
+            }
+            "backGroundColor" => {
+                background_color =
+                    Some(read_form_value(&mut field, REPLACE_INVERT_PDF_PATH).await?);
+            }
+            "textColor" => {
+                text_color = Some(read_form_value(&mut field, REPLACE_INVERT_PDF_PATH).await?);
+            }
+            _ => drain_field(&mut field, REPLACE_INVERT_PDF_PATH).await?,
+        }
+    }
+    let file = file.ok_or_else(|| {
+        ApiError::bad_request_at(REPLACE_INVERT_PDF_PATH, "fileInput is required")
+    })?;
+    let option = option.ok_or_else(|| {
+        ApiError::bad_request_at(
+            REPLACE_INVERT_PDF_PATH,
+            "replaceAndInvertOption is required",
+        )
+    })?;
+    Ok(UploadedReplaceInvertRequest {
+        file,
+        options: ReplaceInvertOptions {
+            option,
+            high_contrast_combination,
+            background_color,
+            text_color,
+        },
+        temp_dir,
+    })
+}
+
+async fn read_ocr_request(mut multipart: Multipart) -> Result<UploadedOcrRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(OCR_PDF_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut languages = Vec::new();
+    let mut sidecar = false;
+    let mut deskew = false;
+    let mut clean = false;
+    let mut clean_final = false;
+    let mut ocr_type = None;
+    let mut ocr_render_type = "hocr".to_owned();
+    let mut remove_images_after = false;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(OCR_PDF_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, OCR_PDF_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "languages" => {
+                let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
+                if !value.trim().is_empty() {
+                    languages.push(value.trim().to_owned());
+                }
+            }
+            "sidecar" => {
+                sidecar = parse_bool_at(
+                    &read_form_value(&mut field, OCR_PDF_PATH).await?,
+                    OCR_PDF_PATH,
+                )?;
+            }
+            "deskew" => {
+                deskew = parse_bool_at(
+                    &read_form_value(&mut field, OCR_PDF_PATH).await?,
+                    OCR_PDF_PATH,
+                )?;
+            }
+            "clean" => {
+                clean = parse_bool_at(
+                    &read_form_value(&mut field, OCR_PDF_PATH).await?,
+                    OCR_PDF_PATH,
+                )?;
+            }
+            "cleanFinal" => {
+                clean_final = parse_bool_at(
+                    &read_form_value(&mut field, OCR_PDF_PATH).await?,
+                    OCR_PDF_PATH,
+                )?;
+            }
+            "ocrType" => {
+                let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
+                if !value.trim().is_empty() {
+                    ocr_type = Some(value.trim().to_owned());
+                }
+            }
+            "ocrRenderType" => {
+                let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
+                if !value.trim().is_empty() {
+                    value.trim().clone_into(&mut ocr_render_type);
+                }
+            }
+            "removeImagesAfter" => {
+                remove_images_after = parse_bool_at(
+                    &read_form_value(&mut field, OCR_PDF_PATH).await?,
+                    OCR_PDF_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, OCR_PDF_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(OCR_PDF_PATH, "fileInput is required"))?;
+    Ok(UploadedOcrRequest {
+        file,
+        options: OcrOptions {
+            languages,
+            sidecar,
+            deskew,
+            clean,
+            clean_final,
+            ocr_type,
+            ocr_render_type,
+            remove_images_after,
+        },
+        temp_dir,
+    })
+}
+
+async fn read_pdf_to_office_request(
+    mut multipart: Multipart,
+    api_path: &'static str,
+) -> Result<UploadedPdfToOfficeRequest, ApiError> {
+    let temp_dir =
+        TempDir::new().map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+    let mut file = None;
+    let mut output_format = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, api_path).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "outputFormat" => {
+                let value = read_form_value(&mut field, api_path).await?;
+                if !value.trim().is_empty() {
+                    output_format = Some(value.trim().to_owned());
+                }
+            }
+            _ => drain_field(&mut field, api_path).await?,
+        }
+    }
+    let file = file.ok_or_else(|| ApiError::bad_request_at(api_path, "fileInput is required"))?;
+    Ok(UploadedPdfToOfficeRequest {
+        file,
+        output_format,
+        temp_dir,
+    })
+}
+
+async fn read_scanner_effect_request(
+    mut multipart: Multipart,
+) -> Result<UploadedScannerEffectRequest, ApiError> {
+    let temp_dir = TempDir::new()
+        .map_err(|error| ApiError::internal_at(SCANNER_EFFECT_PATH, error.to_string()))?;
+    let mut file = None;
+    let mut values = ScannerEffectRequestValues::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request_at(SCANNER_EFFECT_PATH, error.body_text()))?
+    {
+        match field.name().unwrap_or_default() {
+            "fileInput" => {
+                let filename = safe_filename(field.file_name());
+                let path = temp_dir.path().join("input.pdf");
+                write_field_to_file(&mut field, &path, SCANNER_EFFECT_PATH).await?;
+                file = Some(UploadedPdf { filename, path });
+            }
+            "quality" => {
+                let value = read_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+                values.quality = Quality::parse(&value).map_err(|error| {
+                    ApiError::bad_request_at(SCANNER_EFFECT_PATH, error.to_string())
+                })?;
+            }
+            "rotation" => {
+                let value = read_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+                values.rotation = Rotation::parse(&value).map_err(|error| {
+                    ApiError::bad_request_at(SCANNER_EFFECT_PATH, error.to_string())
+                })?;
+            }
+            "colorspace" => {
+                let value = read_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+                values.colorspace = Colorspace::parse(&value).map_err(|error| {
+                    ApiError::bad_request_at(SCANNER_EFFECT_PATH, error.to_string())
+                })?;
+            }
+            "border" => {
+                values.border = parse_i32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "rotate" => {
+                values.rotate = parse_i32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "rotateVariance" => {
+                values.rotate_variance =
+                    parse_i32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "brightness" => {
+                values.brightness = parse_f32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "contrast" => {
+                values.contrast = parse_f32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "blur" => {
+                values.blur = parse_f32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "noise" => {
+                values.noise = parse_f32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "yellowish" => {
+                values.yellowish = parse_bool_at(
+                    &read_form_value(&mut field, SCANNER_EFFECT_PATH).await?,
+                    SCANNER_EFFECT_PATH,
+                )?;
+            }
+            "resolution" => {
+                values.resolution = parse_i32_form_value(&mut field, SCANNER_EFFECT_PATH).await?;
+            }
+            "advancedEnabled" => {
+                values.advanced_enabled = parse_bool_at(
+                    &read_form_value(&mut field, SCANNER_EFFECT_PATH).await?,
+                    SCANNER_EFFECT_PATH,
+                )?;
+            }
+            _ => drain_field(&mut field, SCANNER_EFFECT_PATH).await?,
+        }
+    }
+    let file =
+        file.ok_or_else(|| ApiError::bad_request_at(SCANNER_EFFECT_PATH, "fileInput is required"))?;
+    Ok(UploadedScannerEffectRequest {
+        file,
+        params: ScannerEffectParams::resolve(&values),
         temp_dir,
     })
 }
@@ -5656,18 +11632,35 @@ async fn write_field_to_file(
     path: &Path,
     api_path: &'static str,
 ) -> Result<(), ApiError> {
+    write_field_to_file_bounded(field, path, api_path, usize::MAX).await
+}
+
+async fn write_field_to_file_bounded(
+    field: &mut axum::extract::multipart::Field<'_>,
+    path: &Path,
+    api_path: &'static str,
+    limit: usize,
+) -> Result<(), ApiError> {
     let mut output = File::create(path)
         .await
         .map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+    let mut written = 0_usize;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
     {
+        if written.saturating_add(chunk.len()) > limit {
+            return Err(ApiError::payload_too_large_at(
+                api_path,
+                "PDF exceeds maximum size of 50 MB for AI tools",
+            ));
+        }
         output
             .write_all(&chunk)
             .await
             .map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+        written = written.saturating_add(chunk.len());
     }
     output
         .flush()
@@ -5709,12 +11702,26 @@ async fn read_field_bytes(
     field: &mut axum::extract::multipart::Field<'_>,
     api_path: &'static str,
 ) -> Result<Vec<u8>, ApiError> {
+    read_field_bytes_bounded(field, api_path, usize::MAX).await
+}
+
+async fn read_field_bytes_bounded(
+    field: &mut axum::extract::multipart::Field<'_>,
+    api_path: &'static str,
+    limit: usize,
+) -> Result<Vec<u8>, ApiError> {
     let mut value = Vec::new();
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
     {
+        if value.len().saturating_add(chunk.len()) > limit {
+            return Err(ApiError::bad_request_at(
+                api_path,
+                "multipart field is too large",
+            ));
+        }
         value.extend_from_slice(&chunk);
     }
     Ok(value)
@@ -5747,6 +11754,28 @@ fn parse_bool_at(value: &str, api_path: &'static str) -> Result<bool, ApiError> 
             api_path,
             format!("'{value}' is not a boolean"),
         ))
+    }
+}
+
+fn parse_pdf_to_ebook_target_device(value: &str) -> Result<PdfToEbookTargetDevice, ApiError> {
+    match value.trim() {
+        "TABLET_PHONE_IMAGES" => Ok(PdfToEbookTargetDevice::TabletPhoneImages),
+        "KINDLE_EINK_TEXT" => Ok(PdfToEbookTargetDevice::KindleEinkText),
+        _ => Err(ApiError::bad_request_at(
+            PDF_TO_EPUB_PATH,
+            format!("'{value}' is not a valid targetDevice"),
+        )),
+    }
+}
+
+fn parse_pdf_to_ebook_output_format(value: &str) -> Result<PdfToEbookOutputFormat, ApiError> {
+    match value.trim() {
+        "EPUB" => Ok(PdfToEbookOutputFormat::Epub),
+        "AZW3" => Ok(PdfToEbookOutputFormat::Azw3),
+        _ => Err(ApiError::bad_request_at(
+            PDF_TO_EPUB_PATH,
+            format!("'{value}' is not a valid outputFormat"),
+        )),
     }
 }
 
@@ -5795,6 +11824,21 @@ fn safe_filename(value: Option<&str>) -> String {
         .to_owned()
 }
 
+fn ai_document_output_filename(value: &str) -> String {
+    if value.trim().is_empty() {
+        return "generated-document.pdf".to_owned();
+    }
+    let filename = safe_filename(Some(value));
+    if Path::new(&filename)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    {
+        filename
+    } else {
+        "generated-document.pdf".to_owned()
+    }
+}
+
 fn merge_filename(first_filename: Option<&str>) -> String {
     let filename = first_filename.unwrap_or("default");
     suffixed_filename(filename, "_merged_unsigned.pdf")
@@ -5806,6 +11850,14 @@ fn suffixed_filename(filename: &str, suffix: &str) -> String {
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
         .map_or(filename, |(stem, _)| stem);
     format!("{base}{suffix}")
+}
+
+fn replace_extension(filename: &str, extension: &str) -> String {
+    let base = filename
+        .rsplit_once('.')
+        .filter(|(stem, existing_extension)| !stem.is_empty() && !existing_extension.is_empty())
+        .map_or(filename, |(stem, _)| stem);
+    format!("{base}.{extension}")
 }
 
 fn comic_output_filename(filename: &str, suffix: &str) -> String {
@@ -6100,7 +12152,7 @@ fn map_attachment_error(error: &AttachmentError, api_path: &'static str) -> ApiE
         | AttachmentError::AttachmentsRequired
         | AttachmentError::EmptyAttachment { .. }
         | AttachmentError::AttachmentTooLarge { .. }
-        | AttachmentError::TotalTooLarge
+        | AttachmentError::TotalTooLarge { .. }
         | AttachmentError::NoAttachments
         | AttachmentError::NotFound { .. } => ApiError::bad_request_at(api_path, error.to_string()),
         AttachmentError::NameTreeCycle
@@ -6150,13 +12202,93 @@ fn map_javascript_error(error: &JavascriptError) -> ApiError {
 }
 
 fn map_comment_error(error: &CommentError) -> ApiError {
+    map_comment_error_at(error, ADD_COMMENTS_PATH)
+}
+
+fn map_comment_error_at(error: &CommentError, api_path: &'static str) -> ApiError {
     match error {
         CommentError::InvalidJson(_) | CommentError::ReadPdf { .. } | CommentError::Pdf(_) => {
-            ApiError::bad_request_at(ADD_COMMENTS_PATH, error.to_string())
+            ApiError::bad_request_at(api_path, error.to_string())
         }
         CommentError::PdfiumRuntime { .. } | CommentError::Pdfium(_) | CommentError::Write(_) => {
-            ApiError::internal_at(ADD_COMMENTS_PATH, error.to_string())
+            ApiError::internal_at(api_path, error.to_string())
         }
+    }
+}
+
+fn map_pdf_ai_comment_error(error: &PdfAiCommentError) -> ApiError {
+    match error {
+        PdfAiCommentError::EngineDisabled
+        | PdfAiCommentError::EngineUrl(_)
+        | PdfAiCommentError::EngineClient(_)
+        | PdfAiCommentError::EngineUnavailable(_) => {
+            ApiError::service_unavailable_at(PDF_COMMENT_AGENT_PATH, error.to_string())
+        }
+        PdfAiCommentError::PromptRequired
+        | PdfAiCommentError::PromptTooLong
+        | PdfAiCommentError::NoExtractableText
+        | PdfAiCommentError::Pdfium(_) => {
+            ApiError::bad_request_at(PDF_COMMENT_AGENT_PATH, error.to_string())
+        }
+        PdfAiCommentError::PdfiumUnavailable(_) => {
+            ApiError::unsupported_at(PDF_COMMENT_AGENT_PATH, error.to_string())
+        }
+        PdfAiCommentError::EngineTimedOut => {
+            ApiError::gateway_timeout_at(PDF_COMMENT_AGENT_PATH, error.to_string())
+        }
+        PdfAiCommentError::EngineClientResponse { status, .. } => {
+            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            ApiError {
+                status,
+                message: error.to_string(),
+                path: PDF_COMMENT_AGENT_PATH,
+            }
+        }
+        PdfAiCommentError::EngineServerResponse { .. } | PdfAiCommentError::EngineJson(_) => {
+            ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: error.to_string(),
+                path: PDF_COMMENT_AGENT_PATH,
+            }
+        }
+        PdfAiCommentError::CommentJson(_) => {
+            ApiError::internal_at(PDF_COMMENT_AGENT_PATH, error.to_string())
+        }
+        PdfAiCommentError::Comment(error) => map_comment_error_at(error, PDF_COMMENT_AGENT_PATH),
+    }
+}
+
+fn map_math_audit_error(error: &PdfMathAuditError) -> ApiError {
+    match error {
+        PdfMathAuditError::EngineDisabled
+        | PdfMathAuditError::EngineUrl(_)
+        | PdfMathAuditError::EngineClient(_)
+        | PdfMathAuditError::EngineUnavailable(_) => {
+            ApiError::service_unavailable_at(MATH_AUDITOR_AGENT_PATH, error.to_string())
+        }
+        PdfMathAuditError::PdfiumUnavailable(_) | PdfMathAuditError::TableRuntimeUnavailable(_) => {
+            ApiError::unsupported_at(MATH_AUDITOR_AGENT_PATH, error.to_string())
+        }
+        PdfMathAuditError::Pdfium(_)
+        | PdfMathAuditError::Table(_)
+        | PdfMathAuditError::TooManyPages => {
+            ApiError::bad_request_at(MATH_AUDITOR_AGENT_PATH, error.to_string())
+        }
+        PdfMathAuditError::EngineTimedOut => {
+            ApiError::gateway_timeout_at(MATH_AUDITOR_AGENT_PATH, error.to_string())
+        }
+        PdfMathAuditError::EngineClientResponse { status, .. } => ApiError {
+            status: StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: error.to_string(),
+            path: MATH_AUDITOR_AGENT_PATH,
+        },
+        PdfMathAuditError::EngineServerResponse { .. }
+        | PdfMathAuditError::EngineJson(_)
+        | PdfMathAuditError::EngineUnexpectedResponse { .. } => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message: error.to_string(),
+            path: MATH_AUDITOR_AGENT_PATH,
+        },
     }
 }
 
@@ -6232,6 +12364,97 @@ fn map_pdf_to_image_error(error: &PdfToImageError) -> ApiError {
     }
 }
 
+fn map_pdf_table_error(error: &PdfTableError, api_path: &'static str) -> ApiError {
+    match error {
+        PdfTableError::ReadPdf { .. }
+        | PdfTableError::PageSelection(_)
+        | PdfTableError::TooManyGridAxes
+        | PdfTableError::TooManyCells => ApiError::bad_request_at(api_path, error.to_string()),
+        PdfTableError::RuntimePoisoned
+        | PdfTableError::ReadPage { .. }
+        | PdfTableError::ReadText { .. }
+        | PdfTableError::Io(_)
+        | PdfTableError::Zip(_) => ApiError::internal_at(api_path, error.to_string()),
+    }
+}
+
+fn map_pdf_redaction_error(error: &PdfRedactionError, api_path: &'static str) -> ApiError {
+    match error {
+        PdfRedactionError::ReadPdf { .. }
+        | PdfRedactionError::UnsafeRenderDimensions { .. }
+        | PdfRedactionError::PageSelection(_)
+        | PdfRedactionError::NoSearchTerms
+        | PdfRedactionError::TooManySearchTerms
+        | PdfRedactionError::InvalidPattern(_)
+        | PdfRedactionError::InvalidPadding
+        | PdfRedactionError::TooManyMatches
+        | PdfRedactionError::NoExecutionTargets
+        | PdfRedactionError::TooManyRanges
+        | PdfRedactionError::TooManyImageBoxes
+        | PdfRedactionError::TooManyExecutionBoxes
+        | PdfRedactionError::EmptyRangeStart
+        | PdfRedactionError::InvalidImageBox => {
+            ApiError::bad_request_at(api_path, error.to_string())
+        }
+        PdfRedactionError::RuntimePoisoned
+        | PdfRedactionError::Page { .. }
+        | PdfRedactionError::InvalidPageNumber { .. }
+        | PdfRedactionError::ReadText { .. } => ApiError::internal_at(api_path, error.to_string()),
+    }
+}
+
+fn map_pdf_to_video_error(error: &PdfToVideoError) -> ApiError {
+    match error {
+        PdfToVideoError::InvalidSecondsPerPage
+        | PdfToVideoError::InvalidDpi
+        | PdfToVideoError::DpiExceedsLimit { .. }
+        | PdfToVideoError::InvalidOpacity
+        | PdfToVideoError::WatermarkTextTooLong
+        | PdfToVideoError::WatermarkTooLarge
+        | PdfToVideoError::NoFrames
+        | PdfToVideoError::PdfRender(PdfToImageError::Pdfium(
+            PdfiumToImageError::ReadPdf { .. }
+            | PdfiumToImageError::PageSelection(_)
+            | PdfiumToImageError::NoPages
+            | PdfiumToImageError::PageCount
+            | PdfiumToImageError::UnsafeRenderDimensions { .. }
+            | PdfiumToImageError::UnsafeCombinedDimensions { .. },
+        )) => ApiError::bad_request_at(PDF_TO_VIDEO_PATH, error.to_string()),
+        PdfToVideoError::FfmpegUnavailable {
+            explicitly_configured: false,
+        }
+        | PdfToVideoError::PdfRender(PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        }) => ApiError::unsupported_at(PDF_TO_VIDEO_PATH, error.to_string()),
+        PdfToVideoError::PdfRender(
+            PdfToImageError::InvalidFormat
+            | PdfToImageError::InvalidMode
+            | PdfToImageError::InvalidColorType
+            | PdfToImageError::InvalidDpi
+            | PdfToImageError::DpiExceedsLimit { .. }
+            | PdfToImageError::PdfiumUnavailable {
+                explicitly_configured: true,
+                ..
+            }
+            | PdfToImageError::Pdfium(_),
+        )
+        | PdfToVideoError::EmbeddedFont
+        | PdfToVideoError::FrameArchive(_)
+        | PdfToVideoError::TooManyFrames
+        | PdfToVideoError::Io(_)
+        | PdfToVideoError::FrameImage { .. }
+        | PdfToVideoError::FfmpegUnavailable {
+            explicitly_configured: true,
+        }
+        | PdfToVideoError::FfmpegStart { .. }
+        | PdfToVideoError::FfmpegFailed { .. }
+        | PdfToVideoError::FfmpegNoOutput => {
+            ApiError::internal_at(PDF_TO_VIDEO_PATH, error.to_string())
+        }
+    }
+}
+
 fn map_image_to_pdf_error(error: &ImageToPdfError) -> ApiError {
     match error {
         ImageToPdfError::NoImages
@@ -6280,6 +12503,38 @@ fn map_vector_conversion_error(error: &VectorConversionError, api_path: &'static
         | VectorConversionError::GhostscriptStart { .. }
         | VectorConversionError::GhostscriptFailed { .. }
         | VectorConversionError::GhostscriptNoOutput => {
+            ApiError::internal_at(api_path, error.to_string())
+        }
+    }
+}
+
+fn map_pdfa_error(error: &PdfaError) -> ApiError {
+    map_pdfa_error_at(error, PDF_TO_PDFA_PATH)
+}
+
+fn map_pdfa_error_at(error: &PdfaError, api_path: &'static str) -> ApiError {
+    match error {
+        PdfaError::InvalidPdfExtension | PdfaError::StrictNonCompliant => {
+            ApiError::bad_request_at(api_path, error.to_string())
+        }
+        PdfaError::GhostscriptUnavailable {
+            explicitly_configured: false,
+        }
+        | PdfaError::StrictVerifierUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(api_path, error.to_string()),
+        PdfaError::GrayIccProfile(_)
+        | PdfaError::Io(_)
+        | PdfaError::GhostscriptUnavailable {
+            explicitly_configured: true,
+        }
+        | PdfaError::GhostscriptStart { .. }
+        | PdfaError::GhostscriptFailed { .. }
+        | PdfaError::GhostscriptNoOutput
+        | PdfaError::StrictVerifierUnavailable {
+            explicitly_configured: true,
+        }
+        | PdfaError::StrictVerification { .. } => {
             ApiError::internal_at(api_path, error.to_string())
         }
     }
@@ -6421,11 +12676,60 @@ fn map_cbz_to_pdf_error(error: &ComicBookError) -> ApiError {
             | ImageToPdfError::UnsafeDimensions { .. },
         ) => ApiError::bad_request_at(CBZ_TO_PDF_PATH, error.to_string()),
         ComicBookError::InvalidPdfExtension
+        | ComicBookError::InvalidCbrExtension
         | ComicBookError::Io(_)
         | ComicBookError::ImageToPdf(_)
         | ComicBookError::PdfToImage(_)
-        | ComicBookError::UnexpectedImageOutput => {
+        | ComicBookError::UnexpectedImageOutput
+        | ComicBookError::CbrExtractorUnavailable { .. }
+        | ComicBookError::CbrExtractorFailed { .. }
+        | ComicBookError::CbrExtractorStart { .. }
+        | ComicBookError::RarUnavailable { .. }
+        | ComicBookError::RarFailed { .. }
+        | ComicBookError::RarStart { .. }
+        | ComicBookError::UnsafeExtraction => {
             ApiError::internal_at(CBZ_TO_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_cbr_to_pdf_error(error: &ComicBookError) -> ApiError {
+    match error {
+        ComicBookError::InvalidCbrExtension
+        | ComicBookError::NoImages
+        | ComicBookError::TooManyEntries
+        | ComicBookError::ArchiveTooLarge
+        | ComicBookError::UnsafeExtraction
+        | ComicBookError::CbrExtractorFailed { .. }
+        | ComicBookError::ImageToPdf(
+            ImageToPdfError::NoImages
+            | ImageToPdfError::InvalidFitOption
+            | ImageToPdfError::InvalidColorType
+            | ImageToPdfError::OpenImage { .. }
+            | ImageToPdfError::DecodeImage { .. }
+            | ImageToPdfError::DecodeTiff { .. }
+            | ImageToPdfError::UnsupportedTiff { .. }
+            | ImageToPdfError::UnsafeDimensions { .. },
+        ) => ApiError::bad_request_at(CBR_TO_PDF_PATH, error.to_string()),
+        ComicBookError::CbrExtractorUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(CBR_TO_PDF_PATH, error.to_string()),
+        ComicBookError::InvalidCbzExtension
+        | ComicBookError::InvalidPdfExtension
+        | ComicBookError::EmptyArchive
+        | ComicBookError::Io(_)
+        | ComicBookError::Zip(_)
+        | ComicBookError::ImageToPdf(_)
+        | ComicBookError::PdfToImage(_)
+        | ComicBookError::UnexpectedImageOutput
+        | ComicBookError::CbrExtractorUnavailable {
+            explicitly_configured: true,
+        }
+        | ComicBookError::CbrExtractorStart { .. }
+        | ComicBookError::RarUnavailable { .. }
+        | ComicBookError::RarFailed { .. }
+        | ComicBookError::RarStart { .. } => {
+            ApiError::internal_at(CBR_TO_PDF_PATH, error.to_string())
         }
     }
 }
@@ -6453,6 +12757,7 @@ fn map_pdf_to_cbz_error(error: &ComicBookError) -> ApiError {
             ..
         }) => ApiError::unsupported_at(PDF_TO_CBZ_PATH, error.to_string()),
         ComicBookError::InvalidCbzExtension
+        | ComicBookError::InvalidCbrExtension
         | ComicBookError::EmptyArchive
         | ComicBookError::NoImages
         | ComicBookError::TooManyEntries
@@ -6461,8 +12766,65 @@ fn map_pdf_to_cbz_error(error: &ComicBookError) -> ApiError {
         | ComicBookError::Zip(_)
         | ComicBookError::ImageToPdf(_)
         | ComicBookError::PdfToImage(_)
-        | ComicBookError::UnexpectedImageOutput => {
+        | ComicBookError::UnexpectedImageOutput
+        | ComicBookError::CbrExtractorUnavailable { .. }
+        | ComicBookError::CbrExtractorFailed { .. }
+        | ComicBookError::CbrExtractorStart { .. }
+        | ComicBookError::RarUnavailable { .. }
+        | ComicBookError::RarFailed { .. }
+        | ComicBookError::RarStart { .. }
+        | ComicBookError::UnsafeExtraction => {
             ApiError::internal_at(PDF_TO_CBZ_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_pdf_to_cbr_error(error: &ComicBookError) -> ApiError {
+    match error {
+        ComicBookError::InvalidPdfExtension
+        | ComicBookError::PdfToImage(
+            PdfToImageError::InvalidFormat
+            | PdfToImageError::InvalidMode
+            | PdfToImageError::InvalidColorType
+            | PdfToImageError::InvalidDpi
+            | PdfToImageError::DpiExceedsLimit { .. }
+            | PdfToImageError::Pdfium(
+                PdfiumToImageError::ReadPdf { .. }
+                | PdfiumToImageError::PageSelection(_)
+                | PdfiumToImageError::NoPages
+                | PdfiumToImageError::PageCount
+                | PdfiumToImageError::UnsafeRenderDimensions { .. }
+                | PdfiumToImageError::UnsafeCombinedDimensions { .. },
+            ),
+        ) => ApiError::bad_request_at(PDF_TO_CBR_PATH, error.to_string()),
+        ComicBookError::PdfToImage(PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        })
+        | ComicBookError::RarUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(PDF_TO_CBR_PATH, error.to_string()),
+        ComicBookError::InvalidCbzExtension
+        | ComicBookError::InvalidCbrExtension
+        | ComicBookError::EmptyArchive
+        | ComicBookError::NoImages
+        | ComicBookError::TooManyEntries
+        | ComicBookError::ArchiveTooLarge
+        | ComicBookError::Io(_)
+        | ComicBookError::Zip(_)
+        | ComicBookError::ImageToPdf(_)
+        | ComicBookError::PdfToImage(_)
+        | ComicBookError::UnexpectedImageOutput
+        | ComicBookError::CbrExtractorUnavailable { .. }
+        | ComicBookError::CbrExtractorFailed { .. }
+        | ComicBookError::CbrExtractorStart { .. }
+        | ComicBookError::RarUnavailable {
+            explicitly_configured: true,
+        }
+        | ComicBookError::RarFailed { .. }
+        | ComicBookError::RarStart { .. }
+        | ComicBookError::UnsafeExtraction => {
+            ApiError::internal_at(PDF_TO_CBR_PATH, error.to_string())
         }
     }
 }
@@ -6475,6 +12837,17 @@ fn map_pdf_text_error(error: &PdfTextError) -> ApiError {
             ApiError::bad_request_at(PDF_TO_TEXT_PATH, error.to_string())
         }
         PdfTextError::Write(_) => ApiError::internal_at(PDF_TO_TEXT_PATH, error.to_string()),
+    }
+}
+
+fn map_pdf_markdown_error(error: &PdfMarkdownError) -> ApiError {
+    match error {
+        PdfMarkdownError::ReadPdf { .. } | PdfMarkdownError::ExtractText { .. } => {
+            ApiError::bad_request_at(PDF_TO_MARKDOWN_PATH, error.to_string())
+        }
+        PdfMarkdownError::Write(_) => {
+            ApiError::internal_at(PDF_TO_MARKDOWN_PATH, error.to_string())
+        }
     }
 }
 
@@ -6497,6 +12870,34 @@ fn map_extract_images_error(error: &ExtractImagesError) -> ApiError {
     }
 }
 
+fn map_extract_image_scans_error(error: &ExtractImageScansError) -> ApiError {
+    match error {
+        ExtractImageScansError::NoImages
+        | ExtractImageScansError::TooManyOutputs
+        | ExtractImageScansError::OutputTooLarge
+        | ExtractImageScansError::UnsafeOutput => {
+            ApiError::bad_request_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string())
+        }
+        ExtractImageScansError::PdfToImage(PdfToImageError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        })
+        | ExtractImageScansError::PythonUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string()),
+        ExtractImageScansError::PdfToImage(_)
+        | ExtractImageScansError::Io(_)
+        | ExtractImageScansError::Zip(_)
+        | ExtractImageScansError::PythonUnavailable {
+            explicitly_configured: true,
+        }
+        | ExtractImageScansError::PythonStart { .. }
+        | ExtractImageScansError::PythonFailed { .. } => {
+            ApiError::internal_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string())
+        }
+    }
+}
+
 fn map_flatten_error(error: &FlattenError, api_path: &'static str) -> ApiError {
     match error {
         FlattenError::PdfiumUnavailable {
@@ -6508,6 +12909,276 @@ fn map_flatten_error(error: &FlattenError, api_path: &'static str) -> ApiError {
             ..
         }
         | FlattenError::Pdfium(_) => ApiError::internal_at(api_path, error.to_string()),
+    }
+}
+
+fn map_replace_invert_error(error: &ReplaceInvertError) -> ApiError {
+    match error {
+        ReplaceInvertError::InvalidOption
+        | ReplaceInvertError::InvalidHighContrastCombination
+        | ReplaceInvertError::InvalidColor(_)
+        | ReplaceInvertError::ReadPdf { .. } => {
+            ApiError::bad_request_at(REPLACE_INVERT_PDF_PATH, error.to_string())
+        }
+        ReplaceInvertError::GhostscriptUnavailable
+        | ReplaceInvertError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        } => ApiError::unsupported_at(REPLACE_INVERT_PDF_PATH, error.to_string()),
+        ReplaceInvertError::PdfiumUnavailable {
+            explicitly_configured: true,
+            ..
+        }
+        | ReplaceInvertError::Pdfium(_)
+        | ReplaceInvertError::Pdf(_)
+        | ReplaceInvertError::Write(_)
+        | ReplaceInvertError::GhostscriptFailed { .. }
+        | ReplaceInvertError::GhostscriptStart { .. } => {
+            ApiError::internal_at(REPLACE_INVERT_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_ocr_error(error: &OcrError) -> ApiError {
+    match error {
+        OcrError::NoLanguages | OcrError::InvalidRenderType => {
+            ApiError::bad_request_at(OCR_PDF_PATH, error.to_string())
+        }
+        OcrError::OcrMyPdfUnavailable | OcrError::GhostscriptUnavailable => {
+            ApiError::unsupported_at(OCR_PDF_PATH, error.to_string())
+        }
+        OcrError::OcrMyPdfFailed { .. }
+        | OcrError::OcrMyPdfStart { .. }
+        | OcrError::GhostscriptFailed { .. }
+        | OcrError::Io(_)
+        | OcrError::Zip(_) => ApiError::internal_at(OCR_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_pdf_json_error(error: &PdfJsonError, api_path: &'static str) -> ApiError {
+    match error {
+        PdfJsonError::ReadPdf { .. }
+        | PdfJsonError::InvalidJson(_)
+        | PdfJsonError::UnsupportedText(_)
+        | PdfJsonError::UnsupportedImage(_) => {
+            ApiError::bad_request_at(api_path, error.to_string())
+        }
+        PdfJsonError::Pdf(_) | PdfJsonError::Write(_) => {
+            ApiError::internal_at(api_path, error.to_string())
+        }
+    }
+}
+
+fn map_pdf_json_cache_error(error: &PdfJsonCacheError, api_path: &'static str) -> ApiError {
+    match error {
+        PdfJsonCacheError::Unavailable => ApiError::bad_request_at(api_path, error.to_string()),
+        PdfJsonCacheError::Poisoned | PdfJsonCacheError::Io(_) => {
+            ApiError::internal_at(api_path, error.to_string())
+        }
+    }
+}
+
+fn map_pdf_text_edit_error(error: &PdfTextEditError) -> ApiError {
+    match error {
+        PdfTextEditError::NoEdits
+        | PdfTextEditError::EmptyFind
+        | PdfTextEditError::ReadPdf { .. }
+        | PdfTextEditError::PageSelection(_)
+        | PdfTextEditError::UnencodableReplacement
+        | PdfTextEditError::Pdf(_) => ApiError::bad_request_at(EDIT_TEXT_PATH, error.to_string()),
+        PdfTextEditError::Write(_) => ApiError::internal_at(EDIT_TEXT_PATH, error.to_string()),
+    }
+}
+
+fn map_pdf_to_html_error(error: &PdfToHtmlError) -> ApiError {
+    match error {
+        PdfToHtmlError::PdftohtmlUnavailable => {
+            ApiError::unsupported_at(PDF_TO_HTML_PATH, error.to_string())
+        }
+        PdfToHtmlError::PdftohtmlFailed { .. }
+        | PdfToHtmlError::PdftohtmlStart { .. }
+        | PdfToHtmlError::NoOutput
+        | PdfToHtmlError::Io(_)
+        | PdfToHtmlError::Zip(_) => ApiError::internal_at(PDF_TO_HTML_PATH, error.to_string()),
+    }
+}
+
+fn map_html_to_pdf_error(error: &HtmlToPdfError) -> ApiError {
+    match error {
+        HtmlToPdfError::InvalidExtension
+        | HtmlToPdfError::TooManyArchiveEntries
+        | HtmlToPdfError::ArchiveTooLarge
+        | HtmlToPdfError::UnsafeArchivePath(_)
+        | HtmlToPdfError::ArchiveMissingHtml => {
+            ApiError::bad_request_at(HTML_TO_PDF_PATH, error.to_string())
+        }
+        HtmlToPdfError::WeasyPrintUnavailable => {
+            ApiError::unsupported_at(HTML_TO_PDF_PATH, error.to_string())
+        }
+        HtmlToPdfError::WeasyPrintFailed { .. }
+        | HtmlToPdfError::WeasyPrintStart { .. }
+        | HtmlToPdfError::NoOutput
+        | HtmlToPdfError::Io(_)
+        | HtmlToPdfError::Zip(_) => ApiError::internal_at(HTML_TO_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_ai_document_error(error: &AiDocumentError) -> ApiError {
+    match error {
+        AiDocumentError::InvalidDocument(_) => {
+            ApiError::bad_request_at(CREATE_PDF_AGENT_PATH, error.to_string())
+        }
+        AiDocumentError::Html(HtmlToPdfError::WeasyPrintUnavailable) => {
+            ApiError::unsupported_at(CREATE_PDF_AGENT_PATH, error.to_string())
+        }
+        AiDocumentError::Html(_) => ApiError::internal_at(CREATE_PDF_AGENT_PATH, error.to_string()),
+    }
+}
+
+fn map_ebook_to_pdf_error(error: &EbookToPdfError) -> ApiError {
+    match error {
+        EbookToPdfError::MissingExtension | EbookToPdfError::InvalidExtension(_) => {
+            ApiError::bad_request_at(EBOOK_TO_PDF_PATH, error.to_string())
+        }
+        EbookToPdfError::EbookConvertUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(EBOOK_TO_PDF_PATH, error.to_string()),
+        EbookToPdfError::EbookConvertUnavailable {
+            explicitly_configured: true,
+        }
+        | EbookToPdfError::EbookConvertFailed { .. }
+        | EbookToPdfError::EbookConvertStart { .. }
+        | EbookToPdfError::NoOutput
+        | EbookToPdfError::Io(_) => ApiError::internal_at(EBOOK_TO_PDF_PATH, error.to_string()),
+    }
+}
+
+fn map_pdf_to_ebook_error(error: &PdfToEbookError) -> ApiError {
+    match error {
+        PdfToEbookError::InvalidExtension => {
+            ApiError::bad_request_at(PDF_TO_EPUB_PATH, error.to_string())
+        }
+        PdfToEbookError::EbookConvertUnavailable {
+            explicitly_configured: false,
+        } => ApiError::unsupported_at(PDF_TO_EPUB_PATH, error.to_string()),
+        PdfToEbookError::EbookConvertUnavailable {
+            explicitly_configured: true,
+        }
+        | PdfToEbookError::EbookConvertFailed { .. }
+        | PdfToEbookError::EbookConvertStart { .. }
+        | PdfToEbookError::NoOutput { .. }
+        | PdfToEbookError::Io(_) => ApiError::internal_at(PDF_TO_EPUB_PATH, error.to_string()),
+    }
+}
+
+fn map_eml_to_pdf_error(error: &EmlToPdfError) -> ApiError {
+    match error {
+        EmlToPdfError::InvalidExtension
+        | EmlToPdfError::InvalidMaxAttachmentSize
+        | EmlToPdfError::EmptyInput
+        | EmlToPdfError::InvalidEml
+        | EmlToPdfError::EmlParse(_)
+        | EmlToPdfError::MsgParse(_) => {
+            ApiError::bad_request_at(EML_TO_PDF_PATH, error.to_string())
+        }
+        EmlToPdfError::HtmlToPdf(HtmlToPdfError::WeasyPrintUnavailable) => {
+            ApiError::unsupported_at(EML_TO_PDF_PATH, error.to_string())
+        }
+        EmlToPdfError::HtmlToPdf(_) | EmlToPdfError::Attachment(_) | EmlToPdfError::Io(_) => {
+            ApiError::internal_at(EML_TO_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_url_to_pdf_error(error: &UrlToPdfError) -> Result<Response, ApiError> {
+    match error {
+        UrlToPdfError::InvalidUrl
+        | UrlToPdfError::CredentialsNotAllowed
+        | UrlToPdfError::DisallowedTarget => url_to_pdf_redirect("error.invalidUrlFormat"),
+        UrlToPdfError::Unreachable(_)
+        | UrlToPdfError::Redirected
+        | UrlToPdfError::RemoteStatus(_)
+        | UrlToPdfError::ResponseTooLarge => url_to_pdf_redirect("error.urlNotReachable"),
+        UrlToPdfError::HtmlToPdf(HtmlToPdfError::WeasyPrintUnavailable) => {
+            Err(ApiError::unsupported_at(URL_TO_PDF_PATH, error.to_string()))
+        }
+        UrlToPdfError::HtmlToPdf(_) | UrlToPdfError::Io(_) => {
+            Err(ApiError::internal_at(URL_TO_PDF_PATH, error.to_string()))
+        }
+    }
+}
+
+fn url_to_pdf_redirect(error: &str) -> Result<Response, ApiError> {
+    let location = format!("/url-to-pdf?error={}", urlencoding::encode(error));
+    let location = HeaderValue::from_str(&location).map_err(|_| {
+        ApiError::internal_at(
+            URL_TO_PDF_PATH,
+            "could not encode URL-to-PDF redirect location",
+        )
+    })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::LOCATION, location);
+    Ok((StatusCode::SEE_OTHER, headers).into_response())
+}
+
+fn map_markdown_to_pdf_error(error: &MarkdownToPdfError) -> ApiError {
+    match error {
+        MarkdownToPdfError::InvalidExtension
+        | MarkdownToPdfError::TooManyArchiveEntries
+        | MarkdownToPdfError::ArchiveTooLarge
+        | MarkdownToPdfError::UnsafeArchivePath(_)
+        | MarkdownToPdfError::ArchiveMissingMarkdown => {
+            ApiError::bad_request_at(MARKDOWN_TO_PDF_PATH, error.to_string())
+        }
+        MarkdownToPdfError::HtmlToPdf(HtmlToPdfError::WeasyPrintUnavailable) => {
+            ApiError::unsupported_at(MARKDOWN_TO_PDF_PATH, error.to_string())
+        }
+        MarkdownToPdfError::HtmlToPdf(_)
+        | MarkdownToPdfError::Io(_)
+        | MarkdownToPdfError::Zip(_) => {
+            ApiError::internal_at(MARKDOWN_TO_PDF_PATH, error.to_string())
+        }
+    }
+}
+
+fn map_office_to_pdf_error(error: &OfficeToPdfError, api_path: &'static str) -> ApiError {
+    match error {
+        OfficeToPdfError::MissingExtension
+        | OfficeToPdfError::InvalidExtension(_)
+        | OfficeToPdfError::InvalidOutputFormat(_)
+        | OfficeToPdfError::UnsafeArchive(_) => {
+            ApiError::bad_request_at(api_path, error.to_string())
+        }
+        OfficeToPdfError::SofficeUnavailable => {
+            ApiError::unsupported_at(api_path, error.to_string())
+        }
+        OfficeToPdfError::SofficeFailed { .. }
+        | OfficeToPdfError::SofficeStart { .. }
+        | OfficeToPdfError::NoOutput
+        | OfficeToPdfError::Io(_)
+        | OfficeToPdfError::Zip(_) => ApiError::internal_at(api_path, error.to_string()),
+    }
+}
+
+fn map_scanner_effect_error(error: &ScannerEffectError) -> ApiError {
+    match error {
+        ScannerEffectError::InvalidQuality
+        | ScannerEffectError::InvalidRotation
+        | ScannerEffectError::InvalidColorspace
+        | ScannerEffectError::DpiExceedsLimit { .. } => {
+            ApiError::bad_request_at(SCANNER_EFFECT_PATH, error.to_string())
+        }
+        ScannerEffectError::PdfiumUnavailable {
+            explicitly_configured: false,
+            ..
+        } => ApiError::unsupported_at(SCANNER_EFFECT_PATH, error.to_string()),
+        ScannerEffectError::PdfiumUnavailable {
+            explicitly_configured: true,
+            ..
+        }
+        | ScannerEffectError::Pdfium(_) => {
+            ApiError::internal_at(SCANNER_EFFECT_PATH, error.to_string())
+        }
     }
 }
 
@@ -6563,7 +13234,12 @@ fn map_overlay_error(error: &OverlayError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_UPLOAD_BYTES, parse_data_size};
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{DEFAULT_MAX_UPLOAD_BYTES, TimestampSettings, parse_data_size};
+    use crate::runtime_config::RuntimeConfig;
 
     #[test]
     fn parses_legacy_multipart_size_values() {
@@ -6577,5 +13253,25 @@ mod tests {
         assert_eq!(parse_data_size("0MB"), None);
         assert_eq!(parse_data_size("10MiB"), None);
         assert_eq!(parse_data_size("not-a-size"), None);
+    }
+
+    #[test]
+    fn timestamp_settings_use_yaml_when_no_environment_override_is_present()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "security:\n  timestamp:\n    defaultTsaUrl: https://tsa.example.test\n    customTsaUrls: [https://custom-tsa.example.test]\n",
+        )?;
+        let runtime_config =
+            RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let settings = TimestampSettings::from_runtime_config(&runtime_config);
+        assert_eq!(settings.default_tsa_url, "https://tsa.example.test");
+        assert_eq!(
+            settings.custom_tsa_urls,
+            ["https://custom-tsa.example.test"]
+        );
+        Ok(())
     }
 }

@@ -50,15 +50,15 @@ pub enum CommentError {
 ///
 /// # Errors
 ///
-/// Returns [`CommentError`] for invalid JSON, unreadable PDFs, explicitly
-/// configured but unavailable `PDFium`, malformed annotation arrays, or output
-/// failures.
+/// Returns the number of valid annotations written, or [`CommentError`] for
+/// invalid JSON, unreadable PDFs, explicitly configured but unavailable
+/// `PDFium`, malformed annotation arrays, or output failures.
 pub fn add_comments_to_file(
     input_path: &Path,
     filename: &str,
     comments_json: &str,
     output_path: &Path,
-) -> Result<(), CommentError> {
+) -> Result<usize, CommentError> {
     let comments: Vec<Option<CommentInput>> = serde_json::from_str(comments_json)?;
     let (anchor_requests, anchor_request_indices) = anchor_requests(&comments);
     let anchor_locations = if anchor_requests.is_empty() {
@@ -83,6 +83,7 @@ pub fn add_comments_to_file(
     })?;
     let page_ids: Vec<ObjectId> = document.get_pages().into_values().collect();
     let creation_date = pdf_date_now();
+    let mut annotations_added = 0_usize;
     for (comment_index, comment) in comments.iter().enumerate() {
         let Some(comment) = comment else {
             continue;
@@ -92,10 +93,12 @@ pub fn add_comments_to_file(
             .and_then(|request_index| anchor_locations.get(*request_index))
             .copied()
             .flatten();
-        add_comment(&mut document, &page_ids, comment, location, &creation_date)?;
+        if add_comment(&mut document, &page_ids, comment, location, &creation_date)? {
+            annotations_added = annotations_added.saturating_add(1);
+        }
     }
     document.save(output_path).map_err(CommentError::Write)?;
-    Ok(())
+    Ok(annotations_added)
 }
 
 fn anchor_requests(
@@ -129,20 +132,20 @@ fn add_comment(
     comment: &CommentInput,
     anchor: Option<DetectedTextBounds>,
     creation_date: &str,
-) -> Result<(), lopdf::Error> {
+) -> Result<bool, lopdf::Error> {
     let Some(text) = comment
         .text
         .as_deref()
         .filter(|text| !text.trim().is_empty())
         .filter(|text| text.encode_utf16().count() <= MAX_COMMENT_TEXT_UTF16_UNITS)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Ok(page_index) = usize::try_from(comment.page_index) else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(page_id) = page_ids.get(page_index).copied() else {
-        return Ok(());
+        return Ok(false);
     };
     let [x, y, width, height] = anchor.map_or(
         [comment.x, comment.y, comment.width, comment.height],
@@ -156,7 +159,7 @@ fn add_comment(
         },
     );
     if width <= 0.0 || height <= 0.0 {
-        return Ok(());
+        return Ok(false);
     }
     let author = non_blank_or(comment.author.as_deref(), "Stirling AI");
     let subject = non_blank_or(comment.subject.as_deref(), "Stirling AI Comment");
@@ -189,7 +192,7 @@ fn add_comment(
     document
         .get_dictionary_mut(page_id)?
         .set("Annots", annotations);
-    Ok(())
+    Ok(true)
 }
 
 fn non_blank_or<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {

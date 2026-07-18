@@ -1,0 +1,34 @@
+[package]
+name = "stirling-ai-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+csv = "1.4.0"
+deadpool-postgres = "0.14.1"
+jsonschema = { version = "0.48.0", default-features = false }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+regex = "1.12.2"
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.2"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+subtle = "2.6.1"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-stream = "0.1.18"
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14.0", features = ["native-certs", "ring"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

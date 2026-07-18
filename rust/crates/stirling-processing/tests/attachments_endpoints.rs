@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+    io::{Cursor, Read},
+    process::Command,
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -99,7 +102,7 @@ async fn add_list_extract_rename_and_delete_round_trip() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn validates_missing_attachments_and_reports_pdfa_cutover_boundary()
+async fn validates_missing_attachments_and_optionally_creates_pdfa3b()
 -> Result<(), Box<dyn std::error::Error>> {
     let source = basic_pdf()?;
     let missing = post_pdf("/api/v1/misc/add-attachments", &source, &[], &[]).await?;
@@ -112,10 +115,37 @@ async fn validates_missing_attachments_and_reports_pdfa_cutover_boundary()
         &[("alpha.txt", "text/plain", b"alpha")],
     )
     .await?;
-    assert_eq!(pdfa.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = response_bytes(pdfa).await?;
-    assert!(String::from_utf8_lossy(&body).contains("PDF/A"));
+    if !ghostscript_present() {
+        assert_eq!(pdfa.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_bytes(pdfa).await?;
+        assert!(String::from_utf8_lossy(&body).contains("Ghostscript"));
+        return Ok(());
+    }
+    let pdfa = require_status(pdfa, StatusCode::OK).await?;
+    assert!(
+        pdfa.headers()[header::CONTENT_DISPOSITION]
+            .to_str()?
+            .contains("source_with_attachments_PDFA-3b.pdf")
+    );
+    let document = Document::load_mem(&response_bytes(pdfa).await?)?;
+    assert_eq!(document.catalog()?.get(b"AF")?.as_array()?.len(), 1);
     Ok(())
+}
+
+fn ghostscript_present() -> bool {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["gswin64c", "gswin32c", "gs"]
+    } else {
+        &["gs"]
+    };
+    if let Some(command) = std::env::var_os("STIRLING_PROCESSING_GHOSTSCRIPT_COMMAND")
+        && !command.is_empty()
+    {
+        return Command::new(command).arg("--version").output().is_ok();
+    }
+    candidates
+        .iter()
+        .any(|command| Command::new(command).arg("--version").output().is_ok())
 }
 
 async fn json_response(response: Response) -> Result<Value, Box<dyn std::error::Error>> {

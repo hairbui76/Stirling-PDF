@@ -42,12 +42,26 @@ The deployment images and source also rely on native processing tools including
 LibreOffice/unoserver, Calibre, Ghostscript, OCRmyPDF/Tesseract, FFmpeg, and PDFium.
 Their final role is governed by the external-dependency scope decision below.
 
-As of the same checkpoint, the additive Rust processing service implements 75
-compatibility `POST /api/v1/*` routes and one health route. Its 237 Rust unit and
-HTTP integration tests pass with both the compatibility backend and the pinned
-native PDFium runtime. This is implementation progress, not cutover evidence:
-Java remains the production route owner and the much larger non-UI inventory
-below remains in scope.
+As of the current checkpoint, the additive Rust processing service implements 143
+compatibility `/api/v1/*` routes and one health route. The latest configuration,
+mobile-scanner, synchronous-pipeline, and watched-folder slices, including persisted anonymous
+analytics onboarding, pass focused compilation, strict linting, and unit/HTTP integration tests;
+the full native-PDFium suite must still be rerun for this checkpoint. This is
+implementation progress, not cutover evidence: Java remains the production route
+owner and the much larger non-UI inventory below remains in scope.
+
+The same Rust runtime now owns the six read-only `/api/v1/ui-data/*` metadata
+endpoints used by the unchanged client (footer, home, licenses, pipeline templates,
+OCR languages, and shared signature/font metadata). This does not port the UI;
+personalized signature state remains behind the authentication migration and a final
+Rust deployment must resolve any generated `UNKNOWN` license entries and the notices
+for retained native tools before release.
+
+The Rust workspace also contains an additive AI-engine foundation with the Python
+engine's health, shared-secret, tenant boundary, and one self-contained document
+classifier route. The MCP capability manifest intentionally returns `501` for
+the larger unported agent registry, so this remains implementation progress—not
+AI-engine cutover evidence.
 
 The versioned cross-surface inventory, including AI routes, desktop commands, and data
 boundaries, is maintained in `docs/contracts/legacy-runtime-baseline.md`.

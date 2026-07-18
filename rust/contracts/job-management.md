@@ -1,0 +1,41 @@
+# Asynchronous job management — `JobController`
+
+Rust compatibility contract for the single-node portion of Java's general job API.
+
+## Implemented flow
+
+`POST /api/v1/convert/pdf/text-editor?async=true` retains its specialized PDF→JSON worker. In
+addition, `?async=true` now opts the ported processing POST endpoints into a generic wrapper. It
+streams the exact encoded multipart request into an isolated private temporary directory before
+replying with `{ "jobId": "<random 128-bit id>" }`; the background worker reconstructs the
+request for the normal endpoint and streams the successful response into the job directory. This
+preserves every endpoint's multipart extractor contract without retaining upload or output files
+in memory. Job status reports `complete`, `error`, `progress`, `stage`, and `note` at
+`GET /api/v1/general/job/{jobId}`. The result endpoints are:
+
+- `GET /api/v1/general/job/{jobId}/result` — download the one result file.
+- `GET /api/v1/general/job/{jobId}/result/files` — JSON result-file metadata.
+- `GET /api/v1/general/files/{fileId}/metadata` — one result-file's metadata.
+- `GET /api/v1/general/files/{fileId}` — download the result file.
+- `DELETE /api/v1/general/job/{jobId}` — mark an in-flight job cancelled. A completed job returns
+  400, and an unknown job returns 404.
+
+Results are kept for 30 minutes after completion and are deleted recursively with their private
+directory after expiry. Job and file identifiers are random 128-bit values; neither identifier is
+interpreted as a filesystem path.
+
+## Deliberately not claimed
+
+This slice is process-local. Java's `JobController` also has authenticated ownership validation,
+distributed `JobStore`/Valkey write-through, sticky-410/503 cluster handling, queue position
+reporting, retries/timeouts, and cancellation that can interrupt native processing. The Rust
+wrapper supports the ported processing endpoints rather than every Java `@AutoJobPostMapping`
+controller: job/control routes, mobile scanner, pipeline, settings mutation, and hardware
+certificate enumeration remain synchronous. Cancellation prevents publishing an in-flight result
+but cannot forcibly stop a native worker that is already executing.
+
+## Verification
+
+`tests/pdf_text_editor_endpoint.rs` starts the specialized PDF→JSON job and a generic
+JSON→PDF processing job, polls each to completion, and downloads/list result files by both job and
+file ID.

@@ -18,6 +18,7 @@ use rxing::{
     MultiFormatReader, Reader,
     common::{GlobalHistogramBinarizer, HybridBinarizer},
 };
+use serde::Serialize;
 use tempfile::tempdir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -25,6 +26,7 @@ use crate::{
     page_selection::{PageSelectionError, parse_page_list},
     pdf_bookmarks::{BookmarkEntry, append_bookmarks},
     pdf_merge::MergeInput,
+    pdf_scanner_effect::{ScannerEffectParams, calculate_safe_resolution, process_page},
 };
 
 pub const PDFIUM_LIBRARY_PATH_ENV: &str = "STIRLING_PDFIUM_LIBRARY_PATH";
@@ -88,6 +90,44 @@ pub enum PdfiumTextLocationAttempt {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedTextChunk {
+    pub id: String,
+    pub page: usize,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub enum PdfiumTextChunksAttempt {
+    Extracted(Vec<DetectedTextChunk>),
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+/// Bounded text and image-presence data needed by the math-audit orchestrator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfiumAiPageContent {
+    pub text: String,
+    pub has_images: bool,
+}
+
+/// A successful AI-content scan or a clean indication that `PDFium` is absent.
+#[derive(Debug)]
+pub enum PdfiumAiPageContentAttempt {
+    Extracted(Vec<PdfiumAiPageContent>),
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
 #[derive(Debug)]
 pub enum PdfiumTitleAttempt {
     Detected(Option<String>),
@@ -109,6 +149,24 @@ pub enum PdfiumExtractImagesAttempt {
 #[derive(Debug)]
 pub enum PdfiumFlattenAttempt {
     Flattened,
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum PdfiumInvertAttempt {
+    Inverted,
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum PdfiumScannerAttempt {
+    Processed,
     Unavailable {
         explicitly_configured: bool,
         details: String,
@@ -321,6 +379,72 @@ pub enum PdfiumFlattenError {
         dpi: i32,
     },
     #[error("could not write the flattened PDF with PDFium: {0}")]
+    Save(#[source] PdfiumError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PdfiumInvertError {
+    #[error("could not lock the PDFium runtime because another operation panicked")]
+    RuntimePoisoned,
+    #[error("could not read '{filename}' as a PDF with PDFium: {source}")]
+    ReadPdf {
+        filename: String,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not create the inverted PDF with PDFium: {0}")]
+    CreateDocument(#[source] PdfiumError),
+    #[error("could not {operation} page {page_number} with PDFium: {source}")]
+    Page {
+        operation: &'static str,
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(
+        "page {page_number} would render to unsafe dimensions {width}x{height} pixels at {dpi} DPI"
+    )]
+    UnsafeRenderDimensions {
+        page_number: usize,
+        width: u64,
+        height: u64,
+        dpi: i32,
+    },
+    #[error("could not write the inverted PDF with PDFium: {0}")]
+    Save(#[source] PdfiumError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PdfiumScannerError {
+    #[error("could not lock the PDFium runtime because another operation panicked")]
+    RuntimePoisoned,
+    #[error("could not read '{filename}' as a PDF with PDFium: {source}")]
+    ReadPdf {
+        filename: String,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not create the scanner-effect PDF with PDFium: {0}")]
+    CreateDocument(#[source] PdfiumError),
+    #[error("the provided PDF contains no pages to process")]
+    EmptyDocument,
+    #[error("could not {operation} page {page_number} with PDFium: {source}")]
+    Page {
+        operation: &'static str,
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(
+        "page {page_number} would render to unsafe dimensions {width}x{height} pixels at {dpi} DPI"
+    )]
+    UnsafeRenderDimensions {
+        page_number: usize,
+        width: u64,
+        height: u64,
+        dpi: i32,
+    },
+    #[error("could not write the scanner-effect PDF with PDFium: {0}")]
     Save(#[source] PdfiumError),
 }
 
@@ -649,6 +773,252 @@ fn checked_render_dimensions(
             height,
             dpi,
         })?;
+    Ok((pixel_width, pixel_height))
+}
+
+/// Renders every page to a raster image, inverts its colors, and rebuilds the
+/// PDF with one full-page inverted image per page.
+///
+/// # Errors
+///
+/// Returns [`PdfiumInvertError`] when the runtime is poisoned, the PDF cannot be
+/// read, a page renders to unsafe dimensions, or the output cannot be written.
+pub fn try_invert_pdf_to_file(
+    input_path: &Path,
+    filename: &str,
+    render_dpi: i32,
+    output_path: &Path,
+) -> Result<PdfiumInvertAttempt, PdfiumInvertError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium
+            .lock()
+            .map_err(|_| PdfiumInvertError::RuntimePoisoned)?,
+        Err(details) => {
+            return Ok(PdfiumInvertAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let source = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumInvertError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+
+    let mut output = pdfium
+        .create_new_pdf()
+        .map_err(PdfiumInvertError::CreateDocument)?;
+    for page_index in source.pages().as_range() {
+        let page_number = page_number(page_index);
+        let page = source
+            .pages()
+            .get(page_index)
+            .map_err(|source| PdfiumInvertError::Page {
+                operation: "read",
+                page_number,
+                source,
+            })?;
+        let width = page.width();
+        let height = page.height();
+        let (pixel_width, pixel_height) =
+            checked_invert_render_dimensions(width, height, render_dpi, page_number)?;
+        let render_config = PdfRenderConfig::new()
+            .set_fixed_size(pixel_width, pixel_height)
+            .render_annotations(true)
+            .render_form_data(true);
+        let mut rendered = DynamicImage::ImageRgb8(
+            page.render_with_config(&render_config)
+                .and_then(|bitmap| bitmap.as_image())
+                .map_err(|source| PdfiumInvertError::Page {
+                    operation: "render",
+                    page_number,
+                    source,
+                })?
+                .to_rgb8(),
+        );
+        rendered.invert();
+        let mut output_page = output
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::new_custom(width, height))
+            .map_err(|source| PdfiumInvertError::Page {
+                operation: "create output for",
+                page_number,
+                source,
+            })?;
+        output_page
+            .objects_mut()
+            .create_image_object(
+                PdfPoints::ZERO,
+                PdfPoints::ZERO,
+                &rendered,
+                Some(width),
+                Some(height),
+            )
+            .map_err(|source| PdfiumInvertError::Page {
+                operation: "add the inverted image for",
+                page_number,
+                source,
+            })?;
+    }
+    output
+        .save_to_file(output_path)
+        .map_err(PdfiumInvertError::Save)?;
+    Ok(PdfiumInvertAttempt::Inverted)
+}
+
+fn checked_invert_render_dimensions(
+    width: PdfPoints,
+    height: PdfPoints,
+    dpi: i32,
+    page_number: usize,
+) -> Result<(i32, i32), PdfiumInvertError> {
+    let width = render_dimension(width.value, dpi);
+    let height = render_dimension(height.value, dpi);
+    let max_dimension = u64::from(i32::MAX.unsigned_abs());
+    let unsafe_dimensions = || PdfiumInvertError::UnsafeRenderDimensions {
+        page_number,
+        width,
+        height,
+        dpi,
+    };
+    if width == 0
+        || height == 0
+        || width > max_dimension
+        || height > max_dimension
+        || width.saturating_mul(height) > max_dimension
+    {
+        return Err(unsafe_dimensions());
+    }
+    let pixel_width = i32::try_from(width).map_err(|_| unsafe_dimensions())?;
+    let pixel_height = i32::try_from(height).map_err(|_| unsafe_dimensions())?;
+    Ok((pixel_width, pixel_height))
+}
+
+/// Rasterizes each page, runs the scanner-effect pipeline, and rebuilds the PDF
+/// with one processed image per page placed on a same-sized output page.
+///
+/// # Errors
+///
+/// Returns [`PdfiumScannerError`] when the runtime is poisoned, the PDF cannot be
+/// read, it has no pages, a page renders to unsafe dimensions, or the output
+/// cannot be written.
+pub fn try_scanner_effect_to_file(
+    input_path: &Path,
+    filename: &str,
+    params: &ScannerEffectParams,
+    output_path: &Path,
+) -> Result<PdfiumScannerAttempt, PdfiumScannerError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium
+            .lock()
+            .map_err(|_| PdfiumScannerError::RuntimePoisoned)?,
+        Err(details) => {
+            return Ok(PdfiumScannerAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let source = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumScannerError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    if source.pages().is_empty() {
+        return Err(PdfiumScannerError::EmptyDocument);
+    }
+
+    let mut output = pdfium
+        .create_new_pdf()
+        .map_err(PdfiumScannerError::CreateDocument)?;
+    for page_index in source.pages().as_range() {
+        let page_number = page_number(page_index);
+        let page = source
+            .pages()
+            .get(page_index)
+            .map_err(|source| PdfiumScannerError::Page {
+                operation: "read",
+                page_number,
+                source,
+            })?;
+        let width = page.width();
+        let height = page.height();
+        let safe_dpi = calculate_safe_resolution(width.value, height.value, params.resolution);
+        let (pixel_width, pixel_height) =
+            checked_scanner_render_dimensions(width, height, safe_dpi, page_number)?;
+        let render_config = PdfRenderConfig::new()
+            .set_fixed_size(pixel_width, pixel_height)
+            .render_annotations(true)
+            .render_form_data(true);
+        let rendered = page
+            .render_with_config(&render_config)
+            .and_then(|bitmap| bitmap.as_image())
+            .map_err(|source| PdfiumScannerError::Page {
+                operation: "render",
+                page_number,
+                source,
+            })?
+            .to_rgb8();
+        let processed = process_page(rendered, width.value, height.value, params);
+        let mut output_page = output
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::new_custom(width, height))
+            .map_err(|source| PdfiumScannerError::Page {
+                operation: "create output for",
+                page_number,
+                source,
+            })?;
+        output_page
+            .objects_mut()
+            .create_image_object(
+                PdfPoints::new(processed.offset_x),
+                PdfPoints::new(processed.offset_y),
+                &DynamicImage::ImageRgb8(processed.image),
+                Some(PdfPoints::new(processed.draw_width)),
+                Some(PdfPoints::new(processed.draw_height)),
+            )
+            .map_err(|source| PdfiumScannerError::Page {
+                operation: "add the scanned image for",
+                page_number,
+                source,
+            })?;
+    }
+    output
+        .save_to_file(output_path)
+        .map_err(PdfiumScannerError::Save)?;
+    Ok(PdfiumScannerAttempt::Processed)
+}
+
+fn checked_scanner_render_dimensions(
+    width: PdfPoints,
+    height: PdfPoints,
+    dpi: i32,
+    page_number: usize,
+) -> Result<(i32, i32), PdfiumScannerError> {
+    let width = render_dimension(width.value, dpi);
+    let height = render_dimension(height.value, dpi);
+    let max_dimension = u64::from(i32::MAX.unsigned_abs());
+    let unsafe_dimensions = || PdfiumScannerError::UnsafeRenderDimensions {
+        page_number,
+        width,
+        height,
+        dpi,
+    };
+    if width == 0
+        || height == 0
+        || width > max_dimension
+        || height > max_dimension
+        || width.saturating_mul(height) > max_dimension
+    {
+        return Err(unsafe_dimensions());
+    }
+    let pixel_width = i32::try_from(width).map_err(|_| unsafe_dimensions())?;
+    let pixel_height = i32::try_from(height).map_err(|_| unsafe_dimensions())?;
     Ok((pixel_width, pixel_height))
 }
 
@@ -1518,6 +1888,176 @@ pub fn try_locate_text_anchors(
         locations.push(location);
     }
     Ok(PdfiumTextLocationAttempt::Located(locations))
+}
+
+/// Extracts bounded positioned PDF text segments for an AI annotation request.
+///
+/// `PDFium` exposes segment geometry in PDF user-space coordinates, which is the
+/// coordinate system expected by the annotation writer. Segment boundaries are
+/// intentionally preserved instead of trying to reconstruct a whole page into
+/// an unbounded string; the caller can give each segment to an AI engine as a
+/// stable independently-addressable chunk.
+///
+/// # Errors
+///
+/// Returns [`PdfiumTextError`] when a configured `PDFium` runtime cannot read the
+/// document or its page text. A missing non-configured runtime is returned as
+/// [`PdfiumTextChunksAttempt::Unavailable`] so the HTTP layer can report that
+/// this positioned-text feature is unavailable rather than emitting guessed
+/// annotation locations.
+pub fn try_extract_positioned_text_chunks(
+    input_path: &Path,
+    filename: &str,
+    max_chunks: usize,
+    max_text_characters: usize,
+) -> Result<PdfiumTextChunksAttempt, PdfiumTextError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium,
+        Err(details) => {
+            return Ok(PdfiumTextChunksAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let pdfium = pdfium
+        .lock()
+        .map_err(|_| PdfiumTextError::RuntimePoisoned)?;
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumTextError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let page_count = document.pages().len();
+    let mut chunks = Vec::new();
+    for page_index in 0..page_count {
+        if chunks.len() == max_chunks {
+            break;
+        }
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumTextError::ReadPage {
+                    page_number: usize::try_from(page_index).unwrap_or_default() + 1,
+                    source,
+                })?;
+        let text = page.text().map_err(|source| PdfiumTextError::ReadText {
+            page_number: usize::try_from(page_index).unwrap_or_default() + 1,
+            source,
+        })?;
+        let mut chunk_index = 0_usize;
+        for segment in text.segments().iter() {
+            if chunks.len() == max_chunks {
+                break;
+            }
+            let value = segment.text();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let bounds = segment.bounds();
+            let width = bounds.width().value;
+            let height = bounds.height().value;
+            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let page = usize::try_from(page_index).unwrap_or_default();
+            chunks.push(DetectedTextChunk {
+                id: format!("p{page}-c{chunk_index}"),
+                page,
+                x: bounds.left().value,
+                y: bounds.bottom().value,
+                width,
+                height,
+                text: truncate_characters(value, max_text_characters),
+            });
+            chunk_index = chunk_index.saturating_add(1);
+        }
+    }
+    Ok(PdfiumTextChunksAttempt::Extracted(chunks))
+}
+
+/// Extracts bounded plain text and image-presence flags for every PDF page.
+///
+/// This is intentionally not a general document extractor: its only consumers
+/// classify pages and fulfil the bounded math-audit protocol. `PDFium` segments
+/// preserve visual line groupings better than low-level content-stream token
+/// concatenation, and the per-page text budget keeps the engine payload bounded.
+///
+/// # Errors
+///
+/// Returns [`PdfiumTextError`] when a configured `PDFium` runtime cannot read
+/// the document. A missing non-configured runtime returns
+/// [`PdfiumAiPageContentAttempt::Unavailable`].
+pub fn try_extract_ai_page_content(
+    input_path: &Path,
+    filename: &str,
+    max_text_characters_per_page: usize,
+) -> Result<PdfiumAiPageContentAttempt, PdfiumTextError> {
+    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium,
+        Err(details) => {
+            return Ok(PdfiumAiPageContentAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let pdfium = pdfium
+        .lock()
+        .map_err(|_| PdfiumTextError::RuntimePoisoned)?;
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumTextError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let mut pages = Vec::new();
+    for page_index in 0..document.pages().len() {
+        let page_number = usize::try_from(page_index).unwrap_or_default() + 1;
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumTextError::ReadPage {
+                    page_number,
+                    source,
+                })?;
+        let has_images = page
+            .objects()
+            .iter()
+            .any(|object| object.as_image_object().is_some());
+        let text = page.text().map_err(|source| PdfiumTextError::ReadText {
+            page_number,
+            source,
+        })?;
+        let mut content = String::new();
+        for segment in text.segments().iter() {
+            let segment = segment.text();
+            let segment = segment.trim();
+            if segment.is_empty() || content.chars().count() >= max_text_characters_per_page {
+                continue;
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            let remaining = max_text_characters_per_page.saturating_sub(content.chars().count());
+            content.extend(segment.chars().take(remaining));
+        }
+        pages.push(PdfiumAiPageContent {
+            text: content,
+            has_images,
+        });
+    }
+    Ok(PdfiumAiPageContentAttempt::Extracted(pages))
+}
+
+fn truncate_characters(value: &str, max_characters: usize) -> String {
+    value.chars().take(max_characters).collect()
 }
 
 pub fn try_detect_largest_text_title(

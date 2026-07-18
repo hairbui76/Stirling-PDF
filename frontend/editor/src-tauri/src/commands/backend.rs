@@ -1,7 +1,7 @@
 use tauri_plugin_shell::ShellExt;
 use tauri::Manager;
-use std::sync::Mutex;
 use std::path::{Path, PathBuf};
+use std::{env, sync::Mutex};
 use crate::utils::{add_log, app_data_dir};
 use crate::state::connection_state::{AppConnectionState, ConnectionMode};
 
@@ -110,6 +110,22 @@ fn find_stirling_jar(resource_dir: &PathBuf) -> Result<PathBuf, String> {
     let jar_path = jar_files[0].path();
     add_log(format!("📋 Selected JAR: {:?}", jar_path.file_name().unwrap()));
     Ok(jar_path)
+}
+
+/// Optional native Rust sidecar for migration testing. The bundled Java JAR
+/// remains the default until endpoint parity is proven.
+fn native_backend_path() -> Result<Option<PathBuf>, String> {
+    let Some(path) = env::var_os("STIRLING_NATIVE_BACKEND_PATH") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(format!(
+            "STIRLING_NATIVE_BACKEND_PATH must point to an executable file: {}",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
 }
 
 // Normalize path to remove Windows UNC prefix
@@ -295,6 +311,39 @@ fn run_stirling_pdf_jar(app: &tauri::AppHandle, java_path: &PathBuf, jar_path: &
     Ok(())
 }
 
+fn run_native_backend(app: &tauri::AppHandle, native_path: &PathBuf) -> Result<(), String> {
+    let work_dir = app_data_dir();
+    let config_dir = work_dir.join("configs");
+    let log_dir = work_dir.join("logs");
+    std::fs::create_dir_all(&work_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&config_dir).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+
+    let native_path = normalize_path(native_path);
+    add_log(format!("🦀 Starting native Rust backend: {}", native_path.display()));
+    let sidecar_command = app
+        .shell()
+        .command(native_path.to_string_lossy().as_ref())
+        .current_dir(&work_dir)
+        .env("TAURI_PARENT_PID", std::process::id().to_string())
+        .env("STIRLING_PORT", "0")
+        .env("STIRLING_PDF_CONFIG_DIR", config_dir.to_string_lossy().as_ref())
+        .env("STIRLING_PDF_LOG_DIR", log_dir.to_string_lossy().as_ref())
+        .env("STIRLING_PDF_WORK_DIR", work_dir.to_string_lossy().as_ref());
+    let (rx, child) = sidecar_command.spawn().map_err(|error| {
+        let message = format!("❌ Failed to spawn native Rust sidecar: {}", error);
+        add_log(message.clone());
+        message
+    })?;
+    {
+        let mut process_guard = BACKEND_PROCESS.lock().unwrap();
+        *process_guard = Some(child);
+    }
+    add_log("✅ Native Rust backend started, monitoring output...".to_string());
+    monitor_backend_output(rx);
+    Ok(())
+}
+
 // Monitor backend output in a separate task
 fn monitor_backend_output(mut rx: tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>) {
     tokio::spawn(async move {
@@ -426,6 +475,17 @@ pub async fn start_backend(
     })?;
 
     add_log(format!("🔍 Resource directory: {:?}", resource_dir));
+
+    if let Some(native_path) = native_backend_path().inspect_err(|e| {
+        reset_starting_flag();
+        add_log(e.clone());
+    })? {
+        run_native_backend(&app, &native_path).inspect_err(|_error| {
+            reset_starting_flag();
+        })?;
+        reset_starting_flag();
+        return Ok("Native Rust backend startup initiated successfully".to_string());
+    }
 
     // Find the bundled JRE
     let java_executable = find_bundled_jre(&resource_dir).map_err(|e| {
