@@ -16,7 +16,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{DEFAULT_COST, hash, verify};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt as _;
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
@@ -40,7 +40,6 @@ use crate::security_crypto::{
     ProtectedSecretCipher, SecurityCryptoError, generate_totp_secret, valid_totp_step,
 };
 use crate::security_jwt::VerifiedSupabaseIdentity;
-use crate::security_policy::LicenseTier;
 
 const TOKEN_BYTES: usize = 32;
 const MAX_BEARER_TOKEN_BYTES: usize = 128;
@@ -2295,6 +2294,66 @@ impl SecurityStore {
         Ok(())
     }
 
+    /// Inserts a fully specified audit event, returning its new id.
+    ///
+    /// The standard recorders (`record_audit`, `record_http_audit`) synthesize a
+    /// fixed request-shaped payload. Audit-derived portal surfaces additionally
+    /// read `files`, `automation`, `policyName`, and `policySteps` keys that the
+    /// recorders never write; this seam persists events carrying those keys so
+    /// those surfaces (and their tests) can be exercised against representative
+    /// data. The `path` and `outcome` columns are derived from the supplied
+    /// `data` document when present, so a later read reconstructs the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for bounded-field violations, an unparsable `data`
+    /// document, or unavailable persistent state.
+    pub fn insert_audit_event(
+        &self,
+        principal: &str,
+        source: &str,
+        event_type: &str,
+        data: &str,
+        created_at: i64,
+    ) -> Result<i64, SecurityError> {
+        for value in [principal, source, event_type] {
+            if value.is_empty() || value.len() > MAX_AUDIT_VALUE_BYTES {
+                return Err(SecurityError::InvalidInput);
+            }
+        }
+        let parsed =
+            serde_json::from_str::<serde_json::Value>(data).map_err(|_| SecurityError::InvalidInput)?;
+        let (path, outcome) = parsed.as_object().map_or_else(
+            || (String::new(), String::new()),
+            |object| {
+                let path = object
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let outcome = object
+                    .get("outcome")
+                    .or_else(|| object.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                (path, outcome)
+            },
+        );
+        if path.len() > MAX_AUDIT_VALUE_BYTES {
+            return Err(SecurityError::InvalidInput);
+        }
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO security_audit_events
+             (user_id, principal, source, data, session_id, correlation_id,
+              event_type, path, outcome, created_at)
+             VALUES (NULL, ?1, ?2, ?3, '', '', ?4, ?5, ?6, ?7)",
+            params![principal, source, data, event_type, path, outcome, created_at],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
     /// Persists one post-handler controller event for the reviewed HTTP audit
     /// boundary. Unlike the legacy mutation helper, a returned HTTP error is
     /// still a successful method outcome; Java records failure only when the
@@ -3717,6 +3776,7 @@ impl SecurityStore {
             connection: Mutex::new(connection),
             bcrypt_cost: 4,
             secret_cipher: Some(ProtectedSecretCipher::random()),
+            license_state: RwLock::new(None),
         })
     }
 }
@@ -4377,6 +4437,7 @@ fn normalize_roles<const N: usize>(roles: [&str; N]) -> Result<BTreeSet<String>,
     Ok(normalized)
 }
 
+#[allow(clippy::too_many_lines)]
 fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(

@@ -88,6 +88,10 @@ pub fn endpoint_entitlement(method: &Method, path: &str) -> EndpointEntitlement 
                 | "/api/v1/proprietary/ui-data/audit-export"
                 | "/api/v1/proprietary/ui-data/usage-endpoint-statistics"
                 | "/api/v1/usage/fleet-stats"
+                // Portal audit-derived surfaces (portal_audit::{DOCUMENTS_PATH,
+                // INFRA_AUDIT_LOG_PATH}); @EnterpriseEndpoint in Java.
+                | "/api/v1/documents"
+                | "/api/v1/infrastructure/audit-log"
         ))
         || (method == Method::DELETE && path == "/api/v1/audit/cleanup/before")
         || (method == Method::POST && path == "/api/v1/proprietary/ui-data/audit-clear-all");
@@ -280,6 +284,16 @@ mod tests {
             endpoint_policy(&Method::GET, "/api/v1/config/app-config"),
             EndpointPolicy::Authenticated
         );
+        // Portal audit surfaces authenticate every caller, then resolve the
+        // per-caller audit scope in the handler (admin/team-leader/denied).
+        assert_eq!(
+            endpoint_policy(&Method::GET, "/api/v1/documents"),
+            EndpointPolicy::Authenticated
+        );
+        assert_eq!(
+            endpoint_policy(&Method::GET, "/api/v1/infrastructure/audit-log"),
+            EndpointPolicy::Authenticated
+        );
         assert_eq!(
             endpoint_policy(&Method::GET, "/api/v1/auth/login"),
             EndpointPolicy::Authenticated
@@ -408,6 +422,8 @@ mod tests {
                 "/api/v1/proprietary/ui-data/usage-endpoint-statistics",
             ),
             (Method::GET, "/api/v1/usage/fleet-stats"),
+            (Method::GET, "/api/v1/documents"),
+            (Method::GET, "/api/v1/infrastructure/audit-log"),
         ] {
             let entitlement = endpoint_entitlement(&method, path);
             assert_eq!(entitlement, EndpointEntitlement::Enterprise);

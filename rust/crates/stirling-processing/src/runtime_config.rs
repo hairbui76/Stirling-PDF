@@ -24,6 +24,8 @@ use crate::license::LicenseConfig;
 use crate::runtime_dependencies::discover_dependency_groups;
 use crate::security_jwt::SupabaseJwtConfig;
 use crate::server_certificate::ServerCertificateConfig;
+use crate::storage::{StorageConfig, StorageSharingConfig};
+use crate::workflow_signing::WorkflowSigningConfig;
 
 // Mirrors EndpointConfiguration.init() in the Java service. Values are whitespace-separated
 // endpoint keys to keep the compatibility table readable while preserving the Java group names.
@@ -1235,6 +1237,99 @@ impl RuntimeConfig {
         self.signatures_dir().join("ALL_USERS")
     }
 
+    /// Builds the durable storage configuration from the `storage.*` settings
+    /// tree, mirroring Java's `ApplicationProperties.Storage` defaults. The
+    /// per-request upload ceiling is supplied by the caller because it derives
+    /// from the shared runtime body limit rather than the storage section.
+    pub(crate) fn storage_config(&self, max_upload_bytes: u64) -> StorageConfig {
+        let installation = installation_path(&self.settings_path);
+        let configured_base = self.string(
+            &["storage", "local", "basePath"],
+            "STORAGE_LOCAL_BASEPATH",
+            "",
+        );
+        let base_path = if configured_base.trim().is_empty() {
+            installation.join("storage")
+        } else {
+            PathBuf::from(configured_base)
+        };
+        // Storage tables live alongside the security schema so file ownership can
+        // join `security_users`, matching how `classification_database_path`
+        // shares the durable security database.
+        let database_path = resolve_configured_path(
+            &self.security_bootstrap_config().database_path,
+            &self.string(&["storage", "databasePath"], "STORAGE_DATABASEPATH", ""),
+        );
+        let sharing = StorageSharingConfig {
+            enabled: self.boolean(
+                &["storage", "sharing", "enabled"],
+                "STORAGE_SHARING_ENABLED",
+                false,
+            ),
+            link_enabled: self.boolean(
+                &["storage", "sharing", "linkEnabled"],
+                "STORAGE_SHARING_LINKENABLED",
+                true,
+            ),
+            email_enabled: self.boolean(
+                &["storage", "sharing", "emailEnabled"],
+                "STORAGE_SHARING_EMAILENABLED",
+                false,
+            ),
+            link_expiration_days: u64::try_from(self.signed_integer(
+                &["storage", "sharing", "linkExpirationDays"],
+                "STORAGE_SHARING_LINKEXPIRATIONDAYS",
+                3,
+            ))
+            .unwrap_or(3),
+        };
+        StorageConfig {
+            enabled: self.boolean(&["storage", "enabled"], "STORAGE_ENABLED", false),
+            provider: self.string(&["storage", "provider"], "STORAGE_PROVIDER", "local"),
+            base_path,
+            database_path,
+            sharing,
+            max_file_bytes: megabytes_to_bytes(self.signed_integer(
+                &["storage", "quotas", "maxFileMb"],
+                "STORAGE_QUOTAS_MAXFILEMB",
+                -1,
+            )),
+            max_user_bytes: megabytes_to_bytes(self.signed_integer(
+                &["storage", "quotas", "maxStorageMbPerUser"],
+                "STORAGE_QUOTAS_MAXSTORAGEMBPERUSER",
+                -1,
+            )),
+            max_total_bytes: megabytes_to_bytes(self.signed_integer(
+                &["storage", "quotas", "maxStorageMbTotal"],
+                "STORAGE_QUOTAS_MAXSTORAGEMBTOTAL",
+                -1,
+            )),
+            max_upload_bytes,
+        }
+    }
+
+    /// Builds the collaborative signing configuration from `storage.signing.*`.
+    /// Signing tables share the durable security database so participant and
+    /// owner rows can reference `security_users`.
+    pub(crate) fn workflow_signing_config(&self) -> WorkflowSigningConfig {
+        let database_path = resolve_configured_path(
+            &self.security_bootstrap_config().database_path,
+            &self.string(
+                &["storage", "signing", "databasePath"],
+                "STORAGE_SIGNING_DATABASEPATH",
+                "",
+            ),
+        );
+        WorkflowSigningConfig {
+            enabled: self.boolean(
+                &["storage", "signing", "enabled"],
+                "STORAGE_SIGNING_ENABLED",
+                false,
+            ),
+            database_path,
+        }
+    }
+
     /// Returns the live login-agreement Markdown directory.
     #[must_use]
     pub(crate) fn login_agreement_directory(&self) -> PathBuf {
@@ -1989,6 +2084,14 @@ fn resolve_configured_path(default: &Path, configured: &str) -> PathBuf {
         return default.to_path_buf();
     }
     PathBuf::from(configured)
+}
+
+/// Converts a Java-style megabyte quota into a byte ceiling. Negative values
+/// (Java's `-1` sentinel) mean "unlimited" and map to `None`.
+fn megabytes_to_bytes(megabytes: i64) -> Option<u64> {
+    u64::try_from(megabytes)
+        .ok()
+        .map(|value| value.saturating_mul(1024 * 1024))
 }
 
 fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {

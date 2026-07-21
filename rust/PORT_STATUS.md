@@ -4,11 +4,17 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation:** `task rust:check` passes the full locked workspace with
-the pinned PDFium runtime: formatting, strict workspace/all-target clippy, 107
-AI-engine unit/binary/integration tests, 362 processing library unit tests, every endpoint
-integration suite, and doc tests. External-runtime happy paths remain
-conditional on their respective tools and services.
+**Latest validation (2026-07-22):** `cargo build` and strict
+`cargo clippy --workspace --all-targets --locked -- -D warnings` pass with the pinned
+PDFium runtime (the whole workspace, including every endpoint test target, compiles and
+lints clean). The processing library unit suite runs 360/361 green; the lone failure,
+`policy_config::lexical_path_normalization_removes_dot_segments`, is a POSIX-absolute-path
+assumption that only fails on Windows dev machines (`/srv/...` is not absolute there) and
+passes on the Linux runtime target. The durable-storage and collaborative-signing endpoint
+suites pass. External-runtime happy paths remain conditional on their respective tools and
+services. Note: a full single-invocation `cargo test --workspace` is memory-sensitive on
+Windows dev boxes (the parallel link of ~100 test binaries can corrupt artifacts); run the
+lib suite plus endpoint suites in smaller batches locally, or rely on Linux/CI.
 
 ## Ported compatibility endpoints
 
@@ -180,6 +186,37 @@ auto-rename/auto-split, plus:
 - Secured `ui-data/tessdata-languages` and `ui-data/tessdata/download` — administrator-only
   installed/official language discovery with a ten-minute cache plus bounded, atomic, link-safe
   `.traineddata` installation under the configured runtime directory. See `contracts/ui-data.md`.
+- Secured durable storage (`storage/files`, `storage/files/{id}` + `/download` + `/folder`,
+  `storage/files/folder` bulk move, `storage/folders` + `/{id}`, and user/link shares under
+  `storage/files/{id}/shares/*` and `storage/share-links/*`) — owner-scoped local-provider
+  file storage that shares the durable security database (so ownership joins `security_users`).
+  Java-compatible `storage.*` config (provider, `local.basePath`, `quotas.*`, `sharing.*`),
+  path-traversal-safe object keys, per-user/total/file quotas, folder trees, and share-link /
+  user-share ACLs with roles. Mounted in the reviewed secured router; unauthenticated access is
+  401 and cross-owner access is 404. `config/app-config` now reports the resolved
+  `storageEnabled`/`storageSharingEnabled`/`storageShareLinksEnabled`/`storageShareEmailEnabled`/
+  `storageGroupSigningEnabled` flags (plus `enableLogin`/`activeSecurity`) in secured mode.
+  Closes Java `FileStorageController`, `FolderController`, `FileFolderPlacementController`.
+- Secured collaborative (group) signing — owner session/participant lifecycle under
+  `security/cert-sign/{sessions,sign-requests}/*` (authenticated) and public token-scoped
+  participant access under `workflow/participant/*`. Encrypted participant submissions
+  (`ProtectedSecretCipher`), server-certificate-backed signing, wet-signature overlays (typed
+  text via Helvetica + raster images, normalized page-relative placement — see the new
+  `overlay_signatures_to_file` in `pdf_image_overlay.rs`), an optional summary page, and an
+  invisible incremental CMS signature over the finalized PDF. Gated by `storage.signing.enabled`;
+  fails closed (403) when disabled. Closes Java `SigningSessionController`,
+  `WorkflowParticipantController`.
+- Enterprise-gated portal audit views — `GET /api/v1/documents` (Documents review queue) and
+  `GET /api/v1/infrastructure/audit-log` (Infrastructure → Audit tab): read-only projections of
+  the durable audit store with the faithful Java category/action/target/status/pretty-tool
+  shaping, policy-dispatch detection, and read-noise (`UI_DATA`/`HTTP_REQUEST`) exclusion.
+  Enforced through the same central Enterprise entitlement + `enforce_security` gate as
+  `/api/v1/audit/*`; scope resolves admin → whole-server, team owner → team-principal-scoped,
+  else 403. Closes Java `PortalDocumentsController`, `PortalInfraAuditController`. Parity gap:
+  the reviewed HTTP audit recorder does not yet enrich events with `files`/`policyName`/
+  `automation`/`policySteps`, so live-traffic events currently yield no documents / no policy
+  shaping until that enrichment is ported (the projections are correct given enriched data).
+  See `contracts/portal-audit.md`.
 
 ## Remaining (not yet ported)
 
@@ -396,10 +433,42 @@ MCP capability manifest intentionally excludes this internal classification
 primitive; it advertises only the eight user-facing capabilities shared with the
 legacy oracle.
 
+### SaaS hosted-cloud layer (`app/saas/`) — PAUSED, unverifiable in this env
+
+With durable storage and collaborative signing ported, the entire OSS +
+proprietary-security + processing backend is ported. The remaining unported Java
+controllers all live in the hosted-SaaS product and depend on an entire un-ported
+external-service domain (Supabase auth, payment gateways, cloud billing/entitlement,
+instance registry) that cannot be exercised or verified in this dev environment — the
+same rationale that PAUSED the external-tool converters. They are deliberately deferred:
+
+- `AiCreateController` / `AiCreateInternalController` — `ai/create/sessions/*`
+  (AI document-creation sessions + `JobChargeService` metering).
+- `AiProxyController` (SaaS extras) — `ai/{generate_section, generate_all_sections,
+  chat/*, edit/sessions/*, pdf-editor/*, intent/check, progressive_render,
+  style/{userId}, versions/{userId}, import_template, output, pdf/answer}`.
+- `UserRoleWebhookController` — `user-role/*` (Supabase/billing role webhooks).
+- `AccountLinkController` (`account-link/*`), `InstanceController`,
+  `Payg{Wallet,Invoices,PaymentMethod}Controller`, `PricingPolicyAdminController`,
+  `ProcurementController`, `SaasTeamController`, `SaasFleetUsageController` (a `@Profile("saas")`
+  team-scoped alternative on the already-served `usage/fleet-stats` path — needs a saas-mode
+  switch, not a standalone port).
+- `DatabaseController`/`DatabaseControllerEnterprise` — H2-only
+  (`@Conditional(H2SQLCondition)`) DB backup/restore; N/A for the Rust sqlite store
+  (a sqlite-backup equivalent would be net-new, not strict parity).
+
+`CertSignController`'s base `/api/v1/security` and `PrintFileController`'s
+`/api/v1/misc/print-file` show up in naive scans but are false positives — the real
+cert-sign routes are ported and the Java print-file mapping is commented out (inactive).
+
 ## How to find gaps precisely
 
 Use `docs/contracts/legacy-runtime-baseline.md` for the cross-surface baseline and
 the contract files in `rust/contracts/` for implemented behavior and explicit
 gaps. Source-literal counts are not authoritative because Spring composes class
 and method mappings while the Rust service composes public, conditional, and
-review-only secured routers.
+review-only secured routers. When diffing Java `@*Mapping` literals against the Rust
+route constants, STRIP Java comments first — several controllers keep inactive
+endpoints commented out (e.g. `AuditDashboardController`'s `/stats/range`,
+`/principals`, `/latest`; `PrintFileController`'s `/print-file`), and a naive grep
+reports those as false "unported" gaps.

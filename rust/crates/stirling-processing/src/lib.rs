@@ -101,6 +101,7 @@ mod policy_outputs;
 mod policy_s3;
 mod policy_sources;
 mod policy_triggers;
+mod portal_audit;
 mod resource_access;
 pub mod runtime_config;
 mod runtime_dependencies;
@@ -115,11 +116,15 @@ mod server_certificate;
 pub mod signature_assets;
 pub mod signing_key;
 mod smtp_mail;
+mod storage;
+mod storage_http;
 pub mod svg_to_pdf;
 mod tessdata_admin;
 pub mod ui_data;
 pub mod url_to_pdf;
 pub mod vector_conversion;
+mod workflow_signing;
+mod workflow_signing_http;
 
 use std::{
     cmp::Reverse,
@@ -1460,6 +1465,7 @@ impl ProcessingRuntime {
     ///
     /// Returns an error when durable security state cannot be initialized or an
     /// empty repository has no explicitly configured first administrator.
+    #[allow(clippy::too_many_lines)]
     pub fn with_reviewed_security(
         max_upload_bytes: usize,
         timestamp_settings: TimestampSettings,
@@ -1524,6 +1530,44 @@ impl ProcessingRuntime {
         server_certificate
             .initialize()
             .map_err(|error| SecurityStartupError::ServerCertificate(Box::new(error)))?;
+        let storage_upload_bytes = u64::try_from(max_upload_bytes).unwrap_or(u64::MAX);
+        let storage_configuration = runtime_config.storage_config(storage_upload_bytes);
+        let workflow_signing_configuration = runtime_config.workflow_signing_config();
+        let storage_mail_enabled = runtime_config.smtp_mail_config().enabled;
+        let storage_bootstrap = runtime_config.security_bootstrap_config();
+        let storage_enabled = storage_configuration.enabled;
+        let storage_sharing_enabled = storage_enabled && storage_configuration.sharing.enabled;
+        let storage_app_config = storage::StorageAppConfig {
+            enabled: storage_enabled,
+            sharing_enabled: storage_sharing_enabled,
+            share_links_enabled: storage_sharing_enabled
+                && storage_configuration.sharing.link_enabled,
+            share_email_enabled: storage_sharing_enabled
+                && storage_configuration.sharing.email_enabled
+                && storage_mail_enabled,
+            group_signing_enabled: storage_enabled && workflow_signing_configuration.enabled,
+        };
+        let storage_service = Arc::new(
+            storage::StorageService::open(storage_configuration)
+                .map_err(|error| SecurityStartupError::Storage(Box::new(error)))?,
+        );
+        let workflow_secret_cipher = crate::security_crypto::ProtectedSecretCipher::from_config_or_file(
+            storage_bootstrap
+                .credential_encryption_key
+                .as_ref()
+                .map(|key| key.as_str()),
+            &storage_bootstrap.credential_encryption_key_path,
+        )
+        .map_err(|error| SecurityStartupError::WorkflowSigning(Box::new(error)))?;
+        let workflow_signing_service = Arc::new(
+            workflow_signing::WorkflowSigningService::open(
+                &workflow_signing_configuration,
+                Arc::clone(&storage_service),
+                workflow_secret_cipher,
+                Arc::clone(&server_certificate),
+            )
+            .map_err(|error| SecurityStartupError::WorkflowSigning(Box::new(error)))?,
+        );
         let mut runtime =
             Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
         runtime.license_refresh_runtime = Some(license::LicenseRefreshRuntime::new(
@@ -1540,8 +1584,12 @@ impl ProcessingRuntime {
             .merge(admin_settings::routes().layer(Extension(admin_settings)))
             .merge(license_admin::routes(license_admin))
             .merge(server_certificate::routes())
+            .merge(storage_http::routes(max_upload_bytes))
+            .merge(workflow_signing_http::owner_routes(max_upload_bytes))
             .layer(Extension(personal_signatures))
             .layer(Extension(server_certificate))
+            .layer(Extension(Arc::clone(&storage_service)))
+            .layer(Extension(Arc::clone(&workflow_signing_service)))
             .layer(Extension(initialized_license.state));
         attach_policy_routes(
             &mut runtime,
@@ -1562,7 +1610,12 @@ impl ProcessingRuntime {
             mcp_config,
             security_store,
             &mcp_engine_settings,
-        ));
+        ))
+        .merge(
+            workflow_signing_http::participant_routes(max_upload_bytes)
+                .layer(Extension(Arc::clone(&workflow_signing_service))),
+        )
+        .layer(Extension(storage_app_config));
         Ok(runtime)
     }
 
@@ -2999,6 +3052,7 @@ fn mobile_scanner_unique_filename(filename: &str, number: u16) -> String {
 async fn app_config(
     Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
     license_state: Option<Extension<Arc<license::LicenseState>>>,
+    storage_app_config: Option<Extension<storage::StorageAppConfig>>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let host = headers
@@ -3010,6 +3064,16 @@ async fn app_config(
     let mut config = runtime_config.app_config(host, forwarded_proto);
     if let Some(Extension(license_state)) = license_state {
         license_state.apply_to_app_config(&mut config);
+    }
+    // The storage app-config extension is layered only by the reviewed secured
+    // router, so its presence marks an authenticated deployment where login and
+    // security are active.
+    if let Some(Extension(storage_app_config)) = storage_app_config {
+        if let Some(map) = config.as_object_mut() {
+            map.insert("enableLogin".to_owned(), true.into());
+            map.insert("activeSecurity".to_owned(), true.into());
+        }
+        storage_app_config.apply_to_app_config(&mut config);
     }
     Json(config)
 }
@@ -12885,6 +12949,7 @@ fn map_image_overlay_error(error: &ImageOverlayError) -> ApiError {
         ImageOverlayError::ReadImage(_)
         | ImageOverlayError::Pdf(_)
         | ImageOverlayError::RasterPdf(_)
+        | ImageOverlayError::InvalidPageBox
         | ImageOverlayError::WritePdf(_) => {
             ApiError::internal_at(ADD_IMAGE_PATH, error.to_string())
         }

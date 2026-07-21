@@ -95,6 +95,10 @@ pub enum SecurityStartupError {
     LicenseVerification(#[source] LicenseError),
     #[error("server certificate initialization failed")]
     ServerCertificate(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("durable storage initialization failed")]
+    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("collaborative signing initialization failed")]
+    WorkflowSigning(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Opens durable secured-mode state and bootstraps its first administrator from
@@ -330,6 +334,7 @@ pub(crate) fn secure_router_with_mail(
 fn auth_routes() -> Router {
     Router::new()
         .merge(crate::security_audit_http::routes())
+        .merge(crate::portal_audit::routes())
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(current_user))
         .route("/api/v1/auth/refresh", post(refresh))
@@ -1206,9 +1211,9 @@ async fn save_user_by_admin(
         Ok(Err(SecurityError::UserLimitReached {
             max_allowed,
             available_slots,
-        })) => json_error(
+        })) => json_error_owned(
             StatusCode::BAD_REQUEST,
-            format!(
+            &format!(
                 "Maximum number of users reached. Allowed: {max_allowed}, Available slots: {available_slots}"
             ),
         ),
@@ -1823,6 +1828,7 @@ async fn add_user_to_team(
     team_mutation_response(&result, "User added to team successfully")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn generate_invite(
     Extension(store): Extension<Arc<SecurityStore>>,
     Extension(context): Extension<AuthContext>,
@@ -1921,9 +1927,9 @@ async fn generate_invite(
             available_slots,
         })) => {
             let occupied = max_allowed.saturating_sub(available_slots);
-            json_error(
+            json_error_owned(
                 StatusCode::BAD_REQUEST,
-                format!(
+                &format!(
                     "License limit reached ({occupied}/{max_allowed} users). Contact your administrator to upgrade your license."
                 ),
             )
@@ -2424,6 +2430,10 @@ fn service_unavailable_response() -> Response {
 }
 
 fn json_error(status: StatusCode, message: &'static str) -> Response {
+    json_error_owned(status, message)
+}
+
+fn json_error_owned(status: StatusCode, message: &str) -> Response {
     (
         status,
         Json(serde_json::json!({

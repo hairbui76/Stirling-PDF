@@ -234,7 +234,6 @@ fn error_response(error: &LoginAgreementAdminError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::LoginAgreementAdminService;
-    use std::fs;
 
     #[test]
     fn writes_lists_reads_and_clears_locale_files() -> Result<(), Box<dyn std::error::Error>> {
