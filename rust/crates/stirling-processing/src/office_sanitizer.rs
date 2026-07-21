@@ -277,17 +277,21 @@ fn archive_too_large() -> OfficeSanitizerError {
 }
 
 fn has_rels_extension(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("rels"))
+    let path = Path::new(name);
+    path.file_name()
+        .and_then(|filename| filename.to_str())
+        .is_some_and(|filename| filename.eq_ignore_ascii_case(".rels"))
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rels"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        OfficeSanitizerError, is_external_url, is_sanitizable_extension, sanitize_office_archive,
-        sanitize_xml_part,
+        OfficeSanitizerError, has_rels_extension, is_external_url, is_sanitizable_extension,
+        sanitize_office_archive, sanitize_xml_part,
     };
     use std::{fs, io::Write};
     use tempfile::tempdir;
@@ -301,6 +305,9 @@ mod tests {
         assert!(is_sanitizable_extension("odm"));
         assert!(!is_sanitizable_extension("doc"));
         assert!(!is_sanitizable_extension("rtf"));
+        assert!(has_rels_extension("_rels/.rels"));
+        assert!(has_rels_extension("word/_rels/document.xml.rels"));
+        assert!(!has_rels_extension("word/document.xml"));
     }
 
     #[test]

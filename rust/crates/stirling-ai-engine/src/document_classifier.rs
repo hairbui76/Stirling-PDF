@@ -23,22 +23,24 @@ pub const WINDOW_PAGES: isize = 2;
 const SYSTEM_PROMPT: &str = "You identify what a document is by assigning labels, choosing only from a fixed list of allowed labels you are given.\n\nRules:\n- Pick up to 5 labels that describe this document's type.\n- Only use labels from the allowed list, spelled exactly as listed.\n- Return an empty list if none fit.\n- Judge from the document's content and structure, not from keywords alone. The document may be in any language.\n- You are shown only the first and last pages; that is enough to identify the type.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LabelOption {
     pub id: String,
     pub name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PageText {
+    #[serde(alias = "page_number")]
     pub page_number: i64,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClassifyDocumentRequest {
+    #[serde(alias = "file_name")]
     pub file_name: String,
     #[serde(default)]
     pub pages: Vec<PageText>,

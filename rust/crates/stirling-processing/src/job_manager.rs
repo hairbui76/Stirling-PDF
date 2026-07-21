@@ -42,7 +42,7 @@ struct JobRecord {
     owner: JobOwner,
     status: JobStatus,
     directory: PathBuf,
-    output: Option<JobFile>,
+    outputs: Vec<JobFile>,
     created_at_instant: Instant,
     completed_at_instant: Option<Instant>,
     expires_at: Option<Instant>,
@@ -91,6 +91,13 @@ pub(crate) struct JobFile {
     pub(crate) file_size: u64,
     #[serde(skip)]
     pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JobFileSource {
+    pub(crate) path: PathBuf,
+    pub(crate) file_name: String,
+    pub(crate) content_type: String,
 }
 
 /// Aggregate operational counters returned by the administrator job endpoint.
@@ -188,7 +195,7 @@ impl JobManager {
                             owner,
                             status,
                             directory: directory.clone(),
-                            output: None,
+                            outputs: Vec::new(),
                             created_at_instant,
                             completed_at_instant: None,
                             expires_at: None,
@@ -247,13 +254,13 @@ impl JobManager {
             return Err(JobManagerError::Missing);
         }
         let file_id = random_identifier();
-        record.output = Some(JobFile {
+        record.outputs = vec![JobFile {
             file_id,
             file_name: file_name.into(),
             content_type: content_type.into(),
             file_size: metadata.len(),
             path: output_path,
-        });
+        }];
         record.status.complete = true;
         record.status.progress = 100;
         record.status.stage.clear();
@@ -265,6 +272,107 @@ impl JobManager {
         record.completed_at_instant = Some(completed_at_instant);
         record.expires_at = Some(completed_at_instant + self.result_ttl);
         Ok(())
+    }
+
+    /// Copies and atomically registers every workflow result under one owned job.
+    pub(crate) fn complete_files(
+        &self,
+        job_id: &str,
+        sources: &[JobFileSource],
+    ) -> Result<Vec<JobFile>, JobManagerError> {
+        if sources.is_empty() {
+            return Err(JobManagerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workflow result list is empty",
+            )));
+        }
+        let directory = {
+            let store = self.lock()?;
+            let record = store.jobs.get(job_id).ok_or(JobManagerError::Missing)?;
+            if record.status.complete {
+                return if record.status.error.as_deref() == Some("Job was cancelled by user") {
+                    Err(JobManagerError::Cancelled)
+                } else {
+                    Err(JobManagerError::Missing)
+                };
+            }
+            record.directory.clone()
+        };
+
+        let mut copied_paths = Vec::with_capacity(sources.len());
+        let mut outputs = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            let metadata = match fs::symlink_metadata(&source.path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    cleanup_files(&copied_paths);
+                    return Err(JobManagerError::Io(error));
+                }
+            };
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                cleanup_files(&copied_paths);
+                return Err(JobManagerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workflow result is not a regular file",
+                )));
+            }
+            let target = directory.join(format!("workflow-output-{index}"));
+            if let Err(error) = fs::copy(&source.path, &target) {
+                cleanup_files(&copied_paths);
+                return Err(JobManagerError::Io(error));
+            }
+            let file_size = match fs::metadata(&target) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    copied_paths.push(target);
+                    cleanup_files(&copied_paths);
+                    return Err(JobManagerError::Io(error));
+                }
+            };
+            copied_paths.push(target.clone());
+            outputs.push(JobFile {
+                file_id: random_identifier(),
+                file_name: source.file_name.clone(),
+                content_type: source.content_type.clone(),
+                file_size,
+                path: target,
+            });
+        }
+
+        let mut store = match self.lock() {
+            Ok(store) => store,
+            Err(error) => {
+                cleanup_files(&copied_paths);
+                return Err(error);
+            }
+        };
+        let Some(record) = store.jobs.get_mut(job_id) else {
+            drop(store);
+            cleanup_files(&copied_paths);
+            return Err(JobManagerError::Missing);
+        };
+        if record.status.complete {
+            let cancelled = record.status.error.as_deref() == Some("Job was cancelled by user");
+            drop(store);
+            cleanup_files(&copied_paths);
+            return if cancelled {
+                Err(JobManagerError::Cancelled)
+            } else {
+                Err(JobManagerError::Missing)
+            };
+        }
+        record.outputs.clone_from(&outputs);
+        record.status.complete = true;
+        record.status.progress = 100;
+        record.status.stage.clear();
+        record.status.stage.push_str("complete");
+        record.status.note.clear();
+        record.status.note.push_str("Job completed");
+        let completed_at_instant = Instant::now();
+        record.status.completed_at = Some(Utc::now().to_rfc3339());
+        record.completed_at_instant = Some(completed_at_instant);
+        record.expires_at = Some(completed_at_instant + self.result_ttl);
+        Ok(outputs)
     }
 
     /// Marks a job as failed without exposing server paths or other internal data.
@@ -319,7 +427,23 @@ impl JobManager {
         if record.owner != owner || !record.status.complete || record.status.error.is_some() {
             return Ok(None);
         }
-        Ok(record.output.clone())
+        Ok(record.outputs.first().cloned())
+    }
+
+    pub(crate) fn result_files(
+        &self,
+        owner: JobOwner,
+        job_id: &str,
+    ) -> Result<Option<Vec<JobFile>>, JobManagerError> {
+        self.remove_expired()?;
+        let store = self.lock()?;
+        let Some(record) = store.jobs.get(job_id) else {
+            return Ok(None);
+        };
+        if record.owner != owner || !record.status.complete || record.status.error.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(record.outputs.clone()))
     }
 
     pub(crate) fn job_file(
@@ -334,9 +458,9 @@ impl JobManager {
                 return None;
             }
             record
-                .output
-                .as_ref()
-                .filter(|file| file.file_id == file_id)
+                .outputs
+                .iter()
+                .find(|file| file.file_id == file_id)
                 .cloned()
                 .map(|file| (job_id.clone(), file))
         }))
@@ -404,7 +528,7 @@ impl JobManager {
                     failed_jobs += 1;
                 } else {
                     successful_jobs += 1;
-                    file_result_jobs += usize::from(record.output.is_some());
+                    file_result_jobs += usize::from(!record.outputs.is_empty());
                 }
                 if let Some(completed_at) = record.completed_at_instant {
                     processing_time_millis = processing_time_millis.saturating_add(
@@ -486,6 +610,12 @@ fn random_identifier() -> String {
         identifier.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     identifier
+}
+
+fn cleanup_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,11 @@
 //! refuse secured-mode startup until MFA, external identity, invitations,
 //! tenant resources, and the remaining review gates are complete.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -24,20 +28,30 @@ use tokio::task;
 use zeroize::Zeroizing;
 
 use crate::{
+    license::LicenseError,
     runtime_config::RuntimeConfig,
     security::{
-        AuthContext, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityError, SecurityStore,
-        SessionTokens,
+        AuthContext, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityError,
+        SecurityHttpAuditRecord, SecurityStore, SessionTokens,
     },
     security_crypto::{ProtectedSecretCipher, totp_auth_uri},
     security_jwt::{SupabaseJwtError, SupabaseJwtVerifier},
-    security_policy::{AuthorizationDenial, EndpointPolicy, authorize, endpoint_policy},
+    security_policy::{
+        AuthorizationDenial, EndpointEntitlement, EndpointPolicy, LicenseTier, authorize,
+        authorize_entitlement, endpoint_entitlement, endpoint_policy,
+    },
+    smtp_mail::{SmtpMailService, is_valid_recipient},
 };
 
 const MAX_AUTH_BODY_BYTES: usize = 8 * 1024;
 const REFRESH_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+const AUTOMATION_HEADER: HeaderName = HeaderName::from_static("x-stirling-automation");
+const AUDIT_LEVEL_OFF: u8 = 0;
+const AUDIT_LEVEL_BASIC: u8 = 1;
+const AUDIT_LEVEL_STANDARD: u8 = 2;
+const AUDIT_LEVEL_VERBOSE: u8 = 3;
 
 #[derive(Clone)]
 struct RequestCorrelation(String);
@@ -48,13 +62,25 @@ pub struct SecurityHttpConfig {
     pub invites_enabled: bool,
     pub invite_expiry_hours: u64,
     pub frontend_url: String,
+    pub backend_url: String,
+    pub audit_enabled: bool,
+    pub audit_level: u8,
+    pub license_tier: LicenseTier,
     pub external_jwt: Option<Arc<SupabaseJwtVerifier>>,
+}
+
+#[derive(Clone, Default)]
+struct SecurityMailState {
+    smtp: Option<Arc<SmtpMailService>>,
 }
 
 #[derive(Clone)]
 struct SecurityMiddlewareState {
     store: Arc<SecurityStore>,
     external_jwt: Option<Arc<SupabaseJwtVerifier>>,
+    audit_enabled: bool,
+    audit_level: u8,
+    license_tier: LicenseTier,
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +91,8 @@ pub enum SecurityStartupError {
     MissingInitialAdministrator,
     #[error("external JWT verifier initialization failed")]
     ExternalJwt(#[source] SupabaseJwtError),
+    #[error("commercial license verification failed")]
+    LicenseVerification(#[source] LicenseError),
     #[error("server certificate initialization failed")]
     ServerCertificate(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -114,6 +142,13 @@ struct LoginRequest {
     mfa_code: Option<Zeroizing<String>>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRequest {
+    username: String,
+    password: Zeroizing<String>,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RefreshRequest {
@@ -150,7 +185,9 @@ struct AuthenticationUser {
     portal_access: bool,
     team_lead: bool,
     authentication_type: &'static str,
+    #[serde(rename = "app_metadata")]
     app_metadata: AppMetadata,
+    #[serde(rename = "user_metadata")]
     user_metadata: UserMetadata,
 }
 
@@ -163,6 +200,72 @@ struct AppMetadata {
 #[serde(rename_all = "camelCase")]
 struct UserMetadata {
     first_login: bool,
+    force_password_change: bool,
+}
+
+struct AdminPasswordChangeInput {
+    username: String,
+    new_password: Zeroizing<String>,
+    force_password_change: bool,
+    delivery: Option<PasswordChangeDelivery>,
+}
+
+struct PasswordChangeDelivery {
+    include_password: bool,
+}
+
+enum AdminPasswordChangeError {
+    InvalidForm,
+    SelfTarget,
+    MissingPassword,
+    UserNotFound,
+    ProtectedState,
+    ServiceUnavailable,
+    EmailNotConfigured,
+    InvalidRecipient,
+    DeliveryFailed,
+}
+
+impl IntoResponse for AdminPasswordChangeError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidForm => invalid_form_response(),
+            Self::SelfTarget => named_json_error(
+                StatusCode::BAD_REQUEST,
+                "Cannot change your own password.",
+                "Cannot change your own password.",
+            ),
+            Self::MissingPassword => named_json_error(
+                StatusCode::BAD_REQUEST,
+                "New password is required.",
+                "New password is required.",
+            ),
+            Self::UserNotFound => {
+                named_json_error(StatusCode::NOT_FOUND, "User not found.", "User not found.")
+            }
+            Self::ProtectedState => named_json_error(
+                StatusCode::BAD_REQUEST,
+                "Protected account state cannot be changed.",
+                "Protected account state cannot be changed.",
+            ),
+            Self::ServiceUnavailable => service_unavailable_response(),
+            Self::EmailNotConfigured => named_json_error(
+                StatusCode::BAD_REQUEST,
+                "Email is not configured.",
+                "Email is not configured.",
+            ),
+            Self::InvalidRecipient => named_json_error(
+                StatusCode::BAD_REQUEST,
+                "User's email is not a valid email address. Notifications are disabled.",
+                "User's email is not a valid email address. Notifications are disabled.",
+            ),
+            Self::DeliveryFailed => named_json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Password updated but notification delivery failed",
+                "Password updated but notification delivery failed",
+            ),
+        }
+    }
 }
 
 /// Adds the secure auth routes and fail-closed middleware to an existing router.
@@ -178,6 +281,10 @@ pub fn secure_router(router: Router, store: Arc<SecurityStore>) -> Router {
             invites_enabled: true,
             invite_expiry_hours: 168,
             frontend_url: String::new(),
+            backend_url: String::new(),
+            audit_enabled: true,
+            audit_level: AUDIT_LEVEL_STANDARD,
+            license_tier: LicenseTier::Normal,
             external_jwt: None,
         },
     )
@@ -189,9 +296,25 @@ pub fn secure_router_with_config(
     store: Arc<SecurityStore>,
     config: SecurityHttpConfig,
 ) -> Router {
+    secure_router_with_mail(router, store, config, None)
+}
+
+pub(crate) fn secure_router_with_mail(
+    router: Router,
+    store: Arc<SecurityStore>,
+    config: SecurityHttpConfig,
+    smtp: Option<Arc<SmtpMailService>>,
+) -> Router {
     let middleware_state = SecurityMiddlewareState {
         store: Arc::clone(&store),
         external_jwt: config.external_jwt.clone(),
+        // Java's AuditService is an Enterprise-only service even when the
+        // nested audit setting itself is enabled.
+        audit_enabled: config.audit_enabled && config.license_tier == LicenseTier::Enterprise,
+        audit_level: config
+            .audit_level
+            .clamp(AUDIT_LEVEL_OFF, AUDIT_LEVEL_VERBOSE),
+        license_tier: config.license_tier,
     };
     router
         .merge(auth_routes())
@@ -201,10 +324,12 @@ pub fn secure_router_with_config(
         ))
         .layer(Extension(store))
         .layer(Extension(config))
+        .layer(Extension(SecurityMailState { smtp }))
 }
 
 fn auth_routes() -> Router {
     Router::new()
+        .merge(crate::security_audit_http::routes())
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(current_user))
         .route("/api/v1/auth/refresh", post(refresh))
@@ -217,6 +342,7 @@ fn auth_routes() -> Router {
             post(disable_mfa_by_admin),
         )
         .route("/api/v1/auth/mfa/setup/cancel", post(cancel_mfa_setup))
+        .route("/api/v1/user/register", post(register_user))
         .route("/api/v1/user/change-username", post(change_username))
         .route("/api/v1/user/change-password", post(change_password))
         .route(
@@ -225,9 +351,22 @@ fn auth_routes() -> Router {
         )
         .route("/api/v1/user/get-api-key", post(get_api_key))
         .route("/api/v1/user/update-api-key", post(update_api_key))
+        .route(
+            "/api/v1/user/updateUserSettings",
+            post(update_user_settings),
+        )
+        .route(
+            "/api/v1/user/complete-initial-setup",
+            post(complete_initial_setup),
+        )
         .route("/api/v1/user/users", get(list_signing_users))
+        .route("/api/v1/usage/fleet-stats", get(fleet_usage_stats))
         .route("/api/v1/user/admin/list", get(list_users_by_admin))
         .route("/api/v1/user/admin/saveUser", post(save_user_by_admin))
+        .route(
+            "/api/v1/user/admin/inviteUsers",
+            post(invite_users_by_admin),
+        )
         .route(
             "/api/v1/user/admin/changeRole",
             post(change_user_role_by_admin),
@@ -271,7 +410,9 @@ async fn enforce_security(
 ) -> Response {
     let correlation = RequestCorrelation(random_request_id());
     request.extensions_mut().insert(correlation.clone());
-    let policy = endpoint_policy(request.method(), request.uri().path());
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let policy = endpoint_policy(&method, &path);
     let context = if policy == EndpointPolicy::Public {
         None
     } else if policy == EndpointPolicy::ParticipantToken {
@@ -295,63 +436,178 @@ async fn enforce_security(
     if let Err(denial) = authorize(policy, context.as_ref()) {
         return denial_response(denial, &correlation.0);
     }
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
-    let audit_context = context.clone();
-    if should_audit_request(&method, &path)
-        && let Some(context) = audit_context.as_ref()
-    {
-        let store_for_audit = Arc::clone(&state.store);
-        let context = context.clone();
-        let path = path.clone();
-        let result = task::spawn_blocking(move || {
-            store_for_audit.record_audit(
-                &context,
-                "HTTP_MUTATION",
-                &path,
-                "attempt",
-                Utc::now().timestamp(),
-            )
-        })
-        .await;
-        if !matches!(result, Ok(Ok(()))) {
-            return with_request_id(service_unavailable_response(), &correlation.0);
-        }
+    let entitlement = endpoint_entitlement(&method, &path);
+    if let Err(required) = authorize_entitlement(state.license_tier, entitlement) {
+        return entitlement_denial_response(required, &path, &correlation.0);
     }
+    let audit_plan =
+        audit_capture_plan(&state, &method, &path, request.headers(), context.as_ref());
+    let audit_context = context.clone();
     if let Some(context) = context {
         request.extensions_mut().insert(context);
     }
+    let started_at = Instant::now();
     let response = next.run(request).await;
-    if should_audit_request(&method, &path)
-        && let Some(context) = audit_context
-    {
-        let status = format!("status:{}", response.status().as_u16());
+    if let Some(plan) = audit_plan {
+        let now = Utc::now();
+        let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let record = SecurityHttpAuditRecord {
+            context: audit_context,
+            correlation_id: correlation.0.clone(),
+            source: plan.source.to_owned(),
+            event_type: plan.event_type.to_owned(),
+            method: method.as_str().to_owned(),
+            path,
+            status_code: response.status().as_u16(),
+            latency_ms,
+            include_standard_data: plan.include_standard_data,
+            annotated: plan.annotated,
+            created_at: now.timestamp(),
+            timestamp: now.to_rfc3339(),
+        };
         let store_for_audit = Arc::clone(&state.store);
-        let result = task::spawn_blocking(move || {
-            store_for_audit.record_audit(
-                &context,
-                "HTTP_MUTATION",
-                &path,
-                &status,
-                Utc::now().timestamp(),
-            )
-        })
-        .await;
-        if !matches!(result, Ok(Ok(()))) {
-            return with_request_id(service_unavailable_response(), &correlation.0);
-        }
+        // Java persists controller audit events asynchronously and fail-open.
+        // Await the bounded SQLite write for deterministic request tests, but
+        // never replace the handler response when audit persistence fails.
+        let _ = task::spawn_blocking(move || store_for_audit.record_http_audit(&record)).await;
     }
     with_request_id(response, &correlation.0)
 }
 
-fn should_audit_request(method: &axum::http::Method, path: &str) -> bool {
-    matches!(
-        *method,
-        axum::http::Method::POST
-            | axum::http::Method::PUT
-            | axum::http::Method::PATCH
-            | axum::http::Method::DELETE
-    ) || (method == axum::http::Method::GET && path == "/api/v1/auth/mfa/setup")
+#[derive(Clone, Copy)]
+struct AuditCapturePlan {
+    event_type: &'static str,
+    source: &'static str,
+    include_standard_data: bool,
+    annotated: bool,
+}
+
+fn audit_capture_plan(
+    state: &SecurityMiddlewareState,
+    method: &axum::http::Method,
+    path: &str,
+    headers: &HeaderMap,
+    context: Option<&AuthContext>,
+) -> Option<AuditCapturePlan> {
+    if !state.audit_enabled
+        || state.audit_level < AUDIT_LEVEL_BASIC
+        || is_static_resource_path(path)
+        || (state.audit_level == AUDIT_LEVEL_STANDARD && is_standard_polling_get(method, path))
+    {
+        return None;
+    }
+    let annotated_event = explicit_audit_event(method, path);
+    let annotated = annotated_event.is_some();
+    let event_type = annotated_event.unwrap_or_else(|| inferred_audit_event(method, path));
+    let source = if annotated {
+        // Java leaves source null for explicit @Audited events. The reviewed
+        // Rust schema predates that contract and is NOT NULL; an empty value
+        // preserves exclusion from every named source aggregate.
+        ""
+    } else {
+        audit_source(context, headers, path)
+    };
+    Some(AuditCapturePlan {
+        event_type,
+        source,
+        include_standard_data: !annotated && state.audit_level >= AUDIT_LEVEL_STANDARD,
+        annotated,
+    })
+}
+
+fn explicit_audit_event(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    if method != axum::http::Method::POST {
+        return None;
+    }
+    match path {
+        "/api/v1/auth/login" => Some("USER_LOGIN"),
+        "/api/v1/user/change-username"
+        | "/api/v1/user/change-password"
+        | "/api/v1/user/change-password-on-login" => Some("USER_PROFILE_UPDATE"),
+        _ if path.starts_with("/api/v1/user/admin/unlockUser/") => Some("SETTINGS_CHANGED"),
+        _ if path.starts_with("/api/v1/user/admin/deleteUser/") => Some("USER_PROFILE_UPDATE"),
+        _ => None,
+    }
+}
+
+fn inferred_audit_event(method: &axum::http::Method, path: &str) -> &'static str {
+    if method == axum::http::Method::GET {
+        return if is_ui_data_get(path) {
+            "UI_DATA"
+        } else {
+            "HTTP_REQUEST"
+        };
+    }
+    if path.starts_with("/api/v1/user/")
+        || path.starts_with("/api/v1/users/")
+        || path.starts_with("/api/v1/auth/")
+    {
+        "USER_PROFILE_UPDATE"
+    } else if path == "/api/v1/admin" || path.starts_with("/api/v1/admin/") {
+        "SETTINGS_CHANGED"
+    } else {
+        let lowercase = path.to_ascii_lowercase();
+        if lowercase.starts_with("/api/v1/files/")
+            || lowercase.contains("/upload/")
+            || lowercase.contains("/download/")
+        {
+            "FILE_OPERATION"
+        } else {
+            "PDF_PROCESS"
+        }
+    }
+}
+
+fn is_ui_data_get(path: &str) -> bool {
+    path.starts_with("/api/v1/auth/")
+        || path.starts_with("/api/v1/ui-data/")
+        || path.starts_with("/api/v1/proprietary/ui-data/")
+        || path.starts_with("/api/v1/config/")
+        || path.starts_with("/api/v1/admin/settings/")
+        || path.starts_with("/api/v1/user/")
+        || path.starts_with("/api/v1/users/")
+        || matches!(path, "/api/v1/admin/license-info" | "/login")
+}
+
+fn audit_source(context: Option<&AuthContext>, headers: &HeaderMap, path: &str) -> &'static str {
+    let Some(context) = context else {
+        return "SYSTEM";
+    };
+    if context.authentication_source == crate::security::AuthenticationSource::ApiKey {
+        return "API";
+    }
+    if headers.contains_key(&AUTOMATION_HEADER) {
+        "AUTOMATION"
+    } else if path.starts_with("/api/v1/ai/") {
+        "AI"
+    } else {
+        "WEB"
+    }
+}
+
+fn is_standard_polling_get(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET
+        && (matches!(
+            path,
+            "/api/v1/auth/me"
+                | "/api/v1/app-config"
+                | "/api/v1/footer-info"
+                | "/api/v1/admin/license-info"
+                | "/api/v1/endpoints-availability"
+                | "/health"
+                | "/metrics"
+                | "/actuator/health"
+                | "/actuator/metrics"
+        ) || path.starts_with("/health/")
+            || path.starts_with("/metrics/")
+            || path.starts_with("/actuator/health/")
+            || path.starts_with("/actuator/metrics/"))
+}
+
+fn is_static_resource_path(path: &str) -> bool {
+    matches!(path, "/favicon.ico" | "/manifest.json")
+        || path.starts_with("/assets/")
+        || path.starts_with("/locales/")
 }
 
 async fn authenticate_request(
@@ -626,6 +882,57 @@ async fn change_username(
     )
 }
 
+async fn register_user(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Json(request): Json<RegisterRequest>,
+) -> Response {
+    if request.username.trim().is_empty() {
+        return registration_error("Invalid username format");
+    }
+    if request.password.is_empty() {
+        return registration_error("Password is required");
+    }
+    let username = request.username.trim().to_owned();
+    let response_username = username.clone();
+    let password = request.password;
+    let result =
+        task::spawn_blocking(move || store.register_local_user(&username, &password)).await;
+    match result {
+        Ok(Ok(user_id)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "user": {
+                    "id": user_id,
+                    "email": response_username.clone(),
+                    "username": response_username,
+                    "role": "ROLE_USER",
+                    "enabled": false,
+                    "app_metadata": { "provider": "web" },
+                },
+                "message": "Account created successfully. Please log in.",
+            })),
+        )
+            .into_response(),
+        Ok(Err(SecurityError::Conflict)) => registration_error("User already exists"),
+        Ok(Err(SecurityError::InvalidInput)) => registration_error("Invalid username format"),
+        Ok(Err(SecurityError::UserLimitReached {
+            max_allowed,
+            available_slots,
+        })) => registration_error(format!(
+            "Maximum number of users reached. Allowed: {max_allowed}, Available slots: {available_slots}"
+        )),
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+fn registration_error(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+        .into_response()
+}
+
 async fn change_password(
     Extension(store): Extension<Arc<SecurityStore>>,
     Extension(context): Extension<AuthContext>,
@@ -681,6 +988,38 @@ async fn change_password_fields(
         &result,
         "Password changed successfully. Please log in again.",
     )
+}
+
+async fn update_user_settings(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(context): Extension<AuthContext>,
+    Json(settings): Json<BTreeMap<String, String>>,
+) -> Response {
+    let result =
+        task::spawn_blocking(move || store.replace_user_settings(context.user_id, &settings)).await;
+    match result {
+        Ok(Ok(())) => {
+            Json(serde_json::json!({ "message": "Settings updated successfully" })).into_response()
+        }
+        Ok(Err(SecurityError::InvalidInput)) => invalid_form_response(),
+        Ok(Err(SecurityError::UserNotFound)) => {
+            named_json_error(StatusCode::NOT_FOUND, "User not found", "User not found")
+        }
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+async fn complete_initial_setup(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(context): Extension<AuthContext>,
+) -> Response {
+    match task::spawn_blocking(move || store.complete_initial_setup(context.user_id)).await {
+        Ok(Ok(())) => Json(serde_json::json!({ "success": true })).into_response(),
+        Ok(Err(SecurityError::UserNotFound)) => {
+            named_json_error(StatusCode::NOT_FOUND, "User not found", "User not found")
+        }
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
 }
 
 fn credential_mutation_response(
@@ -752,6 +1091,26 @@ async fn list_users_by_admin(Extension(store): Extension<Arc<SecurityStore>>) ->
     match task::spawn_blocking(move || store.list_users(Utc::now().timestamp())).await {
         Ok(Ok(users)) => Json(serde_json::json!({ "users": users })).into_response(),
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+async fn fleet_usage_stats(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(config): Extension<SecurityHttpConfig>,
+) -> Response {
+    match task::spawn_blocking(move || {
+        store.fleet_usage_stats(
+            config.audit_enabled && config.audit_level >= AUDIT_LEVEL_STANDARD,
+            Utc::now().timestamp(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(stats)) => Json(stats).into_response(),
+        Ok(Err(_)) | Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not calculate fleet usage statistics",
+        ),
     }
 }
 
@@ -844,11 +1203,255 @@ async fn save_user_by_admin(
             "Username already exists.",
             "Username already exists.",
         ),
+        Ok(Err(SecurityError::UserLimitReached {
+            max_allowed,
+            available_slots,
+        })) => json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Maximum number of users reached. Allowed: {max_allowed}, Available slots: {available_slots}"
+            ),
+        ),
         Ok(Err(SecurityError::InvalidInput | SecurityError::TeamNotFound)) => {
             invalid_form_response()
         }
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
     }
+}
+
+async fn invite_users_by_admin(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(config): Extension<SecurityHttpConfig>,
+    Extension(mail): Extension<SecurityMailState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    let fields = match bounded_multipart_fields(multipart).await {
+        Ok(fields) => fields,
+        Err(response) => return response,
+    };
+    let Some(emails) = fields.get("emails") else {
+        return invalid_form_response();
+    };
+    if !config.invites_enabled {
+        return bulk_invite_error_response(
+            StatusCode::BAD_REQUEST,
+            "Email invites are not enabled",
+        );
+    }
+    let Some(smtp) = mail.smtp else {
+        return bulk_invite_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Email service is not configured. Please configure SMTP settings.",
+        );
+    };
+    let mut email_addresses = emails.split(',').map(str::to_owned).collect::<Vec<_>>();
+    if !emails.is_empty() {
+        while email_addresses.last().is_some_and(String::is_empty) {
+            email_addresses.pop();
+        }
+    }
+    if email_addresses.is_empty() {
+        return no_email_addresses_response();
+    }
+    for email in &mut email_addresses {
+        *email = email.trim().to_owned();
+    }
+    let requested_users = email_addresses.len();
+    let store_for_prepare = Arc::clone(&store);
+    let capacity = task::spawn_blocking(move || {
+        store_for_prepare.ensure_bulk_user_invite_capacity(requested_users)
+    })
+    .await;
+    match capacity {
+        Ok(Ok(())) => {}
+        Ok(Err(SecurityError::UserLimitReached {
+            max_allowed,
+            available_slots,
+        })) => {
+            let error = format!(
+                "Not enough user slots available. Allowed: {max_allowed}, Available: {available_slots}, Requested: {requested_users}"
+            );
+            return bulk_invite_error_response(StatusCode::BAD_REQUEST, error);
+        }
+        Ok(Err(_)) | Err(_) => return service_unavailable_response(),
+    }
+    let role = required_form_field(&fields, "role")
+        .unwrap_or("ROLE_USER")
+        .to_ascii_uppercase();
+    if !is_invitable_role(&role) {
+        return bulk_invite_error_response(StatusCode::BAD_REQUEST, "Invalid role specified");
+    }
+    let requested_team_id = match fields.get("teamId") {
+        Some(team_id) => match team_id.trim().parse::<i64>() {
+            Ok(team_id) => Some(team_id),
+            Err(_) => return invalid_form_response(),
+        },
+        None => None,
+    };
+    let store_for_team = Arc::clone(&store);
+    let team = task::spawn_blocking(move || {
+        store_for_team.resolve_bulk_user_invite_team(requested_team_id)
+    })
+    .await;
+    let effective_team_id = match team {
+        Ok(Ok(team_id)) => team_id,
+        Ok(Err(SecurityError::ProtectedSystemState)) => {
+            return bulk_invite_error_response(
+                StatusCode::BAD_REQUEST,
+                "Cannot assign users to Internal team",
+            );
+        }
+        Ok(Err(SecurityError::InvalidInput | SecurityError::TeamNotFound)) => {
+            return invalid_form_response();
+        }
+        Ok(Err(_)) | Err(_) => return service_unavailable_response(),
+    };
+    let login_url = password_login_url(&config, &headers);
+    let (success_count, failure_count, errors) = process_user_invite_batch(
+        store,
+        smtp,
+        email_addresses,
+        role,
+        effective_team_id,
+        login_url,
+    )
+    .await;
+    bulk_user_invite_response(success_count, failure_count, errors)
+}
+
+fn no_email_addresses_response() -> Response {
+    bulk_invite_error_response(
+        StatusCode::BAD_REQUEST,
+        "At least one email address is required",
+    )
+}
+
+fn bulk_invite_error_response(status: StatusCode, error: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": error.into() }))).into_response()
+}
+
+async fn process_user_invite_batch(
+    store: Arc<SecurityStore>,
+    smtp: Arc<SmtpMailService>,
+    email_addresses: Vec<String>,
+    role: String,
+    team_id: i64,
+    login_url: String,
+) -> (usize, usize, String) {
+    let mut success_count = 0_usize;
+    let mut failure_count = 0_usize;
+    let mut errors = String::new();
+    for email in email_addresses {
+        if email.is_empty() {
+            continue;
+        }
+        match invite_one_user(
+            Arc::clone(&store),
+            Arc::clone(&smtp),
+            email,
+            role.clone(),
+            team_id,
+            &login_url,
+        )
+        .await
+        {
+            Ok(()) => success_count += 1,
+            Err(error) => {
+                failure_count += 1;
+                errors.push_str(&error);
+                errors.push_str("; ");
+            }
+        }
+    }
+    (success_count, failure_count, errors)
+}
+
+fn bulk_user_invite_response(
+    success_count: usize,
+    failure_count: usize,
+    errors: String,
+) -> Response {
+    let mut response = serde_json::json!({
+        "successCount": success_count,
+        "failureCount": failure_count,
+    });
+    if failure_count > 0
+        && let Some(response) = response.as_object_mut()
+    {
+        response.insert("errors".to_owned(), errors.into());
+    }
+    if success_count > 0 {
+        if let Some(response) = response.as_object_mut() {
+            response.insert(
+                "message".to_owned(),
+                format!("{success_count} user(s) invited successfully").into(),
+            );
+        }
+        Json(response).into_response()
+    } else {
+        if let Some(response) = response.as_object_mut() {
+            response.insert("error".to_owned(), "Failed to invite any users".into());
+        }
+        (StatusCode::BAD_REQUEST, Json(response)).into_response()
+    }
+}
+
+fn is_invitable_role(role: &str) -> bool {
+    matches!(
+        role,
+        "ROLE_ADMIN"
+            | "ROLE_USER"
+            | "ROLE_PRO_USER"
+            | "ROLE_LIMITED_API_USER"
+            | "ROLE_EXTRA_LIMITED_API_USER"
+            | "ROLE_WEB_ONLY_USER"
+            | "ROLE_DEMO_USER"
+    )
+}
+
+async fn invite_one_user(
+    store: Arc<SecurityStore>,
+    smtp: Arc<SmtpMailService>,
+    email: String,
+    role: String,
+    team_id: i64,
+    login_url: &str,
+) -> Result<(), String> {
+    if !email.contains('@') || !email.contains('.') {
+        return Err(format!("{email}: Invalid email format"));
+    }
+    let temporary_password = random_invite_password();
+    let store_email = email.clone();
+    let store_password = temporary_password.clone();
+    let result = task::spawn_blocking(move || {
+        store.create_invited_local_user(&store_email, &store_password, &role, team_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(SecurityError::Conflict)) => {
+            return Err(format!("{email}: User already exists"));
+        }
+        Ok(Err(SecurityError::UserLimitReached { .. })) => {
+            return Err(format!("{email}: User limit reached"));
+        }
+        Ok(Err(SecurityError::InvalidInput)) => {
+            return Err(format!("{email}: Invalid user data"));
+        }
+        Ok(Err(SecurityError::TeamNotFound)) => {
+            return Err(format!("{email}: Invalid team ID: {team_id}"));
+        }
+        Ok(Err(SecurityError::ProtectedSystemState)) => {
+            return Err(format!("{email}: Invalid team"));
+        }
+        Ok(Err(_)) | Err(_) => {
+            return Err(format!("{email}: Failed to create user"));
+        }
+    }
+    smtp.send_user_invite(&email, &email, &temporary_password, login_url)
+        .await
+        .map_err(|_| format!("{email}: User created but email failed to send"))
 }
 
 async fn change_user_role_by_admin(
@@ -886,41 +1489,120 @@ async fn change_user_role_by_admin(
 async fn change_user_password_by_admin(
     Extension(store): Extension<Arc<SecurityStore>>,
     Extension(context): Extension<AuthContext>,
+    Extension(config): Extension<SecurityHttpConfig>,
+    Extension(mail): Extension<SecurityMailState>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     let fields = match bounded_multipart_fields(multipart).await {
         Ok(fields) => fields,
         Err(response) => return response,
     };
-    let Some(username) = required_form_field(&fields, "username") else {
-        return invalid_form_response();
+    let change = match parse_admin_password_change(&fields, &context.username) {
+        Ok(change) => change,
+        Err(error) => return error.into_response(),
     };
-    if username.eq_ignore_ascii_case(&context.username) {
-        return named_json_error(
-            StatusCode::BAD_REQUEST,
-            "Cannot change your own password.",
-            "Cannot change your own password.",
-        );
-    }
-    if parsed_bool_form_field(&fields, "sendEmail").unwrap_or(false)
-        || parsed_bool_form_field(&fields, "generateRandom").unwrap_or(false)
-    {
-        return named_json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Email-based password delivery is not configured",
-            "Email-based password delivery is not configured",
-        );
-    }
-    let Some(new_password) = required_form_field(&fields, "newPassword") else {
-        return invalid_form_response();
-    };
-    let username = username.to_owned();
-    let new_password = Zeroizing::new(new_password.to_owned());
+    let store_username = change.username.clone();
+    let store_password = change.new_password.clone();
+    let force_password_change = change.force_password_change;
     let result = task::spawn_blocking(move || {
-        store.set_user_password(&username, &new_password, Utc::now().timestamp())
+        store.set_user_password_with_force_change(
+            &store_username,
+            &store_password,
+            force_password_change,
+            Utc::now().timestamp(),
+        )
     })
     .await;
-    admin_user_mutation_response(&result, "User password updated successfully")
+    if let Err(error) = password_change_mutation_result(&result) {
+        return error.into_response();
+    }
+    if let Some(delivery) = change.delivery.as_ref()
+        && let Err(error) =
+            deliver_password_change(&mail, &config, &headers, &change, delivery).await
+    {
+        return error.into_response();
+    }
+    Json(serde_json::json!({ "message": "User password updated successfully" })).into_response()
+}
+
+fn parse_admin_password_change(
+    fields: &BTreeMap<String, Zeroizing<String>>,
+    current_username: &str,
+) -> Result<AdminPasswordChangeInput, AdminPasswordChangeError> {
+    let Some(username) = required_form_field(fields, "username") else {
+        return Err(AdminPasswordChangeError::InvalidForm);
+    };
+    if username.eq_ignore_ascii_case(current_username) {
+        return Err(AdminPasswordChangeError::SelfTarget);
+    }
+    let generate_random = optional_bool_form_field(fields, "generateRandom", false)
+        .map_err(|()| AdminPasswordChangeError::InvalidForm)?;
+    let send_email = optional_bool_form_field(fields, "sendEmail", false)
+        .map_err(|()| AdminPasswordChangeError::InvalidForm)?;
+    let include_password = optional_bool_form_field(fields, "includePassword", false)
+        .map_err(|()| AdminPasswordChangeError::InvalidForm)?;
+    let force_password_change = optional_bool_form_field(fields, "forcePasswordChange", false)
+        .map_err(|()| AdminPasswordChangeError::InvalidForm)?;
+    let new_password = if generate_random {
+        random_temporary_password()
+    } else {
+        let Some(new_password) = fields
+            .get("newPassword")
+            .filter(|password| !password.trim().is_empty())
+        else {
+            return Err(AdminPasswordChangeError::MissingPassword);
+        };
+        Zeroizing::new(new_password.to_string())
+    };
+    Ok(AdminPasswordChangeInput {
+        username: username.to_owned(),
+        new_password,
+        force_password_change,
+        delivery: send_email.then_some(PasswordChangeDelivery { include_password }),
+    })
+}
+
+fn password_change_mutation_result(
+    result: &Result<Result<i64, SecurityError>, task::JoinError>,
+) -> Result<(), AdminPasswordChangeError> {
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(SecurityError::UserNotFound)) => Err(AdminPasswordChangeError::UserNotFound),
+        Ok(Err(SecurityError::ProtectedSystemState)) => {
+            Err(AdminPasswordChangeError::ProtectedState)
+        }
+        Ok(Err(SecurityError::InvalidInput | SecurityError::UnsupportedAuthenticationSource)) => {
+            Err(AdminPasswordChangeError::InvalidForm)
+        }
+        Ok(Err(_)) | Err(_) => Err(AdminPasswordChangeError::ServiceUnavailable),
+    }
+}
+
+async fn deliver_password_change(
+    mail: &SecurityMailState,
+    config: &SecurityHttpConfig,
+    headers: &HeaderMap,
+    change: &AdminPasswordChangeInput,
+    delivery: &PasswordChangeDelivery,
+) -> Result<(), AdminPasswordChangeError> {
+    let Some(smtp) = mail.smtp.as_ref() else {
+        return Err(AdminPasswordChangeError::EmailNotConfigured);
+    };
+    if !change.username.contains('@') || !is_valid_recipient(&change.username) {
+        return Err(AdminPasswordChangeError::InvalidRecipient);
+    }
+    let login_url = password_login_url(config, headers);
+    smtp.send_password_changed(
+        &change.username,
+        &change.username,
+        delivery
+            .include_password
+            .then_some(change.new_password.as_str()),
+        &login_url,
+    )
+    .await
+    .map_err(|_| AdminPasswordChangeError::DeliveryFailed)
 }
 
 async fn change_user_enabled_by_admin(
@@ -1145,6 +1827,8 @@ async fn generate_invite(
     Extension(store): Extension<Arc<SecurityStore>>,
     Extension(context): Extension<AuthContext>,
     Extension(config): Extension<SecurityHttpConfig>,
+    Extension(mail): Extension<SecurityMailState>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     if !config.invites_enabled {
@@ -1158,14 +1842,19 @@ async fn generate_invite(
         Ok(fields) => fields,
         Err(response) => return response,
     };
-    if required_form_field(&fields, "sendEmail").is_some_and(|value| value == "true") {
+    let send_email = match required_form_field(&fields, "sendEmail") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return invalid_form_response(),
+    };
+    let email = required_form_field(&fields, "email").map(str::to_owned);
+    if send_email && email.is_none() {
         return named_json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Email service is not configured",
-            "Email service is not configured",
+            StatusCode::BAD_REQUEST,
+            "Cannot send email without an email address",
+            "Cannot send email without an email address",
         );
     }
-    let email = required_form_field(&fields, "email").map(str::to_owned);
     let role = required_form_field(&fields, "role")
         .unwrap_or("ROLE_USER")
         .to_owned();
@@ -1186,24 +1875,36 @@ async fn generate_invite(
     .await;
     match result {
         Ok(Ok(invite)) => {
-            let base_url = required_form_field(&fields, "frontendBaseUrl")
-                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-                .unwrap_or(&config.frontend_url)
-                .trim_end_matches('/');
+            let base_url = invite_base_url(&config, &fields, &headers);
             let invite_url = if base_url.is_empty() {
                 format!("/invite/{}", invite.token.as_str())
             } else {
                 format!("{base_url}/invite/{}", invite.token.as_str())
             };
-            Json(serde_json::json!({
+            let expires_at = timestamp_string(invite.expires_at);
+            let mut response = serde_json::json!({
                 "token": invite.token.as_str(),
-                "inviteUrl": invite_url,
-                "email": invite.email,
-                "expiresAt": timestamp_string(invite.expires_at),
+                "inviteUrl": &invite_url,
+                "email": &invite.email,
+                "expiresAt": &expires_at,
                 "expiryHours": expiry_hours,
-                "emailSent": false,
-            }))
-            .into_response()
+            });
+            if send_email {
+                let delivery = match (mail.smtp.as_ref(), invite.email.as_deref()) {
+                    (Some(smtp), Some(recipient)) => smtp
+                        .send_invite_link(recipient, &invite_url, &expires_at)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    _ => Err("Email service is not configured".to_owned()),
+                };
+                if let Some(response) = response.as_object_mut() {
+                    response.insert("emailSent".to_owned(), delivery.is_ok().into());
+                    if let Err(error) = delivery {
+                        response.insert("emailError".to_owned(), error.into());
+                    }
+                }
+            }
+            Json(response).into_response()
         }
         Ok(Err(SecurityError::Conflict)) => named_json_error(
             StatusCode::CONFLICT,
@@ -1215,7 +1916,67 @@ async fn generate_invite(
             | SecurityError::TeamNotFound
             | SecurityError::ProtectedSystemState,
         )) => invalid_form_response(),
+        Ok(Err(SecurityError::UserLimitReached {
+            max_allowed,
+            available_slots,
+        })) => {
+            let occupied = max_allowed.saturating_sub(available_slots);
+            json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "License limit reached ({occupied}/{max_allowed} users). Contact your administrator to upgrade your license."
+                ),
+            )
+        }
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+fn invite_base_url(
+    config: &SecurityHttpConfig,
+    fields: &BTreeMap<String, Zeroizing<String>>,
+    headers: &HeaderMap,
+) -> String {
+    validated_http_base_url(&config.frontend_url)
+        .or_else(|| {
+            required_form_field(fields, "frontendBaseUrl").and_then(validated_http_base_url)
+        })
+        .or_else(|| validated_http_base_url(&config.backend_url))
+        .or_else(|| request_base_url(headers))
+        .unwrap_or_default()
+}
+
+fn validated_http_base_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    (!url.is_empty()
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(char::is_control))
+    .then(|| url.to_owned())
+}
+
+fn request_base_url(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?.trim();
+    if host.is_empty() || host.chars().any(char::is_control) {
+        return None;
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    Some(format!("{scheme}://{host}"))
+}
+
+fn password_login_url(config: &SecurityHttpConfig, headers: &HeaderMap) -> String {
+    let base_url = validated_http_base_url(&config.frontend_url)
+        .or_else(|| request_base_url(headers))
+        .unwrap_or_default();
+    if base_url.is_empty() {
+        "/login".to_owned()
+    } else {
+        format!("{base_url}/login")
     }
 }
 
@@ -1414,6 +2175,19 @@ fn parsed_bool_form_field(
     }
 }
 
+fn optional_bool_form_field(
+    fields: &BTreeMap<String, Zeroizing<String>>,
+    name: &str,
+    default: bool,
+) -> Result<bool, ()> {
+    match required_form_field(fields, name) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(()),
+    }
+}
+
 fn invalid_form_response() -> Response {
     named_json_error(
         StatusCode::BAD_REQUEST,
@@ -1530,7 +2304,10 @@ fn authentication_user(context: &AuthContext) -> AuthenticationUser {
         app_metadata: AppMetadata {
             provider: authentication_type,
         },
-        user_metadata: UserMetadata { first_login: false },
+        user_metadata: UserMetadata {
+            first_login: false,
+            force_password_change: context.force_password_change,
+        },
     }
 }
 
@@ -1562,6 +2339,34 @@ fn random_request_id() -> String {
     format!("req_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn random_temporary_password() -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 6];
+    rand::rng().fill(&mut bytes);
+    let mut password = String::with_capacity(12);
+    for byte in bytes {
+        password.push(char::from(HEX[usize::from(byte >> 4)]));
+        password.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Zeroizing::new(password)
+}
+
+fn random_invite_password() -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 6];
+    rand::rng().fill(&mut bytes);
+    let mut password = String::with_capacity(12);
+    for byte in &bytes[..4] {
+        password.push(char::from(HEX[usize::from(byte >> 4)]));
+        password.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    password.push('-');
+    password.push(char::from(HEX[usize::from(bytes[4] >> 4)]));
+    password.push(char::from(HEX[usize::from(bytes[4] & 0x0f)]));
+    password.push(char::from(HEX[usize::from(bytes[5] >> 4)]));
+    Zeroizing::new(password)
+}
+
 fn denial_response(denial: AuthorizationDenial, request_id: &str) -> Response {
     let (status, message) = match denial {
         AuthorizationDenial::AuthenticationRequired
@@ -1577,6 +2382,34 @@ fn denial_response(denial: AuthorizationDenial, request_id: &str) -> Response {
         }
     };
     with_request_id(json_error(status, message), request_id)
+}
+
+fn entitlement_denial_response(
+    required: EndpointEntitlement,
+    path: &str,
+    request_id: &str,
+) -> Response {
+    let detail = match required {
+        EndpointEntitlement::Enterprise => "This endpoint requires an Enterprise license",
+        EndpointEntitlement::ServerOrEnterprise => {
+            "This endpoint requires a Server or Enterprise license"
+        }
+        EndpointEntitlement::Unrestricted => "Forbidden",
+    };
+    let response = (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/problem+json")],
+        Json(serde_json::json!({
+            "type": "/errors/403",
+            "title": "Forbidden",
+            "status": 403,
+            "detail": detail,
+            "timestamp": Utc::now().to_rfc3339(),
+            "path": path,
+        })),
+    )
+        .into_response();
+    with_request_id(response, request_id)
 }
 
 fn unauthorized_response() -> Response {
@@ -1624,21 +2457,23 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        SecurityHttpConfig, SecurityStartupError, initialize_security_store, secure_router,
-        secure_router_with_config,
+        API_KEY_HEADER, AUDIT_LEVEL_STANDARD, AUDIT_LEVEL_VERBOSE, AUTOMATION_HEADER,
+        SecurityHttpConfig, SecurityStartupError, initialize_security_store,
+        random_temporary_password, secure_router, secure_router_with_config,
     };
     use crate::admin_settings::AdminSettingsService;
     use crate::job_manager::{JobManager, JobOwner};
     use crate::job_queue::{JobQueue, JobQueueConfig};
     use crate::runtime_config::RuntimeConfig;
-    use crate::security::SecurityStore;
+    use crate::security::{SecurityAuditFilter, SecurityStore};
     use crate::security_crypto::totp_code_at;
     use crate::security_jwt::{SupabaseJwtConfig, SupabaseJwtVerifier};
+    use crate::security_policy::LicenseTier;
     use axum::{
         Extension, Router,
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
-        routing::get,
+        routing::{get, post},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::Utc;
@@ -1671,7 +2506,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_mutations_write_attempt_and_outcome_audit_events()
+    async fn commercial_routes_enforce_verified_tiers_and_enterprise_only_auditing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (normal_app, normal_store) = test_router_with_license_tier(LicenseTier::Normal)?;
+        let normal_login = response_json(login_request(&normal_app, None).await?).await?;
+        let normal_token = normal_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing normal access token")?;
+        let (content_type, body) = multipart_body(&[("name", "Normal Team")]);
+        let denied_team = normal_app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/team/create")
+                    .header(header::AUTHORIZATION, format!("Bearer {normal_token}"))
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(denied_team.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            denied_team.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let denied_team = response_json(denied_team).await?;
+        assert_eq!(denied_team["type"], "/errors/403");
+        assert_eq!(denied_team["title"], "Forbidden");
+        assert_eq!(denied_team["status"], 403);
+        assert_eq!(
+            denied_team["detail"],
+            "This endpoint requires a Server or Enterprise license"
+        );
+        assert_eq!(denied_team["path"], "/api/v1/team/create");
+        assert!(denied_team["timestamp"].is_string());
+        assert!(
+            normal_store
+                .export_audit_events(&SecurityAuditFilter::default())?
+                .is_empty()
+        );
+
+        let (server_app, server_store) = test_router_with_license_tier(LicenseTier::Server)?;
+        let server_login = response_json(login_request(&server_app, None).await?).await?;
+        let server_token = server_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing server access token")?;
+        let (content_type, body) = multipart_body(&[("name", "Server Team")]);
+        let allowed_team = server_app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/team/create")
+                    .header(header::AUTHORIZATION, format!("Bearer {server_token}"))
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(allowed_team.status(), StatusCode::OK);
+        let denied_audit = authorized_get(&server_app, "/api/v1/audit/data", server_token).await?;
+        assert_eq!(denied_audit.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(denied_audit).await?["detail"],
+            "This endpoint requires an Enterprise license"
+        );
+        assert!(
+            server_store
+                .export_audit_events(&SecurityAuditFilter::default())?
+                .is_empty()
+        );
+
+        let (enterprise_app, enterprise_store) =
+            test_router_with_license_tier(LicenseTier::Enterprise)?;
+        let enterprise_login = response_json(login_request(&enterprise_app, None).await?).await?;
+        let enterprise_token = enterprise_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing enterprise access token")?;
+        let (content_type, body) = multipart_body(&[("name", "Enterprise Team")]);
+        let allowed_team = enterprise_app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/team/create")
+                    .header(header::AUTHORIZATION, format!("Bearer {enterprise_token}"))
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(allowed_team.status(), StatusCode::OK);
+        let events = enterprise_store.export_audit_events(&SecurityAuditFilter::default())?;
+        assert!(
+            events
+                .iter()
+                .any(|event| audit_event_has_path(event, "/api/v1/team/create"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_mutations_write_one_typed_post_handler_audit_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let (app, store) = test_router_with_store()?;
         let login = response_json(login_request(&app, None).await?).await?;
@@ -1688,6 +2616,151 @@ mod tests {
             .await?;
         assert_eq!(rotated.status(), StatusCode::OK);
         assert_eq!(store.audit_event_count()?, 2);
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        let mutation_events = events
+            .iter()
+            .filter(|event| audit_event_has_path(event, "/api/v1/user/update-api-key"))
+            .collect::<Vec<_>>();
+        assert_eq!(mutation_events.len(), 1);
+        assert_eq!(mutation_events[0].event_type, "USER_PROFILE_UPDATE");
+        assert_eq!(mutation_events[0].source, "WEB");
+        let details: Value = serde_json::from_str(&mutation_events[0].data)?;
+        assert_eq!(details["outcome"], "success");
+        assert_eq!(details["httpMethod"], "POST");
+        assert_eq!(details["statusCode"], 200);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_audit_classifies_processing_sources_and_returned_errors_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, store) = test_router_with_store()?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let access_token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+
+        let returned_error =
+            authorized_post(&app, "/api/v1/general/process", access_token, None).await?;
+        assert_eq!(returned_error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            authorized_post(&app, "/api/v1/ai/test", access_token, None)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            authorized_post(
+                &app,
+                "/api/v1/ai/test",
+                access_token,
+                Some((AUTOMATION_HEADER.as_str(), "true")),
+            )
+            .await?
+            .status(),
+            StatusCode::OK
+        );
+
+        let rotated = response_json(
+            authorized_post(&app, "/api/v1/user/update-api-key", access_token, None).await?,
+        )
+        .await?;
+        let api_key = rotated["apiKey"].as_str().ok_or("missing API key")?;
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/general/process")
+                    .header(API_KEY_HEADER, api_key)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(api_response.status(), StatusCode::BAD_REQUEST);
+
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        let processing_events = events
+            .iter()
+            .filter(|event| audit_event_has_path(event, "/api/v1/general/process"))
+            .collect::<Vec<_>>();
+        assert_eq!(processing_events.len(), 2);
+        assert!(
+            processing_events
+                .iter()
+                .all(|event| event.event_type == "PDF_PROCESS")
+        );
+        assert!(processing_events.iter().any(|event| event.source == "WEB"));
+        assert!(processing_events.iter().any(|event| event.source == "API"));
+        let web_details: Value = serde_json::from_str(
+            &processing_events
+                .iter()
+                .find(|event| event.source == "WEB")
+                .ok_or("missing WEB event")?
+                .data,
+        )?;
+        assert_eq!(web_details["outcome"], "success");
+        assert_eq!(web_details["statusCode"], 400);
+
+        let ai_sources = events
+            .iter()
+            .filter(|event| audit_event_has_path(event, "/api/v1/ai/test"))
+            .map(|event| event.source.as_str())
+            .collect::<Vec<_>>();
+        assert!(ai_sources.contains(&"AI"));
+        assert!(ai_sources.contains(&"AUTOMATION"));
+
+        let fleet = store.fleet_usage_stats(true, Utc::now().timestamp())?;
+        assert_eq!(fleet.active_this_month, Some(1));
+        assert_eq!(fleet.pdfs_processed, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_audit_honors_enabled_level_and_exact_standard_polling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (enabled, level) in [(false, AUDIT_LEVEL_VERBOSE), (true, 0)] {
+            let (app, store) = test_router_with_audit_config(enabled, level)?;
+            let login = response_json(login_request(&app, None).await?).await?;
+            let token = login["session"]["access_token"]
+                .as_str()
+                .ok_or("missing access token")?;
+            assert_eq!(
+                authorized_post(&app, "/api/v1/general/process", token, None)
+                    .await?
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(store.audit_event_count()?, 0);
+        }
+
+        let (standard_app, standard_store) =
+            test_router_with_audit_config(true, AUDIT_LEVEL_STANDARD)?;
+        let standard_login = response_json(login_request(&standard_app, None).await?).await?;
+        let standard_token = standard_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+        assert_eq!(
+            authorized_get(&standard_app, "/api/v1/auth/me", standard_token)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(standard_store.audit_event_count()?, 1);
+
+        let (verbose_app, verbose_store) =
+            test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE)?;
+        let verbose_login = response_json(login_request(&verbose_app, None).await?).await?;
+        let verbose_token = verbose_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+        assert_eq!(
+            authorized_get(&verbose_app, "/api/v1/auth/me", verbose_token)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        let verbose_events = verbose_store.export_audit_events(&SecurityAuditFilter::default())?;
+        assert!(verbose_events.iter().any(|event| {
+            event.event_type == "UI_DATA" && audit_event_has_path(event, "/api/v1/auth/me")
+        }));
         Ok(())
     }
 
@@ -1851,7 +2924,7 @@ mod tests {
     #[tokio::test]
     async fn verified_supabase_bearer_provisions_one_live_scoped_identity()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (app, token) = test_router_with_external_jwt()?;
+        let (app, token, store) = test_router_with_external_jwt()?;
         let me = authorized_get(&app, "/api/v1/auth/me", &token).await?;
         assert_eq!(me.status(), StatusCode::OK);
         let first = response_json(me).await?;
@@ -1871,6 +2944,15 @@ mod tests {
         let signing_users =
             response_json(authorized_get(&app, "/api/v1/user/users", &token).await?).await?;
         assert_eq!(signing_users.as_array().map(Vec::len), Some(1));
+        let external_events = store.export_audit_events(&SecurityAuditFilter {
+            principals: vec!["external@example.test".to_owned()],
+            ..SecurityAuditFilter::default()
+        })?;
+        assert!(external_events.iter().any(|event| {
+            audit_event_has_path(event, "/api/v1/user/users")
+                && event.event_type == "UI_DATA"
+                && event.source == "WEB"
+        }));
 
         let mut tampered = token;
         tampered.push('x');
@@ -2162,6 +3244,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invitation_email_without_a_relay_reports_failure_and_keeps_the_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router()?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let access_token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+        let generated = authorized_multipart_post(
+            &app,
+            "/api/v1/invite/generate",
+            access_token,
+            &[
+                ("email", "mail-unavailable@example.test"),
+                ("sendEmail", "true"),
+                ("frontendBaseUrl", "https://pdf.example.test"),
+            ],
+        )
+        .await?;
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_json(generated).await?;
+        assert_eq!(generated["emailSent"], false);
+        assert_eq!(generated["emailError"], "Email service is not configured");
+        let token = generated["token"].as_str().ok_or("missing invite token")?;
+        let validated = app
+            .oneshot(Request::get(format!("/api/v1/invite/validate/{token}")).body(Body::empty())?)
+            .await?;
+        assert_eq!(validated.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_temporary_passwords_match_the_legacy_shape() {
+        let first = random_temporary_password();
+        let second = random_temporary_password();
+        assert_eq!(first.len(), 12);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(first.as_str(), second.as_str());
+    }
+
+    #[tokio::test]
+    async fn admin_password_change_persists_before_missing_mail_is_reported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router()?;
+        let admin_login = response_json(login_request(&app, None).await?).await?;
+        let admin_token = admin_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing admin token")?;
+        let created = authorized_multipart_post(
+            &app,
+            "/api/v1/user/admin/saveUser",
+            admin_token,
+            &[
+                ("username", "mail-change@example.test"),
+                ("password", "old-mail-password"),
+                ("role", "ROLE_USER"),
+                ("authType", "WEB"),
+            ],
+        )
+        .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let user_login = response_json(
+            login_credentials(&app, "mail-change@example.test", "old-mail-password").await?,
+        )
+        .await?;
+        let user_token = user_login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing user token")?;
+
+        let changed = authorized_multipart_post(
+            &app,
+            "/api/v1/user/admin/changePasswordForUser",
+            admin_token,
+            &[
+                ("username", "mail-change@example.test"),
+                ("newPassword", "new-mail-password"),
+                ("sendEmail", "true"),
+                ("forcePasswordChange", "true"),
+            ],
+        )
+        .await?;
+        assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(changed).await?["error"],
+            "Email is not configured."
+        );
+        assert_eq!(
+            authorized_get(&app, "/api/v1/general/protected", user_token)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let replacement =
+            login_credentials(&app, "mail-change@example.test", "new-mail-password").await?;
+        assert_eq!(replacement.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(replacement).await?["user"]["user_metadata"]["forcePasswordChange"],
+            true
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn user_administration_credentials_and_digest_only_api_keys_work_end_to_end()
     -> Result<(), Box<dyn std::error::Error>> {
         let app = test_router()?;
@@ -2395,7 +3583,8 @@ mod tests {
         app_metadata: Value,
     }
 
-    fn test_router_with_external_jwt() -> Result<(Router, String), Box<dyn std::error::Error>> {
+    fn test_router_with_external_jwt()
+    -> Result<(Router, String, Arc<SecurityStore>), Box<dyn std::error::Error>> {
         let private_key = RsaPrivateKey::new(&mut rand::rng(), 2_048)?;
         let public_key = private_key.to_public_key();
         let private_der = private_key.to_pkcs1_der()?;
@@ -2427,16 +3616,20 @@ mod tests {
             .route("/api/v1/general/protected", get(|| async { "ok" }));
         let app = secure_router_with_config(
             router,
-            store,
+            Arc::clone(&store),
             SecurityHttpConfig {
                 totp_issuer: "Stirling PDF".to_owned(),
                 invites_enabled: true,
                 invite_expiry_hours: 168,
                 frontend_url: String::new(),
+                backend_url: String::new(),
+                audit_enabled: true,
+                audit_level: AUDIT_LEVEL_STANDARD,
+                license_tier: LicenseTier::Enterprise,
                 external_jwt: Some(verifier),
             },
         );
-        Ok((app, token))
+        Ok((app, token, store))
     }
 
     fn external_test_token(
@@ -2479,12 +3672,89 @@ mod tests {
 
     fn test_router_with_store() -> Result<(Router, Arc<SecurityStore>), Box<dyn std::error::Error>>
     {
+        test_router_with_license_tier(LicenseTier::Enterprise)
+    }
+
+    fn test_router_with_license_tier(
+        license_tier: LicenseTier,
+    ) -> Result<(Router, Arc<SecurityStore>), Box<dyn std::error::Error>> {
         let store = Arc::new(SecurityStore::in_memory()?);
         assert!(store.bootstrap_admin("admin", "test password")?);
         let router = Router::new()
             .route("/health", get(|| async { "ok" }))
-            .route("/api/v1/general/protected", get(|| async { "ok" }));
-        Ok((secure_router(router, Arc::clone(&store)), store))
+            .route("/api/v1/general/protected", get(|| async { "ok" }))
+            .route(
+                "/api/v1/general/process",
+                post(|| async { (StatusCode::BAD_REQUEST, "invalid") }),
+            )
+            .route("/api/v1/ai/test", post(|| async { "ok" }));
+        let app = secure_router_with_config(
+            router,
+            Arc::clone(&store),
+            SecurityHttpConfig {
+                totp_issuer: "Stirling PDF".to_owned(),
+                invites_enabled: true,
+                invite_expiry_hours: 168,
+                frontend_url: String::new(),
+                backend_url: String::new(),
+                audit_enabled: true,
+                audit_level: AUDIT_LEVEL_STANDARD,
+                license_tier,
+                external_jwt: None,
+            },
+        );
+        Ok((app, store))
+    }
+
+    fn test_router_with_audit_config(
+        audit_enabled: bool,
+        audit_level: u8,
+    ) -> Result<(Router, Arc<SecurityStore>), Box<dyn std::error::Error>> {
+        let store = Arc::new(SecurityStore::in_memory()?);
+        assert!(store.bootstrap_admin("admin", "test password")?);
+        let router = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/api/v1/general/process",
+                post(|| async { (StatusCode::BAD_REQUEST, "invalid") }),
+            );
+        let app = secure_router_with_config(
+            router,
+            Arc::clone(&store),
+            SecurityHttpConfig {
+                totp_issuer: "Stirling PDF".to_owned(),
+                invites_enabled: true,
+                invite_expiry_hours: 168,
+                frontend_url: String::new(),
+                backend_url: String::new(),
+                audit_enabled,
+                audit_level,
+                license_tier: LicenseTier::Enterprise,
+                external_jwt: None,
+            },
+        );
+        Ok((app, store))
+    }
+
+    async fn authorized_post(
+        app: &Router,
+        path: &str,
+        token: &str,
+        extra_header: Option<(&str, &str)>,
+    ) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+        let mut request =
+            Request::post(path).header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
+        Ok(app.clone().oneshot(request.body(Body::empty())?).await?)
+    }
+
+    fn audit_event_has_path(event: &crate::security::SecurityAuditEvent, path: &str) -> bool {
+        serde_json::from_str::<Value>(&event.data)
+            .ok()
+            .and_then(|details| details["path"].as_str().map(str::to_owned))
+            .is_some_and(|stored_path| stored_path == path)
     }
 
     async fn authorized_get(

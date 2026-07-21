@@ -64,12 +64,12 @@ rebuilt file is semantically equivalent rather than guaranteed byte-identical.
 For a page with no preserved `contentStreams`, Rust now draws ordered `textElements`
 using its declared Latin Standard-14 font (or Helvetica by default), WinAnsi text,
 text matrix/position, spacing, scale/rise/render mode, and DeviceGray/DeviceRGB/
-DeviceCMYK colors. Generated font resources use fresh `RustStd*` names, so they do
+DeviceCMYK colors. Generated font resources use fresh `RustFont*` names, so they do
 not collide with existing resource names.
 
 **Deferred (font subsystem, later phases):** applying `textElements` as edits over
-an existing preserved source stream, Symbol/ZapfDingbats encodings, embedded/CID/
-Type3 font drawing, and reconstructing image XObjects.
+an existing preserved source stream, Symbol/ZapfDingbats encodings, synthesizing new
+embedded/CID/Type3 fonts, and glyph-level edits that cannot use a restored source encoding.
 
 The `PdfJsonCosValue` ↔ lopdf `Object` bridge (`cos_value_to_object`,
 `build_stream_from_model`) is reusable by Phases 3–4.
@@ -99,8 +99,10 @@ Form XObjects. It follows `q`/`Q`, `cm`, and Form `/Matrix` transforms, and expo
 decoded text, source character codes, resource font ID, point size, spacing, horizontal
 scale, leading/rise/render mode, and the resulting text matrix. Simple-font `/Widths`
 and Type0 `/ToUnicode` source-code segmentation plus horizontal descendant `/DW`/`/W`
-advances are applied. Type3 outlines, vertical `/W2`, arbitrary CMap fallback, and full
-glyph layout remain conservative.
+advances are applied. Type0 `Identity-V` and vertical CMap writing modes also apply `/DW2`
+defaults and both `/W2` forms to glyph-origin vectors, vertical displacement, and `TJ`
+adjustments. Type3 outlines, non-identity CMap code-to-CID mapping, and full glyph layout
+remain conservative.
 
 The full response also exports each root AcroForm field: fully-qualified and
 partial names, inherited `/FT`, `/V`, `/DV`, and `/Ff`, alternate/mapping names,
@@ -151,8 +153,8 @@ existing cached page.
 
 ## Remaining editor capability
 
-Glyph-accurate `textElements` extraction (including Type3 outlines, vertical `/W2`, arbitrary
-CMap fallback, and embedded font reconstruction), applying editor-authored content over preserved source streams and in
+Glyph-accurate `textElements` extraction (including Type3 outlines, non-identity CMap code-to-CID
+mapping, and embedded font reconstruction), applying editor-authored content over preserved source streams and in
 partial export, font-program round-trip, complex inline filter parameters, ICC/Separation/DeviceN colour
 spaces,
 rich annotation appearance/reply graphs, nested/multi-widget form hierarchies and appearance

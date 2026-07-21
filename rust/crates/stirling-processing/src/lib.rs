@@ -1,6 +1,9 @@
 pub mod additional_language;
 mod admin_settings;
 pub mod ai_document;
+mod ai_proxy;
+mod ai_workflow;
+mod classification;
 pub mod comic_book;
 pub mod ebook_to_pdf;
 pub mod eml_to_pdf;
@@ -10,9 +13,15 @@ pub mod hardware_signing;
 pub mod html_sanitizer;
 pub mod html_to_pdf;
 pub mod image_to_pdf;
+mod integration_config;
+mod integration_http;
 mod job_manager;
 mod job_queue;
+pub mod license;
+mod license_admin;
+mod login_agreement_admin;
 pub mod markdown_to_pdf;
+mod mcp;
 pub mod mobile_scanner;
 pub mod ocr_pdf;
 pub mod office_sanitizer;
@@ -80,12 +89,24 @@ pub mod pdf_verification;
 pub mod pdf_watermark;
 pub mod pdfa;
 mod pdfium_backend;
+mod pdfium_runtime;
+mod personal_signatures;
 mod pipeline;
 mod pipeline_directory;
+mod policy_config;
+mod policy_execution;
+mod policy_http;
+mod policy_ledger;
+mod policy_outputs;
+mod policy_s3;
+mod policy_sources;
+mod policy_triggers;
+mod resource_access;
 pub mod runtime_config;
 mod runtime_dependencies;
 pub mod runtime_metrics;
 pub mod security;
+mod security_audit_http;
 pub mod security_crypto;
 pub mod security_http;
 pub mod security_jwt;
@@ -93,7 +114,9 @@ pub mod security_policy;
 mod server_certificate;
 pub mod signature_assets;
 pub mod signing_key;
+mod smtp_mail;
 pub mod svg_to_pdf;
+mod tessdata_admin;
 pub mod ui_data;
 pub mod url_to_pdf;
 pub mod vector_conversion;
@@ -105,6 +128,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -270,10 +294,10 @@ use crate::{
     pipeline_directory::PipelineDirectoryWatcher,
     runtime_config::RuntimeConfig,
     runtime_metrics::{RuntimeMetrics, application_version},
-    security::AuthContext,
+    security::{AuthContext, SecurityStore},
     security_http::{
         SecurityHttpConfig, SecurityStartupError, initialize_security_store,
-        secure_router_with_config,
+        secure_router_with_mail,
     },
     security_jwt::SupabaseJwtVerifier,
     server_certificate::{ServerCertificateError, ServerCertificateService},
@@ -1302,6 +1326,12 @@ impl IntoResponse for ApiError {
 pub struct ProcessingRuntime {
     router: Router,
     pipeline_directory_watcher: PipelineDirectoryWatcher,
+    pipeline_dispatcher: PipelineDispatcher,
+    job_manager: Arc<JobManager>,
+    job_queue: Arc<JobQueue>,
+    smtp_mail_service: Option<Arc<smtp_mail::SmtpMailService>>,
+    policy_trigger_runtime: Option<policy_triggers::PolicyTriggerRuntime>,
+    license_refresh_runtime: Option<license::LicenseRefreshRuntime>,
 }
 
 impl ProcessingRuntime {
@@ -1334,6 +1364,15 @@ impl ProcessingRuntime {
         let pipeline_directory_config = runtime_config.pipeline_directory_config();
         let job_queue_config = runtime_config.job_queue_config();
         let job_result_ttl = runtime_config.job_result_ttl();
+        let smtp_mail_config = runtime_config.smtp_mail_config();
+        let smtp_mail_service = smtp_mail_config
+            .enabled
+            .then(|| Arc::new(smtp_mail::SmtpMailService::new(smtp_mail_config)));
+        let policies_enabled = runtime_config.policies_enabled();
+        let classification_service = Arc::new(classification::ClassificationService::new(
+            runtime_config.classification_database_path(),
+            policies_enabled,
+        ));
         let runtime_config = Arc::new(runtime_config);
         let runtime_metrics = Arc::new(RuntimeMetrics::new(
             runtime_config.metrics_enabled(),
@@ -1351,51 +1390,65 @@ impl ProcessingRuntime {
         });
         let mobile_scanner = MobileScannerService::new().ok().map(Arc::new);
         let pipeline_dispatcher = PipelineDispatcher::new(
-            processing_routes()
-                .layer(DefaultBodyLimit::max(max_upload_bytes))
-                .layer(Extension(timestamp_settings.clone()))
-                .layer(middleware::from_fn_with_state(
-                    Arc::clone(&async_job_settings),
-                    submit_async_job,
-                ))
-                .layer(middleware::from_fn(enforce_endpoint_availability))
-                .layer(Extension(Arc::clone(&runtime_config)))
-                .layer(Extension(Arc::clone(&ai_comment_engine_settings)))
-                .layer(Extension(Arc::clone(&runtime_metrics)))
-                .layer(Extension(Arc::clone(&job_manager)))
-                .layer(Extension(Arc::clone(&job_queue)))
-                .layer(Extension(mobile_scanner.clone()))
-                .layer(middleware::from_fn_with_state(
-                    Arc::clone(&runtime_metrics),
-                    record_runtime_metrics,
-                )),
-        );
-        let pipeline_directory_watcher =
-            PipelineDirectoryWatcher::new(pipeline_dispatcher.clone(), pipeline_directory_config);
-        let router = processing_routes()
-            .merge(pipeline_routes())
+            processing_routes_with_features(
+                smtp_mail_service.clone(),
+                Arc::clone(&classification_service),
+                policies_enabled,
+            )
             .layer(DefaultBodyLimit::max(max_upload_bytes))
-            .layer(TraceLayer::new_for_http())
-            .layer(Extension(timestamp_settings))
+            .layer(Extension(timestamp_settings.clone()))
             .layer(middleware::from_fn_with_state(
-                async_job_settings,
+                Arc::clone(&async_job_settings),
                 submit_async_job,
             ))
             .layer(middleware::from_fn(enforce_endpoint_availability))
-            .layer(Extension(runtime_config))
-            .layer(Extension(ai_comment_engine_settings))
+            .layer(Extension(Arc::clone(&runtime_config)))
+            .layer(Extension(Arc::clone(&ai_comment_engine_settings)))
             .layer(Extension(Arc::clone(&runtime_metrics)))
-            .layer(Extension(job_manager))
-            .layer(Extension(job_queue))
-            .layer(Extension(mobile_scanner))
-            .layer(Extension(pipeline_dispatcher))
+            .layer(Extension(Arc::clone(&job_manager)))
+            .layer(Extension(Arc::clone(&job_queue)))
+            .layer(Extension(mobile_scanner.clone()))
             .layer(middleware::from_fn_with_state(
-                runtime_metrics,
+                Arc::clone(&runtime_metrics),
                 record_runtime_metrics,
-            ));
+            )),
+        );
+        let pipeline_directory_watcher =
+            PipelineDirectoryWatcher::new(pipeline_dispatcher.clone(), pipeline_directory_config);
+        let router = processing_routes_with_features(
+            smtp_mail_service.clone(),
+            classification_service,
+            policies_enabled,
+        )
+        .merge(pipeline_routes())
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
+        .layer(TraceLayer::new_for_http())
+        .layer(Extension(timestamp_settings))
+        .layer(middleware::from_fn_with_state(
+            async_job_settings,
+            submit_async_job,
+        ))
+        .layer(middleware::from_fn(enforce_endpoint_availability))
+        .layer(Extension(runtime_config))
+        .layer(Extension(ai_comment_engine_settings))
+        .layer(Extension(Arc::clone(&runtime_metrics)))
+        .layer(Extension(Arc::clone(&job_manager)))
+        .layer(Extension(Arc::clone(&job_queue)))
+        .layer(Extension(mobile_scanner))
+        .layer(Extension(pipeline_dispatcher.clone()))
+        .layer(middleware::from_fn_with_state(
+            runtime_metrics,
+            record_runtime_metrics,
+        ));
         Self {
             router,
             pipeline_directory_watcher,
+            pipeline_dispatcher,
+            job_manager,
+            job_queue,
+            smtp_mail_service,
+            policy_trigger_runtime: None,
+            license_refresh_runtime: None,
         }
     }
 
@@ -1412,23 +1465,57 @@ impl ProcessingRuntime {
         timestamp_settings: TimestampSettings,
         runtime_config: RuntimeConfig,
     ) -> Result<Self, SecurityStartupError> {
+        let initialized_license = initialize_verified_license(&runtime_config)?;
         let security_store = initialize_security_store(&runtime_config)?;
-        let external_jwt = runtime_config
-            .security_supabase_jwt_config()
-            .map(SupabaseJwtVerifier::new)
-            .transpose()
-            .map_err(SecurityStartupError::ExternalJwt)?
-            .map(Arc::new);
-        let security_http_config = SecurityHttpConfig {
-            totp_issuer: runtime_config.security_totp_issuer(),
-            invites_enabled: runtime_config.security_invites_enabled(),
-            invite_expiry_hours: runtime_config.security_invite_expiry_hours(),
-            frontend_url: runtime_config.security_frontend_url(),
-            external_jwt,
-        };
+        security_store
+            .attach_license_state(&initialized_license.state)
+            .map_err(SecurityStartupError::Repository)?;
+        let policies_enabled = runtime_config.policies_enabled();
+        let policy_source_readiness = runtime_config.pipeline_directory_config().readiness;
+        let policy_trigger_settings = runtime_config.policy_trigger_settings();
+        let policy_stream_timeout = runtime_config.policy_stream_timeout();
+        let integration_service = Arc::new(integration_config::IntegrationConfigService::new(
+            Arc::clone(&security_store),
+            resource_access::DefaultAccessPolicy::from_config(
+                &runtime_config.security_portal_default_access(),
+            ),
+            true,
+            policies_enabled,
+            runtime_config.policies_allow_private_s3_endpoints(),
+        ));
+        let processed_ledger = initialize_policy_ledger(policies_enabled, &security_store)?;
+        let policy_service = processed_ledger.as_ref().map(|_| {
+            Arc::new(policy_config::PolicyConfigService::new(
+                Arc::clone(&security_store),
+                Arc::clone(&integration_service),
+                runtime_config.policies_allowed_folder_roots(),
+                runtime_config
+                    .settings_path()
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            ))
+        });
+        let mcp_config = runtime_config.mcp_config();
+        let mcp_engine_settings = AiCommentEngineSettings::from_runtime_config(&runtime_config);
+        let security_http_config =
+            reviewed_security_http_config(&runtime_config, initialized_license.verification)?;
         let admin_settings = Arc::new(admin_settings::AdminSettingsService::new(
             runtime_config.settings_path().to_path_buf(),
             runtime_config.settings_snapshot(),
+        ));
+        let license_admin = initialize_license_admin(
+            &runtime_config,
+            &initialized_license,
+            Arc::clone(&admin_settings),
+        );
+        let personal_signatures = Arc::new(personal_signatures::PersonalSignatureService::new(
+            runtime_config.signatures_dir(),
+        ));
+        let login_agreements = Arc::new(login_agreement_admin::LoginAgreementAdminService::new(
+            runtime_config.login_agreement_directory(),
+        ));
+        let tessdata_admin = Arc::new(tessdata_admin::TessdataAdminService::new(
+            runtime_config.tessdata_dir(),
         ));
         let server_certificate = Arc::new(
             ServerCertificateService::new(runtime_config.server_certificate_config())
@@ -1439,13 +1526,43 @@ impl ProcessingRuntime {
             .map_err(|error| SecurityStartupError::ServerCertificate(Box::new(error)))?;
         let mut runtime =
             Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
+        runtime.license_refresh_runtime = Some(license::LicenseRefreshRuntime::new(
+            initialized_license.verifier,
+            Arc::clone(&initialized_license.config),
+            Arc::clone(&initialized_license.state),
+        ));
         runtime.router = runtime
             .router
+            .merge(integration_http::routes(integration_service))
+            .merge(login_agreement_admin::routes(login_agreements))
+            .merge(tessdata_admin::routes(tessdata_admin))
+            .merge(personal_signatures::routes())
             .merge(admin_settings::routes().layer(Extension(admin_settings)))
+            .merge(license_admin::routes(license_admin))
             .merge(server_certificate::routes())
-            .layer(Extension(server_certificate));
-        runtime.router =
-            secure_router_with_config(runtime.router, security_store, security_http_config);
+            .layer(Extension(personal_signatures))
+            .layer(Extension(server_certificate))
+            .layer(Extension(initialized_license.state));
+        attach_policy_routes(
+            &mut runtime,
+            policy_service,
+            processed_ledger,
+            policy_source_readiness,
+            policy_trigger_settings,
+            policy_stream_timeout,
+            max_upload_bytes,
+        );
+        runtime.router = secure_router_with_mail(
+            runtime.router,
+            Arc::clone(&security_store),
+            security_http_config,
+            runtime.smtp_mail_service.clone(),
+        )
+        .merge(mcp::routes(
+            mcp_config,
+            security_store,
+            &mcp_engine_settings,
+        ));
         Ok(runtime)
     }
 
@@ -1454,9 +1571,160 @@ impl ProcessingRuntime {
         tokio::spawn(async move { watcher.run_forever().await });
     }
 
+    pub fn spawn_policy_triggers(&self) {
+        if let Some(triggers) = self.policy_trigger_runtime.clone() {
+            tokio::spawn(async move { Box::pin(triggers.run_forever()).await });
+        }
+    }
+
+    pub fn spawn_license_refresh(&self) {
+        if let Some(refresh) = self.license_refresh_runtime.clone() {
+            tokio::spawn(refresh.run_forever());
+        }
+    }
+
     pub fn into_router(self) -> Router {
         self.router
     }
+
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+}
+
+struct InitializedLicense {
+    verifier: license::LicenseVerifier,
+    config: Arc<license::LicenseConfigState>,
+    state: Arc<license::LicenseState>,
+    verification: license::LicenseVerification,
+}
+
+fn initialize_license_admin(
+    runtime_config: &RuntimeConfig,
+    initialized: &InitializedLicense,
+    settings: Arc<admin_settings::AdminSettingsService>,
+) -> Arc<license_admin::LicenseAdminService> {
+    Arc::new(license_admin::LicenseAdminService::new(
+        initialized.verifier.clone(),
+        Arc::clone(&initialized.config),
+        Arc::clone(&initialized.state),
+        settings,
+        runtime_config
+            .settings_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("configs"))
+            .to_path_buf(),
+    ))
+}
+
+fn initialize_verified_license(
+    runtime_config: &RuntimeConfig,
+) -> Result<InitializedLicense, SecurityStartupError> {
+    let config = runtime_config.license_config();
+    let verifier = license::LicenseVerifier::production()
+        .map_err(SecurityStartupError::LicenseVerification)?;
+    let verification = verifier
+        .verify_config(&config, config.initial_max_users)
+        .map_err(SecurityStartupError::LicenseVerification)?;
+    let config = Arc::new(license::LicenseConfigState::new(config));
+    let state = Arc::new(license::LicenseState::new(verification));
+    Ok(InitializedLicense {
+        verifier,
+        config,
+        state,
+        verification,
+    })
+}
+
+fn reviewed_security_http_config(
+    runtime_config: &RuntimeConfig,
+    verified_license: license::LicenseVerification,
+) -> Result<SecurityHttpConfig, SecurityStartupError> {
+    let external_jwt = runtime_config
+        .security_supabase_jwt_config()
+        .map(SupabaseJwtVerifier::new)
+        .transpose()
+        .map_err(SecurityStartupError::ExternalJwt)?
+        .map(Arc::new);
+    Ok(SecurityHttpConfig {
+        totp_issuer: runtime_config.security_totp_issuer(),
+        invites_enabled: runtime_config.security_invites_enabled(),
+        invite_expiry_hours: runtime_config.security_invite_expiry_hours(),
+        frontend_url: runtime_config.security_frontend_url(),
+        backend_url: runtime_config.security_backend_url(),
+        audit_enabled: runtime_config.security_audit_enabled(),
+        audit_level: runtime_config.security_audit_level(),
+        license_tier: verified_license.tier,
+        external_jwt,
+    })
+}
+
+fn attach_policy_routes(
+    runtime: &mut ProcessingRuntime,
+    policy_service: Option<Arc<policy_config::PolicyConfigService>>,
+    processed_ledger: Option<Arc<policy_ledger::ProcessedLedger>>,
+    readiness: runtime_config::FileReadinessConfig,
+    trigger_settings: runtime_config::PolicyTriggerSettings,
+    stream_timeout: Duration,
+    max_upload_bytes: usize,
+) {
+    let (Some(policy_service), Some(processed_ledger)) = (policy_service, processed_ledger) else {
+        return;
+    };
+    let s3 = policy_s3::S3ConnectionPool::new();
+    let output_service = Arc::new(policy_outputs::PolicyOutputService::new(
+        Arc::clone(&policy_service),
+        Arc::clone(&processed_ledger),
+        s3.clone(),
+    ));
+    let execution_service = Arc::new(policy_execution::PolicyExecutionService::new(
+        Arc::clone(&policy_service),
+        runtime.pipeline_dispatcher.clone(),
+        Arc::clone(&runtime.job_manager),
+        Arc::clone(&runtime.job_queue),
+        output_service,
+    ));
+    let source_runner = Arc::new(policy_sources::PolicySourceRunner::new(
+        Arc::clone(&policy_service),
+        Arc::clone(&execution_service),
+        Arc::clone(&processed_ledger),
+        readiness,
+        s3,
+    ));
+    let trigger_notifier = policy_triggers::PolicyChangeNotifier::default();
+    runtime.policy_trigger_runtime = Some(policy_triggers::PolicyTriggerRuntime::new(
+        Arc::clone(&policy_service),
+        Arc::clone(&source_runner),
+        trigger_settings,
+        trigger_notifier.clone(),
+    ));
+    runtime.router = runtime.router.clone().merge(
+        policy_http::routes(
+            policy_service,
+            execution_service,
+            source_runner,
+            processed_ledger,
+            trigger_notifier,
+            stream_timeout,
+        )
+        .layer(DefaultBodyLimit::max(max_upload_bytes)),
+    );
+}
+
+fn initialize_policy_ledger(
+    policies_enabled: bool,
+    security_store: &Arc<SecurityStore>,
+) -> Result<Option<Arc<policy_ledger::ProcessedLedger>>, SecurityStartupError> {
+    if !policies_enabled {
+        return Ok(None);
+    }
+    let ledger = Arc::new(policy_ledger::ProcessedLedger::new(Arc::clone(
+        security_store,
+    )));
+    ledger
+        .recover_interrupted(chrono::Utc::now().timestamp_millis())
+        .map_err(SecurityStartupError::Repository)?;
+    Ok(Some(ledger))
 }
 
 pub fn app(max_upload_bytes: usize) -> Router {
@@ -1601,6 +1869,23 @@ fn processing_routes() -> Router {
         .route(TIMESTAMP_PDF_PATH, post(timestamp_pdf))
 }
 
+fn processing_routes_with_mail(service: Option<Arc<smtp_mail::SmtpMailService>>) -> Router {
+    service.map_or_else(processing_routes, |service| {
+        processing_routes().merge(smtp_mail::routes(service))
+    })
+}
+
+fn processing_routes_with_features(
+    mail_service: Option<Arc<smtp_mail::SmtpMailService>>,
+    classification_service: Arc<classification::ClassificationService>,
+    policies_enabled: bool,
+) -> Router {
+    processing_routes_with_mail(mail_service).merge(classification::routes(
+        classification_service,
+        policies_enabled,
+    ))
+}
+
 fn pipeline_routes() -> Router {
     Router::new().route(PIPELINE_PATH, post(handle_pipeline))
 }
@@ -1715,6 +2000,8 @@ fn ai_tool_routes() -> Router {
         .route(PDF_COMMENT_AGENT_PATH, post(pdf_comment_agent))
         .route(CREATE_PDF_AGENT_PATH, post(create_pdf_from_html_agent))
         .route(MATH_AUDITOR_AGENT_PATH, post(math_auditor_agent))
+        .merge(ai_proxy::routes())
+        .merge(ai_workflow::routes())
 }
 
 fn image_extraction_routes() -> Router {
@@ -1815,20 +2102,25 @@ async fn health() -> &'static str {
 
 async fn handle_pipeline(
     Extension(dispatcher): Extension<PipelineDispatcher>,
+    auth: Option<Extension<AuthContext>>,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
     let request = pipeline::read_request(multipart)
         .await
         .map_err(pipeline::PipelineFailure::into_api_error)?;
-    let output = pipeline::run(&dispatcher, request)
-        .await
-        .map_err(pipeline::PipelineFailure::into_api_error)?;
+    let output = pipeline::run(
+        &dispatcher,
+        request,
+        auth.as_ref().map(|Extension(auth)| auth),
+    )
+    .await
+    .map_err(pipeline::PipelineFailure::into_api_error)?;
     file_response(
         output.path,
         output.temp_dir,
         &output.filename,
         PIPELINE_PATH,
-        output.content_type,
+        &output.content_type,
     )
     .await
 }
@@ -2141,6 +2433,7 @@ const ASYNC_JOB_PROCESSING_PATHS: &[&str] = &[
     PDF_TO_WORD_PATH,
     PDF_TO_XLSX_PATH,
     PDF_TO_XML_PATH,
+    PIPELINE_PATH,
     POSTER_PRINT_PATH,
     REDACT_EXECUTE_PATH,
     REDACT_PATH,
@@ -2705,6 +2998,7 @@ fn mobile_scanner_unique_filename(filename: &str, number: u16) -> String {
 
 async fn app_config(
     Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    license_state: Option<Extension<Arc<license::LicenseState>>>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let host = headers
@@ -2713,7 +3007,11 @@ async fn app_config(
     let forwarded_proto = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok());
-    Json(runtime_config.app_config(host, forwarded_proto))
+    let mut config = runtime_config.app_config(host, forwarded_proto);
+    if let Some(Extension(license_state)) = license_state {
+        license_state.apply_to_app_config(&mut config);
+    }
+    Json(config)
 }
 
 async fn hardware_signing_capabilities_route() -> Json<hardware_signing::HardwareSigningCapabilities>
@@ -2791,8 +3089,35 @@ async fn ui_data_sign(
 
 async fn shared_signature_image(
     Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    personal_signatures: Option<Extension<Arc<personal_signatures::PersonalSignatureService>>>,
+    auth_context: Option<Extension<AuthContext>>,
     AxumPath(filename): AxumPath<String>,
 ) -> Response {
+    if let (Some(Extension(service)), Some(Extension(context))) =
+        (personal_signatures, auth_context)
+        && let Ok(directory) = service.personal_directory(&context)
+    {
+        match signature_assets::read_signature(&directory, &filename) {
+            Ok(asset) => {
+                return ([(header::CONTENT_TYPE, asset.media_type)], asset.bytes).into_response();
+            }
+            Err(signature_assets::SignatureAssetError::NotFound) => {}
+            Err(signature_assets::SignatureAssetError::InvalidFilename) => {
+                return ApiError::bad_request_at(
+                    SIGNATURE_IMAGE_PATH,
+                    "signature filename is invalid",
+                )
+                .into_response();
+            }
+            Err(signature_assets::SignatureAssetError::Read(error)) => {
+                return ApiError::internal_at(
+                    SIGNATURE_IMAGE_PATH,
+                    format!("could not read personal signature image: {error}"),
+                )
+                .into_response();
+            }
+        }
+    }
     match signature_assets::read_shared_signature(
         &runtime_config.shared_signatures_dir(),
         &filename,
@@ -4088,11 +4413,11 @@ async fn job_result_files(
     if let Some(error) = status.error {
         return (StatusCode::BAD_REQUEST, format!("Job failed: {error}")).into_response();
     }
-    match job_manager.result_file(owner, &job_id) {
-        Ok(Some(file)) => Json(serde_json::json!({
+    match job_manager.result_files(owner, &job_id) {
+        Ok(Some(files)) => Json(serde_json::json!({
             "jobId": job_id,
-            "fileCount": 1,
-            "files": [file],
+            "fileCount": files.len(),
+            "files": files,
         }))
         .into_response(),
         Ok(None) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -7220,7 +7545,7 @@ async fn file_response(
     temp_dir: TempDir,
     output_filename: &str,
     api_path: &'static str,
-    content_type: &'static str,
+    content_type: &str,
 ) -> Result<Response, ApiError> {
     let output_size = tokio::fs::metadata(&output_path)
         .await
@@ -7239,7 +7564,11 @@ async fn file_response(
     );
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .map_err(|_| ApiError::internal_at(api_path, "could not encode response MIME type"))?,
+    );
     headers.insert(
         header::CONTENT_DISPOSITION,
         attachment_header(output_filename, api_path)?,
@@ -12881,18 +13210,13 @@ fn map_extract_image_scans_error(error: &ExtractImageScansError) -> ApiError {
         ExtractImageScansError::PdfToImage(PdfToImageError::PdfiumUnavailable {
             explicitly_configured: false,
             ..
-        })
-        | ExtractImageScansError::PythonUnavailable {
-            explicitly_configured: false,
-        } => ApiError::unsupported_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string()),
+        }) => ApiError::unsupported_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string()),
         ExtractImageScansError::PdfToImage(_)
         | ExtractImageScansError::Io(_)
         | ExtractImageScansError::Zip(_)
-        | ExtractImageScansError::PythonUnavailable {
-            explicitly_configured: true,
-        }
-        | ExtractImageScansError::PythonStart { .. }
-        | ExtractImageScansError::PythonFailed { .. } => {
+        | ExtractImageScansError::Image(_)
+        | ExtractImageScansError::InvalidBorderSize(_)
+        | ExtractImageScansError::InvalidDimensions => {
             ApiError::internal_at(EXTRACT_IMAGE_SCANS_PATH, error.to_string())
         }
     }

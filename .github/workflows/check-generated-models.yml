@@ -3,10 +3,11 @@ name: Check generated models
 # Verifies the committed generated API models are still in sync with the Java
 # OpenAPI spec: the frontend tool API types
 # (frontend/editor/src/core/types/toolApiTypes.ts) and the engine tool
-# models (engine/src/stirling/models/tool_models.py). Regenerates both with the
-# single top-level `task tool-models` and fails if either committed file is
-# out of date. Called from build.yml when the backend Java, frontend, or engine
-# changes; also runs on push to main as a post-merge safety net.
+# models (engine/src/stirling/models/tool_models.py), and the Rust AI operation
+# catalog. Regenerates all three with the single top-level `task tool-models`
+# and fails if any committed file is out of date. Called from build.yml when
+# the backend Java, frontend, or engine changes; also runs on push to main as a
+# post-merge safety net.
 on:
   workflow_call:
   push:
@@ -69,7 +70,8 @@ jobs:
         run: |
           git diff --exit-code \
             frontend/editor/src/core/types/toolApiTypes.ts \
-            engine/src/stirling/models/tool_models.py
+            engine/src/stirling/models/tool_models.py \
+            rust/crates/stirling-ai-engine/src/operation_catalog.json
 
       - name: Comment on generated models check failure
         # Only post a comment on PRs. github-script's PR helpers need an
@@ -84,7 +86,7 @@ jobs:
               marker,
               '### Generated Models Check Failed',
               '',
-              'The generated `frontend/editor/src/core/types/toolApiTypes.ts` and/or `engine/src/stirling/models/tool_models.py` are out of date with the Java OpenAPI spec and will need to be regenerated before they can be merged in.',
+              'The generated frontend types, legacy Python engine models, and/or Rust AI operation catalog are out of date with the Java OpenAPI spec and will need to be regenerated before they can be merged in.',
               '',
               'Run `task tool-models` to regenerate both, then commit the updated files.',
             ].join('\n');
@@ -117,8 +119,8 @@ jobs:
           echo "  Generated Models Check Failed"
           echo "============================================"
           echo ""
-          echo "The generated frontend API types and/or engine tool"
-          echo "models are out of date with the Java OpenAPI spec and"
+          echo "The generated frontend API types, legacy engine models,"
+          echo "and/or Rust operation catalog are out of date and"
           echo "will need to be regenerated before they can be merged in."
           echo ""
           echo "Run 'task tool-models' to regenerate both, then"

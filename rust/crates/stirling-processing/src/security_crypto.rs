@@ -163,6 +163,54 @@ impl ProtectedSecretCipher {
             .map(Zeroizing::new)
             .map_err(|_| SecurityCryptoError::InvalidCiphertext)
     }
+
+    /// Encrypts an integration-config payload in the legacy Java database
+    /// format: standard Base64 of `12-byte IV || ciphertext || 16-byte tag`,
+    /// with no prefix and no associated data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authenticated encryption cannot be performed.
+    pub fn encrypt_java_compatible(&self, plaintext: &[u8]) -> Result<String, SecurityCryptoError> {
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_ref())
+            .map_err(|_| SecurityCryptoError::InvalidKey)?;
+        let mut nonce_bytes = [0_u8; GCM_NONCE_BYTES];
+        rand::rng().fill(&mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|_| SecurityCryptoError::Encryption)?;
+        let mut combined = Vec::with_capacity(GCM_NONCE_BYTES + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        Ok(STANDARD.encode(combined))
+    }
+
+    /// Decrypts the unversioned Java integration-config ciphertext format.
+    ///
+    /// # Errors
+    ///
+    /// Returns a generic error for malformed, tampered, or wrong-key data.
+    pub fn decrypt_java_compatible(
+        &self,
+        protected: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, SecurityCryptoError> {
+        let combined = STANDARD
+            .decode(protected.trim())
+            .map_err(|_| SecurityCryptoError::InvalidCiphertext)?;
+        if combined.len() < GCM_NONCE_BYTES + GCM_TAG_BYTES {
+            return Err(SecurityCryptoError::InvalidCiphertext);
+        }
+        let nonce_bytes: [u8; GCM_NONCE_BYTES] = combined[..GCM_NONCE_BYTES]
+            .try_into()
+            .map_err(|_| SecurityCryptoError::InvalidCiphertext)?;
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_ref())
+            .map_err(|_| SecurityCryptoError::InvalidKey)?;
+        cipher
+            .decrypt(&Nonce::from(nonce_bytes), &combined[GCM_NONCE_BYTES..])
+            .map(Zeroizing::new)
+            .map_err(|_| SecurityCryptoError::InvalidCiphertext)
+    }
 }
 
 /// Generates a Java-compatible 160-bit Base32 TOTP seed without padding.
@@ -322,6 +370,27 @@ mod tests {
             b"persistent"
         );
         assert!(ProtectedSecretCipher::from_base64(&STANDARD.encode([7_u8; 31])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn integration_cipher_matches_the_unversioned_java_aes_gcm_format()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cipher = ProtectedSecretCipher::from_base64(&STANDARD.encode([0_u8; 32]))?;
+        // NIST AES-256-GCM empty-plaintext vector, stored exactly as Java's
+        // Base64(12-byte IV || ciphertext || tag) representation.
+        let fixture = "AAAAAAAAAAAAAAAAUw+K+8dFNrmpY7TxxMtziw==";
+        assert!(cipher.decrypt_java_compatible(fixture)?.is_empty());
+
+        let protected = cipher.encrypt_java_compatible(br#"{"token":"secret"}"#)?;
+        assert!(!protected.starts_with("enc:v1:"));
+        assert_eq!(
+            cipher.decrypt_java_compatible(&protected)?.as_slice(),
+            br#"{"token":"secret"}"#
+        );
+        assert!(cipher.decrypt_java_compatible("not base64").is_err());
+        let wrong = ProtectedSecretCipher::from_base64(&STANDARD.encode([1_u8; 32]))?;
+        assert!(wrong.decrypt_java_compatible(&protected).is_err());
         Ok(())
     }
 

@@ -96,26 +96,7 @@ pub(crate) fn discover_dependency_groups() -> BTreeSet<String> {
 
     // Rust deliberately does not use Java's unoconvert server pool.
     disabled.insert("Unoconvert".to_owned());
-    discover_python_groups(&mut disabled);
     disabled
-}
-
-fn discover_python_groups(disabled: &mut BTreeSet<String>) {
-    let candidates = configured_or_platform_candidates(
-        "STIRLING_PROCESSING_PYTHON_COMMAND",
-        &["python3", "python"],
-        &["python.exe", "python3.exe", "python", "python3"],
-    );
-    let Some(command) = resolve_first(&candidates) else {
-        disabled.insert("Python".to_owned());
-        disabled.insert("OpenCV".to_owned());
-        return;
-    };
-    if !run_with_timeout(&command, &["-c", "import cv2"])
-        .is_some_and(|output| output.status.success())
-    {
-        disabled.insert("OpenCV".to_owned());
-    }
 }
 
 fn resolve_dependency(spec: &DependencySpec) -> Option<PathBuf> {

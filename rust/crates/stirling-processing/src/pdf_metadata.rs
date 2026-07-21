@@ -87,6 +87,35 @@ pub fn update_metadata_to_file(
     Ok(())
 }
 
+/// Sets only the Stirling classification entry in the PDF Info dictionary.
+///
+/// Existing standard and custom metadata is preserved byte-for-byte at the
+/// dictionary-value level; this helper intentionally does not apply the
+/// general metadata endpoint's empty-field semantics.
+///
+/// # Errors
+///
+/// Returns [`MetadataError`] when the input cannot be parsed or the updated PDF
+/// cannot be written.
+pub fn set_classification_metadata_to_file(
+    input_path: &Path,
+    filename: &str,
+    classification: &str,
+    output_path: &Path,
+) -> Result<(), MetadataError> {
+    let mut document = Document::load(input_path).map_err(|source| MetadataError::ReadPdf {
+        filename: filename.to_owned(),
+        source,
+    })?;
+    let info_id = ensure_info_dictionary(&mut document)?;
+    document.get_dictionary_mut(info_id)?.set(
+        "StirlingPDFClassification",
+        Object::string_literal(classification),
+    );
+    document.save(output_path)?;
+    Ok(())
+}
+
 fn ensure_info_dictionary(document: &mut Document) -> Result<ObjectId, lopdf::Error> {
     let existing = document.trailer.get(b"Info").ok().cloned();
     if let Some(Object::Reference(info_id)) = existing {

@@ -1,6 +1,12 @@
 version: '3'
 
 tasks:
+  clean:deps:
+    desc: "Clean Rust dependency build artifacts"
+    run: once
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -Command "Remove-Item -LiteralPath target/debug/deps -Recurse -Force -ErrorAction SilentlyContinue"{{else}}rm -rf -- target/debug/deps{{end}}'
+
   pdfium:install:
     desc: "Install the pinned PDFium runtime"
     cmds:
@@ -16,20 +22,35 @@ tasks:
   run:
     desc: "Run the Rust processing service"
     deps:
+      - clean:deps
       - pdfium:install
     env:
       STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
     cmds:
       - cargo run -p stirling-processing
 
+  ai-engine:run:
+    desc: "Run the Rust AI engine"
+    deps: [clean:deps]
+    cmds:
+      - cargo run -p stirling-ai-engine --bin stirling-ai-engine
+
+  ai-engine:migrate:
+    desc: "Migrate legacy AI-engine document data to Rust storage"
+    deps: [clean:deps]
+    cmds:
+      - cargo run -p stirling-ai-engine --bin migrate-sqlite-vec -- {{.CLI_ARGS}}
+
   build:
     desc: "Build Rust components"
+    deps: [clean:deps]
     cmds:
       - cargo build --workspace --locked
 
   test:
     desc: "Run Rust tests"
     deps:
+      - clean:deps
       - pdfium:install
     env:
       STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
@@ -38,6 +59,7 @@ tasks:
 
   lint:
     desc: "Run Rust linting"
+    deps: [clean:deps]
     cmds:
       - cargo clippy --workspace --all-targets --locked -- -D warnings
 

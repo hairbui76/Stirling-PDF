@@ -15,7 +15,7 @@ includes:
     dir: frontend
   engine:
     taskfile: .taskfiles/engine.yml
-    dir: engine
+    dir: .
   rust:
     taskfile: .taskfiles/rust.yml
     dir: rust
@@ -58,7 +58,6 @@ tasks:
     desc: "Install all project dependencies"
     cmds:
       - task: frontend:install
-      - task: engine:install
       - task: rust:install
 
   # ============================================================
@@ -157,7 +156,6 @@ tasks:
     cmds:
       - task: backend:test
       - task: frontend:test
-      - task: engine:test
       - task: rust:test
 
   # ============================================================
@@ -168,7 +166,6 @@ tasks:
     desc: "Run all linters"
     cmds:
       - task: frontend:lint
-      - task: engine:lint
       - task: rust:lint
 
   fix:
@@ -176,7 +173,6 @@ tasks:
     cmds:
       - task: backend:fix
       - task: frontend:fix
-      - task: engine:fix
       - task: rust:format
 
   format:
@@ -184,7 +180,6 @@ tasks:
     cmds:
       - task: backend:format
       - task: frontend:format
-      - task: engine:format
       - task: rust:format
 
   format:check:
@@ -192,7 +187,6 @@ tasks:
     cmds:
       - task: backend:format:check
       - task: frontend:format:check
-      - task: engine:format:check
       - task: rust:format:check
 
   # ============================================================
@@ -214,7 +208,6 @@ tasks:
     cmds:
       - task: backend:check
       - task: frontend:check
-      - task: engine:check
       - task: rust:check
 
   check:all:
@@ -222,7 +215,6 @@ tasks:
     cmds:
       - task: backend:check
       - task: frontend:check:all
-      - task: engine:check
       - task: rust:check
 
   # ============================================================
@@ -234,6 +226,5 @@ tasks:
     cmds:
       - task: backend:clean
       - task: frontend:clean
-      - task: engine:clean
       - task: rust:clean
       - task: pre-commit:clean

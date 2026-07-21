@@ -32,9 +32,8 @@ tasks:
 
   build:engine:
     desc: "Build engine Docker image"
-    dir: engine
     cmds:
-      - docker build -t stirling-pdf-engine .
+      - docker build -t stirling-pdf-engine -f engine/Dockerfile .
 
   up:
     desc: "Start standard docker compose stack"

@@ -81,7 +81,8 @@ proprietary signing workflows are owner/team scoped.
 7. **Managed server-certificate slice implemented:** secured administrator info/upload/delete/
    generate/download/enabled routes, strict key/certificate matching, AES-protected PKCS#12
    re-wrapping, link rejection, Unix `0600` files, and end-to-end `certType=SERVER` PDF/CMS
-   verification. Proprietary license entitlement, Windows ACL hardening, KMS/HSM-backed key
+   verification. Static proprietary route entitlement is implemented, while Keygen tier
+   derivation, Windows ACL hardening, KMS/HSM-backed key
    custody, certificate policy validation, rotation overlap, and independent review remain gates.
 
 Every source must test bad secrets, weak/expired/invalid chains, malformed PDFs,

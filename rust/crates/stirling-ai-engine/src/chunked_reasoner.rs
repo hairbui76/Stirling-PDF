@@ -1,6 +1,10 @@
 //! Parallel map/reduce reasoning over long ordered page text.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,6 +12,7 @@ use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 
 use crate::{
     documents::StoredPage,
+    progress::{ProgressEvent, emit},
     structured_output::{ModelError, StructuredOutputModel, ToolDefinition},
 };
 
@@ -109,6 +114,14 @@ impl ChunkedReasoner {
             ));
         }
         let slices = slice_pages(pages, self.chars_per_slice);
+        let slice_total = slices.len();
+        emit(ProgressEvent::ReadStarted {
+            question: question.to_owned(),
+            pages: pages.len(),
+            slices: slice_total,
+        })
+        .await;
+        let gather_started = Instant::now();
         let jobs = slices
             .into_iter()
             .map(|slice| ExtractionJob {
@@ -117,7 +130,13 @@ impl ChunkedReasoner {
                 fallback: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let (mut notes, successes) = self.extract_jobs(jobs, question).await;
+        let (mut notes, successes) = self.extract_jobs(jobs, question, true).await;
+        emit(ProgressEvent::ReadDone {
+            completed: successes,
+            slices: slice_total,
+            duration_seconds: round_seconds(gather_started.elapsed()),
+        })
+        .await;
         if successes == 0 {
             return Err(ChunkedReasonerError::AllWorkersFailed);
         }
@@ -130,6 +149,7 @@ impl ChunkedReasoner {
         mut notes: Vec<ChunkNotes>,
         question: &str,
     ) -> Result<Vec<ChunkNotes>, ChunkedReasonerError> {
+        let mut round_number = 0_usize;
         loop {
             let rendered_size = format_notes(&notes).chars().count();
             if rendered_size <= self.notes_char_budget || notes.len() <= 1 {
@@ -137,6 +157,13 @@ impl ChunkedReasoner {
             }
             let previous_count = notes.len();
             let groups = group_notes(&notes, self.chars_per_slice);
+            round_number += 1;
+            emit(ProgressEvent::CompressionRound {
+                round_number,
+                notes_in: previous_count,
+                groups: groups.len(),
+            })
+            .await;
             let jobs = groups
                 .into_iter()
                 .map(|group| ExtractionJob {
@@ -145,7 +172,7 @@ impl ChunkedReasoner {
                     fallback: group,
                 })
                 .collect::<Vec<_>>();
-            let (next, successes) = self.extract_jobs(jobs, question).await;
+            let (next, successes) = self.extract_jobs(jobs, question, false).await;
             if successes == 0 {
                 return Ok(next);
             }
@@ -161,7 +188,9 @@ impl ChunkedReasoner {
         &self,
         jobs: Vec<ExtractionJob>,
         question: &str,
+        report_slices: bool,
     ) -> (Vec<ChunkNotes>, usize) {
+        let total = jobs.len();
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
         let mut tasks = JoinSet::new();
         for (index, job) in jobs.into_iter().enumerate() {
@@ -171,6 +200,7 @@ impl ChunkedReasoner {
             let worker_timeout = self.worker_timeout;
             let max_output_tokens = self.max_output_tokens;
             tasks.spawn(async move {
+                let started = Instant::now();
                 let result = extract_job(
                     model,
                     semaphore,
@@ -180,19 +210,30 @@ impl ChunkedReasoner {
                     &question,
                 )
                 .await;
-                (index, job, result)
+                (index, job, result, started.elapsed())
             });
         }
 
         let mut completed = Vec::new();
         let mut successes = 0_usize;
         while let Some(joined) = tasks.join_next().await {
-            let Ok((index, job, result)) = joined else {
+            let Ok((index, job, result, duration)) = joined else {
                 continue;
             };
             match result {
                 Ok(extracted) => {
                     successes += 1;
+                    if report_slices {
+                        emit(ProgressEvent::SliceDone {
+                            completed: successes,
+                            total,
+                            pages: page_range_label(&job.pages),
+                            duration_ms: duration.as_millis(),
+                            excerpts: extracted.relevant_excerpts.len(),
+                            facts: extracted.facts.len(),
+                        })
+                        .await;
+                    }
                     completed.push((
                         index,
                         vec![ChunkNotes {
@@ -213,6 +254,18 @@ impl ChunkedReasoner {
         let notes = completed.into_iter().flat_map(|(_, notes)| notes).collect();
         (notes, successes)
     }
+}
+
+fn page_range_label(pages: &[u32]) -> String {
+    match pages {
+        [] => "pages=?".to_owned(),
+        [page] => format!("pages={page}"),
+        [first, .., last] => format!("pages={first}-{last}"),
+    }
+}
+
+fn round_seconds(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 100.0).round() / 100.0
 }
 
 #[derive(Clone, Debug)]

@@ -19,6 +19,28 @@ pub enum EndpointPolicy {
     Administrator,
 }
 
+/// Verified commercial license tier available to the secured HTTP boundary.
+///
+/// Configuration intent (`premium.enabled`) and the presence of a key are not
+/// evidence of entitlement. Callers must therefore supply `Server` or
+/// `Enterprise` only after the license has been cryptographically or remotely
+/// verified.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LicenseTier {
+    #[default]
+    Normal,
+    Server,
+    Enterprise,
+}
+
+/// License requirement attached to an exact Java controller route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointEntitlement {
+    Unrestricted,
+    ServerOrEnterprise,
+    Enterprise,
+}
+
 /// A stable denial category which an HTTP boundary can map without exposing
 /// user, session, or policy internals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +49,72 @@ pub enum AuthorizationDenial {
     ParticipantTokenRequired,
     DemoUserRestricted,
     AdministratorRequired,
+}
+
+/// Resolves the commercial entitlement required by a reviewed route.
+///
+/// This deliberately uses an exact method/path matrix. Broad prefixes would
+/// incorrectly license-gate unannotated endpoints such as Java's team list UI
+/// data and would let future routes inherit a paid tier without review.
+#[must_use]
+pub fn endpoint_entitlement(method: &Method, path: &str) -> EndpointEntitlement {
+    if method == Method::POST
+        && matches!(
+            path,
+            "/api/v1/team/create"
+                | "/api/v1/team/rename"
+                | "/api/v1/team/delete"
+                | "/api/v1/team/setOwner"
+                | "/api/v1/team/removeOwner"
+                | "/api/v1/team/addUser"
+        )
+    {
+        return EndpointEntitlement::ServerOrEnterprise;
+    }
+
+    let enterprise = (method == Method::GET
+        && matches!(
+            path,
+            "/api/v1/audit/data"
+                | "/api/v1/audit/stats"
+                | "/api/v1/audit/types"
+                | "/api/v1/audit/export/csv"
+                | "/api/v1/audit/export/json"
+                | "/api/v1/proprietary/ui-data/audit-events"
+                | "/api/v1/proprietary/ui-data/audit-charts"
+                | "/api/v1/proprietary/ui-data/audit-event-types"
+                | "/api/v1/proprietary/ui-data/audit-users"
+                | "/api/v1/proprietary/ui-data/audit-stats"
+                | "/api/v1/proprietary/ui-data/audit-export"
+                | "/api/v1/proprietary/ui-data/usage-endpoint-statistics"
+                | "/api/v1/usage/fleet-stats"
+        ))
+        || (method == Method::DELETE && path == "/api/v1/audit/cleanup/before")
+        || (method == Method::POST && path == "/api/v1/proprietary/ui-data/audit-clear-all");
+    if enterprise {
+        EndpointEntitlement::Enterprise
+    } else {
+        EndpointEntitlement::Unrestricted
+    }
+}
+
+/// Checks a previously verified license tier against one route requirement.
+///
+/// # Errors
+///
+/// Returns the unmet entitlement when the verified tier is insufficient.
+pub fn authorize_entitlement(
+    tier: LicenseTier,
+    entitlement: EndpointEntitlement,
+) -> Result<(), EndpointEntitlement> {
+    let allowed = match entitlement {
+        EndpointEntitlement::Unrestricted => true,
+        EndpointEntitlement::ServerOrEnterprise => {
+            matches!(tier, LicenseTier::Server | LicenseTier::Enterprise)
+        }
+        EndpointEntitlement::Enterprise => tier == LicenseTier::Enterprise,
+    };
+    if allowed { Ok(()) } else { Err(entitlement) }
 }
 
 /// Resolves one normalized request path to its secured-mode policy.
@@ -42,6 +130,11 @@ pub fn endpoint_policy(method: &Method, path: &str) -> EndpointPolicy {
     }
     if path.starts_with("/api/v1/workflow/participant/") {
         return EndpointPolicy::ParticipantToken;
+    }
+    if path == "/api/v1/classification/labels"
+        && (method == Method::PUT || method == Method::DELETE)
+    {
+        return EndpointPolicy::Administrator;
     }
     if is_administrator_path(path) {
         return EndpointPolicy::Administrator;
@@ -109,7 +202,10 @@ fn is_public_auth(method: &Method, path: &str) -> bool {
     method == Method::POST
         && matches!(
             path,
-            "/api/v1/auth/login" | "/api/v1/auth/refresh" | "/api/v1/auth/logout"
+            "/api/v1/auth/login"
+                | "/api/v1/auth/refresh"
+                | "/api/v1/auth/logout"
+                | "/api/v1/user/register"
         )
 }
 
@@ -121,8 +217,15 @@ fn is_public_invitation(method: &Method, path: &str) -> bool {
 fn is_administrator_path(path: &str) -> bool {
     path.starts_with("/api/v1/admin/")
         || path == "/api/v1/admin"
+        || matches!(
+            path,
+            "/api/v1/ui-data/tessdata-languages" | "/api/v1/ui-data/tessdata/download"
+        )
         || path.starts_with("/api/v1/audit/")
+        || path.starts_with("/api/v1/proprietary/ui-data/audit-")
+        || path == "/api/v1/proprietary/ui-data/usage-endpoint-statistics"
         || path.starts_with("/api/v1/database/")
+        || path == "/api/v1/usage/fleet-stats"
         || path.starts_with("/api/v1/team/")
         || path.starts_with("/api/v1/user/admin/")
         || path.starts_with("/api/v1/auth/mfa/disable/admin/")
@@ -149,7 +252,10 @@ fn is_non_demo_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorizationDenial, EndpointPolicy, authorize, endpoint_policy};
+    use super::{
+        AuthorizationDenial, EndpointEntitlement, EndpointPolicy, LicenseTier, authorize,
+        authorize_entitlement, endpoint_entitlement, endpoint_policy,
+    };
     use crate::security::{AuthContext, AuthenticationSource};
     use axum::http::Method;
     use std::collections::BTreeSet;
@@ -162,6 +268,7 @@ mod tests {
             (Method::POST, "/api/v1/auth/login"),
             (Method::POST, "/api/v1/auth/refresh"),
             (Method::POST, "/api/v1/auth/logout"),
+            (Method::POST, "/api/v1/user/register"),
             (Method::GET, "/api/v1/invite/validate/token"),
             (Method::POST, "/api/v1/invite/accept/token"),
             (Method::GET, "/api/v1/mobile-scanner/files/id"),
@@ -190,6 +297,10 @@ mod tests {
             EndpointPolicy::Administrator
         );
         assert_eq!(
+            endpoint_policy(&Method::GET, "/api/v1/usage/fleet-stats"),
+            EndpointPolicy::Administrator
+        );
+        assert_eq!(
             endpoint_policy(&Method::POST, "/api/v1/user/change-password"),
             EndpointPolicy::NonDemoUser
         );
@@ -200,12 +311,29 @@ mod tests {
             "/api/v1/invite/generate",
             "/api/v1/invite/revoke/7",
             "/api/v1/proprietary/ui-data/admin-settings",
+            "/api/v1/audit/data",
+            "/api/v1/proprietary/ui-data/audit-events",
+            "/api/v1/proprietary/ui-data/usage-endpoint-statistics",
+            "/api/v1/ui-data/tessdata-languages",
+            "/api/v1/ui-data/tessdata/download",
         ] {
             assert_eq!(
                 endpoint_policy(&Method::POST, path),
                 EndpointPolicy::Administrator
             );
         }
+        assert_eq!(
+            endpoint_policy(&Method::PUT, "/api/v1/classification/labels"),
+            EndpointPolicy::Administrator
+        );
+        assert_eq!(
+            endpoint_policy(&Method::DELETE, "/api/v1/classification/labels"),
+            EndpointPolicy::Administrator
+        );
+        assert_eq!(
+            endpoint_policy(&Method::GET, "/api/v1/classification/labels"),
+            EndpointPolicy::Authenticated
+        );
     }
 
     #[test]
@@ -235,6 +363,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_commercial_route_matrix_enforces_both_java_license_tiers() {
+        for path in [
+            "/api/v1/team/create",
+            "/api/v1/team/rename",
+            "/api/v1/team/delete",
+            "/api/v1/team/setOwner",
+            "/api/v1/team/removeOwner",
+            "/api/v1/team/addUser",
+        ] {
+            let entitlement = endpoint_entitlement(&Method::POST, path);
+            assert_eq!(entitlement, EndpointEntitlement::ServerOrEnterprise);
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Normal, entitlement),
+                Err(EndpointEntitlement::ServerOrEnterprise)
+            );
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Server, entitlement),
+                Ok(())
+            );
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Enterprise, entitlement),
+                Ok(())
+            );
+        }
+
+        for (method, path) in [
+            (Method::GET, "/api/v1/audit/data"),
+            (Method::GET, "/api/v1/audit/stats"),
+            (Method::GET, "/api/v1/audit/types"),
+            (Method::GET, "/api/v1/audit/export/csv"),
+            (Method::GET, "/api/v1/audit/export/json"),
+            (Method::DELETE, "/api/v1/audit/cleanup/before"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-events"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-charts"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-event-types"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-users"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-stats"),
+            (Method::GET, "/api/v1/proprietary/ui-data/audit-export"),
+            (Method::POST, "/api/v1/proprietary/ui-data/audit-clear-all"),
+            (
+                Method::GET,
+                "/api/v1/proprietary/ui-data/usage-endpoint-statistics",
+            ),
+            (Method::GET, "/api/v1/usage/fleet-stats"),
+        ] {
+            let entitlement = endpoint_entitlement(&method, path);
+            assert_eq!(entitlement, EndpointEntitlement::Enterprise);
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Normal, entitlement),
+                Err(EndpointEntitlement::Enterprise)
+            );
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Server, entitlement),
+                Err(EndpointEntitlement::Enterprise)
+            );
+            assert_eq!(
+                authorize_entitlement(LicenseTier::Enterprise, entitlement),
+                Ok(())
+            );
+        }
+
+        for (method, path) in [
+            (Method::GET, "/api/v1/team/list"),
+            (Method::POST, "/api/v1/team/list"),
+            (Method::GET, "/api/v1/proprietary/ui-data/teams"),
+            (Method::GET, "/api/v1/audit/not-reviewed"),
+            (Method::POST, "/api/v1/audit/data"),
+        ] {
+            assert_eq!(
+                endpoint_entitlement(&method, path),
+                EndpointEntitlement::Unrestricted
+            );
+        }
+    }
+
     fn context<const N: usize>(roles: [&str; N]) -> AuthContext {
         AuthContext {
             user_id: 7,
@@ -248,6 +452,7 @@ mod tests {
             team_id: None,
             permissions: BTreeSet::new(),
             external_subject: None,
+            force_password_change: false,
             session_id: "session".to_owned(),
             correlation_id: "request".to_owned(),
         }

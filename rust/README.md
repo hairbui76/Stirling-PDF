@@ -13,12 +13,16 @@ implements `POST /api/v1/general/crop`,
 `POST /api/v1/convert/pdf/xlsx`,
 `GET /api/v1/config/app-config`,
 `GET /api/v1/config/login-disclaimer`,
+secured `GET /api/v1/admin/login-agreement`,
+secured `GET /api/v1/admin/login-agreement/{locale}`,
+secured `PUT /api/v1/admin/login-agreement/{locale}`,
 `GET /api/v1/config/endpoint-enabled`,
 `GET /api/v1/config/endpoints-enabled`,
 `GET /api/v1/config/endpoints-availability`,
 `GET /api/v1/config/group-enabled`,
 `GET /api/v1/settings/get-endpoints-status`,
 `POST /api/v1/settings/update-enable-analytics`,
+conditional `POST /api/v1/general/send-email`,
 `GET /api/v1/info/status`,
 `GET /api/v1/info/health`,
 `GET /api/v1/info/load`,
@@ -40,6 +44,7 @@ implements `POST /api/v1/general/crop`,
 `GET /api/v1/ui-data/ocr-pdf`,
 `GET /api/v1/ui-data/sign`,
 `GET /api/v1/general/signatures/{filename}`,
+secured `/api/v1/proprietary/signatures` management,
 `POST /api/v1/mobile-scanner/create-session/{sessionId}`,
 `GET /api/v1/mobile-scanner/validate-session/{sessionId}`,
 `POST /api/v1/mobile-scanner/upload/{sessionId}`,
@@ -137,9 +142,9 @@ RGB PNG pages into the existing numbered archive contracts. CBR extraction uses
 PDF/A-1b, PDF/A-2b, PDF/A-3b, and PDF/X conversion uses a sandboxed Ghostscript
 adapter with embedded sRGB/Gray ICC profiles; strict PDF/A validation uses the
 existing veraPDF command seam when configured.
-Image-scan extraction accepts raster images or PDF pages, runs the packaged
-OpenCV splitter through Python, and returns one PNG or a safe ZIP of detected
-photos.
+Image-scan extraction accepts raster images or PDF pages, runs the median-background,
+mask/contour, and Canny/Hough splitter natively in Rust, and returns one PNG or a
+safe ZIP of detected photos without a Python/OpenCV runtime.
 PDF-to-video conversion renders annotated PDFium PNG frames, applies an embedded-font
 diagonal watermark without shell interpolation, and encodes MP4 or WebM through FFmpeg.
 Set `STIRLING_PROCESSING_FFMPEG_COMMAND` to select a particular executable; the route returns
@@ -220,7 +225,10 @@ configuration and endpoint-availability routes used by the unchanged UI; see
 [`contracts/runtime-config.md`](contracts/runtime-config.md) for supported values
 and explicit infrastructure gaps. It also exposes a bounded, locale-aware
 login-disclaimer reader for anonymous/no-login operation; see
-[`contracts/login-disclaimer.md`](contracts/login-disclaimer.md). The same YAML timestamp settings now feed the
+[`contracts/login-disclaimer.md`](contracts/login-disclaimer.md). The reviewed secured router also
+provides administrator-only, atomic login-agreement listing, replacement, and clearing while the
+public reader remains lock-free; see
+[`contracts/login-agreement-admin.md`](contracts/login-agreement-admin.md). The same YAML timestamp settings now feed the
 normal Rust server constructor, with timestamp environment aliases taking precedence.
 It also implements the anonymous one-time analytics choice used during onboarding:
 multipart or URL-encoded `enabled` is persisted to `settings.yml` and immediately
@@ -243,9 +251,23 @@ shared signature/font metadata to the unchanged client; see
 generated from the Rust lockfile during build; `UNKNOWN` entries and native-tool
 notices remain release-compliance gates.
 
-Together, the service currently owns 143 compatibility
-`/api/v1/*` routes,
-plus its health endpoint.
+The reviewed secured router also provides the proprietary administrator-only
+Tessdata inventory and downloader. It preserves the installed/available/writable
+response contract while adding bounded downloads, atomic replacement, and
+link-safe storage under the configured Tessdata directory; see
+[`contracts/ui-data.md`](contracts/ui-data.md).
+
+The reviewed secured router also owns authenticated saved-signature management
+under `/api/v1/proprietary/signatures`. It preserves the personal/shared JSON
+and filesystem contract, personal quotas, administrator-only shared mutations,
+and personal-first lookup through the existing general signature-asset route;
+see [`contracts/personal-signatures.md`](contracts/personal-signatures.md).
+
+The implemented compatibility surface is listed in
+[`PORT_STATUS.md`](PORT_STATUS.md) and covered by focused endpoint suites. A
+fixed route total is intentionally deferred to the versioned baseline-to-Rust
+manifest so nested secured routers and conditional endpoints are counted by
+method and path rather than inferred from source literals.
 
 Install the pinned PDFium runtime and run locally from the repository root:
 
@@ -263,10 +285,17 @@ oracle until every documented limit in the per-route files under `contracts/`
 is removed and parity tests pass.
 
 For desktop migration validation only, set `STIRLING_NATIVE_BACKEND_PATH` to an
-absolute path for a Rust processing executable. The unchanged Tauri host then
-starts it with `STIRLING_PORT=0`, observes the same startup log, and keeps the
-Java JAR launcher as the default when the variable is absent. The native binary
-is not yet bundled or enabled for production desktop builds.
+absolute path for a Rust processing executable. The Tauri host then starts it
+with an ephemeral port and explicit desktop/base-path settings, migrates the
+legacy workspace, accepts the stable startup handshake from either output
+stream, and fails a bounded startup on early process exit. The processing binary
+prints that handshake even when `RUST_LOG` is unset, exits when the PID/start-time
+identity of its Tauri parent disappears, and atomically initializes the packaged
+settings template plus empty override only on a fresh install. Java remains the
+default when the variable is absent; the Rust binary and PDFium are not yet bundled
+or enabled for production desktop builds. Upgrade-time settings migration,
+sidecar/PDFium packaging, cross-platform bundle proof, and the default switch remain
+cutover gates. See `contracts/desktop-native-startup.md`.
 
 `task rust:install` downloads PDFium revision 7543 for the current platform, verifies
 its pinned SHA-256 digest, and keeps the runtime under the ignored `rust/.pdfium`

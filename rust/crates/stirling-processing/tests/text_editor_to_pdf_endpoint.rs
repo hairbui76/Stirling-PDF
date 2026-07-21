@@ -82,7 +82,7 @@ async fn draws_an_editor_authored_standard14_page() -> Result<(), Box<dyn std::e
                 .operands
                 .first()
                 .and_then(|object| object.as_name().ok())
-                == Some(b"RustStd0")
+                == Some(b"RustFont0")
     }));
     let text = content
         .operations

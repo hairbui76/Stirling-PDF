@@ -4,6 +4,7 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -26,7 +27,7 @@ use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::ApiError;
+use crate::{ApiError, security::AuthContext};
 
 pub(crate) const PIPELINE_PATH: &str = "/api/v1/pipeline/handleData";
 
@@ -36,6 +37,15 @@ const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
 static MULTIPART_BOUNDARY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipelineProgressPhase {
+    Started,
+    Completed,
+}
+
+pub(crate) type PipelineProgress = Arc<dyn Fn(usize, PipelineProgressPhase) + Send + Sync>;
+pub(crate) type SupportingFiles = BTreeMap<String, Vec<PipelineFile>>;
 
 #[derive(Clone)]
 pub(crate) struct PipelineDispatcher {
@@ -59,7 +69,7 @@ pub(crate) struct PipelineRequest {
 pub(crate) struct PipelineOutput {
     pub(crate) path: PathBuf,
     pub(crate) filename: String,
-    pub(crate) content_type: &'static str,
+    pub(crate) content_type: String,
     pub(crate) temp_dir: TempDir,
 }
 
@@ -67,6 +77,8 @@ pub(crate) struct PipelineOutput {
 pub(crate) struct PipelineFile {
     pub(crate) filename: String,
     pub(crate) path: PathBuf,
+    pub(crate) content_type: Option<String>,
+    pub(crate) origin: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,12 +98,47 @@ pub(crate) struct PipelineOperation {
     pub(crate) operation: String,
     #[serde(default)]
     pub(crate) parameters: BTreeMap<String, Value>,
+    #[serde(default, rename = "fileParameters")]
+    pub(crate) file_parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PipelineFilesOutput {
     pub(crate) files: Vec<PipelineFile>,
     _temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+pub(crate) struct PipelineWorkflowOutput {
+    pub(crate) files: Vec<PipelineFile>,
+    pub(crate) report: Option<Value>,
+    pub(crate) report_tool: Option<String>,
+    _temp_dir: TempDir,
+}
+
+#[derive(Debug)]
+struct PipelineReport {
+    value: Value,
+    tool: String,
+}
+
+#[derive(Debug)]
+struct DispatchResult {
+    files: Vec<PipelineFile>,
+    report: Option<Value>,
+}
+
+#[derive(Clone, Copy)]
+struct DispatchOptions<'a> {
+    auth: Option<&'a AuthContext>,
+    mode: DispatchMode,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DispatchMode {
+    Pipeline,
+    Policy,
+    Workflow,
 }
 
 #[derive(Debug)]
@@ -140,9 +187,15 @@ pub(crate) async fn read_request(
         match field.name().unwrap_or_default() {
             "fileInput" => {
                 let filename = safe_filename(field.file_name());
+                let content_type = field.content_type().map(ToString::to_string);
                 let path = temp_dir.path().join(format!("input-{}", files.len()));
                 write_field_to_file(&mut field, &path).await?;
-                files.push(PipelineFile { filename, path });
+                files.push(PipelineFile {
+                    filename,
+                    path,
+                    content_type,
+                    origin: None,
+                });
             }
             "json" => {
                 let value = read_field_text(&mut field, CONFIG_LIMIT_BYTES).await?;
@@ -222,11 +275,29 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), PipelineFai
 pub(crate) async fn run(
     dispatcher: &PipelineDispatcher,
     request: PipelineRequest,
+    auth: Option<&AuthContext>,
 ) -> Result<PipelineOutput, PipelineFailure> {
     let workspace = create_output_workspace(request.temp_dir.path()).await?;
-    let files =
-        execute_operations(dispatcher, request.files, &request.operations, &workspace).await?;
-    build_output(files, request.temp_dir, workspace).await
+    let (files, _) = execute_operations(
+        dispatcher,
+        request.files,
+        &request.operations,
+        &SupportingFiles::new(),
+        &workspace,
+        None,
+        DispatchOptions {
+            auth,
+            mode: DispatchMode::Pipeline,
+        },
+    )
+    .await?;
+    let mut output = build_output(files, request.temp_dir, workspace).await?;
+    if output.content_type != "application/zip" {
+        // The legacy pipeline endpoint deliberately presents a generic download,
+        // while policy jobs retain the dispatched tool's MIME type in their file metadata.
+        "application/octet-stream".clone_into(&mut output.content_type);
+    }
+    Ok(output)
 }
 
 pub(crate) async fn run_files(
@@ -239,9 +310,94 @@ pub(crate) async fn run_files(
         PipelineFailure::Internal(format!("could not create pipeline workspace: {error}"))
     })?;
     let workspace = create_output_workspace(temp_dir.path()).await?;
-    let files = execute_operations(dispatcher, files, &config.operations, &workspace).await?;
+    let (files, _) = execute_operations(
+        dispatcher,
+        files,
+        &config.operations,
+        &SupportingFiles::new(),
+        &workspace,
+        None,
+        DispatchOptions {
+            auth: None,
+            mode: DispatchMode::Pipeline,
+        },
+    )
+    .await?;
     Ok(PipelineFilesOutput {
         files,
+        _temp_dir: temp_dir,
+    })
+}
+
+pub(crate) async fn run_policy_files(
+    dispatcher: &PipelineDispatcher,
+    files: Vec<PipelineFile>,
+    operations: &[PipelineOperation],
+    supporting_files: &SupportingFiles,
+    auth: &AuthContext,
+    progress: PipelineProgress,
+) -> Result<PipelineOutput, PipelineFailure> {
+    if operations.is_empty() {
+        return Err(PipelineFailure::BadRequest(
+            "Pipeline definition has no steps".to_owned(),
+        ));
+    }
+    let temp_dir = TempDir::new().map_err(|error| {
+        PipelineFailure::Internal(format!("could not create pipeline workspace: {error}"))
+    })?;
+    let workspace = create_output_workspace(temp_dir.path()).await?;
+    let (files, _) = execute_operations(
+        dispatcher,
+        files,
+        operations,
+        supporting_files,
+        &workspace,
+        Some(progress),
+        DispatchOptions {
+            auth: Some(auth),
+            mode: DispatchMode::Policy,
+        },
+    )
+    .await?;
+    build_output(files, temp_dir, workspace).await
+}
+
+pub(crate) async fn run_workflow_files(
+    dispatcher: &PipelineDispatcher,
+    mut files: Vec<PipelineFile>,
+    operations: &[PipelineOperation],
+    auth: Option<&AuthContext>,
+    progress: PipelineProgress,
+) -> Result<PipelineWorkflowOutput, PipelineFailure> {
+    if operations.is_empty() {
+        return Err(PipelineFailure::BadRequest(
+            "Pipeline definition has no steps".to_owned(),
+        ));
+    }
+    for (index, file) in files.iter_mut().enumerate() {
+        file.origin = Some(index);
+    }
+    let temp_dir = TempDir::new().map_err(|error| {
+        PipelineFailure::Internal(format!("could not create pipeline workspace: {error}"))
+    })?;
+    let workspace = create_output_workspace(temp_dir.path()).await?;
+    let (files, report) = execute_operations(
+        dispatcher,
+        files,
+        operations,
+        &SupportingFiles::new(),
+        &workspace,
+        Some(progress),
+        DispatchOptions {
+            auth,
+            mode: DispatchMode::Workflow,
+        },
+    )
+    .await?;
+    Ok(PipelineWorkflowOutput {
+        files,
+        report: report.as_ref().map(|report| report.value.clone()),
+        report_tool: report.map(|report| report.tool),
         _temp_dir: temp_dir,
     })
 }
@@ -258,53 +414,96 @@ async fn execute_operations(
     dispatcher: &PipelineDispatcher,
     mut files: Vec<PipelineFile>,
     operations: &[PipelineOperation],
+    supporting_files: &SupportingFiles,
     workspace: &Path,
-) -> Result<Vec<PipelineFile>, PipelineFailure> {
+    progress: Option<PipelineProgress>,
+    options: DispatchOptions<'_>,
+) -> Result<(Vec<PipelineFile>, Option<PipelineReport>), PipelineFailure> {
     let mut output_sequence = 0_usize;
-    for operation in operations {
+    let mut last_report = None;
+    for (step_index, operation) in operations.iter().enumerate() {
         validate_operation_path(&operation.operation)?;
+        if let Some(progress) = &progress {
+            progress(step_index + 1, PipelineProgressPhase::Started);
+        }
+        let mut step_report = None;
         let next_files = if is_multi_input_operation(&operation.operation) {
             if files.is_empty() {
                 Vec::new()
             } else {
-                dispatch_operation(
+                let operation_result = dispatch_operation(
                     dispatcher,
                     operation,
                     &files,
+                    supporting_files,
                     workspace,
                     &mut output_sequence,
+                    options,
                 )
-                .await?
+                .await?;
+                step_report = operation_result.report;
+                operation_result.files
             }
+        } else if files.is_empty() {
+            let operation_result = dispatch_operation(
+                dispatcher,
+                operation,
+                &[],
+                supporting_files,
+                workspace,
+                &mut output_sequence,
+                options,
+            )
+            .await?;
+            step_report = operation_result.report;
+            operation_result.files
         } else {
             let mut results = Vec::new();
             for file in &files {
-                results.extend(
-                    dispatch_operation(
-                        dispatcher,
-                        operation,
-                        std::slice::from_ref(file),
-                        workspace,
-                        &mut output_sequence,
-                    )
-                    .await?,
-                );
+                let operation_result = dispatch_operation(
+                    dispatcher,
+                    operation,
+                    std::slice::from_ref(file),
+                    supporting_files,
+                    workspace,
+                    &mut output_sequence,
+                    options,
+                )
+                .await?;
+                if step_report.is_none() {
+                    step_report = operation_result.report;
+                }
+                results.extend(operation_result.files);
             }
             results
         };
         files = next_files;
+        if let Some(value) = step_report {
+            last_report = Some(PipelineReport {
+                value,
+                tool: operation.operation.clone(),
+            });
+        }
+        if let Some(progress) = &progress {
+            progress(step_index + 1, PipelineProgressPhase::Completed);
+        }
     }
-    Ok(files)
+    Ok((files, last_report))
 }
 
 async fn dispatch_operation(
     dispatcher: &PipelineDispatcher,
     operation: &PipelineOperation,
     files: &[PipelineFile],
+    supporting_files: &SupportingFiles,
     workspace: &Path,
     output_sequence: &mut usize,
-) -> Result<Vec<PipelineFile>, PipelineFailure> {
-    let request = build_operation_request(operation, files).await?;
+    options: DispatchOptions<'_>,
+) -> Result<DispatchResult, PipelineFailure> {
+    let mut request = build_operation_request(operation, files, supporting_files).await?;
+    if let Some(auth) = options.auth {
+        request.extensions_mut().insert(auth.clone());
+    }
     let response = dispatcher
         .router
         .clone()
@@ -313,7 +512,10 @@ async fn dispatch_operation(
         .map_err(|error| PipelineFailure::Internal(format!("internal dispatch failed: {error}")))?;
     let status = response.status();
     if status == StatusCode::NO_CONTENT && is_filter_operation(&operation.operation) {
-        return Ok(Vec::new());
+        return Ok(DispatchResult {
+            files: Vec::new(),
+            report: None,
+        });
     }
     if status != StatusCode::OK {
         return Err(PipelineFailure::Step {
@@ -324,19 +526,61 @@ async fn dispatch_operation(
     }
 
     let filename = pipeline_filename(&operation.operation, response.headers());
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let report = if options.mode == DispatchMode::Workflow {
+        parse_report_header(response.headers(), &operation.operation)
+    } else {
+        None
+    };
+    if options.mode == DispatchMode::Workflow
+        && content_type.as_deref().is_some_and(is_json_content_type)
+    {
+        let bytes = to_bytes(response.into_body(), CONFIG_LIMIT_BYTES)
+            .await
+            .map_err(|error| {
+                PipelineFailure::Internal(format!(
+                    "could not read JSON tool response from '{}': {error}",
+                    operation.operation
+                ))
+            })?;
+        let value = serde_json::from_slice(&bytes).map_err(|error| {
+            PipelineFailure::Internal(format!(
+                "tool '{}' returned invalid JSON: {error}",
+                operation.operation
+            ))
+        })?;
+        return Ok(DispatchResult {
+            files: Vec::new(),
+            report: Some(value),
+        });
+    }
+    let origin = (files.len() == 1).then(|| files[0].origin).flatten();
     let path = workspace.join(format!("operation-output-{output_sequence}"));
     *output_sequence = output_sequence.saturating_add(1);
     write_response_to_file(response, &path).await?;
-    if is_zip_file(&path)? {
-        extract_zip(path, workspace, output_sequence).await
+    let unpack_zip =
+        options.mode == DispatchMode::Pipeline || should_unpack_zip_response(&operation.operation);
+    let files = if unpack_zip && is_zip_file(&path)? {
+        extract_zip(path, workspace, output_sequence, origin).await?
     } else {
-        Ok(vec![PipelineFile { filename, path }])
-    }
+        vec![PipelineFile {
+            filename,
+            path,
+            content_type,
+            origin,
+        }]
+    };
+    Ok(DispatchResult { files, report })
 }
 
 async fn build_operation_request(
     operation: &PipelineOperation,
     files: &[PipelineFile],
+    supporting_files: &SupportingFiles,
 ) -> Result<Request<Body>, PipelineFailure> {
     let boundary = format!(
         "stirling-pipeline-{}",
@@ -369,6 +613,33 @@ async fn build_operation_request(
         parts.push(Box::pin(ReaderStream::new(input)));
         parts.push(bytes_part("\r\n"));
     }
+    for (field_name, asset_key) in &operation.file_parameters {
+        if !is_valid_form_field_name(field_name) {
+            return Err(PipelineFailure::BadRequest(format!(
+                "pipeline supporting-file field name '{field_name}' is invalid"
+            )));
+        }
+        let assets = supporting_files.get(asset_key).ok_or_else(|| {
+            PipelineFailure::BadRequest(format!(
+                "Step {} references supporting file '{}' for field '{}' but no such file was provided",
+                operation.operation, asset_key, field_name
+            ))
+        })?;
+        for file in assets {
+            let filename = safe_multipart_filename(&file.filename);
+            parts.push(bytes_part(format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )));
+            let input = File::open(&file.path).await.map_err(|error| {
+                PipelineFailure::Internal(format!(
+                    "could not read supporting file '{}': {error}",
+                    file.filename
+                ))
+            })?;
+            parts.push(Box::pin(ReaderStream::new(input)));
+            parts.push(bytes_part("\r\n"));
+        }
+    }
     parts.push(bytes_part(format!("--{boundary}--\r\n")));
 
     Request::builder()
@@ -393,6 +664,13 @@ fn bytes_part(value: impl Into<Vec<u8>>) -> MultipartStream {
 
 fn parameter_values(value: &Value) -> Vec<String> {
     match value {
+        Value::Array(values)
+            if values
+                .iter()
+                .any(|value| matches!(value, Value::Array(_) | Value::Object(_))) =>
+        {
+            vec![value.to_string()]
+        }
         Value::Array(values) => values.iter().flat_map(parameter_values).collect(),
         Value::String(value) => vec![value.clone()],
         Value::Null => vec![String::new()],
@@ -469,16 +747,16 @@ async fn extract_zip(
     archive_path: PathBuf,
     workspace: &Path,
     output_sequence: &mut usize,
+    origin: Option<usize>,
 ) -> Result<Vec<PipelineFile>, PipelineFailure> {
     let workspace = workspace.to_owned();
     let sequence = *output_sequence;
-    let result =
-        task::spawn_blocking(move || extract_zip_blocking(&archive_path, &workspace, sequence))
-            .await
-            .map_err(|error| {
-                PipelineFailure::Internal(format!("ZIP extraction task failed: {error}"))
-            })?
-            .map_err(PipelineFailure::BadRequest)?;
+    let result = task::spawn_blocking(move || {
+        extract_zip_blocking(&archive_path, &workspace, sequence, origin)
+    })
+    .await
+    .map_err(|error| PipelineFailure::Internal(format!("ZIP extraction task failed: {error}")))?
+    .map_err(PipelineFailure::BadRequest)?;
     *output_sequence = output_sequence.saturating_add(result.len());
     Ok(result)
 }
@@ -487,6 +765,7 @@ fn extract_zip_blocking(
     archive_path: &Path,
     workspace: &Path,
     sequence: usize,
+    origin: Option<usize>,
 ) -> Result<Vec<PipelineFile>, String> {
     let input = StdFile::open(archive_path)
         .map_err(|error| format!("could not open ZIP response: {error}"))?;
@@ -530,7 +809,12 @@ fn extract_zip_blocking(
             return Err("ZIP response is too large after extraction".to_owned());
         }
         actual_size = actual_size.saturating_add(copied);
-        outputs.push(PipelineFile { filename, path });
+        outputs.push(PipelineFile {
+            filename,
+            path,
+            content_type: None,
+            origin,
+        });
     }
     Ok(outputs)
 }
@@ -558,7 +842,9 @@ async fn build_output(
         return Ok(PipelineOutput {
             path: file.path,
             filename: file.filename,
-            content_type: "application/octet-stream",
+            content_type: file
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_owned()),
             temp_dir,
         });
     }
@@ -573,7 +859,7 @@ async fn build_output(
     Ok(PipelineOutput {
         path: output_path,
         filename: "output.zip".to_owned(),
-        content_type: "application/zip",
+        content_type: "application/zip".to_owned(),
         temp_dir,
     })
 }
@@ -682,10 +968,15 @@ fn validate_operation_path(operation: &str) -> Result<(), PipelineFailure> {
     let Some(namespace) = segments.next() else {
         return Err(disallowed_operation(operation));
     };
-    if !matches!(
+    let is_standard_namespace = matches!(
         namespace,
         "general" | "misc" | "security" | "convert" | "filter"
-    ) || !segments.clone().any(|_| true)
+    );
+    let is_ai_tool_namespace = namespace == "ai"
+        && segments.clone().next() == Some("tools")
+        && segments.clone().count() >= 2;
+    if (!is_standard_namespace && !is_ai_tool_namespace)
+        || !segments.clone().any(|_| true)
         || segments.any(|segment| {
             segment.is_empty()
                 || !segment
@@ -698,6 +989,32 @@ fn validate_operation_path(operation: &str) -> Result<(), PipelineFailure> {
     Ok(())
 }
 
+fn parse_report_header(headers: &HeaderMap, operation: &str) -> Option<Value> {
+    let raw = headers.get("X-Stirling-Tool-Report")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match serde_json::from_str(raw) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(
+                operation,
+                %error,
+                "ignoring malformed X-Stirling-Tool-Report header"
+            );
+            None
+        }
+    }
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    content_type.split(';').next().is_some_and(|media_type| {
+        let media_type = media_type.trim();
+        media_type.eq_ignore_ascii_case("application/json")
+            || media_type.to_ascii_lowercase().ends_with("+json")
+    })
+}
+
 fn disallowed_operation(operation: &str) -> PipelineFailure {
     PipelineFailure::BadRequest(format!(
         "pipeline operation '{operation}' is not permitted for internal dispatch"
@@ -707,7 +1024,24 @@ fn disallowed_operation(operation: &str) -> PipelineFailure {
 fn is_multi_input_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "/api/v1/general/merge-pdfs" | "/api/v1/convert/img/pdf"
+        "/api/v1/general/merge-pdfs"
+            | "/api/v1/general/overlay-pdfs"
+            | "/api/v1/convert/img/pdf"
+            | "/api/v1/convert/svg/pdf"
+            | "/api/v1/misc/add-attachments"
+            | "/api/v1/misc/rename-attachment"
+            | "/api/v1/misc/delete-attachment"
+    )
+}
+
+fn should_unpack_zip_response(operation: &str) -> bool {
+    matches!(
+        operation,
+        "/api/v1/general/overlay-pdfs"
+            | "/api/v1/general/split-pages"
+            | "/api/v1/convert/svg/pdf"
+            | "/api/v1/misc/extract-image-scans"
+            | "/api/v1/misc/extract-images"
     )
 }
 

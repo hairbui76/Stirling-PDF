@@ -7,6 +7,10 @@ leaving the Rust process. It is the synchronous API counterpart of Java's
 `PipelineProcessor`: each step is dispatched through the same Rust route
 handlers and receives ordinary multipart fields.
 
+Adding `?async=true` persists the exact multipart request and admits the whole pipeline through the
+shared resource-weighted job queue. The normal pipeline response becomes the owner-scoped job
+result and is available through the generic status/result/file endpoints.
+
 ## Request
 
 The body is `multipart/form-data` and requires:

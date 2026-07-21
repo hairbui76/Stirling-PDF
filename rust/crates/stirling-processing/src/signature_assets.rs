@@ -1,4 +1,4 @@
-//! Read-only shared signature-image assets for no-login deployments.
+//! Read-only personal and shared signature-image assets.
 
 use std::{fs, path::Path};
 
@@ -31,7 +31,26 @@ pub fn read_shared_signature(
     directory: &Path,
     filename: &str,
 ) -> Result<SignatureAsset, SignatureAssetError> {
+    read_signature(directory, filename)
+}
+
+/// Loads one signature image from an already-authorized directory without
+/// following symlinks or escaping that directory.
+///
+/// # Errors
+///
+/// Returns [`SignatureAssetError::InvalidFilename`] for unsafe names,
+/// [`SignatureAssetError::NotFound`] when there is no ordinary file at that
+/// name, and [`SignatureAssetError::Read`] for an otherwise unreadable file.
+pub fn read_signature(
+    directory: &Path,
+    filename: &str,
+) -> Result<SignatureAsset, SignatureAssetError> {
     validate_filename(filename)?;
+    let directory_metadata = fs::symlink_metadata(directory).map_err(map_metadata_error)?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(SignatureAssetError::NotFound);
+    }
     let path = directory.join(filename);
     let metadata = fs::symlink_metadata(&path).map_err(map_metadata_error)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -78,7 +97,8 @@ fn image_media_type(filename: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{SignatureAssetError, image_media_type, validate_filename};
+    use super::{SignatureAssetError, image_media_type, read_signature, validate_filename};
+    use tempfile::tempdir;
 
     #[test]
     fn validates_java_safe_filenames_without_path_traversal() {
@@ -98,5 +118,17 @@ mod tests {
         assert_eq!(image_media_type("signature.JPEG"), "image/jpeg");
         assert_eq!(image_media_type("signature.png"), "image/png");
         assert_eq!(image_media_type("signature.webp"), "image/png");
+    }
+
+    #[test]
+    fn rejects_a_non_directory_asset_root() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let file = temporary.path().join("not-a-directory");
+        std::fs::write(&file, b"not a directory")?;
+        assert!(matches!(
+            read_signature(&file, "signature.png"),
+            Err(SignatureAssetError::NotFound)
+        ));
+        Ok(())
     }
 }

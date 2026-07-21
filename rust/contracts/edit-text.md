@@ -40,12 +40,10 @@ of its Form graph and resource dictionaries. This makes all-page and partial-pag
 edits deterministic even when the source shares one Form between pages, and keeps
 unselected pages unchanged.
 
-A repeated or cyclic invocation of the same Form object on one page is a safe
-sequence boundary because its visual instances still point to the same mutable PDF
-string objects; Rust does not guess an instance-specific rewrite. Text whose active
-font has no usable encoding is likewise a safe boundary. Java's full JSON rebuild
-can materialize repeated visual instances and reconstruct font programs; those are
-the remaining advanced-editor parity limits.
+Repeated visual invocations on one page are rewritten through private Form graphs, so one visual
+instance cannot mutate its sibling. Cyclic Form back-edges remain a safe sequence boundary. Text
+whose active font has no usable encoding is likewise a safe boundary. Java's full JSON rebuild can
+reconstruct additional font programs; that remains an advanced-editor parity limit.
 
 ## Verification
 

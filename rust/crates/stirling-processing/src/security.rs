@@ -8,25 +8,39 @@
 //! the surrounding middleware and route set pass security review.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{DEFAULT_COST, hash, verify};
+use hmac::{Hmac, Mac};
 use rand::RngExt as _;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::Serialize;
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
+};
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::integration_config::{IntegrationConfig, IntegrationType, NewIntegrationConfig};
+use crate::license::{LicenseState, LicenseVerification};
+use crate::policy_config::{PolicyDefinition, PolicySource, SourceDocStats};
+use crate::policy_ledger::{
+    ClaimState, MAX_ATTEMPTS, ProcessedFileStatus, identity_hash as policy_identity_hash,
+};
+use crate::resource_access::{
+    AccessPermission, DefaultAccessPolicy, OwnerScope, PrincipalType, ResourceGrant, ResourceType,
+};
 use crate::security_crypto::{
     ProtectedSecretCipher, SecurityCryptoError, generate_totp_secret, valid_totp_step,
 };
 use crate::security_jwt::VerifiedSupabaseIdentity;
+use crate::security_policy::LicenseTier;
 
 const TOKEN_BYTES: usize = 32;
 const MAX_BEARER_TOKEN_BYTES: usize = 128;
@@ -45,12 +59,22 @@ const SESSION_ID_PREFIX: &str = "spdf_sid_";
 const INVITE_TOKEN_PREFIX: &str = "spdf_inv_";
 const DEFAULT_TEAM_NAME: &str = "Default";
 const INTERNAL_TEAM_NAME: &str = "Internal";
+const INTERNAL_API_USERNAME: &str = "STIRLING-PDF-BACKEND-API-USER";
 const MAX_TEAM_NAME_BYTES: usize = 100;
 const MAX_EXTERNAL_ISSUER_BYTES: usize = 2_048;
 const MAX_EXTERNAL_SUBJECT_BYTES: usize = 128;
 const MAX_EXTERNAL_SESSION_ID_BYTES: usize = 256;
 const MAX_PERMISSION_BYTES: usize = 128;
 const MAX_EXTERNAL_PERMISSIONS: usize = 128;
+const DEFAULT_USER_LIMIT: i64 = 5;
+const UNLIMITED_USER_LIMIT: i64 = i32::MAX as i64;
+const USER_LICENSE_SETTINGS_ID: i64 = 1;
+const USER_SEAT_INTEGRITY_SECRET: &[u8] = b"stirling-pdf-user-license-guard";
+const MAX_USER_SETTINGS: usize = 128;
+const MAX_USER_SETTING_KEY_BYTES: usize = 256;
+const MAX_USER_SETTING_VALUE_BYTES: usize = 4 * 1024;
+const MAX_AUDIT_FILTER_VALUES: usize = 32;
+const MAX_AUDIT_EXPORT_EVENTS: usize = 50_000;
 
 pub const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -68,6 +92,7 @@ pub struct AuthContext {
     pub team_id: Option<i64>,
     pub permissions: BTreeSet<String>,
     pub external_subject: Option<String>,
+    pub force_password_change: bool,
     pub session_id: String,
     pub correlation_id: String,
 }
@@ -118,8 +143,16 @@ pub struct SecurityUserSummary {
     pub authentication_type: String,
     pub team_id: Option<i64>,
     pub team_name: Option<String>,
+    #[serde(flatten)]
+    pub credential_state: SecurityUserCredentialState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityUserCredentialState {
     pub mfa_enabled: bool,
     pub locked: bool,
+    pub force_password_change: bool,
 }
 
 #[derive(Serialize)]
@@ -154,11 +187,79 @@ pub struct InviteSummary {
     pub expires_at: i64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SecurityAuditFilter {
+    pub event_types: Vec<String>,
+    pub principals: Vec<String>,
+    pub principal_contains: Option<String>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityAuditEvent {
+    pub id: i64,
+    pub principal: String,
+    pub event_type: String,
+    pub source: String,
+    pub data: String,
+    pub timestamp: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityAuditPage {
+    pub events: Vec<SecurityAuditEvent>,
+    pub total_events: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SecurityHttpAuditRecord {
+    pub context: Option<AuthContext>,
+    pub correlation_id: String,
+    pub source: String,
+    pub event_type: String,
+    pub method: String,
+    pub path: String,
+    pub status_code: u16,
+    pub latency_ms: u64,
+    pub include_standard_data: bool,
+    pub annotated: bool,
+    pub created_at: i64,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetUsageStats {
+    pub editors_deployed: i64,
+    pub active_this_month: Option<i64>,
+    pub pdfs_processed: Option<i64>,
+}
+
+/// Durable user-allocation values exposed to administrator surfaces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSeatMetrics {
+    pub max_allowed_users: i64,
+    pub available_slots: i64,
+    pub grandfathered_user_count: i64,
+    pub license_max_users: i64,
+    pub premium_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecurityAuditUsageScope {
+    All,
+    Ui,
+    Api,
+}
+
 /// Durable security state for one standalone Rust process.
 pub struct SecurityStore {
     connection: Mutex<Connection>,
     bcrypt_cost: u32,
     secret_cipher: Option<ProtectedSecretCipher>,
+    license_state: RwLock<Option<Arc<LicenseState>>>,
 }
 
 #[derive(Debug, Error)]
@@ -181,6 +282,11 @@ pub enum SecurityError {
     TeamNotFound,
     #[error("security state conflicts with an existing record")]
     Conflict,
+    #[error("security user limit reached (allowed: {max_allowed}, available: {available_slots})")]
+    UserLimitReached {
+        max_allowed: i64,
+        available_slots: i64,
+    },
     #[error("system-owned security state cannot be changed")]
     ProtectedSystemState,
     #[error("security team must be empty")]
@@ -195,6 +301,8 @@ pub enum SecurityError {
     MfaSetupRequired,
     #[error("multi-factor authentication configuration is unavailable")]
     MfaConfiguration,
+    #[error("integration credential encryption is unavailable")]
+    IntegrationProtectionUnavailable,
     #[error("multi-factor authentication is already enabled")]
     MfaAlreadyEnabled,
     #[error("multi-factor authentication is unavailable for this account")]
@@ -203,6 +311,8 @@ pub enum SecurityError {
     Poisoned,
     #[error("security store operation failed")]
     Storage(#[source] rusqlite::Error),
+    #[error("audit query exceeds the bounded event limit")]
+    AuditEventLimitExceeded,
     #[error("credential hashing failed")]
     PasswordHash(#[source] bcrypt::BcryptError),
     #[error("security store filesystem setup failed")]
@@ -237,6 +347,7 @@ struct StoredUser {
     enabled: bool,
     authentication_type: String,
     team_id: Option<i64>,
+    force_password_change: bool,
 }
 
 struct StoredSession {
@@ -289,7 +400,72 @@ impl SecurityStore {
             connection: Mutex::new(connection),
             bcrypt_cost: DEFAULT_COST,
             secret_cipher,
+            license_state: RwLock::new(None),
         })
+    }
+
+    /// Connects the verified live license result to durable seat accounting.
+    /// Subsequent administrator mutations and periodic refreshes update the
+    /// repository immediately through a weak callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable seat settings cannot be synchronized.
+    pub fn attach_license_state(
+        self: &Arc<Self>,
+        state: &Arc<LicenseState>,
+    ) -> Result<(), SecurityError> {
+        *self
+            .license_state
+            .write()
+            .map_err(|_| SecurityError::Poisoned)? = Some(Arc::clone(state));
+        let store = Arc::downgrade(self);
+        state.subscribe(move |_| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            if let Err(error) = store.synchronize_license_max_users() {
+                tracing::warn!(%error, "failed to synchronize verified user-seat entitlement");
+            }
+        });
+        self.synchronize_license_max_users()
+    }
+
+    /// Returns the effective allocation and durable grandfathering values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the security repository is unavailable.
+    pub fn user_seat_metrics(&self) -> Result<UserSeatMetrics, SecurityError> {
+        let verification = self.current_license_verification()?;
+        let connection = self.lock()?;
+        seat_metrics(&connection, verification)
+    }
+
+    fn current_license_verification(&self) -> Result<LicenseVerification, SecurityError> {
+        let state = self
+            .license_state
+            .read()
+            .map_err(|_| SecurityError::Poisoned)?
+            .clone();
+        Ok(state.map_or_else(LicenseVerification::default, |state| state.current()))
+    }
+
+    fn synchronize_license_max_users(&self) -> Result<(), SecurityError> {
+        // Take the database lock before reading the authoritative state so
+        // concurrent refresh callbacks cannot persist an older result last.
+        let connection = self.lock()?;
+        let verification = self.current_license_verification()?;
+        let license_max_users = if verification.running_pro_or_higher() {
+            i64::from(verification.max_users)
+        } else {
+            0
+        };
+        connection.execute(
+            "UPDATE user_license_settings SET license_max_users = ?1 WHERE id = ?2",
+            params![license_max_users, USER_LICENSE_SETTINGS_ID],
+        )?;
+        Ok(())
     }
 
     /// Creates the first administrator only when the user table is empty.
@@ -329,15 +505,17 @@ impl SecurityStore {
         roles: [&str; N],
         team_id: Option<i64>,
     ) -> Result<i64, SecurityError> {
-        let username = normalize_username(username)?;
+        let username = normalize_web_username(username)?;
         validate_password(password)?;
         let roles = normalize_roles(roles)?;
         let password_hash = hash(password, self.bcrypt_cost)?;
+        let verification = self.current_license_verification()?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if find_user(&transaction, &username.normalized)?.is_some() {
             return Err(SecurityError::Conflict);
         }
+        ensure_user_capacity(&transaction, verification, 1)?;
         let team_id = resolve_team_id(&transaction, team_id)?;
         transaction.execute(
             "INSERT INTO security_users
@@ -357,6 +535,235 @@ impl SecurityStore {
         Ok(user_id)
     }
 
+    /// Verifies that a bulk account invitation fits within the standalone
+    /// community user allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty request, insufficient user slots, or
+    /// unavailable persistent state.
+    pub fn ensure_bulk_user_invite_capacity(
+        &self,
+        requested_users: usize,
+    ) -> Result<(), SecurityError> {
+        let requested_users =
+            i64::try_from(requested_users).map_err(|_| SecurityError::InvalidInput)?;
+        if requested_users == 0 {
+            return Err(SecurityError::InvalidInput);
+        }
+        let verification = self.current_license_verification()?;
+        let connection = self.lock()?;
+        ensure_user_capacity(&connection, verification, requested_users)
+    }
+
+    /// Resolves the default invitation team and rejects the Internal team.
+    /// An explicitly requested missing team is preserved so Java-compatible
+    /// bulk handling can report it as an individual invitation failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the Internal team or unavailable persistent state.
+    pub fn resolve_bulk_user_invite_team(
+        &self,
+        team_id: Option<i64>,
+    ) -> Result<i64, SecurityError> {
+        let connection = self.lock()?;
+        let team_id = match team_id {
+            Some(team_id) => team_id,
+            None => resolve_team_id(&connection, None)?,
+        };
+        if team_name_by_id(&connection, team_id)?
+            .is_some_and(|name| name.eq_ignore_ascii_case(INTERNAL_TEAM_NAME))
+        {
+            return Err(SecurityError::ProtectedSystemState);
+        }
+        Ok(team_id)
+    }
+
+    /// Creates an enabled web user whose generated password must be replaced
+    /// after the first login. The user allocation is checked in the same write
+    /// transaction so concurrent invitation requests cannot exceed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity data or role, duplicate users, a
+    /// full allocation, a missing/system team, password hashing failure, or
+    /// unavailable persistent state.
+    pub fn create_invited_local_user(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+        team_id: i64,
+    ) -> Result<i64, SecurityError> {
+        let username = normalize_web_username(username)?;
+        validate_password(password)?;
+        let role = normalize_invitable_role(role)?;
+        let password_hash = hash(password, self.bcrypt_cost)?;
+        let verification = self.current_license_verification()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if find_user(&transaction, &username.normalized)?.is_some() {
+            return Err(SecurityError::Conflict);
+        }
+        ensure_user_capacity(&transaction, verification, 1)?;
+        let team_name =
+            team_name_by_id(&transaction, team_id)?.ok_or(SecurityError::TeamNotFound)?;
+        if team_name.eq_ignore_ascii_case(INTERNAL_TEAM_NAME) {
+            return Err(SecurityError::ProtectedSystemState);
+        }
+        transaction.execute(
+            "INSERT INTO security_users
+             (username, username_norm, password_hash, enabled, authentication_type, team_id,
+              force_password_change)
+             VALUES (?1, ?2, ?3, 1, 'web', ?4, 1)",
+            params![
+                username.original,
+                username.normalized,
+                password_hash,
+                team_id
+            ],
+        )?;
+        let user_id = transaction.last_insert_rowid();
+        let roles = BTreeSet::from([role]);
+        insert_roles(&transaction, user_id, &roles)?;
+        insert_team_membership(&transaction, user_id, team_id, false)?;
+        transaction.commit()?;
+        Ok(user_id)
+    }
+
+    /// Creates a disabled self-registration account in the Default team.
+    /// The community user limit is checked in the same write transaction so
+    /// concurrent registrations cannot overrun it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate credentials, a full account
+    /// allocation, password hashing failure, or unavailable persistent state.
+    pub fn register_local_user(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<i64, SecurityError> {
+        let username = normalize_web_username(username)?;
+        validate_password(password)?;
+        let password_hash = hash(password, self.bcrypt_cost)?;
+        let verification = self.current_license_verification()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if find_user(&transaction, &username.normalized)?.is_some() {
+            return Err(SecurityError::Conflict);
+        }
+        ensure_user_capacity(&transaction, verification, 1)?;
+        let team_id = resolve_team_id(&transaction, None)?;
+        transaction.execute(
+            "INSERT INTO security_users
+             (username, username_norm, password_hash, enabled, authentication_type, team_id)
+             VALUES (?1, ?2, ?3, 0, 'web', ?4)",
+            params![
+                username.original,
+                username.normalized,
+                password_hash,
+                team_id
+            ],
+        )?;
+        let user_id = transaction.last_insert_rowid();
+        insert_roles(
+            &transaction,
+            user_id,
+            &["ROLE_USER".to_owned()].into_iter().collect(),
+        )?;
+        insert_team_membership(&transaction, user_id, team_id, false)?;
+        transaction.commit()?;
+        Ok(user_id)
+    }
+
+    /// Atomically replaces every user-owned preference with the supplied map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing users, oversized/invalid entries, or
+    /// unavailable persistent state.
+    pub fn replace_user_settings(
+        &self,
+        user_id: i64,
+        settings: &BTreeMap<String, String>,
+    ) -> Result<(), SecurityError> {
+        validate_user_settings(settings)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if find_user_by_id(&transaction, user_id)?.is_none() {
+            return Err(SecurityError::UserNotFound);
+        }
+        transaction.execute(
+            "DELETE FROM security_user_settings WHERE user_id = ?1",
+            [user_id],
+        )?;
+        for (key, value) in settings {
+            transaction.execute(
+                "INSERT INTO security_user_settings (user_id, setting_key, setting_value)
+                 VALUES (?1, ?2, ?3)",
+                params![user_id, key, value],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads the complete durable preference map for one user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing user or unavailable persistent state.
+    pub fn user_settings(&self, user_id: i64) -> Result<BTreeMap<String, String>, SecurityError> {
+        let connection = self.lock()?;
+        if find_user_by_id(&connection, user_id)?.is_none() {
+            return Err(SecurityError::UserNotFound);
+        }
+        let mut statement = connection.prepare(
+            "SELECT setting_key, setting_value FROM security_user_settings
+             WHERE user_id = ?1 ORDER BY setting_key",
+        )?;
+        statement
+            .query_map([user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Marks the authenticated user's first-run setup as complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing user or unavailable persistent state.
+    pub fn complete_initial_setup(&self, user_id: i64) -> Result<(), SecurityError> {
+        let connection = self.lock()?;
+        let updated = connection.execute(
+            "UPDATE security_users SET initial_setup_completed = 1 WHERE user_id = ?1",
+            [user_id],
+        )?;
+        if updated == 0 {
+            return Err(SecurityError::UserNotFound);
+        }
+        Ok(())
+    }
+
+    /// Reports whether the durable first-run setup marker is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing user or unavailable persistent state.
+    pub fn initial_setup_is_complete(&self, user_id: i64) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT initial_setup_completed FROM security_users WHERE user_id = ?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(SecurityError::UserNotFound)
+    }
+
     /// Resolves or provisions a fully verified Supabase subject without ever
     /// linking by email. Anonymous identities may upgrade to a full identity
     /// for the same `(issuer, subject)` but never downgrade or cross-link.
@@ -373,9 +780,10 @@ impl SecurityStore {
     ) -> Result<AuthContext, SecurityError> {
         validate_external_identity(identity, now)?;
         let username = normalize_username(&identity.username)?;
+        let verification = self.current_license_verification()?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let user = resolve_external_user(&transaction, identity, &username, now)?;
+        let user = resolve_external_user(&transaction, identity, &username, verification, now)?;
         let mut context = context_for_user(
             &transaction,
             &user,
@@ -403,7 +811,7 @@ impl SecurityStore {
                         EXISTS(
                             SELECT 1 FROM security_mfa m
                             WHERE m.user_id = u.user_id AND m.enabled = 1
-                        )
+                        ), u.force_password_change
                  FROM security_users u
                  LEFT JOIN security_teams t ON t.team_id = u.team_id
                  ORDER BY u.username COLLATE NOCASE",
@@ -419,6 +827,7 @@ impl SecurityStore {
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, bool>(7)?,
+                        row.get::<_, bool>(8)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -433,6 +842,7 @@ impl SecurityStore {
             team_id,
             team_name,
             mfa_enabled,
+            force_password_change,
         ) in rows
         {
             let roles = roles_for_user(&connection, id)?
@@ -450,8 +860,11 @@ impl SecurityStore {
                 authentication_type,
                 team_id,
                 team_name,
-                mfa_enabled,
-                locked,
+                credential_state: SecurityUserCredentialState {
+                    mfa_enabled,
+                    locked,
+                    force_password_change,
+                },
             });
         }
         Ok(users)
@@ -483,7 +896,8 @@ impl SecurityStore {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
-            "UPDATE security_users SET password_hash = ?1
+            "UPDATE security_users
+             SET password_hash = ?1, force_password_change = 0
              WHERE user_id = ?2 AND password_hash = ?3 AND authentication_type = 'web'",
             params![replacement_hash, user_id, current_hash],
         )?;
@@ -509,7 +923,7 @@ impl SecurityStore {
         now: i64,
     ) -> Result<(), SecurityError> {
         validate_password(current_password)?;
-        let new_username = normalize_username(new_username)?;
+        let new_username = normalize_web_username(new_username)?;
         let current_hash = self.web_password_hash(user_id)?;
         if !verify(current_password, &current_hash)? {
             return Err(SecurityError::InvalidCredentials);
@@ -561,6 +975,23 @@ impl SecurityStore {
         new_password: &str,
         now: i64,
     ) -> Result<i64, SecurityError> {
+        self.set_user_password_with_force_change(username, new_password, false, now)
+    }
+
+    /// Replaces another local user's password, persists its forced-change
+    /// policy, and revokes every active session in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input, identity-source, missing-user, protected-state, or
+    /// persistence error.
+    pub fn set_user_password_with_force_change(
+        &self,
+        username: &str,
+        new_password: &str,
+        force_password_change: bool,
+        now: i64,
+    ) -> Result<i64, SecurityError> {
         let username = normalize_username(username)?;
         validate_password(new_password)?;
         let replacement_hash = hash(new_password, self.bcrypt_cost)?;
@@ -591,8 +1022,10 @@ impl SecurityStore {
             return Err(SecurityError::ProtectedSystemState);
         }
         transaction.execute(
-            "UPDATE security_users SET password_hash = ?1 WHERE user_id = ?2",
-            params![replacement_hash, user_id],
+            "UPDATE security_users
+             SET password_hash = ?1, force_password_change = ?2
+             WHERE user_id = ?3",
+            params![replacement_hash, force_password_change, user_id],
         )?;
         revoke_sessions_in(&transaction, user_id, now)?;
         transaction.commit()?;
@@ -741,6 +1174,20 @@ impl SecurityStore {
                  (issuer, subject, blocked_at)
              SELECT issuer, subject, unixepoch()
              FROM security_external_identities WHERE user_id = ?1",
+            [user.id],
+        )?;
+        transaction.execute(
+            "DELETE FROM resource_grants
+             WHERE resource_type = 'INTEGRATION_CONFIG'
+               AND resource_id IN (
+                   SELECT CAST(integration_config_id AS TEXT)
+                   FROM integration_configs WHERE owner_user_id = ?1
+               )",
+            [user.id],
+        )?;
+        transaction.execute(
+            "DELETE FROM resource_grants
+             WHERE principal_type = 'USER' AND principal_id = ?1",
             [user.id],
         )?;
         transaction.execute("DELETE FROM security_users WHERE user_id = ?1", [user.id])?;
@@ -1091,6 +1538,19 @@ impl SecurityStore {
         if member_count != 0 {
             return Err(SecurityError::TeamNotEmpty);
         }
+        let owned_resource_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM integration_configs WHERE owner_team_id = ?1",
+            [team_id],
+            |row| row.get(0),
+        )?;
+        if owned_resource_count != 0 {
+            return Err(SecurityError::TeamNotEmpty);
+        }
+        transaction.execute(
+            "DELETE FROM resource_grants
+             WHERE principal_type = 'TEAM' AND principal_id = ?1",
+            [team_id],
+        )?;
         transaction.execute("DELETE FROM security_teams WHERE team_id = ?1", [team_id])?;
         transaction.commit()?;
         Ok(())
@@ -1216,8 +1676,18 @@ impl SecurityStore {
         let role = normalize_assignable_role(role)?;
         let token = random_secret(INVITE_TOKEN_PREFIX);
         let digest = token_digest(&token);
+        let verification = self.current_license_verification()?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if verification.running_pro_or_higher() {
+            let active_invites = transaction.query_row(
+                "SELECT COUNT(*) FROM security_invites
+                 WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > ?1",
+                [now],
+                |row| row.get::<_, i64>(0),
+            )?;
+            ensure_user_capacity(&transaction, verification, active_invites.saturating_add(1))?;
+        }
         let team_id = resolve_team_id(&transaction, team_id)?;
         if team_name_by_id(&transaction, team_id)?
             .is_some_and(|name| name.eq_ignore_ascii_case(INTERNAL_TEAM_NAME))
@@ -1511,6 +1981,25 @@ impl SecurityStore {
         )
     }
 
+    pub(crate) fn policy_automation_context(
+        &self,
+        username: &str,
+        correlation_id: &str,
+    ) -> Result<AuthContext, SecurityError> {
+        let normalized = normalize_username(username)?;
+        let connection = self.lock()?;
+        let user = find_user(&connection, &normalized.normalized)?
+            .filter(|user| user.enabled)
+            .ok_or(SecurityError::UserNotFound)?;
+        context_for_user(
+            &connection,
+            &user,
+            AuthenticationSource::AccessToken,
+            String::new(),
+            correlation_id,
+        )
+    }
+
     /// Rotates a refresh token in one immediate `SQLite` transaction. The old
     /// access and refresh tokens are revoked before the replacement commits.
     ///
@@ -1760,13 +2249,41 @@ impl SecurityStore {
                 return Err(SecurityError::InvalidInput);
             }
         }
+        let source = match context.authentication_source {
+            AuthenticationSource::Password | AuthenticationSource::AccessToken => "WEB",
+            AuthenticationSource::ApiKey => "API",
+            AuthenticationSource::SupabaseJwt => "SUPABASE",
+        };
+        let status_code = outcome
+            .strip_prefix("status:")
+            .and_then(|value| value.parse::<u16>().ok());
+        let normalized_outcome =
+            status_code.map_or(
+                outcome,
+                |status| {
+                    if status >= 400 { "failure" } else { "success" }
+                },
+            );
+        let mut data = serde_json::json!({
+            "path": path,
+            "outcome": normalized_outcome,
+        });
+        if let Some(status_code) = status_code {
+            data["status"] = serde_json::Value::String(normalized_outcome.to_owned());
+            data["statusCode"] = serde_json::Value::from(status_code);
+        }
+        let data = serde_json::to_string(&data).map_err(|_| SecurityError::InvalidInput)?;
         let connection = self.lock()?;
         connection.execute(
             "INSERT INTO security_audit_events
-             (user_id, session_id, correlation_id, event_type, path, outcome, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (user_id, principal, source, data, session_id, correlation_id,
+              event_type, path, outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 context.user_id,
+                context.username,
+                source,
+                data,
                 context.session_id,
                 context.correlation_id,
                 event_type,
@@ -1776,6 +2293,308 @@ impl SecurityStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persists one post-handler controller event for the reviewed HTTP audit
+    /// boundary. Unlike the legacy mutation helper, a returned HTTP error is
+    /// still a successful method outcome; Java records failure only when the
+    /// controller throws.
+    pub(crate) fn record_http_audit(
+        &self,
+        record: &SecurityHttpAuditRecord,
+    ) -> Result<(), SecurityError> {
+        let (user_id, principal, session_id) =
+            record
+                .context
+                .as_ref()
+                .map_or((None, "system", ""), |context| {
+                    (
+                        Some(context.user_id),
+                        context.username.as_str(),
+                        context.session_id.as_str(),
+                    )
+                });
+        for value in [
+            principal,
+            record.source.as_str(),
+            record.event_type.as_str(),
+            record.method.as_str(),
+            record.path.as_str(),
+            record.correlation_id.as_str(),
+            session_id,
+        ] {
+            if value.len() > MAX_AUDIT_VALUE_BYTES {
+                return Err(SecurityError::InvalidInput);
+            }
+        }
+        if record.event_type.is_empty()
+            || record.method.is_empty()
+            || record.path.is_empty()
+            || record.correlation_id.is_empty()
+        {
+            return Err(SecurityError::InvalidInput);
+        }
+        let outcome_key = if record.annotated {
+            "status"
+        } else {
+            "outcome"
+        };
+        let mut data = serde_json::json!({
+            "timestamp": record.timestamp.as_str(),
+            "principal": principal,
+            "httpMethod": record.method.as_str(),
+            "path": record.path.as_str(),
+        });
+        data[outcome_key] = serde_json::Value::String("success".to_owned());
+        if record.include_standard_data {
+            data["sessionId"] = if session_id.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(session_id.to_owned())
+            };
+            data["requestId"] = serde_json::Value::String(record.correlation_id.clone());
+            data["latencyMs"] = serde_json::Value::from(record.latency_ms);
+            data["statusCode"] = serde_json::Value::from(record.status_code);
+        }
+        let data = serde_json::to_string(&data).map_err(|_| SecurityError::InvalidInput)?;
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO security_audit_events
+             (user_id, principal, source, data, session_id, correlation_id,
+              event_type, path, outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'success', ?9)",
+            params![
+                user_id,
+                principal,
+                record.source.as_str(),
+                data,
+                session_id,
+                record.correlation_id.as_str(),
+                record.event_type.as_str(),
+                record.path.as_str(),
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns a newest-first page of durable audit events matching bounded filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters/pagination or unavailable persistent state.
+    pub fn query_audit_events(
+        &self,
+        filter: &SecurityAuditFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SecurityAuditPage, SecurityError> {
+        if limit == 0 || limit > 200 {
+            return Err(SecurityError::InvalidInput);
+        }
+        let limit = i64::try_from(limit).map_err(|_| SecurityError::InvalidInput)?;
+        let offset = i64::try_from(offset).map_err(|_| SecurityError::InvalidInput)?;
+        let (where_clause, values) = audit_filter_sql(filter)?;
+        let connection = self.lock()?;
+        let count_sql = format!("SELECT COUNT(*) FROM security_audit_events{where_clause}");
+        let total_events: i64 =
+            connection.query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get(0)
+            })?;
+        let query_sql = format!(
+            "SELECT event_id, principal, event_type, source, data, path, outcome, created_at
+             FROM security_audit_events{where_clause}
+             ORDER BY created_at DESC, event_id DESC LIMIT ? OFFSET ?"
+        );
+        let mut query_values = values;
+        query_values.push(SqlValue::Integer(limit));
+        query_values.push(SqlValue::Integer(offset));
+        let mut statement = connection.prepare(&query_sql)?;
+        let events = statement
+            .query_map(params_from_iter(query_values.iter()), audit_event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SecurityAuditPage {
+            events,
+            total_events: usize::try_from(total_events).map_err(|_| SecurityError::InvalidInput)?,
+        })
+    }
+
+    /// Returns a bounded newest-first export set matching the same filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters, an oversized export, or unavailable state.
+    pub fn export_audit_events(
+        &self,
+        filter: &SecurityAuditFilter,
+    ) -> Result<Vec<SecurityAuditEvent>, SecurityError> {
+        let page = self.query_audit_events(filter, 0, 200)?;
+        if page.total_events > MAX_AUDIT_EXPORT_EVENTS {
+            return Err(SecurityError::InvalidInput);
+        }
+        if page.total_events <= page.events.len() {
+            return Ok(page.events);
+        }
+        let (where_clause, mut values) = audit_filter_sql(filter)?;
+        values.push(SqlValue::Integer(
+            i64::try_from(MAX_AUDIT_EXPORT_EVENTS).map_err(|_| SecurityError::InvalidInput)?,
+        ));
+        let query_sql = format!(
+            "SELECT event_id, principal, event_type, source, data, path, outcome, created_at
+             FROM security_audit_events{where_clause}
+             ORDER BY created_at DESC, event_id DESC LIMIT ?"
+        );
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&query_sql)?;
+        statement
+            .query_map(params_from_iter(values.iter()), audit_event_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Lists all distinct stored event types in lexical order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn audit_event_types(&self) -> Result<Vec<String>, SecurityError> {
+        self.audit_distinct_values("event_type")
+    }
+
+    /// Computes the self-hosted editor-fleet usage card from durable identities
+    /// and STANDARD-level WEB audit events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent security or audit state is unavailable.
+    pub fn fleet_usage_stats(
+        &self,
+        standard_audit_enabled: bool,
+        now: i64,
+    ) -> Result<FleetUsageStats, SecurityError> {
+        let connection = self.lock()?;
+        let editors_deployed = connection.query_row(
+            "SELECT COUNT(*) FROM security_users WHERE username_norm <> LOWER(?1)",
+            [INTERNAL_API_USERNAME],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if !standard_audit_enabled {
+            return Ok(FleetUsageStats {
+                editors_deployed,
+                active_this_month: None,
+                pdfs_processed: None,
+            });
+        }
+        let since = now.saturating_sub(30 * 24 * 60 * 60);
+        let active_this_month = connection.query_row(
+            "SELECT COUNT(DISTINCT principal)
+             FROM security_audit_events
+             WHERE source = 'WEB' AND event_type <> 'UI_DATA' AND created_at > ?1",
+            [since],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let pdfs_processed = connection.query_row(
+            "SELECT COUNT(*)
+             FROM security_audit_events
+             WHERE source = 'WEB'
+               AND event_type IN ('PDF_PROCESS', 'FILE_OPERATION')
+               AND created_at > 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(FleetUsageStats {
+            editors_deployed,
+            active_this_month: Some(active_this_month.min(editors_deployed)),
+            pdfs_processed: Some(pdfs_processed),
+        })
+    }
+
+    /// Loads only the retained JSON payloads needed by endpoint-usage
+    /// aggregation, after applying Java's strict cutoff and exact UI/non-UI
+    /// type split. The explicit row bound replaces Java's unbounded materialization.
+    pub(crate) fn endpoint_usage_audit_data(
+        &self,
+        cutoff: i64,
+        scope: SecurityAuditUsageScope,
+    ) -> Result<Vec<String>, SecurityError> {
+        let type_predicate = match scope {
+            SecurityAuditUsageScope::All => "",
+            SecurityAuditUsageScope::Ui => " AND event_type = 'UI_DATA'",
+            SecurityAuditUsageScope::Api => " AND event_type <> 'UI_DATA'",
+        };
+        let connection = self.lock()?;
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM security_audit_events
+             WHERE created_at > ?1{type_predicate}"
+        );
+        let count = connection.query_row(&count_sql, [cutoff], |row| row.get::<_, i64>(0))?;
+        if count > 50_000 {
+            return Err(SecurityError::AuditEventLimitExceeded);
+        }
+        let query_sql = format!(
+            "SELECT data FROM security_audit_events
+             WHERE created_at > ?1{type_predicate}"
+        );
+        let mut statement = connection.prepare(&query_sql)?;
+        statement
+            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Lists all distinct retained principals in lexical order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn audit_principals(&self) -> Result<Vec<String>, SecurityError> {
+        self.audit_distinct_values("principal")
+    }
+
+    /// Deletes audit events strictly older than the supplied timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn delete_audit_events_before(&self, cutoff: i64) -> Result<usize, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM security_audit_events WHERE created_at < ?1",
+                [cutoff],
+            )
+            .map_err(SecurityError::from)
+    }
+
+    /// Deletes every retained audit event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn clear_audit_events(&self) -> Result<usize, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .execute("DELETE FROM security_audit_events", [])
+            .map_err(SecurityError::from)
+    }
+
+    fn audit_distinct_values(&self, column: &str) -> Result<Vec<String>, SecurityError> {
+        let sql = match column {
+            "event_type" => {
+                "SELECT DISTINCT event_type FROM security_audit_events ORDER BY event_type"
+            }
+            "principal" => {
+                "SELECT DISTINCT principal FROM security_audit_events
+                 WHERE principal != '' ORDER BY principal COLLATE NOCASE"
+            }
+            _ => return Err(SecurityError::InvalidInput),
+        };
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(sql)?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
     }
 
     fn read_mfa(&self, user_id: i64) -> Result<Option<StoredMfa>, SecurityError> {
@@ -1825,6 +2644,986 @@ impl SecurityStore {
             .ok_or(SecurityError::MfaConfiguration)
     }
 
+    pub(crate) fn is_team_owner(&self, user_id: i64, team_id: i64) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM security_team_memberships
+                     WHERE user_id = ?1 AND team_id = ?2 AND is_owner = 1
+                 )",
+                params![user_id, team_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn is_any_team_owner(&self, user_id: i64) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM security_team_memberships
+                     WHERE user_id = ?1 AND is_owner = 1
+                 )",
+                [user_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn resource_principal_exists(
+        &self,
+        principal_type: PrincipalType,
+        principal_id: i64,
+    ) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        let table = match principal_type {
+            PrincipalType::User => "security_users",
+            PrincipalType::Team => "security_teams",
+        };
+        let column = match principal_type {
+            PrincipalType::User => "user_id",
+            PrincipalType::Team => "team_id",
+        };
+        connection
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1)"),
+                [principal_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_resource_grant(
+        &self,
+        resource_type: ResourceType,
+        resource_id: &str,
+        principal_type: PrincipalType,
+        principal_id: i64,
+        permission: AccessPermission,
+        granted_by_user_id: i64,
+    ) -> Result<ResourceGrant, SecurityError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_id = transaction
+            .query_row(
+                "SELECT resource_grant_id FROM resource_grants
+                 WHERE resource_type = ?1 AND resource_id = ?2
+                   AND principal_type = ?3 AND principal_id = ?4
+                 ORDER BY resource_grant_id LIMIT 1",
+                params![
+                    resource_type.as_str(),
+                    resource_id,
+                    principal_type.as_str(),
+                    principal_id,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = existing_id {
+            transaction.execute(
+                "UPDATE resource_grants
+                 SET permission = ?1, granted_by_user_id = ?2
+                 WHERE resource_grant_id = ?3",
+                params![permission.as_str(), granted_by_user_id, existing_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM resource_grants
+                 WHERE resource_type = ?1 AND resource_id = ?2
+                   AND principal_type = ?3 AND principal_id = ?4
+                   AND resource_grant_id != ?5",
+                params![
+                    resource_type.as_str(),
+                    resource_id,
+                    principal_type.as_str(),
+                    principal_id,
+                    existing_id,
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO resource_grants
+                     (resource_type, resource_id, principal_type, principal_id, permission,
+                      granted_by_user_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    resource_type.as_str(),
+                    resource_id,
+                    principal_type.as_str(),
+                    principal_id,
+                    permission.as_str(),
+                    granted_by_user_id,
+                ],
+            )?;
+        }
+        let grant = transaction.query_row(
+            "SELECT resource_grant_id, resource_type, resource_id, principal_type, principal_id,
+                    permission,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch')
+             FROM resource_grants
+             WHERE resource_type = ?1 AND resource_id = ?2
+               AND principal_type = ?3 AND principal_id = ?4",
+            params![
+                resource_type.as_str(),
+                resource_id,
+                principal_type.as_str(),
+                principal_id,
+            ],
+            resource_grant_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(grant)
+    }
+
+    pub(crate) fn revoke_resource_grant(&self, id: i64) -> Result<(), SecurityError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM resource_grants WHERE resource_grant_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_resource_grants(
+        &self,
+        resource_type: ResourceType,
+        resource_id: &str,
+    ) -> Result<Vec<ResourceGrant>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT resource_grant_id, resource_type, resource_id, principal_type, principal_id,
+                    permission,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch')
+             FROM resource_grants
+             WHERE resource_type = ?1 AND resource_id = ?2 ORDER BY resource_grant_id",
+        )?;
+        statement
+            .query_map(
+                params![resource_type.as_str(), resource_id],
+                resource_grant_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_resource_grants_for_principal(
+        &self,
+        principal_type: PrincipalType,
+        principal_id: i64,
+    ) -> Result<Vec<ResourceGrant>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT resource_grant_id, resource_type, resource_id, principal_type, principal_id,
+                    permission,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch')
+             FROM resource_grants
+             WHERE principal_type = ?1 AND principal_id = ?2 ORDER BY resource_grant_id",
+        )?;
+        statement
+            .query_map(
+                params![principal_type.as_str(), principal_id],
+                resource_grant_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn granted_resource_ids(
+        &self,
+        resource_type: ResourceType,
+        user_id: i64,
+        team_id: Option<i64>,
+    ) -> Result<BTreeSet<String>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT resource_id FROM resource_grants
+             WHERE resource_type = ?1
+               AND ((principal_type = 'USER' AND principal_id = ?2)
+                 OR (principal_type = 'TEAM' AND principal_id = ?3))
+             ORDER BY resource_id",
+        )?;
+        statement
+            .query_map(params![resource_type.as_str(), user_id, team_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn create_integration_config(
+        &self,
+        config: &NewIntegrationConfig,
+    ) -> Result<IntegrationConfig, SecurityError> {
+        let encrypted = self.encrypt_integration_config(&config.config)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO integration_configs
+                 (integration_type, name, scope, owner_user_id, owner_team_id,
+                  enabled, locked, default_access, config_encrypted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                config.integration_type.as_str(),
+                config.name,
+                config.scope.as_str(),
+                config.owner_user_id,
+                config.owner_team_id,
+                config.enabled,
+                config.locked,
+                config.default_access.as_str(),
+                encrypted,
+            ],
+        )?;
+        let id = transaction.last_insert_rowid();
+        let stored = select_integration_config(&transaction, id, self.integration_cipher()?)?
+            .ok_or(SecurityError::Conflict)?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub(crate) fn update_integration_config(
+        &self,
+        config: &IntegrationConfig,
+    ) -> Result<IntegrationConfig, SecurityError> {
+        let encrypted = self.encrypt_integration_config(&config.config)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE integration_configs
+             SET name = ?1, enabled = ?2, locked = ?3, default_access = ?4,
+                 config_encrypted = ?5, updated_at = unixepoch()
+             WHERE integration_config_id = ?6",
+            params![
+                config.name,
+                config.enabled,
+                config.locked,
+                config.default_access.as_str(),
+                encrypted,
+                config.id,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(SecurityError::Conflict);
+        }
+        let stored =
+            select_integration_config(&transaction, config.id, self.integration_cipher()?)?
+                .ok_or(SecurityError::Conflict)?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub(crate) fn get_integration_config(
+        &self,
+        id: i64,
+    ) -> Result<Option<IntegrationConfig>, SecurityError> {
+        let connection = self.lock()?;
+        select_integration_config(&connection, id, self.integration_cipher()?)
+    }
+
+    pub(crate) fn list_integration_configs(&self) -> Result<Vec<IntegrationConfig>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT integration_config_id, integration_type, name, scope,
+                    owner_user_id, owner_team_id, enabled, locked, default_access,
+                    config_encrypted,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%S', updated_at, 'unixepoch')
+             FROM integration_configs ORDER BY integration_config_id",
+        )?;
+        statement
+            .query_map([], |row| integration_config_from_row(row, cipher))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn locked_server_integration_exists(
+        &self,
+        integration_type: IntegrationType,
+    ) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM integration_configs
+                     WHERE scope = 'SERVER' AND integration_type = ?1 AND locked = 1
+                 )",
+                [integration_type.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn delete_integration_config(&self, id: i64) -> Result<(), SecurityError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM resource_grants
+             WHERE resource_type = 'INTEGRATION_CONFIG' AND resource_id = ?1",
+            [id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM integration_configs WHERE integration_config_id = ?1",
+            [id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn integration_config_usages(&self, id: i64) -> Result<Vec<String>, SecurityError> {
+        let mut usages = self
+            .list_all_policy_sources()?
+            .into_iter()
+            .filter(|source| options_reference_integration(&source.options, id))
+            .map(|source| format!("source '{}'", source.name))
+            .collect::<Vec<_>>();
+        usages.extend(
+            self.list_all_policy_definitions()?
+                .into_iter()
+                .filter(|policy| options_reference_integration(&policy.output.options, id))
+                .map(|policy| format!("pipeline '{}'", policy.name)),
+        );
+        Ok(usages)
+    }
+
+    pub(crate) fn save_policy_source(&self, source: &PolicySource) -> Result<(), SecurityError> {
+        let plaintext = serde_json::to_vec(source).map_err(|_| SecurityError::InvalidInput)?;
+        let encrypted = self
+            .integration_cipher()?
+            .encrypt_java_compatible(&plaintext)?;
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO policy_sources
+                 (id, name, type, owner, team_id, enabled, source_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 type = excluded.type,
+                 owner = excluded.owner,
+                 team_id = excluded.team_id,
+                 enabled = excluded.enabled,
+                 source_json = excluded.source_json",
+            params![
+                source.id,
+                source.name,
+                source.source_type,
+                source.owner,
+                source.team_id,
+                source.enabled,
+                encrypted,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_policy_source(
+        &self,
+        id: &str,
+    ) -> Result<Option<PolicySource>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT source_json FROM policy_sources WHERE id = ?1",
+                [id],
+                |row| protected_json_from_row(row, 0, cipher),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_policy_sources(
+        &self,
+        team_id: Option<i64>,
+    ) -> Result<Vec<PolicySource>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT source_json FROM policy_sources
+             WHERE team_id IS ?1 ORDER BY name, id",
+        )?;
+        statement
+            .query_map([team_id], |row| protected_json_from_row(row, 0, cipher))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn list_all_policy_sources(&self) -> Result<Vec<PolicySource>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("SELECT source_json FROM policy_sources")?;
+        statement
+            .query_map([], |row| protected_json_from_row(row, 0, cipher))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn delete_policy_source(&self, id: &str) -> Result<(), SecurityError> {
+        let connection = self.lock()?;
+        connection.execute("DELETE FROM policy_sources WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub(crate) fn policy_source_doc_stats(
+        &self,
+        source_ids: &[String],
+    ) -> Result<BTreeMap<String, SourceDocStats>, SecurityError> {
+        let connection = self.lock()?;
+        let now_hour: i64 =
+            connection.query_row("SELECT CAST(unixepoch() / 3600 AS INTEGER)", [], |row| {
+                row.get(0)
+            })?;
+        let first_day_hour = ((now_hour / 24) - 29) * 24;
+        let mut result = BTreeMap::new();
+        let mut statement = connection.prepare(
+            "SELECT
+                 COALESCE((SELECT doc_total FROM policy_source_doc_totals WHERE source_id = ?1), 0),
+                 COALESCE(SUM(CASE WHEN bucket_hour >= ?2 THEN doc_count ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN bucket_hour >= ?3 THEN doc_count ELSE 0 END), 0)
+             FROM policy_source_doc_counts WHERE source_id = ?1",
+        )?;
+        for source_id in source_ids {
+            let (total, recent_docs, monthly_docs) =
+                statement.query_row(params![source_id, now_hour - 23, first_day_hour], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            result.insert(
+                source_id.clone(),
+                SourceDocStats {
+                    total: u64::try_from(total).unwrap_or_default(),
+                    last_24h: u64::try_from(recent_docs).unwrap_or_default(),
+                    last_30d: u64::try_from(monthly_docs).unwrap_or_default(),
+                },
+            );
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn policy_source_daily_series(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<u64>, SecurityError> {
+        const DAYS: usize = 30;
+        const DAYS_I64: i64 = 30;
+        let connection = self.lock()?;
+        let current_day: i64 =
+            connection.query_row("SELECT CAST(unixepoch() / 86400 AS INTEGER)", [], |row| {
+                row.get(0)
+            })?;
+        let first_day = current_day - (DAYS_I64 - 1);
+        let mut series = vec![0_u64; DAYS];
+        let mut statement = connection.prepare(
+            "SELECT CAST(bucket_hour / 24 AS INTEGER), SUM(doc_count)
+             FROM policy_source_doc_counts
+             WHERE source_id = ?1 AND bucket_hour >= ?2
+             GROUP BY CAST(bucket_hour / 24 AS INTEGER)",
+        )?;
+        let rows = statement.query_map(params![source_id, first_day * 24], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (day, count) = row?;
+            let index = day - first_day;
+            if let Ok(index) = usize::try_from(index)
+                && index < DAYS
+            {
+                series[index] = u64::try_from(count).unwrap_or_default();
+            }
+        }
+        Ok(series)
+    }
+
+    pub(crate) fn record_policy_source_docs(
+        &self,
+        source_id: &str,
+        documents: u64,
+    ) -> Result<(), SecurityError> {
+        if documents == 0 {
+            return Ok(());
+        }
+        let documents = i64::try_from(documents).map_err(|_| SecurityError::InvalidInput)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let bucket_hour: i64 =
+            transaction.query_row("SELECT CAST(unixepoch() / 3600 AS INTEGER)", [], |row| {
+                row.get(0)
+            })?;
+        transaction.execute(
+            "INSERT INTO policy_source_doc_totals(source_id, doc_total) VALUES (?1, ?2)
+             ON CONFLICT(source_id) DO UPDATE SET doc_total = doc_total + excluded.doc_total",
+            params![source_id, documents],
+        )?;
+        transaction.execute(
+            "INSERT INTO policy_source_doc_counts(source_id, bucket_hour, doc_count)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(source_id, bucket_hour)
+             DO UPDATE SET doc_count = doc_count + excluded.doc_count",
+            params![source_id, bucket_hour, documents],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn policy_processed_states(
+        &self,
+        policy_id: &str,
+        identities: &[String],
+    ) -> Result<HashMap<String, ClaimState>, SecurityError> {
+        if identities.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let identity_by_hash = identities
+            .iter()
+            .map(|identity| (policy_identity_hash(identity), identity.clone()))
+            .collect::<HashMap<_, _>>();
+        let hashes = identity_by_hash.keys().cloned().collect::<Vec<_>>();
+        let connection = self.lock()?;
+        let mut states = HashMap::new();
+        for chunk in hashes.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT identity_hash, status, signature, content_hash
+                 FROM policy_processed_files
+                 WHERE policy_id = ? AND identity_hash IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(SqlValue::Text(policy_id.to_owned()));
+            values.extend(chunk.iter().cloned().map(SqlValue::Text));
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (hash, status_value, gate, content_hash) = row?;
+                let identity = identity_by_hash
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(SecurityError::Conflict)?;
+                states.insert(
+                    identity,
+                    ClaimState {
+                        status: ProcessedFileStatus::parse(&status_value)?,
+                        gate,
+                        content_hash,
+                    },
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn claim_policy_processed_file(
+        &self,
+        policy_id: &str,
+        identity: &str,
+        gate: &str,
+        content_hash: Option<&str>,
+        observed: Option<&ClaimState>,
+        now_millis: i64,
+    ) -> Result<bool, SecurityError> {
+        validate_policy_claim(policy_id, identity, gate, content_hash)?;
+        let hash = policy_identity_hash(identity);
+        let connection = self.lock()?;
+        let Some(observed) = observed else {
+            return connection
+                .execute(
+                    "INSERT INTO policy_processed_files
+                         (policy_id, identity_hash, identity, signature, content_hash, status,
+                          attempts, last_seen, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'PROCESSING', 1, ?6, ?6)
+                     ON CONFLICT(policy_id, identity_hash) DO NOTHING",
+                    params![policy_id, hash, identity, gate, content_hash, now_millis],
+                )
+                .map(|updated| updated == 1)
+                .map_err(Into::into);
+        };
+        if observed.status == ProcessedFileStatus::Processing {
+            return Ok(false);
+        }
+        if observed.gate == gate {
+            if observed.status != ProcessedFileStatus::Interrupted {
+                return Ok(false);
+            }
+            return connection
+                .execute(
+                    "UPDATE policy_processed_files
+                     SET status = 'PROCESSING', attempts = attempts + 1,
+                         last_seen = ?1, updated_at = ?1
+                     WHERE policy_id = ?2 AND identity_hash = ?3
+                       AND status = 'INTERRUPTED' AND signature = ?4 AND attempts < ?5",
+                    params![now_millis, policy_id, hash, gate, MAX_ATTEMPTS],
+                )
+                .map(|updated| updated == 1)
+                .map_err(Into::into);
+        }
+        let Some(content_hash) = content_hash else {
+            return connection
+                .execute(
+                    "UPDATE policy_processed_files
+                     SET status = 'PROCESSING', signature = ?1, content_hash = NULL, attempts = 1,
+                         last_seen = ?2, updated_at = ?2
+                     WHERE policy_id = ?3 AND identity_hash = ?4
+                       AND status <> 'PROCESSING' AND signature <> ?1",
+                    params![gate, now_millis, policy_id, hash],
+                )
+                .map(|updated| updated == 1)
+                .map_err(Into::into);
+        };
+        if observed.content_hash.as_deref() == Some(content_hash) {
+            if observed.status == ProcessedFileStatus::Interrupted {
+                return connection
+                    .execute(
+                        "UPDATE policy_processed_files
+                         SET status = 'PROCESSING', signature = ?1, attempts = attempts + 1,
+                             last_seen = ?2, updated_at = ?2
+                         WHERE policy_id = ?3 AND identity_hash = ?4
+                           AND status = 'INTERRUPTED' AND content_hash = ?5 AND attempts < ?6",
+                        params![
+                            gate,
+                            now_millis,
+                            policy_id,
+                            hash,
+                            content_hash,
+                            MAX_ATTEMPTS
+                        ],
+                    )
+                    .map(|updated| updated == 1)
+                    .map_err(Into::into);
+            }
+            connection.execute(
+                "UPDATE policy_processed_files
+                 SET signature = ?1, last_seen = ?2, updated_at = ?2
+                 WHERE policy_id = ?3 AND identity_hash = ?4
+                   AND status <> 'PROCESSING' AND content_hash = ?5 AND signature <> ?1",
+                params![gate, now_millis, policy_id, hash, content_hash],
+            )?;
+            return Ok(false);
+        }
+        connection
+            .execute(
+                "UPDATE policy_processed_files
+                 SET status = 'PROCESSING', signature = ?1, content_hash = ?2, attempts = 1,
+                     last_seen = ?3, updated_at = ?3
+                 WHERE policy_id = ?4 AND identity_hash = ?5
+                   AND status <> 'PROCESSING'
+                   AND (content_hash IS NULL OR content_hash <> ?2)",
+                params![gate, content_hash, now_millis, policy_id, hash],
+            )
+            .map(|updated| updated == 1)
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn settle_policy_processed_file(
+        &self,
+        policy_id: &str,
+        identity: &str,
+        gate: &str,
+        content_hash: Option<&str>,
+        status: ProcessedFileStatus,
+        now_millis: i64,
+    ) -> Result<(), SecurityError> {
+        validate_policy_claim(policy_id, identity, gate, content_hash)?;
+        if status == ProcessedFileStatus::Processing {
+            return Err(SecurityError::InvalidInput);
+        }
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO policy_processed_files
+                 (policy_id, identity_hash, identity, signature, content_hash, status,
+                  attempts, last_seen, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)
+             ON CONFLICT(policy_id, identity_hash) DO UPDATE SET
+                 signature = excluded.signature,
+                 content_hash = excluded.content_hash,
+                 status = excluded.status,
+                 last_seen = excluded.last_seen,
+                 updated_at = excluded.updated_at",
+            params![
+                policy_id,
+                policy_identity_hash(identity),
+                identity,
+                gate,
+                content_hash,
+                status.as_str(),
+                now_millis
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "used by the staged policy output-sink port")]
+    pub(crate) fn forget_policy_processed_output(
+        &self,
+        policy_id: &str,
+        identity: &str,
+        gate: &str,
+    ) -> Result<(), SecurityError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM policy_processed_files
+             WHERE policy_id = ?1 AND identity_hash = ?2
+               AND signature = ?3 AND status = 'DONE'",
+            params![policy_id, policy_identity_hash(identity), gate],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn all_policy_processed_done(&self, identity: &str) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        let unsettled: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM policy_processed_files
+                 WHERE identity_hash = ?1 AND status <> 'DONE'
+             )",
+            [policy_identity_hash(identity)],
+            |row| row.get(0),
+        )?;
+        Ok(!unsettled)
+    }
+
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn mark_policy_processed_seen(
+        &self,
+        policy_id: &str,
+        identities: &[String],
+        now_millis: i64,
+    ) -> Result<(), SecurityError> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let hashes = identities
+            .iter()
+            .map(|identity| policy_identity_hash(identity))
+            .collect::<Vec<_>>();
+        let connection = self.lock()?;
+        for chunk in hashes.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE policy_processed_files SET last_seen = ?
+                 WHERE policy_id = ? AND identity_hash IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 2);
+            values.push(SqlValue::Integer(now_millis));
+            values.push(SqlValue::Text(policy_id.to_owned()));
+            values.extend(chunk.iter().cloned().map(SqlValue::Text));
+            connection.execute(&sql, params_from_iter(values.iter()))?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+    pub(crate) fn delete_unseen_policy_processed(
+        &self,
+        policy_id: &str,
+        seen_since_millis: i64,
+    ) -> Result<usize, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM policy_processed_files
+                 WHERE policy_id = ?1 AND last_seen < ?2 AND status <> 'PROCESSING'",
+                params![policy_id, seen_since_millis],
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code, reason = "mounted with the staged processed-history route")]
+    pub(crate) fn clear_policy_processed_history(
+        &self,
+        policy_id: &str,
+    ) -> Result<(), SecurityError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM policy_processed_files WHERE policy_id = ?1",
+            [policy_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_interrupted_policy_files(
+        &self,
+        now_millis: i64,
+    ) -> Result<usize, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "UPDATE policy_processed_files
+                 SET status = 'INTERRUPTED', updated_at = ?1
+                 WHERE status = 'PROCESSING'",
+                [now_millis],
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn save_policy_definition(
+        &self,
+        policy: &PolicyDefinition,
+    ) -> Result<(), SecurityError> {
+        let plaintext = serde_json::to_vec(policy).map_err(|_| SecurityError::InvalidInput)?;
+        let encrypted = self
+            .integration_cipher()?
+            .encrypt_java_compatible(&plaintext)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_sort_order = transaction
+            .query_row(
+                "SELECT sort_order FROM policies WHERE id = ?1",
+                [&policy.id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let sort_order = existing_sort_order.unwrap_or_else(|| {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM policies
+                     WHERE team_id IS ?1",
+                    [policy.team_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+        });
+        transaction.execute(
+            "INSERT INTO policies
+                 (id, name, owner, enabled, trigger_type, team_id, sort_order, policy_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 owner = excluded.owner,
+                 enabled = excluded.enabled,
+                 trigger_type = excluded.trigger_type,
+                 team_id = excluded.team_id,
+                 sort_order = excluded.sort_order,
+                 policy_json = excluded.policy_json",
+            params![
+                policy.id,
+                policy.name,
+                policy.owner,
+                policy.enabled,
+                policy.trigger.as_ref().map(|trigger| &trigger.trigger_type),
+                policy.team_id,
+                sort_order,
+                encrypted,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn get_policy_definition(
+        &self,
+        id: &str,
+    ) -> Result<Option<PolicyDefinition>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT policy_json FROM policies WHERE id = ?1",
+                [id],
+                |row| protected_json_from_row(row, 0, cipher),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_policy_definitions(
+        &self,
+        team_id: Option<i64>,
+    ) -> Result<Vec<PolicyDefinition>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT policy_json FROM policies WHERE team_id IS ?1
+             ORDER BY COALESCE(sort_order, 0), id",
+        )?;
+        statement
+            .query_map([team_id], |row| protected_json_from_row(row, 0, cipher))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_all_policy_definitions(
+        &self,
+    ) -> Result<Vec<PolicyDefinition>, SecurityError> {
+        let cipher = self.integration_cipher()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("SELECT policy_json FROM policies")?;
+        statement
+            .query_map([], |row| protected_json_from_row(row, 0, cipher))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn reorder_policy_definitions(
+        &self,
+        team_id: Option<i64>,
+        ids: &[String],
+    ) -> Result<(), SecurityError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut position = 0_i64;
+        for id in ids {
+            let updated = transaction.execute(
+                "UPDATE policies SET sort_order = ?1 WHERE id = ?2 AND team_id IS ?3",
+                params![position, id, team_id],
+            )?;
+            if updated == 1 {
+                position += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_policy_definition(&self, id: &str) -> Result<(), SecurityError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM policy_processed_files WHERE policy_id = ?1",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM policies WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn integration_cipher(&self) -> Result<&ProtectedSecretCipher, SecurityError> {
+        self.secret_cipher
+            .as_ref()
+            .ok_or(SecurityError::IntegrationProtectionUnavailable)
+    }
+
+    fn encrypt_integration_config(
+        &self,
+        config: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, SecurityError> {
+        let plaintext = serde_json::to_vec(config).map_err(|_| SecurityError::InvalidInput)?;
+        self.integration_cipher()?
+            .encrypt_java_compatible(&plaintext)
+            .map_err(Into::into)
+    }
+
     fn clear_login_failures(&self, username: &str) -> Result<(), SecurityError> {
         let normalized = normalize_username(username)?;
         let connection = self.lock()?;
@@ -1848,7 +3647,7 @@ impl SecurityStore {
         password: &str,
         roles: [&str; N],
     ) -> Result<bool, SecurityError> {
-        let username = normalize_username(username)?;
+        let username = normalize_web_username(username)?;
         validate_password(password)?;
         let roles = normalize_roles(roles)?;
         let password_hash = hash(password, self.bcrypt_cost)?;
@@ -1922,6 +3721,211 @@ impl SecurityStore {
     }
 }
 
+fn audit_filter_sql(
+    filter: &SecurityAuditFilter,
+) -> Result<(String, Vec<SqlValue>), SecurityError> {
+    if filter.event_types.len() > MAX_AUDIT_FILTER_VALUES
+        || filter.principals.len() > MAX_AUDIT_FILTER_VALUES
+        || (filter.principal_contains.is_some() && !filter.principals.is_empty())
+        || filter.start_at.is_some() != filter.end_at.is_some()
+        || filter
+            .start_at
+            .zip(filter.end_at)
+            .is_some_and(|(start, end)| start >= end)
+    {
+        return Err(SecurityError::InvalidInput);
+    }
+    for value in filter
+        .event_types
+        .iter()
+        .chain(&filter.principals)
+        .chain(filter.principal_contains.iter())
+    {
+        if value.is_empty()
+            || value.len() > MAX_AUDIT_VALUE_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(SecurityError::InvalidInput);
+        }
+    }
+    let mut clauses = Vec::new();
+    let mut values = Vec::new();
+    if !filter.event_types.is_empty() {
+        clauses.push(format!(
+            "event_type IN ({})",
+            vec!["?"; filter.event_types.len()].join(",")
+        ));
+        values.extend(filter.event_types.iter().cloned().map(SqlValue::Text));
+    }
+    if !filter.principals.is_empty() {
+        clauses.push(format!(
+            "principal IN ({})",
+            vec!["?"; filter.principals.len()].join(",")
+        ));
+        values.extend(filter.principals.iter().cloned().map(SqlValue::Text));
+    }
+    if let Some(principal) = &filter.principal_contains {
+        clauses.push("LOWER(principal) LIKE LOWER(?)".to_owned());
+        values.push(SqlValue::Text(format!("%{principal}%")));
+    }
+    if let Some((start, end)) = filter.start_at.zip(filter.end_at) {
+        clauses.push("created_at >= ? AND created_at < ?".to_owned());
+        values.push(SqlValue::Integer(start));
+        values.push(SqlValue::Integer(end));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    Ok((where_clause, values))
+}
+
+fn resource_grant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceGrant> {
+    let resource_type = row.get::<_, String>(1)?;
+    let principal_type = row.get::<_, String>(3)?;
+    let permission = row.get::<_, String>(5)?;
+    Ok(ResourceGrant {
+        id: row.get(0)?,
+        resource_type: ResourceType::from_database(&resource_type)
+            .ok_or_else(|| invalid_persisted_enum(1, &resource_type))?,
+        resource_id: row.get(2)?,
+        principal_type: PrincipalType::from_database(&principal_type)
+            .ok_or_else(|| invalid_persisted_enum(3, &principal_type))?,
+        principal_id: row.get(4)?,
+        permission: AccessPermission::from_database(&permission)
+            .ok_or_else(|| invalid_persisted_enum(5, &permission))?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn select_integration_config(
+    connection: &Connection,
+    id: i64,
+    cipher: &ProtectedSecretCipher,
+) -> Result<Option<IntegrationConfig>, SecurityError> {
+    connection
+        .query_row(
+            "SELECT integration_config_id, integration_type, name, scope,
+                    owner_user_id, owner_team_id, enabled, locked, default_access,
+                    config_encrypted,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%S', updated_at, 'unixepoch')
+             FROM integration_configs WHERE integration_config_id = ?1",
+            [id],
+            |row| integration_config_from_row(row, cipher),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn integration_config_from_row(
+    row: &rusqlite::Row<'_>,
+    cipher: &ProtectedSecretCipher,
+) -> rusqlite::Result<IntegrationConfig> {
+    let integration_type = row.get::<_, String>(1)?;
+    let scope = row.get::<_, String>(3)?;
+    let default_access = row.get::<_, String>(8)?;
+    let encrypted = row.get::<_, Option<String>>(9)?;
+    let config = match encrypted.filter(|value| !value.trim().is_empty()) {
+        Some(encrypted) => {
+            let plaintext = cipher
+                .decrypt_java_compatible(&encrypted)
+                .map_err(|error| invalid_persisted_value(9, error))?;
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&plaintext)
+                .unwrap_or_default()
+        }
+        None => serde_json::Map::new(),
+    };
+    Ok(IntegrationConfig {
+        id: row.get(0)?,
+        integration_type: IntegrationType::from_database(&integration_type)
+            .ok_or_else(|| invalid_persisted_enum(1, &integration_type))?,
+        name: row.get(2)?,
+        scope: OwnerScope::from_database(&scope)
+            .ok_or_else(|| invalid_persisted_enum(3, &scope))?,
+        owner_user_id: row.get(4)?,
+        owner_team_id: row.get(5)?,
+        enabled: row.get(6)?,
+        locked: row.get(7)?,
+        default_access: DefaultAccessPolicy::from_database(&default_access)
+            .ok_or_else(|| invalid_persisted_enum(8, &default_access))?,
+        config,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn invalid_persisted_enum(index: usize, value: &str) -> rusqlite::Error {
+    invalid_persisted_value(
+        index,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid persisted enum value {value:?}"),
+        ),
+    )
+}
+
+fn invalid_persisted_value(
+    index: usize,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn protected_json_from_row<T: DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    cipher: &ProtectedSecretCipher,
+) -> rusqlite::Result<T> {
+    let stored = row.get::<_, String>(index)?;
+    let plaintext = cipher.decrypt_java_compatible(&stored).map_or_else(
+        |_| stored.as_bytes().to_vec(),
+        |plaintext| plaintext.to_vec(),
+    );
+    serde_json::from_slice(&plaintext).map_err(|error| invalid_persisted_value(index, error))
+}
+
+fn options_reference_integration(
+    options: &serde_json::Map<String, serde_json::Value>,
+    integration_id: i64,
+) -> bool {
+    options.get("connectionId").is_some_and(|reference| {
+        reference.as_i64() == Some(integration_id)
+            || reference
+                .as_str()
+                .and_then(|reference| reference.trim().parse::<i64>().ok())
+                == Some(integration_id)
+    })
+}
+
+fn audit_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecurityAuditEvent> {
+    let stored_data = row.get::<_, String>(4)?;
+    let path = row.get::<_, String>(5)?;
+    let outcome = row.get::<_, String>(6)?;
+    let mut data = serde_json::from_str::<serde_json::Value>(&stored_data).unwrap_or_else(|_| {
+        serde_json::json!({
+            "rawData": stored_data,
+        })
+    });
+    if let Some(object) = data.as_object_mut() {
+        object
+            .entry("path")
+            .or_insert_with(|| serde_json::Value::String(path));
+        object
+            .entry("outcome")
+            .or_insert_with(|| serde_json::Value::String(outcome));
+    }
+    Ok(SecurityAuditEvent {
+        id: row.get(0)?,
+        principal: row.get(1)?,
+        event_type: row.get(2)?,
+        source: row.get(3)?,
+        data: serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_owned()),
+        timestamp: row.get(7)?,
+    })
+}
+
 struct NormalizedUsername {
     original: String,
     normalized: String,
@@ -1978,6 +3982,7 @@ fn resolve_external_user(
     transaction: &Transaction<'_>,
     identity: &VerifiedSupabaseIdentity,
     username: &NormalizedUsername,
+    verification: LicenseVerification,
     now: i64,
 ) -> Result<StoredUser, SecurityError> {
     let blocked: bool = transaction.query_row(
@@ -2002,6 +4007,7 @@ fn resolve_external_user(
     if let Some(user_id) = existing_user_id {
         update_external_user(transaction, identity, username, user_id, now)
     } else {
+        ensure_user_capacity(transaction, verification, 1)?;
         insert_external_user(transaction, identity, username, now)
     }
 }
@@ -2179,6 +4185,23 @@ fn normalize_assignable_role(role: &str) -> Result<String, SecurityError> {
     Ok(role)
 }
 
+fn normalize_invitable_role(role: &str) -> Result<String, SecurityError> {
+    let role = role.trim().to_ascii_uppercase();
+    if !matches!(
+        role.as_str(),
+        "ROLE_ADMIN"
+            | "ROLE_USER"
+            | "ROLE_PRO_USER"
+            | "ROLE_LIMITED_API_USER"
+            | "ROLE_EXTRA_LIMITED_API_USER"
+            | "ROLE_WEB_ONLY_USER"
+            | "ROLE_DEMO_USER"
+    ) {
+        return Err(SecurityError::InvalidInput);
+    }
+    Ok(role)
+}
+
 fn find_active_invite(
     connection: &Connection,
     digest: &[u8],
@@ -2241,6 +4264,93 @@ fn normalize_username(username: &str) -> Result<NormalizedUsername, SecurityErro
     })
 }
 
+fn normalize_web_username(username: &str) -> Result<NormalizedUsername, SecurityError> {
+    let username = normalize_username(username)?;
+    if matches!(username.normalized.as_str(), "all_users" | "anonymoususer")
+        || (!is_simple_web_username(&username.original)
+            && !is_web_email_address(&username.original))
+    {
+        return Err(SecurityError::InvalidInput);
+    }
+    Ok(username)
+}
+
+fn is_simple_web_username(username: &str) -> bool {
+    let bytes = username.as_bytes();
+    if !(3..=50).contains(&bytes.len())
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'+' | b'-')
+        })
+    {
+        return false;
+    }
+    !bytes.windows(2).any(|pair| {
+        pair.iter()
+            .all(|byte| matches!(byte, b'@' | b'.' | b'_' | b'+' | b'-'))
+    })
+}
+
+fn is_web_email_address(email: &str) -> bool {
+    if email.is_empty() || email.len() > MAX_USERNAME_BYTES {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    if domain.contains('@')
+        || local.is_empty()
+        || local.len() > 64
+        || !local
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !local
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !local
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        return false;
+    }
+    let labels = domain.split('.').collect::<Vec<_>>();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        || labels
+            .first()
+            .is_none_or(|label| label.len() < 2 || label.starts_with('-'))
+    {
+        return false;
+    }
+    labels.last().is_some_and(|label| {
+        label.len() >= 2 && label.bytes().all(|byte| byte.is_ascii_alphabetic())
+    })
+}
+
+fn validate_user_settings(settings: &BTreeMap<String, String>) -> Result<(), SecurityError> {
+    if settings.len() > MAX_USER_SETTINGS
+        || settings.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > MAX_USER_SETTING_KEY_BYTES
+                || key.chars().any(char::is_control)
+                || value.len() > MAX_USER_SETTING_VALUE_BYTES
+                || value.contains('\0')
+        })
+    {
+        return Err(SecurityError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn validate_password(password: &str) -> Result<(), SecurityError> {
     if password.is_empty() || password.len() > MAX_PASSWORD_BYTES || password.contains('\0') {
         return Err(SecurityError::InvalidInput);
@@ -2288,6 +4398,10 @@ fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
              enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
              authentication_type TEXT NOT NULL,
              team_id INTEGER,
+             force_password_change INTEGER NOT NULL DEFAULT 0
+                 CHECK(force_password_change IN (0, 1)),
+             initial_setup_completed INTEGER NOT NULL DEFAULT 0
+                 CHECK(initial_setup_completed IN (0, 1)),
              created_at INTEGER NOT NULL DEFAULT (unixepoch())
          );
          CREATE TABLE IF NOT EXISTS security_user_roles (
@@ -2328,14 +4442,6 @@ fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
              created_at INTEGER NOT NULL,
              revoked_at INTEGER
          );
-         CREATE TABLE IF NOT EXISTS security_mfa (
-             user_id INTEGER PRIMARY KEY REFERENCES security_users(user_id) ON DELETE CASCADE,
-             enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
-             required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0, 1)),
-             secret_ciphertext TEXT NOT NULL,
-             last_used_step INTEGER,
-             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );
          CREATE TABLE IF NOT EXISTS security_invites (
              invite_id INTEGER PRIMARY KEY AUTOINCREMENT,
              token_hash BLOB NOT NULL UNIQUE,
@@ -2353,6 +4459,9 @@ fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
          CREATE TABLE IF NOT EXISTS security_audit_events (
              event_id INTEGER PRIMARY KEY AUTOINCREMENT,
              user_id INTEGER REFERENCES security_users(user_id) ON DELETE SET NULL,
+             principal TEXT NOT NULL,
+             source TEXT NOT NULL,
+             data TEXT NOT NULL,
              session_id TEXT NOT NULL,
              correlation_id TEXT NOT NULL,
              event_type TEXT NOT NULL,
@@ -2361,8 +4470,475 @@ fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
              created_at INTEGER NOT NULL
          );",
     )?;
+    initialize_user_license_settings_schema(connection)?;
+    initialize_resource_access_schema(connection)?;
+    initialize_user_security_schema(connection)?;
+    migrate_audit_event_details(connection)?;
+    migrate_force_password_change(connection)?;
+    migrate_initial_setup_completed(connection)?;
     initialize_external_identity_schema(connection)?;
     migrate_team_memberships(connection)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct StoredUserLicenseSettings {
+    grandfathered_user_count: i64,
+    grandfathering_locked: bool,
+    license_max_users: i64,
+    integrity_salt: String,
+    signature: String,
+}
+
+fn initialize_user_license_settings_schema(connection: &Connection) -> Result<(), SecurityError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_license_settings (
+             id INTEGER PRIMARY KEY CHECK(id = 1),
+             grandfathered_user_count INTEGER NOT NULL,
+             grandfathering_locked INTEGER NOT NULL
+                 CHECK(grandfathering_locked IN (0, 1)),
+             license_max_users INTEGER NOT NULL,
+             integrity_salt TEXT NOT NULL,
+             grandfathered_user_signature TEXT NOT NULL
+         );",
+    )?;
+    let existing = load_user_license_settings(connection)?;
+    match existing {
+        None => {
+            let count = real_user_count(connection)?.max(DEFAULT_USER_LIMIT);
+            let salt = random_integrity_salt();
+            let signature = user_seat_signature(count, &salt)?;
+            connection.execute(
+                "INSERT INTO user_license_settings
+                 (id, grandfathered_user_count, grandfathering_locked,
+                  license_max_users, integrity_salt, grandfathered_user_signature)
+                 VALUES (?1, ?2, 1, 0, ?3, ?4)",
+                params![USER_LICENSE_SETTINGS_ID, count, salt, signature],
+            )?;
+        }
+        Some(settings) if !settings.grandfathering_locked => {
+            let count = real_user_count(connection)?.max(DEFAULT_USER_LIMIT);
+            let salt = if settings.integrity_salt.trim().is_empty() {
+                random_integrity_salt()
+            } else {
+                settings.integrity_salt
+            };
+            let signature = user_seat_signature(count, &salt)?;
+            connection.execute(
+                "UPDATE user_license_settings
+                 SET grandfathered_user_count = ?1, grandfathering_locked = 1,
+                     integrity_salt = ?2, grandfathered_user_signature = ?3
+                 WHERE id = ?4",
+                params![count, salt, signature, USER_LICENSE_SETTINGS_ID],
+            )?;
+        }
+        Some(settings) if settings.signature.trim().is_empty() => {
+            let salt = if settings.integrity_salt.trim().is_empty() {
+                random_integrity_salt()
+            } else {
+                settings.integrity_salt
+            };
+            let signature = user_seat_signature(settings.grandfathered_user_count, &salt)?;
+            connection.execute(
+                "UPDATE user_license_settings
+                 SET integrity_salt = ?1, grandfathered_user_signature = ?2
+                 WHERE id = ?3",
+                params![salt, signature, USER_LICENSE_SETTINGS_ID],
+            )?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn load_user_license_settings(
+    connection: &Connection,
+) -> Result<Option<StoredUserLicenseSettings>, SecurityError> {
+    connection
+        .query_row(
+            "SELECT grandfathered_user_count, grandfathering_locked, license_max_users,
+                    integrity_salt, grandfathered_user_signature
+             FROM user_license_settings WHERE id = ?1",
+            [USER_LICENSE_SETTINGS_ID],
+            |row| {
+                Ok(StoredUserLicenseSettings {
+                    grandfathered_user_count: row.get(0)?,
+                    grandfathering_locked: row.get(1)?,
+                    license_max_users: row.get(2)?,
+                    integrity_salt: row.get(3)?,
+                    signature: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(SecurityError::from)
+}
+
+fn validated_user_license_settings(
+    connection: &Connection,
+) -> Result<StoredUserLicenseSettings, SecurityError> {
+    let mut settings = load_user_license_settings(connection)?
+        .ok_or(SecurityError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+    let mut changed = false;
+    if settings.integrity_salt.trim().is_empty() {
+        settings.integrity_salt = random_integrity_salt();
+        changed = true;
+    }
+    let signed_count = settings
+        .signature
+        .split_once(':')
+        .and_then(|(count, _)| count.parse::<i64>().ok());
+    let signature_valid = signed_count.is_some_and(|count| {
+        user_seat_signature(count, &settings.integrity_salt)
+            .is_ok_and(|expected| expected == settings.signature)
+    });
+    let mut target_count = settings.grandfathered_user_count;
+    if signature_valid {
+        if let Some(count) = signed_count
+            && count != target_count
+        {
+            target_count = count;
+            changed = true;
+        }
+    } else {
+        // Preserve the Java migration contract: a parseable embedded count is
+        // retained when an old secret or salt invalidates the digest.
+        target_count = signed_count.unwrap_or(real_user_count(connection)?.max(DEFAULT_USER_LIMIT));
+        changed = true;
+    }
+    target_count = target_count.max(DEFAULT_USER_LIMIT);
+    if target_count != settings.grandfathered_user_count {
+        settings.grandfathered_user_count = target_count;
+        changed = true;
+    }
+    if changed || settings.signature.trim().is_empty() {
+        settings.signature = user_seat_signature(target_count, &settings.integrity_salt)?;
+        connection.execute(
+            "UPDATE user_license_settings
+             SET grandfathered_user_count = ?1, integrity_salt = ?2,
+                 grandfathered_user_signature = ?3 WHERE id = ?4",
+            params![
+                target_count,
+                settings.integrity_salt,
+                settings.signature,
+                USER_LICENSE_SETTINGS_ID
+            ],
+        )?;
+    }
+    Ok(settings)
+}
+
+fn user_seat_signature(count: i64, salt: &str) -> Result<String, SecurityError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(USER_SEAT_INTEGRITY_SECRET)
+        .map_err(|_| SecurityError::InvalidInput)?;
+    mac.update(format!("{count}:{salt}").as_bytes());
+    Ok(format!(
+        "{count}:{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ))
+}
+
+fn random_integrity_salt() -> String {
+    let mut bytes = [0_u8; 24];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn real_user_count(connection: &Connection) -> Result<i64, SecurityError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM security_users
+             WHERE username_norm <> LOWER(?1)",
+            [INTERNAL_API_USERNAME],
+            |row| row.get(0),
+        )
+        .map_err(SecurityError::from)
+}
+
+fn seat_metrics(
+    connection: &Connection,
+    verification: LicenseVerification,
+) -> Result<UserSeatMetrics, SecurityError> {
+    let settings = validated_user_license_settings(connection)?;
+    let current_users = real_user_count(connection)?;
+    let max_allowed_users = if verification.running_pro_or_higher() {
+        if settings.license_max_users == 0 {
+            UNLIMITED_USER_LIMIT
+        } else {
+            settings.license_max_users
+        }
+    } else {
+        settings.grandfathered_user_count
+    };
+    Ok(UserSeatMetrics {
+        max_allowed_users,
+        available_slots: max_allowed_users.saturating_sub(current_users).max(0),
+        grandfathered_user_count: settings
+            .grandfathered_user_count
+            .saturating_sub(DEFAULT_USER_LIMIT)
+            .max(0),
+        license_max_users: settings.license_max_users,
+        premium_enabled: verification.running_pro_or_higher(),
+    })
+}
+
+fn ensure_user_capacity(
+    connection: &Connection,
+    verification: LicenseVerification,
+    requested_users: i64,
+) -> Result<(), SecurityError> {
+    if requested_users <= 0 {
+        return Err(SecurityError::InvalidInput);
+    }
+    let metrics = seat_metrics(connection, verification)?;
+    if requested_users > metrics.available_slots {
+        return Err(SecurityError::UserLimitReached {
+            max_allowed: metrics.max_allowed_users,
+            available_slots: metrics.available_slots,
+        });
+    }
+    Ok(())
+}
+
+fn initialize_resource_access_schema(connection: &Connection) -> Result<(), SecurityError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS resource_grants (
+             resource_grant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             resource_type TEXT NOT NULL
+                 CHECK(resource_type IN ('PORTAL', 'INTEGRATION_CONFIG')),
+             resource_id TEXT NOT NULL DEFAULT '',
+             principal_type TEXT NOT NULL CHECK(principal_type IN ('USER', 'TEAM')),
+             principal_id INTEGER NOT NULL,
+             permission TEXT NOT NULL DEFAULT 'USE' CHECK(permission IN ('USE', 'MANAGE')),
+             granted_by_user_id INTEGER
+                 REFERENCES security_users(user_id) ON DELETE SET NULL,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             UNIQUE(resource_type, resource_id, principal_type, principal_id)
+         );
+         CREATE INDEX IF NOT EXISTS resource_grants_resource_idx
+             ON resource_grants(resource_type, resource_id);
+         CREATE INDEX IF NOT EXISTS resource_grants_principal_idx
+             ON resource_grants(principal_type, principal_id);
+         CREATE TABLE IF NOT EXISTS integration_configs (
+             integration_config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             integration_type TEXT NOT NULL CHECK(integration_type IN ('S3', 'MCP', 'API')),
+             name TEXT NOT NULL,
+             scope TEXT NOT NULL CHECK(scope IN ('USER', 'TEAM', 'SERVER')),
+             owner_user_id INTEGER
+                 REFERENCES security_users(user_id) ON DELETE CASCADE,
+             owner_team_id INTEGER
+                 REFERENCES security_teams(team_id) ON DELETE RESTRICT,
+             enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+             locked INTEGER NOT NULL DEFAULT 0 CHECK(locked IN (0, 1)),
+             default_access TEXT NOT NULL DEFAULT 'EXPLICIT_ONLY'
+                 CHECK(default_access IN ('ORG_ALL', 'ADMINS_AND_TEAM_LEADS', 'EXPLICIT_ONLY')),
+             config_encrypted TEXT,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             CHECK(
+                 (scope = 'USER' AND owner_user_id IS NOT NULL AND owner_team_id IS NULL)
+                 OR (scope = 'TEAM' AND owner_user_id IS NULL AND owner_team_id IS NOT NULL)
+                 OR (scope = 'SERVER' AND owner_user_id IS NULL AND owner_team_id IS NULL)
+             )
+         );",
+    )?;
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS integration_configs_owner_user_idx
+             ON integration_configs(owner_user_id);
+         CREATE INDEX IF NOT EXISTS integration_configs_owner_team_idx
+             ON integration_configs(owner_team_id);
+         CREATE INDEX IF NOT EXISTS integration_configs_type_idx
+             ON integration_configs(integration_type);
+         CREATE INDEX IF NOT EXISTS integration_configs_scope_idx
+             ON integration_configs(scope);",
+    )?;
+    initialize_policy_config_schema(connection)?;
+    Ok(())
+}
+
+fn initialize_policy_config_schema(connection: &Connection) -> Result<(), SecurityError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS policies (
+             id TEXT PRIMARY KEY,
+             name TEXT,
+             owner TEXT,
+             enabled INTEGER NOT NULL DEFAULT 0,
+             trigger_type TEXT,
+             team_id INTEGER,
+             sort_order INTEGER,
+             policy_json TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_policies_team ON policies(team_id);
+         CREATE INDEX IF NOT EXISTS idx_policies_trigger ON policies(trigger_type, enabled);
+         CREATE TABLE IF NOT EXISTS policy_sources (
+             id TEXT PRIMARY KEY,
+             name TEXT,
+             type TEXT,
+             owner TEXT,
+             team_id INTEGER,
+             enabled INTEGER NOT NULL DEFAULT 0,
+             source_json TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_policy_sources_team ON policy_sources(team_id);
+         CREATE TABLE IF NOT EXISTS policy_source_doc_counts (
+             source_id TEXT NOT NULL,
+             bucket_hour INTEGER NOT NULL,
+             doc_count INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(source_id, bucket_hour)
+         );
+         CREATE TABLE IF NOT EXISTS policy_source_doc_totals (
+             source_id TEXT PRIMARY KEY,
+             doc_total INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS policy_processed_files (
+             policy_id TEXT NOT NULL,
+             identity_hash TEXT NOT NULL,
+             identity TEXT,
+             signature TEXT NOT NULL,
+             content_hash TEXT,
+             status TEXT NOT NULL
+                 CHECK(status IN ('PROCESSING', 'DONE', 'ERROR', 'INTERRUPTED')),
+             attempts INTEGER NOT NULL DEFAULT 1,
+             last_seen INTEGER NOT NULL DEFAULT 0,
+             updated_at INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(policy_id, identity_hash)
+         );
+         CREATE INDEX IF NOT EXISTS idx_processed_files_policy_seen
+             ON policy_processed_files(policy_id, last_seen);
+         CREATE INDEX IF NOT EXISTS idx_processed_files_identity
+             ON policy_processed_files(identity_hash);",
+    )?;
+    let policy_columns = connection
+        .prepare("SELECT name FROM pragma_table_info('policies')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !policy_columns.contains("sort_order") {
+        connection.execute_batch("ALTER TABLE policies ADD COLUMN sort_order INTEGER;")?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code, reason = "used by the staged policy source-sweep port")]
+fn validate_policy_claim(
+    policy_id: &str,
+    identity: &str,
+    gate: &str,
+    content_hash: Option<&str>,
+) -> Result<(), SecurityError> {
+    if policy_id.is_empty()
+        || policy_id.len() > 255
+        || identity.is_empty()
+        || identity.len() > 4_096
+        || gate.is_empty()
+        || gate.len() > 255
+        || content_hash.is_some_and(|hash| hash.is_empty() || hash.len() > 64)
+    {
+        Err(SecurityError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn migrate_audit_event_details(connection: &Connection) -> Result<(), SecurityError> {
+    let columns = connection
+        .prepare("SELECT name FROM pragma_table_info('security_audit_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !columns.contains("principal") {
+        connection.execute_batch(
+            "ALTER TABLE security_audit_events
+                 ADD COLUMN principal TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !columns.contains("source") {
+        connection.execute_batch(
+            "ALTER TABLE security_audit_events
+                 ADD COLUMN source TEXT NOT NULL DEFAULT 'WEB';",
+        )?;
+    }
+    if !columns.contains("data") {
+        connection.execute_batch(
+            "ALTER TABLE security_audit_events
+                 ADD COLUMN data TEXT NOT NULL DEFAULT '{}';",
+        )?;
+    }
+    connection.execute_batch(
+        "UPDATE security_audit_events
+         SET principal = COALESCE(
+             (SELECT username FROM security_users
+              WHERE security_users.user_id = security_audit_events.user_id),
+             principal
+         )
+         WHERE principal = '';
+         CREATE INDEX IF NOT EXISTS security_audit_timestamp_idx
+             ON security_audit_events(created_at);
+         CREATE INDEX IF NOT EXISTS security_audit_principal_idx
+             ON security_audit_events(principal);
+         CREATE INDEX IF NOT EXISTS security_audit_type_idx
+             ON security_audit_events(event_type);
+         CREATE INDEX IF NOT EXISTS security_audit_type_source_timestamp_idx
+             ON security_audit_events(event_type, source, created_at);
+         CREATE INDEX IF NOT EXISTS security_audit_source_timestamp_principal_idx
+             ON security_audit_events(source, created_at, principal);",
+    )?;
+    Ok(())
+}
+
+fn initialize_user_security_schema(connection: &Connection) -> Result<(), SecurityError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS security_mfa (
+             user_id INTEGER PRIMARY KEY REFERENCES security_users(user_id) ON DELETE CASCADE,
+             enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+             required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0, 1)),
+             secret_ciphertext TEXT NOT NULL,
+             last_used_step INTEGER,
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE IF NOT EXISTS security_user_settings (
+             user_id INTEGER NOT NULL REFERENCES security_users(user_id) ON DELETE CASCADE,
+             setting_key TEXT NOT NULL,
+             setting_value TEXT NOT NULL,
+             PRIMARY KEY(user_id, setting_key)
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_force_password_change(connection: &Connection) -> Result<(), SecurityError> {
+    let column_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('security_users')
+             WHERE name = 'force_password_change'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !column_exists {
+        connection.execute_batch(
+            "ALTER TABLE security_users
+             ADD COLUMN force_password_change INTEGER NOT NULL DEFAULT 0
+                 CHECK(force_password_change IN (0, 1));",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_initial_setup_completed(connection: &Connection) -> Result<(), SecurityError> {
+    let column_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('security_users')
+             WHERE name = 'initial_setup_completed'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !column_exists {
+        connection.execute_batch(
+            "ALTER TABLE security_users
+             ADD COLUMN initial_setup_completed INTEGER NOT NULL DEFAULT 0
+                 CHECK(initial_setup_completed IN (0, 1));",
+        )?;
+    }
     Ok(())
 }
 
@@ -2478,7 +5054,8 @@ fn find_user(
 ) -> Result<Option<StoredUser>, SecurityError> {
     connection
         .query_row(
-            "SELECT user_id, username, password_hash, enabled, authentication_type, team_id
+            "SELECT user_id, username, password_hash, enabled, authentication_type, team_id,
+                    force_password_change
              FROM security_users WHERE username_norm = ?1",
             [username_norm],
             stored_user_from_row,
@@ -2493,7 +5070,8 @@ fn find_user_by_id(
 ) -> Result<Option<StoredUser>, SecurityError> {
     connection
         .query_row(
-            "SELECT user_id, username, password_hash, enabled, authentication_type, team_id
+            "SELECT user_id, username, password_hash, enabled, authentication_type, team_id,
+                    force_password_change
              FROM security_users WHERE user_id = ?1",
             [user_id],
             stored_user_from_row,
@@ -2510,6 +5088,7 @@ fn stored_user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUser>
         enabled: row.get(3)?,
         authentication_type: row.get(4)?,
         team_id: row.get(5)?,
+        force_password_change: row.get(6)?,
     })
 }
 
@@ -2596,6 +5175,7 @@ fn context_for_user(
         team_id: user.team_id,
         permissions: BTreeSet::new(),
         external_subject: None,
+        force_password_change: user.force_password_change,
         session_id,
         correlation_id: correlation_id.to_owned(),
     })
@@ -2793,9 +5373,15 @@ fn token_digest(token: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityError, SecurityStore,
+        DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityAuditFilter, SecurityError, SecurityStore,
         initialize_connection,
+    };
+    use crate::integration_config::{IntegrationType, NewIntegrationConfig};
+    use crate::resource_access::{
+        AccessPermission, DefaultAccessPolicy, OwnerScope, PrincipalType, ResourceType,
     };
     use crate::security_crypto::totp_code_at;
     use crate::security_jwt::VerifiedSupabaseIdentity;
@@ -2867,7 +5453,21 @@ mod tests {
              );
              INSERT INTO security_users
                  (username, username_norm, password_hash, authentication_type, team_id)
-             VALUES ('legacy', 'legacy', 'unused', 'web', NULL);",
+             VALUES ('legacy', 'legacy', 'unused', 'web', NULL);
+             CREATE TABLE security_audit_events (
+                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER,
+                 session_id TEXT NOT NULL,
+                 correlation_id TEXT NOT NULL,
+                 event_type TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 outcome TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             INSERT INTO security_audit_events
+                 (user_id, session_id, correlation_id, event_type, path, outcome, created_at)
+             VALUES (1, 'legacy-session', 'legacy-request', 'HTTP_MUTATION',
+                     '/api/v1/legacy', 'status:200', 1000);",
         )?;
 
         initialize_connection(&connection)?;
@@ -2883,6 +5483,149 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(migrated, ("Default".to_owned(), "Default".to_owned(), 0));
+        let migrated_flags: (bool, bool) = connection.query_row(
+            "SELECT force_password_change, initial_setup_completed
+             FROM security_users WHERE username_norm = 'legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(migrated_flags, (false, false));
+        let settings_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'security_user_settings'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(settings_table_exists);
+        let migrated_audit: (String, String, String) = connection.query_row(
+            "SELECT principal, source, data FROM security_audit_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            migrated_audit,
+            ("legacy".to_owned(), "WEB".to_owned(), "{}".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filters_exports_and_cleans_durable_audit_events() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("audit-admin", "audit-admin-password")?);
+        let context = store.authenticate_password(
+            "audit-admin",
+            "audit-admin-password",
+            100,
+            "audit-request",
+        )?;
+        store.record_audit(
+            &context,
+            "HTTP_MUTATION",
+            "/api/v1/admin/settings",
+            "status:200",
+            1_000,
+        )?;
+        store.record_audit(
+            &context,
+            "PDF_PROCESS",
+            "/api/v1/misc/compress-pdf",
+            "status:500",
+            2_000,
+        )?;
+        store.record_audit(
+            &context,
+            "USER_LOGIN",
+            "/api/v1/auth/login",
+            "success",
+            3_000,
+        )?;
+
+        let page = store.query_audit_events(&SecurityAuditFilter::default(), 1, 1)?;
+        assert_eq!(page.total_events, 3);
+        assert_eq!(page.events[0].event_type, "PDF_PROCESS");
+        let filtered = store.export_audit_events(&SecurityAuditFilter {
+            event_types: vec!["PDF_PROCESS".to_owned()],
+            principal_contains: Some("ADMIN".to_owned()),
+            start_at: Some(1_500),
+            end_at: Some(2_500),
+            ..SecurityAuditFilter::default()
+        })?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].principal, "audit-admin");
+        let data: serde_json::Value = serde_json::from_str(&filtered[0].data)?;
+        assert_eq!(data["outcome"], "failure");
+        assert_eq!(data["statusCode"], 500);
+        assert_eq!(store.audit_principals()?, ["audit-admin"]);
+        assert!(
+            store
+                .audit_event_types()?
+                .contains(&"USER_LOGIN".to_owned())
+        );
+        assert_eq!(store.delete_audit_events_before(2_500)?, 2);
+        assert_eq!(store.clear_audit_events()?, 1);
+        assert_eq!(store.audit_event_count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn persists_bounded_registration_settings_and_initial_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("security.db");
+        let store = SecurityStore::open(&database)?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let user_id = store.register_local_user("pending@example.test", "pending-test-password")?;
+        assert!(matches!(
+            store.authenticate_password(
+                "pending@example.test",
+                "pending-test-password",
+                100,
+                "disabled"
+            ),
+            Err(SecurityError::AccountDisabled)
+        ));
+        assert!(matches!(
+            store.register_local_user("pending@example.test", "another-test-password"),
+            Err(SecurityError::Conflict)
+        ));
+        assert!(matches!(
+            store.register_local_user("a--b", "invalid-username-password"),
+            Err(SecurityError::InvalidInput)
+        ));
+
+        let first_settings = BTreeMap::from([
+            ("language".to_owned(), "en-US".to_owned()),
+            ("theme".to_owned(), "dark".to_owned()),
+        ]);
+        store.replace_user_settings(user_id, &first_settings)?;
+        assert!(!store.initial_setup_is_complete(user_id)?);
+        store.complete_initial_setup(user_id)?;
+
+        let second_settings = BTreeMap::from([("language".to_owned(), "fr-FR".to_owned())]);
+        store.replace_user_settings(user_id, &second_settings)?;
+        let oversized = BTreeMap::from([("key".to_owned(), "x".repeat(4 * 1024 + 1))]);
+        assert!(matches!(
+            store.replace_user_settings(user_id, &oversized),
+            Err(SecurityError::InvalidInput)
+        ));
+        drop(store);
+
+        let reopened = SecurityStore::open(&database)?;
+        assert_eq!(reopened.user_settings(user_id)?, second_settings);
+        assert!(reopened.initial_setup_is_complete(user_id)?);
+        for username in ["third-user", "fourth-user", "fifth-user"] {
+            reopened.register_local_user(username, "registration-test-password")?;
+        }
+        assert!(matches!(
+            reopened.register_local_user("sixth-user", "registration-test-password"),
+            Err(SecurityError::UserLimitReached {
+                max_allowed: 5,
+                available_slots: 0,
+            })
+        ));
         Ok(())
     }
 
@@ -3086,6 +5829,42 @@ mod tests {
         assert_eq!(store.delete_user("renamed@example.test")?, user_id);
         assert_eq!(store.list_users(213)?.len(), 2);
         assert_eq!(admin.user_id, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn forced_password_change_is_durable_and_self_service_clears_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        let user_id = store.create_local_user(
+            "person@example.test",
+            "first-test-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        store.set_user_password_with_force_change(
+            "person@example.test",
+            "forced-test-password",
+            true,
+            100,
+        )?;
+        let forced = store.authenticate_password(
+            "person@example.test",
+            "forced-test-password",
+            101,
+            "forced",
+        )?;
+        assert_eq!(forced.user_id, user_id);
+        assert!(forced.force_password_change);
+
+        store.change_own_password(user_id, "forced-test-password", "final-test-password", 102)?;
+        let changed = store.authenticate_password(
+            "person@example.test",
+            "final-test-password",
+            103,
+            "cleared",
+        )?;
+        assert!(!changed.force_password_change);
         Ok(())
     }
 
@@ -3436,6 +6215,77 @@ mod tests {
             Err(SecurityError::InvalidInvite)
         ));
         assert_eq!(store.cleanup_invites(2_005)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resource_schema_cleans_user_state_and_rejects_team_deletion_with_owned_configs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let admin = store.authenticate_password("admin", "test-only-password", 100, "admin")?;
+        let user_id = store.create_local_user(
+            "resource-user@example.test",
+            "resource-user-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        store.upsert_resource_grant(
+            ResourceType::Portal,
+            "",
+            PrincipalType::User,
+            user_id,
+            AccessPermission::Use,
+            admin.user_id,
+        )?;
+        let config = store.create_integration_config(&NewIntegrationConfig {
+            integration_type: IntegrationType::Api,
+            name: "Owned API".to_owned(),
+            scope: OwnerScope::User,
+            owner_user_id: Some(user_id),
+            owner_team_id: None,
+            enabled: true,
+            locked: false,
+            default_access: DefaultAccessPolicy::ExplicitOnly,
+            config: serde_json::Map::new(),
+        })?;
+        store.upsert_resource_grant(
+            ResourceType::IntegrationConfig,
+            &config.id.to_string(),
+            PrincipalType::User,
+            admin.user_id,
+            AccessPermission::Manage,
+            admin.user_id,
+        )?;
+
+        assert_eq!(store.delete_user("resource-user@example.test")?, user_id);
+        let connection = store.lock()?;
+        let integration_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM integration_configs", [], |row| {
+                row.get(0)
+            })?;
+        let grant_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM resource_grants", [], |row| row.get(0))?;
+        drop(connection);
+        assert_eq!(integration_count, 0);
+        assert_eq!(grant_count, 0);
+
+        let team_id = store.create_team("Owned Resource Team")?;
+        store.create_integration_config(&NewIntegrationConfig {
+            integration_type: IntegrationType::Mcp,
+            name: "Team MCP".to_owned(),
+            scope: OwnerScope::Team,
+            owner_user_id: None,
+            owner_team_id: Some(team_id),
+            enabled: true,
+            locked: false,
+            default_access: DefaultAccessPolicy::ExplicitOnly,
+            config: serde_json::Map::new(),
+        })?;
+        assert!(matches!(
+            store.delete_team(team_id),
+            Err(SecurityError::TeamNotEmpty)
+        ));
         Ok(())
     }
 }

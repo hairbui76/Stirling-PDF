@@ -6,18 +6,23 @@ use stirling_processing::{
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod desktop_settings;
+mod parent_process;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    desktop_settings::initialize_from_environment()?;
     if RuntimeConfig::security_mode_is_requested() {
         return Err(std::io::Error::other(
             "DOCKER_ENABLE_SECURITY=true is not supported by the Rust runtime yet; refusing to start without authentication and authorization middleware",
         )
         .into());
     }
+    let parent_process = parent_process::ParentProcessWatcher::from_environment()?;
 
     let address = SocketAddr::from(([127, 0, 0, 1], configured_port()?));
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -26,13 +31,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_upload_bytes_from_environment(),
     );
     runtime.spawn_pipeline_directory_watcher();
+    runtime.spawn_policy_triggers();
     info!(%address, "starting Stirling Rust processing service");
-    info!(
-        port = address.port(),
-        "Stirling-PDF running on port: {}",
-        address.port()
-    );
-    axum::serve(listener, runtime.into_router()).await?;
+    // Desktop discovers an ephemeral sidecar port from this stable handshake.
+    // It must not depend on RUST_LOG: EnvFilter defaults to ERROR when that
+    // variable is absent, which would otherwise leave the desktop waiting
+    // forever for an INFO event that never reaches the child-process pipe.
+    println!("Stirling-PDF running on port: {}", address.port());
+    let server = axum::serve(listener, runtime.into_router());
+    if let Some(parent_process) = parent_process {
+        tokio::select! {
+            result = server => result?,
+            () = parent_process.wait_until_exit() => {
+                info!("Tauri parent process exited; shutting down Stirling Rust processing service");
+            }
+        }
+    } else {
+        server.await?;
+    }
     Ok(())
 }
 

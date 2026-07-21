@@ -6,14 +6,16 @@
 The Rust security router now has durable local BCrypt users and lockout,
 rotating opaque sessions, digest-only API keys, encrypted TOTP seeds with replay
 protection, roles, teams, invitations, local-user administration, a central
-endpoint policy, bounded parsing, and mutation audit records. Supabase JWT
+endpoint policy, bounded parsing, mutation audit records, disabled self-registration,
+durable user settings, initial-setup completion, and administrator-only audit
+filtering/aggregation/export/retention. Supabase JWT
 identity is also implemented behind an optional strict JWKS verifier:
 public-key algorithms only, bounded cache/refresh, issuer/expiry/audience and
 required-claim checks, and durable `(issuer, subject)` mapping without email
 auto-linking. Integration tests exercise the router, but the production binary
 still fails closed when `DOCKER_ENABLE_SECURITY=true` is requested. Generic
-OIDC login, SAML, device identity, broader resource-owner policies, SMTP delivery,
-recovery flows, migration compatibility, and the final independent review
+OIDC login, SAML, device identity, broader resource-owner policies, recovery
+flows, Java-database migration compatibility, and the final independent review
 remain required before that guard can be removed.
 
 The reviewed boundary now also scopes asynchronous job records, status,
@@ -23,8 +25,12 @@ are only mounted inside this secured router and persist bounded restart-pending
 YAML deltas with secret masking and mutation audit coverage. Managed server-certificate
 administration is also secured: uploads are strictly parsed and re-wrapped, generated keys use
 RSA-2048/SHA-256, filesystem links are rejected, and `certType=SERVER` resolves only from the
-server-held service extension. Proprietary license entitlement, external KMS/HSM support, and an
-independent key-storage review still gate production use.
+server-held service extension. Static proprietary route entitlement now fails closed on a trusted
+Normal/Server/Enterprise tier derived from pinned-key offline verification or fixed-account Keygen
+validation and machine activation. The five administrator license lifecycle routes now update that
+same live verifier configuration with serialized settings persistence and bounded offline uploads.
+External KMS/HSM support, seat-allocation integration, and an independent key-storage review still
+gate production use.
 
 ## Java baseline
 

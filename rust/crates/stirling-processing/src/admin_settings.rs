@@ -205,6 +205,28 @@ impl AdminSettingsService {
         Ok(count)
     }
 
+    /// Persists live runtime-owned settings through the same serialized writer
+    /// as restart-pending administrator edits, without adding them to the
+    /// pending-restart delta. License activation uses this path because Java
+    /// applies those values immediately.
+    pub(crate) fn persist_immediate(
+        &self,
+        updates: BTreeMap<String, Value>,
+    ) -> Result<(), AdminSettingsError> {
+        if updates.is_empty() {
+            return Err(AdminSettingsError::Invalid);
+        }
+        let normalized = updates
+            .into_iter()
+            .map(|(key, value)| {
+                let key = normalize_setting_key(&key)?;
+                validate_update(&key, &value)?;
+                Ok((key, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, AdminSettingsError>>()?;
+        self.persist_updates(&normalized)
+    }
+
     fn update_section(
         &self,
         section: &str,

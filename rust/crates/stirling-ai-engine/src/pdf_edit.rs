@@ -29,14 +29,15 @@ static OPERATION_CATALOG: LazyLock<Result<BTreeMap<String, Value>, serde_json::E
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PdfEditRequest {
+    #[serde(alias = "user_message")]
     pub user_message: String,
     #[serde(default)]
     pub files: Vec<AiFile>,
-    #[serde(default)]
+    #[serde(default, alias = "conversation_history")]
     pub conversation_history: Vec<ConversationMessage>,
-    #[serde(default)]
+    #[serde(default, alias = "page_text")]
     pub page_text: Vec<EditExtractedFileText>,
-    #[serde(default)]
+    #[serde(default, alias = "enabled_endpoints")]
     pub enabled_endpoints: Vec<String>,
 }
 
@@ -69,6 +70,7 @@ impl PdfEditRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditExtractedFileText {
+    #[serde(alias = "file_name")]
     pub file_name: String,
     #[serde(default)]
     pub pages: Vec<EditTextSelection>,
@@ -77,6 +79,7 @@ pub struct EditExtractedFileText {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditTextSelection {
+    #[serde(alias = "page_number")]
     pub page_number: Option<i64>,
     pub text: String,
 }

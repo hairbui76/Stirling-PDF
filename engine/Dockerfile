@@ -1,37 +1,31 @@
-# syntax=docker/dockerfile:1.5
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
+# syntax=docker/dockerfile:1.7
+FROM rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f AS builder
 
-ARG TASK_VERSION=3.49.1
+WORKDIR /build
+COPY rust/ ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --locked -p stirling-ai-engine --bins \
+    && cp target/release/stirling-ai-engine /tmp/stirling-ai-engine \
+    && cp target/release/migrate-sqlite-vec /tmp/migrate-sqlite-vec
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && ARCH=$(dpkg --print-architecture) \
-    && curl -fsSL "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_${TASK_VERSION}_linux_${ARCH}.deb" -o /tmp/task.deb \
-    && dpkg -i /tmp/task.deb \
-    && rm /tmp/task.deb \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system stirling \
+    && useradd --system --gid stirling --home-dir /app --shell /usr/sbin/nologin stirling \
+    && install -d -o stirling -g stirling /app/data
 
-# Source under /app/engine/ to match root Taskfile's `includes.engine.dir: engine`.
-WORKDIR /app/engine
-
-COPY pyproject.toml uv.lock .env ./
-COPY scripts/ ./scripts/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
-
-COPY src/ ./src/
+COPY --from=builder /tmp/stirling-ai-engine /usr/local/bin/stirling-ai-engine
+COPY --from=builder /tmp/migrate-sqlite-vec /usr/local/bin/migrate-sqlite-vec
 
 WORKDIR /app
-COPY Taskfile.yml ./
-COPY .taskfiles/ ./.taskfiles/
+ENV STIRLING_ENGINE_HOST=0.0.0.0 \
+    STIRLING_ENGINE_PORT=5001
 
-ENV PATH="/app/engine/.venv/bin:$PATH"
-ENV PYTHONUNBUFFERED=1
-ENV STIRLING_ENGINE_WORKERS=4
-# Container runs on a fixed port; skip the host-only free-port probe (its script
-# is not shipped in the image). engine:run honours these.
-ENV ENGINE_PORT_PROBE=false
-ENV STIRLING_ENGINE_PORT=5001
-
+USER stirling
 EXPOSE 5001
 
-CMD ["task", "engine:run"]
+CMD ["/usr/local/bin/stirling-ai-engine"]

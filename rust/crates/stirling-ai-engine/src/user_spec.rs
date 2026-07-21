@@ -46,17 +46,20 @@ pub type AgentSpec = AgentDraft;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentDraftRequest {
+    #[serde(alias = "user_message")]
     pub user_message: String,
-    #[serde(default)]
+    #[serde(default, alias = "conversation_history")]
     pub conversation_history: Vec<ConversationMessage>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentRevisionRequest {
+    #[serde(alias = "user_message")]
     pub user_message: String,
-    #[serde(default)]
+    #[serde(default, alias = "conversation_history")]
     pub conversation_history: Vec<ConversationMessage>,
+    #[serde(alias = "current_draft")]
     pub current_draft: AgentDraft,
 }
 

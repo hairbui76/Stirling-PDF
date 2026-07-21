@@ -9,8 +9,10 @@ addition, `?async=true` now opts the ported processing POST endpoints into a gen
 streams the exact encoded multipart request into an isolated private temporary directory before
 replying with `{ "jobId": "<random 128-bit id>" }`; the background worker reconstructs the
 request for the normal endpoint and streams the successful response into the job directory. This
-preserves every endpoint's multipart extractor contract without retaining upload or output files
-in memory. Job status reports `complete`, `error`, `progress`, `stage`, and `note` at
+includes `POST /api/v1/pipeline/handleData?async=true`, so a complete multi-step pipeline can be
+queued without changing its multipart or output contract. The wrapper preserves every endpoint's
+multipart extractor contract without retaining upload or output files in memory. Job status
+reports `complete`, `error`, `progress`, `stage`, and `note` at
 `GET /api/v1/general/job/{jobId}`. The result endpoints are:
 
 - `GET /api/v1/general/job/{jobId}/result` — download the one result file.
@@ -30,12 +32,12 @@ This slice is process-local. Java's `JobController` also has authenticated owner
 distributed `JobStore`/Valkey write-through, sticky-410/503 cluster handling, queue position
 reporting, retries/timeouts, and cancellation that can interrupt native processing. The Rust
 wrapper supports the ported processing endpoints rather than every Java `@AutoJobPostMapping`
-controller: job/control routes, mobile scanner, pipeline, settings mutation, and hardware
+controller: job/control routes, mobile scanner, settings mutation, and hardware
 certificate enumeration remain synchronous. Cancellation prevents publishing an in-flight result
 but cannot forcibly stop a native worker that is already executing.
 
 ## Verification
 
-`tests/pdf_text_editor_endpoint.rs` starts the specialized PDF→JSON job and a generic
-JSON→PDF processing job, polls each to completion, and downloads/list result files by both job and
-file ID.
+`tests/pdf_text_editor_endpoint.rs` starts the specialized PDF→JSON job and a generic JSON→PDF
+processing job. `tests/pipeline_endpoint.rs` queues a multi-step pipeline through the same wrapper.
+The tests poll jobs to completion and download/list result files by job and file ID.

@@ -42,11 +42,12 @@ The deployment images and source also rely on native processing tools including
 LibreOffice/unoserver, Calibre, Ghostscript, OCRmyPDF/Tesseract, FFmpeg, and PDFium.
 Their final role is governed by the external-dependency scope decision below.
 
-As of the current checkpoint, the additive Rust processing service implements 143
-compatibility `/api/v1/*` routes and one health route. The latest configuration,
-mobile-scanner, synchronous-pipeline, and watched-folder slices, including persisted anonymous
-analytics onboarding, pass focused compilation, strict linting, and unit/HTTP integration tests;
-the full native-PDFium suite must still be rerun for this checkpoint. This is
+As of the current checkpoint, the additive Rust processing service implements the
+compatibility surfaces enumerated in `rust/PORT_STATUS.md`. The full locked Rust
+workspace passes formatting, strict all-target Clippy, unit tests, the pinned-PDFium
+endpoint suites, process-level AI-engine smoke coverage, and doc tests. A fixed
+route total is intentionally deferred to the versioned baseline-to-Rust manifest,
+which must count conditional and nested routers by method and path. This is
 implementation progress, not cutover evidence: Java remains the production route
 owner and the much larger non-UI inventory below remains in scope.
 
@@ -57,11 +58,11 @@ personalized signature state remains behind the authentication migration and a f
 Rust deployment must resolve any generated `UNKNOWN` license entries and the notices
 for retained native tools before release.
 
-The Rust workspace also contains an additive AI-engine foundation with the Python
-engine's health, shared-secret, tenant boundary, and one self-contained document
-classifier route. The MCP capability manifest intentionally returns `501` for
-the larger unported agent registry, so this remains implementation progress—not
-AI-engine cutover evidence.
+The Rust workspace now contains the operational AI-engine replacement with the
+legacy route surface, shared-secret and tenant boundaries, document storage,
+provider adapters, agent manifest, and streaming orchestrator. Normal Task,
+container, PR-demo, and AI-CI paths run `stirling-ai-engine`; the Python source
+and tests remain explicitly available as a compatibility oracle.
 
 The versioned cross-surface inventory, including AI routes, desktop commands, and data
 boundaries, is maintained in `docs/contracts/legacy-runtime-baseline.md`.
@@ -112,8 +113,13 @@ retained as earlier scope-analysis and initial-phase records.
 - Public HTTP contracts remain backward compatible during a rolling migration.
 - Existing native processors may remain behind explicit Rust adapters where required
   for compatible behaviour.
-- The Python AI engine and Tauri host are ported in later phases after their contracts
-  are frozen; they are part of the accepted terminal objective.
+- The AI engine runtime has moved to Rust after its HTTP contract gate; Python
+  remains an explicit oracle while deployment credentials and external storage
+  are verified. The Tauri host now has a bounded opt-in Rust-launcher parity
+  path with parent-lifecycle enforcement and fresh-install settings initialization,
+  while upgrade-template migration, production sidecar/PDFium packaging,
+  cross-platform bundle proof, and removal of the Java default remain a later
+  cutover phase.
 
 ## Completion Evidence
 

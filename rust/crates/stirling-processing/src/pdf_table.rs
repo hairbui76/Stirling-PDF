@@ -6,12 +6,10 @@
 
 use std::{
     collections::BTreeSet,
-    env,
     fmt::Write as _,
     fs::{self, File},
     io::{self, Write},
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    path::Path,
 };
 
 use pdfium_render::prelude::*;
@@ -20,7 +18,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
     page_selection::{PageSelectionError, parse_page_list},
-    pdfium_backend::PDFIUM_LIBRARY_PATH_ENV,
+    pdfium_runtime::shared_pdfium_runtime,
 };
 
 const LINE_ALIGNMENT_TOLERANCE: f32 = 1.0;
@@ -29,14 +27,6 @@ const MIN_RULE_LENGTH: f32 = 5.0;
 const MAX_GRID_AXES: usize = 128;
 const MAX_TABLE_CELLS: usize = 4_096;
 const CHARACTER_LINE_TOLERANCE: f32 = 2.0;
-
-static TABLE_PDFIUM: OnceLock<TablePdfiumRuntime> = OnceLock::new();
-
-#[derive(Debug)]
-struct TablePdfiumRuntime {
-    explicitly_configured: bool,
-    instance: Result<Mutex<Pdfium>, String>,
-}
 
 /// The output form chosen by the Java CSV route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +120,7 @@ pub fn extract_pdf_tables_to_csv(
     page_numbers: &str,
     output_path: &Path,
 ) -> Result<PdfTableAttempt, PdfTableError> {
-    let runtime = TABLE_PDFIUM.get_or_init(initialize_table_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium.lock().map_err(|_| PdfTableError::RuntimePoisoned)?,
         Err(_) => {
@@ -201,7 +191,7 @@ pub fn extract_pdf_page_tables_as_csv(
     filename: &str,
     page_index: usize,
 ) -> Result<PdfTableContentAttempt, PdfTableError> {
-    let runtime = TABLE_PDFIUM.get_or_init(initialize_table_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium.lock().map_err(|_| PdfTableError::RuntimePoisoned)?,
         Err(_) => {
@@ -246,7 +236,7 @@ pub fn extract_pdf_tables_to_xlsx(
     page_numbers: &str,
     output_path: &Path,
 ) -> Result<PdfXlsxAttempt, PdfTableError> {
-    let runtime = TABLE_PDFIUM.get_or_init(initialize_table_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium.lock().map_err(|_| PdfTableError::RuntimePoisoned)?,
         Err(_) => {
@@ -876,32 +866,6 @@ fn filename_stem(filename: &str) -> &str {
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
         .map_or(filename, |(stem, _)| stem)
-}
-
-fn initialize_table_pdfium() -> TablePdfiumRuntime {
-    let configured_path = env::var_os(PDFIUM_LIBRARY_PATH_ENV).map(PathBuf::from);
-    let explicitly_configured = configured_path.is_some();
-    let bindings = match configured_path {
-        Some(path) => Pdfium::bind_to_library(pdfium_library_path(&path)),
-        None => Pdfium::bind_to_system_library(),
-    };
-    TablePdfiumRuntime {
-        explicitly_configured,
-        instance: bindings.map(Pdfium::new).map(Mutex::new).map_err(|error| {
-            format!(
-                "{error}; set {PDFIUM_LIBRARY_PATH_ENV} to the PDFium shared library or its directory"
-            )
-        }),
-    }
-}
-
-fn pdfium_library_path(configured_path: &Path) -> PathBuf {
-    let path = if configured_path.is_dir() {
-        Pdfium::pdfium_platform_library_name_at_path(configured_path)
-    } else {
-        configured_path.to_owned()
-    };
-    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(test)]

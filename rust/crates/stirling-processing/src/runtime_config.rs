@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use crate::job_queue::JobQueueConfig;
+use crate::license::LicenseConfig;
 use crate::runtime_dependencies::discover_dependency_groups;
 use crate::security_jwt::SupabaseJwtConfig;
 use crate::server_certificate::ServerCertificateConfig;
@@ -163,6 +164,13 @@ pub(crate) struct FileReadinessConfig {
     pub(crate) allowed_extensions: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PolicyTriggerSettings {
+    pub(crate) schedule_sweep: Duration,
+    pub(crate) watch_reconcile: Duration,
+    pub(crate) watch_quiet_period: Duration,
+}
+
 pub struct RuntimeConfig {
     settings: Value,
     settings_path: PathBuf,
@@ -171,6 +179,76 @@ pub struct RuntimeConfig {
     analytics_override: Mutex<Option<bool>>,
     dependency_disabled_groups: BTreeSet<String>,
     dependencies_checked: bool,
+}
+
+/// Resolved configuration for the proprietary MCP HTTP boundary.
+///
+/// OAuth fields are retained even though the first Rust MCP slice mounts only
+/// `apikey` mode. Keeping one complete compatibility model prevents a later
+/// OAuth port from inventing a second configuration shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct McpConfig {
+    pub(crate) enabled: bool,
+    pub(crate) scopes_enabled: bool,
+    pub(crate) engine_capability_refresh_minutes: u64,
+    pub(crate) allowed_operations: Vec<String>,
+    pub(crate) blocked_operations: Vec<String>,
+    pub(crate) max_request_bytes: usize,
+    pub(crate) max_inline_response_bytes: u64,
+    pub(crate) auth: McpAuthConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct McpAuthConfig {
+    pub(crate) mode: String,
+    pub(crate) issuer_uri: String,
+    pub(crate) jwks_uri: String,
+    pub(crate) resource_id: String,
+    pub(crate) accepted_audiences: Vec<String>,
+    pub(crate) username_claim: String,
+    pub(crate) require_existing_account: bool,
+}
+
+fn resolve_mcp_auth(
+    string: &impl Fn(&[&str], &[&str], &str) -> String,
+    strings: &impl Fn(&[&str], &[&str]) -> Vec<String>,
+    boolean: &impl Fn(&[&str], &[&str], bool) -> bool,
+) -> McpAuthConfig {
+    McpAuthConfig {
+        mode: string(&["MCP_AUTH_MODE"], &["mcp", "auth", "mode"], "oauth"),
+        issuer_uri: string(
+            &["MCP_AUTH_ISSUERURI", "MCP_AUTH_ISSUER_URI"],
+            &["mcp", "auth", "issuerUri"],
+            "",
+        ),
+        jwks_uri: string(
+            &["MCP_AUTH_JWKSURI", "MCP_AUTH_JWKS_URI"],
+            &["mcp", "auth", "jwksUri"],
+            "",
+        ),
+        resource_id: string(
+            &["MCP_AUTH_RESOURCEID", "MCP_AUTH_RESOURCE_ID"],
+            &["mcp", "auth", "resourceId"],
+            "",
+        ),
+        accepted_audiences: strings(
+            &["MCP_AUTH_ACCEPTEDAUDIENCES", "MCP_AUTH_ACCEPTED_AUDIENCES"],
+            &["mcp", "auth", "acceptedAudiences"],
+        ),
+        username_claim: string(
+            &["MCP_AUTH_USERNAMECLAIM", "MCP_AUTH_USERNAME_CLAIM"],
+            &["mcp", "auth", "usernameClaim"],
+            "sub",
+        ),
+        require_existing_account: boolean(
+            &[
+                "MCP_AUTH_REQUIREEXISTINGACCOUNT",
+                "MCP_AUTH_REQUIRE_EXISTING_ACCOUNT",
+            ],
+            &["mcp", "auth", "requireExistingAccount"],
+            true,
+        ),
+    }
 }
 
 /// Trusted local credentials used only when an empty secured-mode database is
@@ -186,6 +264,37 @@ pub struct SecurityBootstrapConfig {
     pub credential_encryption_key_path: PathBuf,
     pub credential_encryption_key: Option<Zeroizing<String>>,
     pub initial_login: Option<InitialLoginCredentials>,
+}
+
+/// SMTP relay settings for the optional email-with-attachment route.
+///
+/// Secrets are zeroized with the resolved configuration. Certificate and
+/// hostname verification are always retained by the Rust transport.
+#[derive(Clone)]
+pub(crate) struct SmtpMailConfig {
+    pub(crate) enabled: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) username: Option<String>,
+    pub(crate) password: Option<Zeroizing<String>>,
+    pub(crate) from: String,
+    pub(crate) transport_security: SmtpTransportSecurity,
+    pub(crate) ssl_trust: Option<String>,
+    pub(crate) hostname_verification: SmtpHostnameVerification,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SmtpTransportSecurity {
+    Plaintext,
+    OpportunisticStartTls,
+    RequiredStartTls,
+    ImplicitTls,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SmtpHostnameVerification {
+    Required,
+    Disabled,
 }
 
 impl Clone for RuntimeConfig {
@@ -278,6 +387,55 @@ impl RuntimeConfig {
         )
     }
 
+    /// Resolves the legacy `mail.*` SMTP relay settings without opening a
+    /// network connection. The route is mounted only when `mail.enabled` is
+    /// true.
+    #[must_use]
+    pub(crate) fn smtp_mail_config(&self) -> SmtpMailConfig {
+        let optional_string = |path: &[&str], environment: &str| {
+            let value = self.string(path, environment, "");
+            (!value.trim().is_empty()).then_some(value)
+        };
+        let configured_port = self.u64(&["mail", "port"], "MAIL_PORT", 587);
+        let ssl_enable = self.boolean(&["mail", "sslEnable"], "MAIL_SSLENABLE", false);
+        let start_tls_enable =
+            self.boolean(&["mail", "startTlsEnable"], "MAIL_STARTTLSENABLE", true);
+        let start_tls_required = self.boolean(
+            &["mail", "startTlsRequired"],
+            "MAIL_STARTTLSREQUIRED",
+            false,
+        );
+        let transport_security = if ssl_enable {
+            SmtpTransportSecurity::ImplicitTls
+        } else if start_tls_enable && start_tls_required {
+            SmtpTransportSecurity::RequiredStartTls
+        } else if start_tls_enable {
+            SmtpTransportSecurity::OpportunisticStartTls
+        } else {
+            SmtpTransportSecurity::Plaintext
+        };
+        let hostname_verification = if self.optional_boolean(
+            &["mail", "sslCheckServerIdentity"],
+            "MAIL_SSLCHECKSERVERIDENTITY",
+        ) == Some(false)
+        {
+            SmtpHostnameVerification::Disabled
+        } else {
+            SmtpHostnameVerification::Required
+        };
+        SmtpMailConfig {
+            enabled: self.boolean(&["mail", "enabled"], "MAIL_ENABLED", false),
+            host: self.string(&["mail", "host"], "MAIL_HOST", ""),
+            port: u16::try_from(configured_port).unwrap_or(587),
+            username: optional_string(&["mail", "username"], "MAIL_USERNAME"),
+            password: optional_string(&["mail", "password"], "MAIL_PASSWORD").map(Zeroizing::new),
+            from: self.string(&["mail", "from"], "MAIL_FROM", ""),
+            transport_security,
+            ssl_trust: optional_string(&["mail", "sslTrust"], "MAIL_SSLTRUST"),
+            hostname_verification,
+        }
+    }
+
     /// Resolves the backend-to-engine connection settings shared by AI tools.
     ///
     /// The environment names mirror Spring's relaxed binding for
@@ -308,6 +466,154 @@ impl RuntimeConfig {
             .unwrap_or(120)
             .max(1);
         (enabled, url, timeout_seconds)
+    }
+
+    #[must_use]
+    pub(crate) fn ai_engine_long_running_timeout(&self) -> Duration {
+        let seconds = env::var("AIENGINE_LONGRUNNINGTIMEOUTSECONDS")
+            .ok()
+            .or_else(|| env::var("AIENGINE_LONG_RUNNING_TIMEOUT_SECONDS").ok())
+            .and_then(|value| value.parse().ok())
+            .or_else(|| {
+                value_at(&self.settings, &["aiEngine", "longRunningTimeoutSeconds"])
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(600)
+            .max(1);
+        Duration::from_secs(seconds)
+    }
+
+    #[must_use]
+    pub(crate) fn ai_workflow_stream_timeout(&self) -> Duration {
+        let milliseconds = env::var("STIRLING_AI_STREAMTIMEOUTMS")
+            .ok()
+            .or_else(|| env::var("STIRLING_AI_STREAM_TIMEOUT_MS").ok())
+            .and_then(|value| value.parse().ok())
+            .or_else(|| {
+                value_at(&self.settings, &["stirling", "ai", "streamTimeoutMs"])
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(1_800_000)
+            .max(1);
+        Duration::from_millis(milliseconds)
+    }
+
+    #[must_use]
+    pub(crate) fn ai_workflow_document_ttl(&self) -> Duration {
+        let minutes = env::var("SECURITY_JWT_TOKENEXPIRYMINUTES")
+            .ok()
+            .or_else(|| env::var("SECURITY_JWT_TOKEN_EXPIRY_MINUTES").ok())
+            .and_then(|value| value.parse().ok())
+            .or_else(|| {
+                value_at(&self.settings, &["security", "jwt", "tokenExpiryMinutes"])
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(1_440)
+            .max(1);
+        Duration::from_secs(minutes.saturating_mul(60))
+    }
+
+    /// Resolves the complete Java-compatible `mcp.*` tree.
+    #[must_use]
+    pub(crate) fn mcp_config(&self) -> McpConfig {
+        self.mcp_config_with_environment(|name| env::var(name).ok())
+    }
+
+    fn mcp_config_with_environment(
+        &self,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> McpConfig {
+        let environment_value = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| environment(name).filter(|value| !value.is_empty()))
+        };
+        let boolean = |names: &[&str], path: &[&str], default| {
+            environment_value(names)
+                .as_deref()
+                .and_then(parse_boolean)
+                .or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+                .unwrap_or(default)
+        };
+        let string = |names: &[&str], path: &[&str], default: &str| {
+            environment_value(names)
+                .or_else(|| {
+                    value_at(&self.settings, path)
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| default.to_owned())
+        };
+        let strings = |names: &[&str], path: &[&str]| {
+            environment_value(names).map_or_else(
+                || {
+                    value_at(&self.settings, path)
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+                |value| split_strings(&value),
+            )
+        };
+        let positive_u64 = |names: &[&str], path: &[&str], default| {
+            environment_value(names)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .or_else(|| value_at(&self.settings, path).and_then(Value::as_u64))
+                .unwrap_or(default)
+        };
+
+        let configured_request_bytes = positive_u64(
+            &["MCP_MAXREQUESTBYTES", "MCP_MAX_REQUEST_BYTES"],
+            &["mcp", "maxRequestBytes"],
+            10 * 1024 * 1024,
+        );
+        let max_request_bytes = if configured_request_bytes == 0 {
+            256 * 1024
+        } else {
+            usize::try_from(configured_request_bytes).unwrap_or(usize::MAX)
+        };
+
+        McpConfig {
+            enabled: boolean(&["MCP_ENABLED"], &["mcp", "enabled"], false),
+            scopes_enabled: boolean(
+                &["MCP_SCOPESENABLED", "MCP_SCOPES_ENABLED"],
+                &["mcp", "scopesEnabled"],
+                true,
+            ),
+            engine_capability_refresh_minutes: positive_u64(
+                &[
+                    "MCP_ENGINECAPABILITYREFRESHMINUTES",
+                    "MCP_ENGINE_CAPABILITY_REFRESH_MINUTES",
+                ],
+                &["mcp", "engineCapabilityRefreshMinutes"],
+                5,
+            )
+            .max(1),
+            allowed_operations: strings(
+                &["MCP_ALLOWEDOPERATIONS", "MCP_ALLOWED_OPERATIONS"],
+                &["mcp", "allowedOperations"],
+            ),
+            blocked_operations: strings(
+                &["MCP_BLOCKEDOPERATIONS", "MCP_BLOCKED_OPERATIONS"],
+                &["mcp", "blockedOperations"],
+            ),
+            max_request_bytes,
+            max_inline_response_bytes: positive_u64(
+                &[
+                    "MCP_MAXINLINERESPONSEBYTES",
+                    "MCP_MAX_INLINE_RESPONSE_BYTES",
+                ],
+                &["mcp", "maxInlineResponseBytes"],
+                10 * 1024 * 1024,
+            ),
+            auth: resolve_mcp_auth(&string, &strings, &boolean),
+        }
     }
 
     /// Resolves bounded asynchronous job admission. Values mirror the Java
@@ -419,6 +725,112 @@ impl RuntimeConfig {
         security_mode_requested_from_value(env::var("DOCKER_ENABLE_SECURITY").ok().as_deref())
     }
 
+    /// Returns whether team classification policies are enabled.
+    #[must_use]
+    pub(crate) fn policies_enabled(&self) -> bool {
+        self.boolean(&["policies", "enabled"], "POLICIES_ENABLED", false)
+    }
+
+    #[must_use]
+    pub(crate) fn policies_allow_private_s3_endpoints(&self) -> bool {
+        env_bool("POLICIES_ALLOW_PRIVATE_S3_ENDPOINTS").unwrap_or_else(|| {
+            self.boolean(
+                &["policies", "allowPrivateS3Endpoints"],
+                "POLICIES_ALLOWPRIVATES3ENDPOINTS",
+                false,
+            )
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn policies_allowed_folder_roots(&self) -> Vec<PathBuf> {
+        env::var("POLICIES_ALLOWED_FOLDER_ROOTS")
+            .ok()
+            .map_or_else(
+                || {
+                    self.strings(
+                        &["policies", "allowedFolderRoots"],
+                        "POLICIES_ALLOWEDFOLDERROOTS",
+                    )
+                },
+                |value| split_strings(&value),
+            )
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn policy_stream_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.u64(
+                &["policies", "streamTimeoutMs"],
+                "POLICIES_STREAMTIMEOUTMS",
+                1_800_000,
+            )
+            .max(1),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn policy_trigger_settings(&self) -> PolicyTriggerSettings {
+        PolicyTriggerSettings {
+            schedule_sweep: Duration::from_secs(
+                self.u64(
+                    &["policies", "scheduleSweepSeconds"],
+                    "POLICIES_SCHEDULESWEEPSECONDS",
+                    60,
+                )
+                .clamp(1, 86_400),
+            ),
+            watch_reconcile: Duration::from_secs(
+                self.u64(
+                    &["policies", "watchReconcileSeconds"],
+                    "POLICIES_WATCHRECONCILESECONDS",
+                    300,
+                )
+                .clamp(1, 86_400),
+            ),
+            watch_quiet_period: Duration::from_millis(
+                self.u64(
+                    &["policies", "watchQuietPeriodMs"],
+                    "POLICIES_WATCHQUIETPERIODMS",
+                    500,
+                )
+                .clamp(1, 60_000),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn security_portal_default_access(&self) -> String {
+        env::var("SECURITY_PORTAL_DEFAULT_ACCESS")
+            .ok()
+            .or_else(|| env::var("SECURITY_PORTAL_DEFAULTACCESS").ok())
+            .unwrap_or_else(|| {
+                self.string(
+                    &["security", "portal", "defaultAccess"],
+                    "SECURITY_PORTAL_DEFAULTACCESS",
+                    "ADMINS_AND_TEAM_LEADS",
+                )
+            })
+    }
+
+    /// Resolves the durable classification-label database.
+    ///
+    /// By default labels share the security `SQLite` file under `configs/`, as in
+    /// the Java deployment model, while an explicit path keeps tests and
+    /// specialized deployments isolated.
+    #[must_use]
+    pub(crate) fn classification_database_path(&self) -> PathBuf {
+        let configured = self.string(
+            &["policies", "databasePath"],
+            "STIRLING_CLASSIFICATION_DATABASE_PATH",
+            "",
+        );
+        resolve_configured_path(&self.security_bootstrap_config().database_path, &configured)
+    }
+
     /// Resolves the durable security database and optional first administrator
     /// from the same Java-compatible settings tree used by the rest of the app.
     /// No insecure default password is synthesized.
@@ -506,9 +918,101 @@ impl RuntimeConfig {
         .clamp(1, 24 * 365)
     }
 
+    /// Reports whether enterprise audit capture is enabled.
+    #[must_use]
+    pub fn security_audit_enabled(&self) -> bool {
+        self.boolean(
+            &["premium", "enterpriseFeatures", "audit", "enabled"],
+            "PREMIUM_ENTERPRISEFEATURES_AUDIT_ENABLED",
+            true,
+        )
+    }
+
+    /// Returns Java's signed audit level clamped to `OFF..VERBOSE` (`0..=3`).
+    #[must_use]
+    pub fn security_audit_level(&self) -> u8 {
+        let level = self
+            .signed_integer(
+                &["premium", "enterpriseFeatures", "audit", "level"],
+                "PREMIUM_ENTERPRISEFEATURES_AUDIT_LEVEL",
+                2,
+            )
+            .clamp(0, 3);
+        u8::try_from(level).unwrap_or(2)
+    }
+
+    /// Reports whether STANDARD enterprise audit events are configured. Fleet
+    /// usage must return null audit-derived figures below this level because
+    /// the source events cannot exist.
+    #[must_use]
+    pub fn security_standard_audit_enabled(&self) -> bool {
+        self.security_audit_enabled() && self.security_audit_level() >= 2
+    }
+
+    /// Resolves the Java-compatible premium license settings, including the
+    /// temporary `enterpriseEdition` migration fallback.
+    #[must_use]
+    pub(crate) fn license_config(&self) -> LicenseConfig {
+        self.license_config_with_environment(|name| env::var(name).ok())
+    }
+
+    fn license_config_with_environment(
+        &self,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> LicenseConfig {
+        const EMPTY_KEY: &str = "00000000-0000-0000-0000-000000000000";
+        let configured_bool = |path: &[&str], name: &str| {
+            environment(name)
+                .as_deref()
+                .and_then(parse_boolean)
+                .or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+                .unwrap_or(false)
+        };
+        let configured_string = |path: &[&str], name: &str, default: &str| {
+            environment(name)
+                .or_else(|| {
+                    value_at(&self.settings, path)
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| default.to_owned())
+        };
+        let premium_enabled = configured_bool(&["premium", "enabled"], "PREMIUM_ENABLED");
+        let legacy_enabled = configured_bool(
+            &["enterpriseEdition", "enabled"],
+            "ENTERPRISEEDITION_ENABLED",
+        );
+        let mut key = configured_string(&["premium", "key"], "PREMIUM_KEY", EMPTY_KEY);
+        if key == EMPTY_KEY {
+            let legacy_key = configured_string(
+                &["enterpriseEdition", "key"],
+                "ENTERPRISEEDITION_KEY",
+                EMPTY_KEY,
+            );
+            if legacy_key != EMPTY_KEY {
+                key = legacy_key;
+            }
+        }
+        let initial_max_users = environment("PREMIUM_MAXUSERS")
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| value_at(&self.settings, &["premium", "maxUsers"]).and_then(Value::as_i64))
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0);
+        LicenseConfig {
+            enabled: premium_enabled || legacy_enabled,
+            key: Zeroizing::new(key),
+            initial_max_users,
+        }
+    }
+
     #[must_use]
     pub fn security_frontend_url(&self) -> String {
         self.frontend_url(None, None)
+    }
+
+    #[must_use]
+    pub fn security_backend_url(&self) -> String {
+        self.string(&["system", "backendUrl"], "SYSTEM_BACKENDURL", "")
     }
 
     /// Resolves optional Supabase JWT verification settings. An absent issuer
@@ -717,13 +1221,24 @@ impl RuntimeConfig {
             )
     }
 
-    /// Returns the shared signature-image directory used in no-login mode.
+    /// Returns the root directory for Java-compatible saved signature assets.
     #[must_use]
-    pub fn shared_signatures_dir(&self) -> PathBuf {
+    pub fn signatures_dir(&self) -> PathBuf {
         installation_path(&self.settings_path)
             .join("customFiles")
             .join("signatures")
-            .join("ALL_USERS")
+    }
+
+    /// Returns the shared signature-image directory used in no-login mode.
+    #[must_use]
+    pub fn shared_signatures_dir(&self) -> PathBuf {
+        self.signatures_dir().join("ALL_USERS")
+    }
+
+    /// Returns the live login-agreement Markdown directory.
+    #[must_use]
+    pub(crate) fn login_agreement_directory(&self) -> PathBuf {
+        self.custom_files_dir.join("disclaimer")
     }
 
     /// Returns the administrator-provided static-font directory.
@@ -955,11 +1470,10 @@ impl RuntimeConfig {
                 false,
             ),
         );
-        insert(
-            config,
-            "premiumEnabled",
-            self.boolean(&["premium", "enabled"], "PREMIUM_ENABLED", false),
-        );
+        insert(config, "premiumEnabled", self.license_config().enabled);
+        insert(config, "runningProOrHigher", false);
+        insert(config, "runningEE", false);
+        insert(config, "license", "NORMAL");
         insert(
             config,
             "aiEngineEnabled",
@@ -1356,6 +1870,14 @@ impl RuntimeConfig {
             .unwrap_or(default)
     }
 
+    fn signed_integer(&self, path: &[&str], environment: &str, default: i64) -> i64 {
+        env::var(environment)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| value_at(&self.settings, path).and_then(Value::as_i64))
+            .unwrap_or(default)
+    }
+
     fn usize(environment: &str, default: usize) -> usize {
         env::var(environment)
             .ok()
@@ -1499,7 +2021,7 @@ fn login_disclaimer_path(custom_files_dir: &Path, locale: &str) -> Option<PathBu
     path.starts_with(&directory).then_some(path)
 }
 
-fn is_valid_locale(locale: &str) -> bool {
+pub(crate) fn is_valid_locale(locale: &str) -> bool {
     if !(2..=35).contains(&locale.len()) {
         return false;
     }
@@ -1538,13 +2060,15 @@ fn value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
 }
 
 fn env_bool(name: &str) -> Option<bool> {
-    env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        })
+    env::var(name).ok().and_then(|value| parse_boolean(&value))
+}
+
+fn parse_boolean(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn security_mode_requested_from_value(value: Option<&str>) -> bool {
@@ -1627,15 +2151,132 @@ fn is_loopback_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        RuntimeConfig, endpoint_key_for_uri, merge_json, security_mode_requested_from_value,
-        split_strings,
+        McpAuthConfig, McpConfig, RuntimeConfig, endpoint_key_for_uri, merge_json,
+        security_mode_requested_from_value, split_strings,
     };
+
+    #[test]
+    fn policy_stream_timeout_matches_java_default_and_yaml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert_eq!(config.policy_stream_timeout().as_millis(), 1_800_000);
+
+        fs::write(&settings, "policies:\n  streamTimeoutMs: 4321\n")?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert_eq!(config.policy_stream_timeout().as_millis(), 4_321);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_configuration_defaults_match_java() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+
+        assert_eq!(
+            config.mcp_config_with_environment(|_| None),
+            McpConfig {
+                enabled: false,
+                scopes_enabled: true,
+                engine_capability_refresh_minutes: 5,
+                allowed_operations: Vec::new(),
+                blocked_operations: Vec::new(),
+                max_request_bytes: 10 * 1024 * 1024,
+                max_inline_response_bytes: 10 * 1024 * 1024,
+                auth: McpAuthConfig {
+                    mode: "oauth".to_owned(),
+                    issuer_uri: String::new(),
+                    jwks_uri: String::new(),
+                    resource_id: String::new(),
+                    accepted_audiences: Vec::new(),
+                    username_claim: "sub".to_owned(),
+                    require_existing_account: true,
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_configuration_loads_the_complete_yaml_tree() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "mcp:\n  enabled: true\n  scopesEnabled: false\n  engineCapabilityRefreshMinutes: 9\n  allowedOperations: [agent-a, agent-b]\n  blockedOperations: [agent-b]\n  maxRequestBytes: 1234\n  maxInlineResponseBytes: 5678\n  auth:\n    mode: apikey\n    issuerUri: https://issuer.example.test\n    jwksUri: https://issuer.example.test/jwks\n    resourceId: https://stirling.example.test/mcp\n    acceptedAudiences: [stirling, authenticated]\n    usernameClaim: email\n    requireExistingAccount: false\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let mcp = config.mcp_config_with_environment(|_| None);
+
+        assert!(mcp.enabled);
+        assert!(!mcp.scopes_enabled);
+        assert_eq!(mcp.engine_capability_refresh_minutes, 9);
+        assert_eq!(mcp.allowed_operations, ["agent-a", "agent-b"]);
+        assert_eq!(mcp.blocked_operations, ["agent-b"]);
+        assert_eq!(mcp.max_request_bytes, 1234);
+        assert_eq!(mcp.max_inline_response_bytes, 5678);
+        assert_eq!(mcp.auth.mode, "apikey");
+        assert_eq!(mcp.auth.issuer_uri, "https://issuer.example.test");
+        assert_eq!(mcp.auth.jwks_uri, "https://issuer.example.test/jwks");
+        assert_eq!(mcp.auth.resource_id, "https://stirling.example.test/mcp");
+        assert_eq!(mcp.auth.accepted_audiences, ["stirling", "authenticated"]);
+        assert_eq!(mcp.auth.username_claim, "email");
+        assert!(!mcp.auth.require_existing_account);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_environment_aliases_override_yaml_and_preserve_request_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "mcp:\n  enabled: false\n  scopesEnabled: true\n  maxRequestBytes: 99\n  auth:\n    mode: oauth\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let environment = BTreeMap::from([
+            ("MCP_ENABLED", "true"),
+            ("MCP_SCOPES_ENABLED", "false"),
+            ("MCP_ENGINECAPABILITYREFRESHMINUTES", "0"),
+            ("MCP_ALLOWED_OPERATIONS", "agent-a, agent-b"),
+            ("MCP_BLOCKEDOPERATIONS", "agent-b"),
+            ("MCP_MAXREQUESTBYTES", "0"),
+            ("MCP_MAX_INLINE_RESPONSE_BYTES", "2048"),
+            ("MCP_AUTH_MODE", "apikey"),
+            ("MCP_AUTH_ISSUER_URI", "https://issuer.example.test"),
+            ("MCP_AUTH_JWKSURI", "https://issuer.example.test/jwks"),
+            ("MCP_AUTH_RESOURCE_ID", "https://stirling.example.test/mcp"),
+            ("MCP_AUTH_ACCEPTEDAUDIENCES", "stirling, authenticated"),
+            ("MCP_AUTH_USERNAME_CLAIM", "email"),
+            ("MCP_AUTH_REQUIREEXISTINGACCOUNT", "false"),
+        ]);
+        let mcp = config.mcp_config_with_environment(|name| {
+            environment.get(name).map(|value| (*value).to_owned())
+        });
+
+        assert!(mcp.enabled);
+        assert!(!mcp.scopes_enabled);
+        assert_eq!(mcp.engine_capability_refresh_minutes, 1);
+        assert_eq!(mcp.allowed_operations, ["agent-a", "agent-b"]);
+        assert_eq!(mcp.blocked_operations, ["agent-b"]);
+        assert_eq!(mcp.max_request_bytes, 256 * 1024);
+        assert_eq!(mcp.max_inline_response_bytes, 2048);
+        assert_eq!(mcp.auth.mode, "apikey");
+        assert_eq!(mcp.auth.username_claim, "email");
+        assert!(!mcp.auth.require_existing_account);
+        Ok(())
+    }
 
     #[test]
     fn custom_settings_override_base_settings() -> Result<(), Box<dyn std::error::Error>> {
@@ -1661,6 +2302,50 @@ mod tests {
                 vec!["https://custom-tsa.example.test".to_owned()]
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn license_config_migrates_legacy_enterprise_settings_and_environment_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "premium:\n  enabled: false\n  key: 00000000-0000-0000-0000-000000000000\n  maxUsers: 6\nenterpriseEdition:\n  enabled: true\n  key: legacy-key\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let license = config.license_config_with_environment(|_| None);
+        assert!(license.enabled);
+        assert_eq!(license.key.as_str(), "legacy-key");
+        assert_eq!(license.initial_max_users, 6);
+
+        let environment = BTreeMap::from([
+            ("PREMIUM_ENABLED", "true"),
+            ("PREMIUM_KEY", "current-key"),
+            ("PREMIUM_MAXUSERS", "13"),
+        ]);
+        let license = config.license_config_with_environment(|name| {
+            environment.get(name).map(|value| (*value).to_owned())
+        });
+        assert!(license.enabled);
+        assert_eq!(license.key.as_str(), "current-key");
+        assert_eq!(license.initial_max_users, 13);
+        Ok(())
+    }
+
+    #[test]
+    fn app_config_defaults_to_unverified_normal_license_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "premium:\n  enabled: true\n  key: opaque-key\n")?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let app_config = config.app_config(None, None);
+        assert_eq!(app_config["premiumEnabled"], true);
+        assert_eq!(app_config["runningProOrHigher"], false);
+        assert_eq!(app_config["runningEE"], false);
+        assert_eq!(app_config["license"], "NORMAL");
         Ok(())
     }
 

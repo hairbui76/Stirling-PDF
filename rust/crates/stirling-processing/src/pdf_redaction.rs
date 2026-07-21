@@ -6,9 +6,7 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    env,
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    path::Path,
 };
 
 use image::{DynamicImage, Rgb, RgbImage};
@@ -19,7 +17,7 @@ use thiserror::Error;
 use crate::{
     page_selection::{PageSelectionError, parse_page_list},
     pdf_flatten::configured_max_render_dpi,
-    pdfium_backend::PDFIUM_LIBRARY_PATH_ENV,
+    pdfium_runtime::shared_pdfium_runtime,
 };
 
 const MAX_RENDER_PIXELS: f64 = 100_000_000.0;
@@ -36,14 +34,6 @@ const RANGE_MIDPOINT_SLACK: f32 = 30.0;
 const RANGE_MIN_COLUMN_LINE_WIDTH: f32 = 100.0;
 const RANGE_MIN_SIDE_LINES: usize = 3;
 const RANGE_COLUMN_OVERLAP_SLACK: f32 = 2.0;
-
-static REDACTION_PDFIUM: OnceLock<RedactionPdfiumRuntime> = OnceLock::new();
-
-#[derive(Debug)]
-struct RedactionPdfiumRuntime {
-    explicitly_configured: bool,
-    instance: Result<Mutex<Pdfium>, String>,
-}
 
 /// A manually specified redaction rectangle, with top-left page coordinates in PDF points.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +165,7 @@ pub fn redact_pdf_to_raster_file(
     page_redaction_color: [u8; 3],
     output_path: &Path,
 ) -> Result<PdfRedactionAttempt, PdfRedactionError> {
-    let runtime = REDACTION_PDFIUM.get_or_init(initialize_redaction_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -594,7 +584,7 @@ fn automatic_redaction_boxes(
     patterns: &[Regex],
     options: &AutoRedactionOptions,
 ) -> Result<PdfiumSearch<Vec<RedactionBox>>, PdfRedactionError> {
-    let runtime = REDACTION_PDFIUM.get_or_init(initialize_redaction_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1048,7 +1038,7 @@ fn range_document_geometry(
     filename: &str,
     color: [u8; 3],
 ) -> Result<PdfiumSearch<Vec<RangePageGeometry>>, PdfRedactionError> {
-    let runtime = REDACTION_PDFIUM.get_or_init(initialize_redaction_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1175,7 +1165,7 @@ fn document_page_dimensions(
     input_path: &Path,
     filename: &str,
 ) -> Result<PdfiumSearch<Vec<PageDimensions>>, PdfRedactionError> {
-    let runtime = REDACTION_PDFIUM.get_or_init(initialize_redaction_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1219,7 +1209,7 @@ fn detected_image_redaction_boxes(
     selected_pages: Option<&BTreeSet<usize>>,
     color: [u8; 3],
 ) -> Result<PdfiumSearch<Vec<RedactionBox>>, PdfRedactionError> {
-    let runtime = REDACTION_PDFIUM.get_or_init(initialize_redaction_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1516,32 +1506,6 @@ fn render_dimensions(
         return Err(PdfRedactionError::UnsafeRenderDimensions { page_number });
     }
     Ok((pixel_width as i32, pixel_height as i32))
-}
-
-fn initialize_redaction_pdfium() -> RedactionPdfiumRuntime {
-    let configured_path = env::var_os(PDFIUM_LIBRARY_PATH_ENV).map(PathBuf::from);
-    let explicitly_configured = configured_path.is_some();
-    let bindings = match configured_path {
-        Some(path) => Pdfium::bind_to_library(pdfium_library_path(&path)),
-        None => Pdfium::bind_to_system_library(),
-    };
-    RedactionPdfiumRuntime {
-        explicitly_configured,
-        instance: bindings.map(Pdfium::new).map(Mutex::new).map_err(|error| {
-            format!(
-                "{error}; set {PDFIUM_LIBRARY_PATH_ENV} to the PDFium shared library or its directory"
-            )
-        }),
-    }
-}
-
-fn pdfium_library_path(configured_path: &Path) -> PathBuf {
-    let path = if configured_path.is_dir() {
-        Pdfium::pdfium_platform_library_name_at_path(configured_path)
-    } else {
-        configured_path.to_owned()
-    };
-    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(test)]

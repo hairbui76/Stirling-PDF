@@ -1,9 +1,9 @@
 name: AI Engine CI
 
-# Runs the engine quality gate (lint, type-check, format-check, tests). Called
-# from build.yml on PRs and merge_group; also runs directly on push to main as
-# a post-merge safety net. Freshness of the generated tool_models.py is checked
-# by the shared check-generated-models workflow.
+# Runs the Rust engine quality gate and the explicit Python legacy-oracle gate.
+# Called from build.yml on PRs and merge_group; also runs directly on push to
+# main as a post-merge safety net. Generated-model freshness is checked by the
+# shared check-generated-models workflow.
 on:
   workflow_call:
   push:
@@ -29,23 +29,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901d61fb841f559994984270fce7 # stable
         with:
-          enable-cache: true
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: rust -> target
 
       - name: Install Task
         uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
 
-      - name: Quality-check engine
+      - name: Quality-check Rust engine
         id: engine-check
         run: task engine:check
+        continue-on-error: true
+
+      - name: Install uv for legacy oracle
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Quality-check legacy Python oracle
+        id: legacy-check
+        run: task engine:legacy:check
         continue-on-error: true
 
       - name: Comment on engine check failure
         # Only post a comment on PRs. github-script's PR helpers need an
         # issue/PR number, which doesn't exist on merge_group runs.
-        if: steps.engine-check.outcome == 'failure' && github.event_name == 'pull_request'
+        if: (steps.engine-check.outcome == 'failure' || steps.legacy-check.outcome == 'failure') && github.event_name == 'pull_request'
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -55,9 +71,9 @@ jobs:
               marker,
               '### Engine Check Failed',
               '',
-              'There are issues with your Python code that will need to be fixed before they can be merged in.',
+              'The Rust AI engine and/or its Python legacy oracle failed validation.',
               '',
-              'Run `task engine:fix` to auto-fix what can be fixed automatically, then run `task engine:check` to see what still needs fixing manually.',
+              'Run `task engine:fix` and `task engine:check` for the runtime. Run `task engine:legacy:fix` and `task engine:legacy:check` for the oracle.',
             ].join('\n');
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -82,23 +98,22 @@ jobs:
             }
 
       - name: Fail if engine check failed
-        if: steps.engine-check.outcome == 'failure'
+        if: steps.engine-check.outcome == 'failure' || steps.legacy-check.outcome == 'failure'
         run: |
           echo "============================================"
           echo "  Engine Check Failed"
           echo "============================================"
           echo ""
-          echo "There are issues with your Python code that"
-          echo "will need to be fixed before they can be merged in."
+          echo "The Rust AI engine and/or its Python legacy oracle"
+          echo "failed validation."
           echo ""
-          echo "Run 'task engine:fix' to auto-fix what can be"
-          echo "fixed automatically, then run 'task engine:check'"
-          echo "to see what still needs fixing manually."
+          echo "Runtime: task engine:fix && task engine:check"
+          echo "Oracle:  task engine:legacy:fix && task engine:legacy:check"
           echo "============================================"
           exit 1
 
       - name: Remove engine check comment on success
-        if: steps.engine-check.outcome == 'success' && github.event_name == 'pull_request'
+        if: steps.engine-check.outcome == 'success' && steps.legacy-check.outcome == 'success' && github.event_name == 'pull_request'
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:

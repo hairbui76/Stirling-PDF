@@ -31,10 +31,12 @@ logic and each is a track of its own.
 - **Java:** Spring Security, optional auth gated by `DOCKER_ENABLE_SECURITY`, user
   management, sessions (`create-session`/`validate-session`), login, SaaS/OAuth,
   API keys, per-endpoint authorization.
-- **Rust plan:** pick a stack (`axum` + `tower` middleware; sessions via
-  `tower-sessions`; password hashing via `argon2`; JWT/OAuth via `jsonwebtoken` +
-  an OIDC client). Model the user store and the `DOCKER_ENABLE_SECURITY=false`
-  "everything open" mode first, then layered auth.
+- **Rust status:** an opt-in `axum`/`tower` boundary now provides durable BCrypt
+  identities, lockout, rotating digest-only opaque sessions/API keys, encrypted
+  replay-safe TOTP, role/team/invite administration, Supabase JWT verification,
+  disabled self-registration, durable user settings, initial-setup completion,
+  administrator audit query/export/retention, and owner-scoped jobs. Generic OIDC/SAML/device identity, broader resource
+  ownership, Java database migration, and independent review remain.
 - **Risk:** HIGH. Security-critical; needs its own design doc + threat review before
   any code. Do NOT auto-generate in a loop. Recommend: port with security disabled
   first (matches OSS default), design the secured mode separately.
@@ -65,7 +67,9 @@ logic and each is a track of its own.
 `update-enable-analytics`, and footer/home data are now ported. The legacy
 `/js/additionalLanguageCode.js` response bakes the bundled locale directories
 into the Rust binary at build time and applies the strict `ui.languages`
-allowlist. `print-file` remains unported; its Java controller is itself a TODO.
+allowlist. The proprietary administrator-only Tessdata inventory/downloader is
+also ported with bounded atomic installation. `print-file` remains unported; its
+Java controller is itself a TODO.
 
 ### Suggested A-sequence
 A1 (config) → A3 (pipeline) → A5 (misc) → **design docs for A2 + A4** → A2 → A4.
@@ -127,7 +131,9 @@ does not claim glyph-accurate extraction or font reconstruction yet.
 - **Phase 3 (in progress):** PDF→JSON text extraction. Page and invoked Form-XObject
   content-stream text/state, resource scopes, and affine transforms are now exported. Type0
   `/ToUnicode` source-code segmentation plus horizontal descendant `/DW`/`/W` advances are
-  applied; Type3 outlines, vertical `/W2`, arbitrary CMap fallback, and full layout remain.
+  applied. Vertical writing now applies `/DW2` defaults plus both `/W2` forms to glyph origins,
+  displacement, and `TJ` movement; Type3 outlines, non-identity CMap code-to-CID mapping, and full
+  layout remain.
   Direct and Form-nested image XObjects export
   page-space transforms plus bounded JPEG or 8-bit DeviceRGB/DeviceGray/DeviceCMYK payloads,
   applying `/Decode` ranges and grayscale `/SMask` alpha, and expanding packed 1/2/4/8-bit

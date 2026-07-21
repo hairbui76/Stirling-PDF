@@ -151,6 +151,8 @@ impl PipelineDirectoryWatcher {
             files.push(PipelineFile {
                 filename: entry.file_name().to_string_lossy().into_owned(),
                 path,
+                content_type: None,
+                origin: None,
             });
         }
         files.sort_by(|left, right| left.filename.cmp(&right.filename));
@@ -208,7 +210,7 @@ fn find_config_file(directory: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
-async fn file_is_ready(path: &Path, config: &FileReadinessConfig) -> bool {
+pub(crate) async fn file_is_ready(path: &Path, config: &FileReadinessConfig) -> bool {
     if !config.enabled {
         return true;
     }
@@ -276,6 +278,8 @@ async fn move_inputs(
         moved_files.push(PipelineFile {
             filename: file.filename.clone(),
             path: target,
+            content_type: file.content_type.clone(),
+            origin: file.origin,
         });
     }
     Ok(moved_files)

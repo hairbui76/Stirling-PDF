@@ -77,11 +77,15 @@ tauri: &tauri
   - Taskfile.yml
   - .taskfiles/desktop.yml
 
-# Files that affect the AI engine (Python tool models, fixers, tests). Gate
-# the engine validation job on changes to engine sources or to the Java
-# tool surfaces it generates models from.
+# Files that affect the Rust AI engine or its explicit Python legacy oracle.
+# Gate validation on either implementation and on the Java tool surfaces used
+# to generate the shared operation catalog.
 engine: &engine
   - engine/**
+  - rust/Cargo.toml
+  - rust/Cargo.lock
+  - rust/crates/stirling-ai-engine/**
+  - rust/tools/generate_ai_operation_catalog.py
   - app/(common|core|proprietary|saas)/src/main/java/**
   - .github/workflows/ai-engine.yml
   - Taskfile.yml
@@ -98,6 +102,8 @@ generated-models: &generated-models
   - frontend/editor/src/core/types/toolApiTypes.ts
   - engine/scripts/generate_tool_models.py
   - engine/src/stirling/models/tool_models.py
+  - rust/tools/generate_ai_operation_catalog.py
+  - rust/crates/stirling-ai-engine/src/operation_catalog.json
   - .taskfiles/frontend.yml
   - .taskfiles/engine.yml
   - .github/workflows/check-generated-models.yml

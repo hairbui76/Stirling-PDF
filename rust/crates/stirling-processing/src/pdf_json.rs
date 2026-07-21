@@ -2839,9 +2839,11 @@ fn standard14_font_name(document: &Document, font: &Dictionary) -> Option<String
 /// This is the first pure-Rust glyph phase. It handles the standard text-state
 /// operators and recurses into Form `XObjects` with their resource dictionaries
 /// and affine transforms. `Type0` source codes are segmented through `/ToUnicode`,
-/// with horizontal descendant `/DW` and `/W` advances. Type3 outlines, vertical
-/// `/W2` metrics, arbitrary `CMap` fallbacks, and some graphics-state transitions
-/// remain conservative until the full glyph interpreter lands.
+/// with horizontal descendant `/DW` and `/W` advances. Vertical Type0 fonts use
+/// `/DW2` and both `/W2` forms for glyph origins, displacement, and `TJ`
+/// adjustment. Type3 outlines, non-identity `CMap` code-to-CID mapping, and some
+/// graphics-state transitions remain conservative until the full glyph
+/// interpreter lands.
 fn extract_text_elements(document: &Document, page_id: lopdf::ObjectId) -> Vec<PdfJsonTextElement> {
     let Ok(resources) = inherited_value(document, page_id, b"Resources") else {
         return Vec::new();
@@ -3095,8 +3097,36 @@ enum TextOperator {
 struct TextRun {
     text: String,
     char_codes: Vec<i32>,
-    advance: f32,
+    advance: TextVector,
+    origin: TextVector,
     space_width: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextVector {
+    x: f32,
+    y: f32,
+}
+
+impl TextVector {
+    fn add_assign(&mut self, other: Self) {
+        self.x += other.x;
+        self.y += other.y;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TextWritingMode {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy)]
+struct VerticalMetric {
+    displacement_y: f32,
+    position_x: f32,
+    position_y: f32,
 }
 
 enum TextFontSource<'a> {
@@ -3119,6 +3149,10 @@ struct TextFontMetrics {
     fallback_width: f32,
     composite: bool,
     code_bytes: usize,
+    writing_mode: TextWritingMode,
+    vertical_metrics: BTreeMap<u32, VerticalMetric>,
+    default_vertical_position_y: f32,
+    default_vertical_displacement_y: f32,
 }
 
 impl Default for TextFontMetrics {
@@ -3128,19 +3162,22 @@ impl Default for TextFontMetrics {
             fallback_width: 500.0,
             composite: false,
             code_bytes: 1,
+            writing_mode: TextWritingMode::Horizontal,
+            vertical_metrics: BTreeMap::new(),
+            default_vertical_position_y: 880.0,
+            default_vertical_displacement_y: -1000.0,
         }
     }
 }
 
 impl TextFontMetrics {
-    fn advance_for_codes(&self, codes: &[u32], text: &str, state: &TextState) -> f32 {
-        let horizontal_scaling = state.horizontal_scaling / 100.0;
+    fn advance_for_codes(&self, codes: &[u32], text: &str, state: &TextState) -> TextVector {
         let glyph_advance = if codes.is_empty() {
-            character_count(text) * self.fallback_width
+            character_count(text) * self.default_advance()
         } else {
             codes
                 .iter()
-                .map(|code| self.width_for_code(*code))
+                .map(|code| self.advance_for_code(*code))
                 .sum::<f32>()
         };
         let spacing_count = if codes.is_empty() {
@@ -3158,10 +3195,28 @@ impl TextFontMetrics {
                 .filter(|code| **code == u32::from(b' '))
                 .fold(0.0_f32, |count, _| count + 1.0)
         };
-        (glyph_advance / 1000.0 * state.font_size
+        let advance = glyph_advance / 1000.0 * state.font_size
             + spacing_count * state.character_spacing
-            + spaces * state.word_spacing)
-            * horizontal_scaling
+            + spaces * state.word_spacing;
+        match self.writing_mode {
+            TextWritingMode::Horizontal => TextVector {
+                x: advance * state.horizontal_scaling / 100.0,
+                y: 0.0,
+            },
+            TextWritingMode::Vertical => TextVector { x: 0.0, y: advance },
+        }
+    }
+
+    fn origin_for_codes(&self, codes: &[u32], state: &TextState) -> TextVector {
+        if self.writing_mode != TextWritingMode::Vertical {
+            return TextVector::default();
+        }
+        let code = codes.first().copied().unwrap_or_default();
+        let metric = self.vertical_metric_for_code(code);
+        TextVector {
+            x: -metric.position_x / 1000.0 * state.font_size * state.horizontal_scaling / 100.0,
+            y: -metric.position_y / 1000.0 * state.font_size,
+        }
     }
 
     fn space_width(&self, state: &TextState) -> f32 {
@@ -3174,6 +3229,31 @@ impl TextFontMetrics {
             .get(&code)
             .copied()
             .unwrap_or(self.fallback_width)
+    }
+
+    fn default_advance(&self) -> f32 {
+        match self.writing_mode {
+            TextWritingMode::Horizontal => self.fallback_width,
+            TextWritingMode::Vertical => self.default_vertical_displacement_y,
+        }
+    }
+
+    fn advance_for_code(&self, code: u32) -> f32 {
+        match self.writing_mode {
+            TextWritingMode::Horizontal => self.width_for_code(code),
+            TextWritingMode::Vertical => self.vertical_metric_for_code(code).displacement_y,
+        }
+    }
+
+    fn vertical_metric_for_code(&self, code: u32) -> VerticalMetric {
+        self.vertical_metrics
+            .get(&code)
+            .copied()
+            .unwrap_or_else(|| VerticalMetric {
+                displacement_y: self.default_vertical_displacement_y,
+                position_x: self.width_for_code(code) / 2.0,
+                position_y: self.default_vertical_position_y,
+            })
     }
 }
 
@@ -3398,7 +3478,9 @@ fn append_text_element(
     let z_order = i32::try_from(elements.len())
         .ok()
         .and_then(|index| index.checked_add(1_000_000));
-    let matrix = concatenate_affine(transform, state.text_matrix);
+    let mut glyph_text_matrix = state.text_matrix;
+    translate_text_matrix(&mut glyph_text_matrix, run.origin.x, run.origin.y);
+    let matrix = concatenate_affine(transform, glyph_text_matrix);
     let horizontal_scale = (matrix[0].mul_add(matrix[0], matrix[1] * matrix[1])).sqrt();
     let vertical_scale = (matrix[2].mul_add(matrix[2], matrix[3] * matrix[3])).sqrt();
     let font_id = font.resource_id.clone();
@@ -3419,8 +3501,16 @@ fn append_text_element(
         rise: (state.rise != 0.0).then_some(state.rise),
         x: Some(matrix[4] + matrix[2] * state.rise),
         y: Some(matrix[5] + matrix[3] * state.rise),
-        width: Some(run.advance * horizontal_scale),
-        height: Some(state.font_size * vertical_scale),
+        width: Some(match font.metrics.writing_mode {
+            TextWritingMode::Horizontal => run.advance.x.abs() * horizontal_scale,
+            TextWritingMode::Vertical => state.font_size.abs() * horizontal_scale,
+        }),
+        height: Some(match font.metrics.writing_mode {
+            TextWritingMode::Horizontal => state.font_size.abs() * vertical_scale,
+            TextWritingMode::Vertical => {
+                run.advance.y.abs().max(state.font_size.abs()) * vertical_scale
+            }
+        }),
         text_matrix: Some(matrix.to_vec()),
         fill_color: state.fill_color.clone(),
         stroke_color: state.stroke_color.clone(),
@@ -3428,7 +3518,7 @@ fn append_text_element(
         char_codes: Some(run.char_codes),
         ..PdfJsonTextElement::default()
     });
-    translate_text_matrix(&mut state.text_matrix, run.advance, 0.0);
+    translate_text_matrix(&mut state.text_matrix, run.advance.x, run.advance.y);
 }
 
 fn text_run(
@@ -3444,20 +3534,34 @@ fn text_run(
             let items = operands.first()?.as_array().ok()?;
             let mut text = String::new();
             let mut char_codes = Vec::new();
-            let mut advance = 0.0;
-            let mut adjustment = 0.0;
+            let mut advance = TextVector::default();
+            let mut adjustment = TextVector::default();
+            let mut origin = None;
             for item in items {
                 if let Some(run) = text_run_from_object(item, encoding, metrics, state) {
+                    origin.get_or_insert(TextVector {
+                        x: run.origin.x + adjustment.x,
+                        y: run.origin.y + adjustment.y,
+                    });
                     text.push_str(&run.text);
                     char_codes.extend(run.char_codes);
-                    advance += run.advance;
+                    advance.add_assign(run.advance);
                 } else if let Some(value) = number_as_f32(item) {
-                    adjustment -=
-                        value / 1000.0 * state.font_size * state.horizontal_scaling / 100.0;
+                    match metrics.writing_mode {
+                        TextWritingMode::Horizontal => {
+                            adjustment.x -=
+                                value / 1000.0 * state.font_size * state.horizontal_scaling / 100.0;
+                        }
+                        TextWritingMode::Vertical => {
+                            adjustment.y -= value / 1000.0 * state.font_size;
+                        }
+                    }
                 }
             }
+            advance.add_assign(adjustment);
             (!text.is_empty()).then(|| TextRun {
-                advance: advance + adjustment,
+                advance,
+                origin: origin.unwrap_or_default(),
                 text,
                 char_codes,
                 space_width: metrics.space_width(state),
@@ -3479,6 +3583,7 @@ fn text_run_from_object(
     let source_codes = text_source_codes(encoding, bytes, metrics.code_bytes);
     (!text.is_empty()).then(|| TextRun {
         advance: metrics.advance_for_codes(&source_codes, &text, state),
+        origin: metrics.origin_for_codes(&source_codes, state),
         char_codes: source_codes
             .iter()
             .map(|code| i32::from_be_bytes(code.to_be_bytes()))
@@ -3560,6 +3665,7 @@ fn text_font_metrics(document: &Document, font: &Dictionary) -> TextFontMetrics 
 }
 
 fn cid_text_font_metrics(document: &Document, font: &Dictionary) -> TextFontMetrics {
+    let writing_mode = type0_writing_mode(document, font);
     let descendant = font
         .get(b"DescendantFonts")
         .ok()
@@ -3572,18 +3678,224 @@ fn cid_text_font_metrics(document: &Document, font: &Dictionary) -> TextFontMetr
             fallback_width: 1000.0,
             composite: true,
             code_bytes: 2,
+            writing_mode,
             ..TextFontMetrics::default()
         };
     };
     let fallback_width = dictionary_f32(document, descendant, b"DW")
         .filter(|width| width.is_finite() && *width >= 0.0)
         .unwrap_or(1000.0);
+    let (default_vertical_position_y, default_vertical_displacement_y) =
+        cid_vertical_defaults(document, descendant);
     TextFontMetrics {
         widths: cid_widths(document, descendant),
         fallback_width,
         composite: true,
         code_bytes: 2,
+        writing_mode,
+        vertical_metrics: cid_vertical_metrics(document, descendant),
+        default_vertical_position_y,
+        default_vertical_displacement_y,
     }
+}
+
+fn type0_writing_mode(document: &Document, font: &Dictionary) -> TextWritingMode {
+    let Some(encoding) = font
+        .get(b"Encoding")
+        .ok()
+        .and_then(|encoding| resolved_object(document, encoding))
+    else {
+        return TextWritingMode::Horizontal;
+    };
+    let vertical = match encoding {
+        Object::Name(name) => cmap_name_is_vertical(name),
+        Object::Dictionary(dictionary) => cmap_dictionary_is_vertical(document, dictionary),
+        Object::Stream(stream) => {
+            cmap_dictionary_is_vertical(document, &stream.dict)
+                || stream
+                    .get_plain_content_with_limit(MAX_EMBEDDED_FONT_BYTES)
+                    .ok()
+                    .and_then(|content| cmap_wmode(&content))
+                    == Some(1)
+        }
+        _ => false,
+    };
+    if vertical {
+        TextWritingMode::Vertical
+    } else {
+        TextWritingMode::Horizontal
+    }
+}
+
+fn cmap_dictionary_is_vertical(document: &Document, dictionary: &Dictionary) -> bool {
+    dictionary_i32(document, dictionary, b"WMode") == Some(1)
+        || dictionary
+            .get(b"UseCMap")
+            .ok()
+            .and_then(|value| resolved_object(document, value))
+            .and_then(|value| value.as_name().ok())
+            .is_some_and(cmap_name_is_vertical)
+}
+
+fn cmap_name_is_vertical(name: &[u8]) -> bool {
+    name.ends_with(b"-V")
+}
+
+fn cmap_wmode(content: &[u8]) -> Option<i32> {
+    let mut index = 0;
+    while index < content.len() {
+        if content[index] == b'%' {
+            index += 1;
+            while index < content.len() && !matches!(content[index], b'\r' | b'\n') {
+                index += 1;
+            }
+            continue;
+        }
+        if content[index..].starts_with(b"/WMode")
+            && content
+                .get(index + b"/WMode".len())
+                .is_none_or(u8::is_ascii_whitespace)
+        {
+            index += b"/WMode".len();
+            while content.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+            }
+            let start = index;
+            while content.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if start != index
+                && content
+                    .get(index)
+                    .is_none_or(|byte| byte.is_ascii_whitespace() || is_pdf_delimiter(*byte))
+            {
+                return std::str::from_utf8(&content[start..index])
+                    .ok()?
+                    .parse()
+                    .ok();
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn cid_vertical_defaults(document: &Document, descendant: &Dictionary) -> (f32, f32) {
+    let Some(defaults) = descendant
+        .get(b"DW2")
+        .ok()
+        .and_then(|defaults| resolved_object(document, defaults))
+        .and_then(|defaults| defaults.as_array().ok())
+    else {
+        return (880.0, -1000.0);
+    };
+    let position_y = defaults
+        .first()
+        .and_then(|value| resolved_object(document, value))
+        .and_then(number_as_f32)
+        .filter(|value| value.is_finite());
+    let displacement_y = defaults
+        .get(1)
+        .and_then(|value| resolved_object(document, value))
+        .and_then(number_as_f32)
+        .filter(|value| value.is_finite());
+    match (position_y, displacement_y) {
+        (Some(position_y), Some(displacement_y)) => (position_y, displacement_y),
+        _ => (880.0, -1000.0),
+    }
+}
+
+fn cid_vertical_metrics(
+    document: &Document,
+    descendant: &Dictionary,
+) -> BTreeMap<u32, VerticalMetric> {
+    let Some(metrics) = descendant
+        .get(b"W2")
+        .ok()
+        .and_then(|metrics| resolved_object(document, metrics))
+        .and_then(|metrics| metrics.as_array().ok())
+    else {
+        return BTreeMap::new();
+    };
+    let mut result = BTreeMap::new();
+    let mut index = 0;
+    while index + 1 < metrics.len() && result.len() < MAX_CID_WIDTH_ENTRIES {
+        let Some(first_code) = resolved_u32(document, &metrics[index]) else {
+            break;
+        };
+        let Some(specification) = resolved_object(document, &metrics[index + 1]) else {
+            break;
+        };
+        if let Ok(values) = specification.as_array() {
+            for (offset, values) in values.chunks_exact(3).enumerate() {
+                if result.len() >= MAX_CID_WIDTH_ENTRIES {
+                    break;
+                }
+                let Some(code) = u32::try_from(offset)
+                    .ok()
+                    .and_then(|offset| first_code.checked_add(offset))
+                else {
+                    break;
+                };
+                if let Some(metric) = vertical_metric(document, values) {
+                    result.insert(code, metric);
+                }
+            }
+            index += 2;
+            continue;
+        }
+
+        let Some(last_code) = specification
+            .as_i64()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            break;
+        };
+        let Some(metric) = metrics
+            .get(index + 2..index + 5)
+            .and_then(|values| vertical_metric(document, values))
+        else {
+            break;
+        };
+        let Some(entry_count) = last_code
+            .checked_sub(first_code)
+            .and_then(|difference| difference.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            break;
+        };
+        if entry_count > MAX_CID_WIDTH_ENTRIES.saturating_sub(result.len()) {
+            break;
+        }
+        for code in first_code..=last_code {
+            result.insert(code, metric);
+        }
+        index += 5;
+    }
+    result
+}
+
+fn resolved_u32(document: &Document, value: &Object) -> Option<u32> {
+    resolved_object(document, value)
+        .and_then(|value| value.as_i64().ok())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn vertical_metric(document: &Document, values: &[Object]) -> Option<VerticalMetric> {
+    let [displacement_y, position_x, position_y] = values else {
+        return None;
+    };
+    let displacement_y = resolved_object(document, displacement_y).and_then(number_as_f32)?;
+    let position_x = resolved_object(document, position_x).and_then(number_as_f32)?;
+    let position_y = resolved_object(document, position_y).and_then(number_as_f32)?;
+    (displacement_y.is_finite() && position_x.is_finite() && position_y.is_finite()).then_some(
+        VerticalMetric {
+            displacement_y,
+            position_x,
+            position_y,
+        },
+    )
 }
 
 fn cid_widths(document: &Document, descendant: &Dictionary) -> BTreeMap<u32, f32> {
@@ -6698,7 +7010,7 @@ q 20 0 0 10 5 7 cm BI /W 2 /H 1 /CS /RGB /BPC 8 ID\n"
         Ok(())
     }
 
-    fn type0_cid_document() -> lopdf::Document {
+    fn type0_cid_document(vertical: bool) -> lopdf::Document {
         use lopdf::{Document, Object, Stream, dictionary};
 
         let to_unicode = br"/CIDInit /ProcSet findresource begin
@@ -6710,9 +7022,10 @@ begincmap
 1 begincodespacerange
 <0000> <ffff>
 endcodespacerange
-2 beginbfchar
+3 beginbfchar
 <0001> <4e2d>
 <0002> <6587>
+<0003> <8a9e>
 endbfchar
 endcmap
 CMapName currentdict /CMap defineresource pop
@@ -6736,7 +7049,7 @@ end";
             "StemV" => 80,
             "FontFile2" => font_program_id,
         });
-        let descendant_id = source.add_object(dictionary! {
+        let mut descendant = dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType2",
             "BaseFont" => "RustCID",
@@ -6755,19 +7068,25 @@ end";
                 2.into(),
                 700.into(),
             ],
-        });
+        };
+        if vertical {
+            add_vertical_type0_metrics(&mut descendant);
+        }
+        let descendant_id = source.add_object(descendant);
         let font_id = source.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
             "BaseFont" => "RustCID",
-            "Encoding" => "Identity-H",
+            "Encoding" => if vertical { "Identity-V" } else { "Identity-H" },
             "DescendantFonts" => vec![Object::Reference(descendant_id)],
             "ToUnicode" => to_unicode_id,
         });
-        let content_id = source.add_object(Stream::new(
-            dictionary! {},
-            b"BT /F0 10 Tf 1 0 0 1 10 20 Tm <00010002> Tj ET".to_vec(),
-        ));
+        let content = if vertical {
+            b"BT /F0 10 Tf 1 0 0 1 10 100 Tm <00010002> Tj [<0003> 200] TJ <0001> Tj ET".to_vec()
+        } else {
+            b"BT /F0 10 Tf 1 0 0 1 10 20 Tm <00010002> Tj ET".to_vec()
+        };
+        let content_id = source.add_object(Stream::new(dictionary! {}, content));
         let page_object_id = source.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => page_tree_id,
@@ -6789,12 +7108,30 @@ end";
         source
     }
 
+    fn add_vertical_type0_metrics(descendant: &mut lopdf::Dictionary) {
+        use lopdf::Object;
+
+        descendant.set("DW2", Object::Array(vec![900.into(), (-1100).into()]));
+        descendant.set(
+            "W2",
+            Object::Array(vec![
+                1.into(),
+                Object::Array(vec![(-900).into(), 250.into(), 800.into()]),
+                2.into(),
+                2.into(),
+                (-700).into(),
+                300.into(),
+                750.into(),
+            ]),
+        );
+    }
+
     #[test]
     fn extracts_type0_cids_with_descendant_widths() -> Result<(), Box<dyn std::error::Error>> {
         use super::{convert_json_to_pdf, pdf_to_json};
         use lopdf::{Document, content::Content};
 
-        let mut source = type0_cid_document();
+        let mut source = type0_cid_document(false);
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("type0-cid.pdf");
         source.save(&path)?;
@@ -6829,6 +7166,83 @@ end";
             .ok_or("missing rebuilt CID text")?;
         assert_eq!(encoded, &[0, 1, 0, 2]);
         Ok(())
+    }
+
+    #[test]
+    fn extracts_vertical_type0_origins_dw2_w2_and_tj_advances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::pdf_to_json;
+
+        let mut source = type0_cid_document(true);
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("type0-vertical.pdf");
+        source.save(&path)?;
+
+        let model = pdf_to_json(&path, "type0-vertical.pdf", false)?;
+        let elements = &model.pages[0].text_elements;
+        assert_eq!(elements.len(), 3);
+
+        assert_eq!(elements[0].text.as_deref(), Some("中文"));
+        assert_eq!(elements[0].char_codes, Some(vec![1, 2]));
+        assert_eq!(elements[0].x, Some(7.5));
+        assert_eq!(elements[0].y, Some(92.0));
+        assert_eq!(elements[0].width, Some(10.0));
+        assert_eq!(elements[0].height, Some(16.0));
+        assert_eq!(
+            elements[0].text_matrix,
+            Some(vec![1.0, 0.0, 0.0, 1.0, 7.5, 92.0])
+        );
+
+        assert_eq!(elements[1].text.as_deref(), Some("語"));
+        assert_eq!(elements[1].x, Some(5.0));
+        assert_eq!(elements[1].y, Some(75.0));
+        assert_eq!(elements[1].height, Some(13.0));
+
+        assert_eq!(elements[2].text.as_deref(), Some("中"));
+        assert_eq!(elements[2].x, Some(7.5));
+        assert_eq!(elements[2].y, Some(63.0));
+        assert_eq!(elements[2].height, Some(10.0));
+        Ok(())
+    }
+
+    #[test]
+    fn vertical_cmap_and_metric_parsers_are_bounded_and_fail_closed() {
+        use super::{
+            TextWritingMode, cid_vertical_defaults, cid_vertical_metrics, type0_writing_mode,
+        };
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let cmap_id = document.add_object(Stream::new(
+            dictionary! {},
+            b"% /WMode 0 def\n/WMode 1 def\n".to_vec(),
+        ));
+        let font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => cmap_id,
+        };
+        assert_eq!(
+            type0_writing_mode(&document, &font),
+            TextWritingMode::Vertical
+        );
+
+        let malformed = dictionary! {
+            "W2" => vec![
+                1.into(),
+                Object::Array(vec![(-900).into(), 250.into()]),
+                2.into(),
+                100_000.into(),
+                (-1000).into(),
+                500.into(),
+                880.into(),
+            ],
+        };
+        assert!(cid_vertical_metrics(&document, &malformed).is_empty());
+        assert_eq!(
+            cid_vertical_defaults(&document, &malformed),
+            (880.0, -1000.0)
+        );
     }
 
     #[test]

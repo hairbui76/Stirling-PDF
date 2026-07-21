@@ -6,12 +6,19 @@ directory when unset). The custom file recursively overrides the base file.
 The corresponding all-caps Spring-style environment variables take precedence
 for the settings that this slice exposes.
 
+The conditional SMTP route also resolves the existing `mail.*` tree and its
+`MAIL_*` overrides. See [`send-email.md`](send-email.md) for its supported TLS
+policy and multipart contract.
+
 ## Routes
 
 | Route | Response |
 | --- | --- |
-| `GET /api/v1/config/app-config` | Public application configuration consumed during UI bootstrap. It includes UI/system toggles, legal links, timestamp presets, startup dependency-probe completion, and an externally visible `frontendUrl` derived from `Host` plus a safe `X-Forwarded-Proto`. |
+| `GET /api/v1/config/app-config` | Public application configuration consumed during UI bootstrap. It includes UI/system toggles, legal links, timestamp presets, startup dependency-probe completion, verified dynamic license fields, and an externally visible `frontendUrl` derived from `Host` plus a safe `X-Forwarded-Proto`. |
 | `GET /api/v1/config/login-disclaimer[?lang=<locale>]` | Enabled login-agreement markdown with locale fallback; unauthenticated calls return `401` when login is configured. |
+| `GET /api/v1/admin/login-agreement` | Secured administrator-only sorted list of stored login-agreement locales. |
+| `GET /api/v1/admin/login-agreement/{locale}` | Secured administrator-only locale and Markdown lookup. |
+| `PUT /api/v1/admin/login-agreement/{locale}` | Secured administrator-only atomic replacement or clearing of one locale. |
 | `GET /api/v1/config/endpoint-enabled?endpoint=<key>` | JSON boolean for one endpoint key. |
 | `GET /api/v1/config/endpoints-enabled?endpoints=<key>,<key>` | JSON map of requested endpoint keys to booleans. |
 | `GET /api/v1/config/endpoints-availability[?endpoints=<key>,<key>]` | JSON map containing `{ "enabled": boolean, "reason": null | "CONFIG" | "DEPENDENCY" }`. Without a query it returns the known Java endpoint key set plus configured disabled keys. |
@@ -39,15 +46,30 @@ environment aliases take precedence.
 The standalone Rust executable probes optional command-line tools once before
 accepting requests. It resolves configured command overrides and platform `PATH`
 candidates for Ghostscript, OCRmyPDF, LibreOffice, WeasyPrint, `pdftohtml`, QPDF,
-RAR, Calibre, Python, and OpenCV. QPDF below 12.0.0 and WeasyPrint below 58.0 are
-treated as unavailable, matching Java's minimum-version gates. Each process probe
-has a five-second kill timeout. Missing groups feed the same endpoint-alternative
-logic as configured group removal and surface as reason `DEPENDENCY`; explicit
-configuration still takes precedence as reason `CONFIG`.
+RAR, and Calibre. QPDF below 12.0.0 and WeasyPrint below 58.0 are treated as
+unavailable, matching Java's minimum-version gates. Image-scan extraction is native
+and no longer probes Python or OpenCV. Each process probe has a five-second kill
+timeout. Missing groups feed the same endpoint-alternative logic as configured group
+removal and surface as reason `DEPENDENCY`; explicit configuration still takes
+precedence as reason `CONFIG`.
 
 `dependenciesReady` means startup probing has completed, not that every optional
 tool is installed. Embedded/test router constructors intentionally remain
 process-free; the service binary selects the discovery-enabled constructor.
+
+## Commercial license configuration
+
+`premium.enabled`, `premium.key`, and `premium.maxUsers` resolve their existing
+`PREMIUM_*` environment overrides. A `file:` key is read from the process
+working directory when relative. The deprecated `enterpriseEdition.enabled`
+and `.key` fields remain a migration fallback when the premium block is disabled
+or still contains the zero UUID placeholder.
+
+These values are configuration intent, not entitlement. The reviewed secured
+runtime verifies the key through the commercial-license boundary before adding
+`runningProOrHigher`, `runningEE`, and `license` to app-config. The normal router
+reports `false`, `false`, and `NORMAL`; it never treats a configured key as
+verified. See [`license-entitlement.md`](license-entitlement.md).
 
 ## Timestamp settings
 
@@ -62,24 +84,29 @@ precedence, including `SECURITY_TIMESTAMP_DEFAULT_TSA_URL` and
 The public agreement reader resolves locale-specific markdown from
 `customFiles/disclaimer` below the same base path. It is available in
 anonymous/no-login operation. When `security.enableLogin` is configured, Rust
-returns `401` until the authentication migration provides an authenticated
-request context. See [`login-disclaimer.md`](login-disclaimer.md) for the exact
-lookup and safety rules.
+returns `401` on the public route unless the request passes through the reviewed
+secured router with an authenticated context. That router also owns the
+administrator-only list/read/update/clear surface with atomic replacement and
+link-safe bounds. See [`login-disclaimer.md`](login-disclaimer.md) for lookup
+rules and [`login-agreement-admin.md`](login-agreement-admin.md) for mutation.
 
 ## Explicit boundaries
 
-Apart from the first-run analytics choice, this slice does not yet support broader
-settings mutation, login authentication, admin state, storage, or signing hardware.
-`app-config` deliberately reports those unported security
+Apart from the first-run analytics choice and the reviewed administrator surfaces,
+this slice does not yet support arbitrary settings mutation, external identity
+providers, general durable application storage, or signing hardware.
+`app-config` deliberately reports unported security
 capabilities as disabled rather than advertising a UI flow that the Rust service
 cannot complete.
 
 ## Verification
 
-Unit coverage proves YAML recursive override, endpoint normalization and
+Unit coverage proves YAML recursive override, legacy/current license resolution, endpoint normalization and
 availability (including distinct configuration/dependency reasons), dependency
 version parsing, and timestamp configuration extraction. HTTP integration coverage
 proves app-config bootstrap fields, host/proxy URL reconstruction, endpoint
 availability, group status, batch status, settings status, interceptor `403`,
 the API cache policy, the login-disclaimer route, and both multipart and
-URL-encoded analytics onboarding paths.
+URL-encoded analytics onboarding paths. The reviewed security fixture separately
+proves administrator login-agreement writes, public visibility, clearing, and
+unauthenticated/non-administrator denial.

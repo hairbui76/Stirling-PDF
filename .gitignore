@@ -270,6 +270,9 @@ frontend/editor/public/locales/*/translation.backup*.json
 .gradle-cache/
 rust/target/
 rust/.pdfium/
+# Local Rust AI-engine document stores (default `data/rag.db` from the repo root).
+/data/
+rust/data/
 scripts/pdf-collection/
 **/tmp/
 *.backup
@@ -285,6 +288,9 @@ docs/type3/signatures/
 
 # Claude
 .claude/
+
+# Local Codex agent settings
+.codex/config.toml
 
 # Playwright MCP screenshots / traces
 .playwright-mcp/

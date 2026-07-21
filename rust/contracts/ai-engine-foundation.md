@@ -1,9 +1,13 @@
 # Rust AI Engine Foundation Contract
 
-`stirling-ai-engine` owns the Rust process boundary at `127.0.0.1:5001` and the
-current Python engine's HTTP agent surface. SQLite and pgvector deployments can
-cut over after their provider and Java proxy configuration is switched; the
-included migration binary converts legacy sqlite-vec files.
+`stirling-ai-engine` owns the Rust process boundary and the current Python
+engine's HTTP agent surface. It binds to `127.0.0.1:5001` by default.
+`STIRLING_ENGINE_HOST` accepts an explicit IPv4 or IPv6 address and
+`STIRLING_ENGINE_PORT` accepts a port from `0` through `65535`; port `0` selects
+an ephemeral port and the startup log reports the address actually assigned.
+SQLite and pgvector deployments can cut over after their provider and Java
+proxy configuration is switched; the included migration binary converts legacy
+sqlite-vec files.
 
 ## Implemented compatibility boundary
 
@@ -14,7 +18,11 @@ included migration binary converts legacy sqlite-vec files.
   routes return `503` rather than run without authentication.
 - When `STIRLING_REQUIRE_USER_ID=true`, non-health routes require a non-empty
   `X-User-Id` after shared-secret authentication. The identity is carried to
-  handlers as the typed `UserId` request extension.
+  handlers as the typed `UserId` request extension; a missing identity returns
+  Python-compatible `401`.
+- Every JSON POST request accepts both the Python `ApiModel` camel-case aliases
+  and its snake-case field names, including nested request models. Unknown
+  fields are rejected with `422` instead of being silently ignored.
 - Default model names match the existing engine configuration:
   `anthropic:claude-haiku-4-5` for both smart and fast models.
 
@@ -127,7 +135,10 @@ For pgvector, replace `--target-sqlite` with `--target-pgvector` and its
 PostgreSQL DSN. Provider credentials use the same `VOYAGE_API_KEY`,
 `OPENAI_API_KEY`, or Ollama environment as the engine. Chunk size, overlap and
 pool bounds default to their corresponding `STIRLING_*` settings and can be
-overridden by command flags.
+overridden by `--chunk-size`, `--chunk-overlap`, `--pool-min-size`, and
+`--pool-max-size`. Run the binary with `--help` for the complete command
+contract. Exactly one destination is required, and duplicate options are
+rejected.
 
 The migration reads only ordinary metadata, ordered-page and ACL tables. It
 does not load the sqlite-vec extension or trust old vector blobs; it chunks and
@@ -160,8 +171,18 @@ plan, then consume its trusted report on the resume turn.
 
 ## Ported orchestration and agent workflows
 
-`POST /api/v1/orchestrator` streams newline-delimited heartbeat/result frames and
-routes PDF question, edit, review, create, and saved-agent drafting requests.
+`POST /api/v1/orchestrator` streams newline-delimited heartbeat, progress, and
+result frames and routes PDF question, edit, review, create, and saved-agent
+drafting requests. Long-document reasoning emits the Python-compatible
+`whole_doc_read_started`, `whole_doc_slice_done`,
+`whole_doc_compression_round`, and `whole_doc_read_done` phases. The progress
+emitter is request-scoped and is a no-op outside an orchestrator stream, so
+concurrent requests cannot receive each other's events.
+Identity is enforced after capability routing: PDF question and review require
+`X-User-Id` before any ACL-backed delegate runs, while edit, create, saved-agent
+drafting, and unsupported-capability responses can run anonymously unless the
+deployment-wide `STIRLING_REQUIRE_USER_ID` guard is enabled. Non-document
+capabilities also remain available if document storage failed to initialize.
 Resume capability dispatch is deterministic. PDF edit parameters are validated
 against the generated snapshot of all current Java operation schemas and only
 server-enabled operations may be selected. PDF review produces grounded sticky
@@ -176,6 +197,27 @@ Python manifest's `/api/v1/ai/agents/...` draft/revise paths are accepted.
 `POST /api/v1/agents/next-action` intentionally preserves Python's current
 terminal `cannot_continue` behavior rather than pretending execution planning
 exists.
+
+## Operational runtime
+
+Normal Task entry points now run `stirling-ai-engine`: `task engine:dev`,
+`engine:run`, `engine:test`, and `engine:check`. Consequently `task dev:all`
+starts the Rust process and configures the Java proxy with its selected port.
+The former Python commands remain explicit under `task engine:legacy:*` for
+oracle comparisons and are still validated by a separately named CI step.
+The run and development tasks load the optional `engine/.env.local` with
+precedence over `engine/.env`, preserving local provider credentials without
+requiring the Rust binary itself to parse dotenv files.
+
+The engine image builds from the repository root with `engine/Dockerfile`. Its
+pinned Rust builder produces both the server and `migrate-sqlite-vec`; the
+non-Python Debian runtime installs only CA certificates, runs as a non-root
+user, and binds `0.0.0.0:5001`. PR demo builds use the same root context.
+
+Java OpenAPI generation still has one intentional Python dependency:
+`task engine:tool-models` regenerates the retained Python `tool_models.py`, then
+uses it to update Rust's compile-time `operation_catalog.json`. Generated-model
+CI diffs both artifacts.
 
 ## Remaining cutover constraints
 
@@ -207,6 +249,9 @@ caller-supplied schema rather than carrying classifier-only response parsing.
 ## Required proof before cutover
 
 Every advertised capability has a typed request/response boundary and contract
-coverage. Production cutover still requires provider credentials, Java proxy
-routing, storage selection, and the relevant processing service to be verified
-in the target deployment.
+coverage. A process-level smoke test starts the compiled binary on an ephemeral
+port and verifies public health, shared-secret and user-ID failures,
+authenticated capabilities, and a representative POST independently of the
+in-process router tests. Production cutover still requires provider
+credentials, Java proxy routing, storage selection, and the relevant processing
+service to be verified in the target deployment.

@@ -1,17 +1,15 @@
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
-    env,
     fs::File,
     hash::{Hash, Hasher},
     io::{self, Cursor, Write},
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    path::Path,
 };
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
 use pdfium_render::prelude::{
-    PdfDocument, PdfPage, PdfPageObjectsCommon, PdfPagePaperSize, PdfPageRenderRotation, PdfPoints,
-    PdfRenderConfig, Pdfium, PdfiumError,
+    PdfDocument, PdfPage, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPagePaperSize,
+    PdfPageRenderRotation, PdfPoints, PdfRenderConfig, Pdfium, PdfiumError,
 };
 use rxing::{
     BarcodeFormat, BinaryBitmap, DecodeHintValue, DecodeHints, Luma8LuminanceSource,
@@ -27,21 +25,13 @@ use crate::{
     pdf_bookmarks::{BookmarkEntry, append_bookmarks},
     pdf_merge::MergeInput,
     pdf_scanner_effect::{ScannerEffectParams, calculate_safe_resolution, process_page},
+    pdfium_runtime::shared_pdfium_runtime,
 };
 
-pub const PDFIUM_LIBRARY_PATH_ENV: &str = "STIRLING_PDFIUM_LIBRARY_PATH";
 const MAX_BOOKMARKS_PER_DOCUMENT: usize = 100_000;
 const QR_DETECTION_DPI: i32 = 150;
 const MAX_QR_IMAGE_PIXELS: u64 = 100_000_000;
 const BLANK_QR_CHECK_SAMPLES: usize = 20;
-
-static PDFIUM: OnceLock<PdfiumRuntime> = OnceLock::new();
-
-#[derive(Debug)]
-struct PdfiumRuntime {
-    explicitly_configured: bool,
-    instance: Result<Mutex<Pdfium>, String>,
-}
 
 #[derive(Debug)]
 pub enum PdfiumMergeAttempt {
@@ -122,6 +112,38 @@ pub struct PdfiumAiPageContent {
 #[derive(Debug)]
 pub enum PdfiumAiPageContentAttempt {
     Extracted(Vec<PdfiumAiPageContent>),
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+/// Bounded AI page content paired with its one-based source page number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfiumAiPageWindowContent {
+    pub page_number: usize,
+    pub content: PdfiumAiPageContent,
+}
+
+/// A successful edge-window scan or a clean indication that `PDFium` is absent.
+#[derive(Debug)]
+pub enum PdfiumAiPageWindowAttempt {
+    Extracted(Vec<PdfiumAiPageWindowContent>),
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfiumWorkflowPageText {
+    pub page_number: usize,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub enum PdfiumWorkflowTextAttempt {
+    Extracted(Vec<PdfiumWorkflowPageText>),
     Unavailable {
         explicitly_configured: bool,
         details: String,
@@ -578,6 +600,11 @@ pub enum PdfiumTextError {
     },
     #[error("the requested page index exceeds PDFium's signed 32-bit page index")]
     PageIndex,
+    #[error("requested page number {page_number} is outside the PDF page range 1-{page_count}")]
+    InvalidPage {
+        page_number: usize,
+        page_count: usize,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -623,7 +650,7 @@ pub fn try_flatten_pdf_to_file(
     render_dpi: i32,
     output_path: &Path,
 ) -> Result<PdfiumFlattenAttempt, PdfiumFlattenError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -789,7 +816,7 @@ pub fn try_invert_pdf_to_file(
     render_dpi: i32,
     output_path: &Path,
 ) -> Result<PdfiumInvertAttempt, PdfiumInvertError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -911,7 +938,7 @@ pub fn try_scanner_effect_to_file(
     params: &ScannerEffectParams,
     output_path: &Path,
 ) -> Result<PdfiumScannerAttempt, PdfiumScannerError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1041,7 +1068,7 @@ pub fn try_auto_split_pdf_to_zip(
     maximum_dpi: i32,
     output_path: &Path,
 ) -> Result<PdfiumAutoSplitAttempt, PdfiumAutoSplitError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1132,7 +1159,7 @@ pub fn try_convert_pdf_to_images(
     include_annotations: bool,
     output_path: &Path,
 ) -> Result<PdfiumToImageAttempt, PdfiumToImageError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1618,7 +1645,7 @@ pub fn try_detect_blank_image_pages(
     threshold: i32,
     white_percent: f32,
 ) -> Result<PdfiumBlankDetectionAttempt, PdfiumBlankDetectionError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium
             .lock()
@@ -1736,7 +1763,7 @@ pub fn try_extract_page_images_to_zip(
     extension: &str,
     output_path: &Path,
 ) -> Result<PdfiumExtractImagesAttempt, PdfiumExtractImagesError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -1829,7 +1856,7 @@ pub fn try_locate_text_anchors(
     filename: &str,
     requests: &[(usize, String)],
 ) -> Result<PdfiumTextLocationAttempt, PdfiumTextError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -1911,7 +1938,7 @@ pub fn try_extract_positioned_text_chunks(
     max_chunks: usize,
     max_text_characters: usize,
 ) -> Result<PdfiumTextChunksAttempt, PdfiumTextError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -1997,7 +2024,7 @@ pub fn try_extract_ai_page_content(
     filename: &str,
     max_text_characters_per_page: usize,
 ) -> Result<PdfiumAiPageContentAttempt, PdfiumTextError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2056,6 +2083,272 @@ pub fn try_extract_ai_page_content(
     Ok(PdfiumAiPageContentAttempt::Extracted(pages))
 }
 
+/// Extracts Java-workflow-compatible page text with global page/character budgets.
+///
+/// Requested page numbers are one-based, de-duplicated in caller order, and
+/// validated before extraction. Contextual mode prepends page dimensions and
+/// appends direct image bounds; ingest mode returns raw text only. Character
+/// limits are counted as UTF-16 code units to match Java `String.length()`.
+pub fn try_extract_workflow_page_text(
+    input_path: &Path,
+    filename: &str,
+    requested_pages: &[usize],
+    max_pages: usize,
+    max_characters: usize,
+    contextual: bool,
+) -> Result<PdfiumWorkflowTextAttempt, PdfiumTextError> {
+    let runtime = shared_pdfium_runtime();
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium,
+        Err(details) => {
+            return Ok(PdfiumWorkflowTextAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let pdfium = pdfium
+        .lock()
+        .map_err(|_| PdfiumTextError::RuntimePoisoned)?;
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumTextError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let page_count = usize::try_from(document.pages().len()).unwrap_or_default();
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    if requested_pages.is_empty() {
+        selected.extend(1..=page_count);
+    } else {
+        for &page_number in requested_pages {
+            if page_number == 0 || page_number > page_count {
+                return Err(PdfiumTextError::InvalidPage {
+                    page_number,
+                    page_count,
+                });
+            }
+            if seen.insert(page_number) {
+                selected.push(page_number);
+            }
+        }
+    }
+
+    let mut remaining_characters = max_characters;
+    let mut output = Vec::new();
+    for page_number in selected.into_iter().take(max_pages) {
+        if remaining_characters == 0 {
+            break;
+        }
+        let page_index =
+            i32::try_from(page_number.saturating_sub(1)).map_err(|_| PdfiumTextError::PageIndex)?;
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumTextError::ReadPage {
+                    page_number,
+                    source,
+                })?;
+        let page_text = page.text().map_err(|source| PdfiumTextError::ReadText {
+            page_number,
+            source,
+        })?;
+        let mut text = String::new();
+        for segment in page_text.segments().iter() {
+            let segment = segment.text();
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(segment);
+        }
+        if contextual {
+            text = contextual_workflow_text(&page, &text);
+        }
+        let page_limit = remaining_characters.min(4_000);
+        let text = truncate_utf16(&text, page_limit).trim().to_owned();
+        if text.is_empty() {
+            continue;
+        }
+        remaining_characters = remaining_characters.saturating_sub(text.encode_utf16().count());
+        output.push(PdfiumWorkflowPageText { page_number, text });
+    }
+    Ok(PdfiumWorkflowTextAttempt::Extracted(output))
+}
+
+fn contextual_workflow_text(page: &PdfPage<'_>, extracted_text: &str) -> String {
+    let page_width = page.width().value;
+    let page_height = page.height().value;
+    let mut text = format!(
+        "--- Page dimensions: {page_width:.0}x{page_height:.0} pts (PDF user-space: origin bottom-left, Y up) ---\n{extracted_text}"
+    );
+    let mut images = Vec::new();
+    for object in page.objects().iter() {
+        if object.as_image_object().is_none() {
+            continue;
+        }
+        let Ok(bounds) = object.bounds() else {
+            continue;
+        };
+        let left = bounds.left().value;
+        let bottom = bounds.bottom().value;
+        let right = bounds.right().value;
+        let top = bounds.top().value;
+        let center_x = left.midpoint(right);
+        let center_y = bottom.midpoint(top);
+        let horizontal = if center_x < page_width / 3.0 {
+            "left"
+        } else if center_x > page_width * 2.0 / 3.0 {
+            "right"
+        } else {
+            "center"
+        };
+        let vertical = if center_y < page_height / 3.0 {
+            "bottom"
+        } else if center_y > page_height * 2.0 / 3.0 {
+            "top"
+        } else {
+            "middle"
+        };
+        images.push(format!(
+            "Image {}: position={vertical}-{horizontal}, size={:.0}x{:.0} pts, bounds=(x1={left:.0}, y1={bottom:.0}, x2={right:.0}, y2={top:.0})",
+            images.len() + 1,
+            right - left,
+            top - bottom,
+        ));
+    }
+    if !images.is_empty() {
+        text.push_str("\n\n--- Images on this page ---\n");
+        text.push_str(&images.join("\n"));
+    }
+    text
+}
+
+fn truncate_utf16(value: &str, max_units: usize) -> String {
+    let mut units = 0_usize;
+    value
+        .chars()
+        .take_while(|character| {
+            let width = character.len_utf16();
+            if units.saturating_add(width) > max_units {
+                return false;
+            }
+            units = units.saturating_add(width);
+            true
+        })
+        .collect()
+}
+
+/// Extracts bounded text and image-presence flags from only the first and last
+/// `pages_per_edge` pages. Overlapping indices are de-duplicated.
+///
+/// This avoids walking every page when a classifier needs only a small edge
+/// window, keeping both `PDFium` work and the outbound AI payload bounded.
+///
+/// # Errors
+///
+/// Returns [`PdfiumTextError`] when a configured `PDFium` runtime cannot read
+/// the document. A missing non-configured runtime returns
+/// [`PdfiumAiPageWindowAttempt::Unavailable`].
+pub fn try_extract_ai_page_window_content(
+    input_path: &Path,
+    filename: &str,
+    max_text_characters_per_page: usize,
+    pages_per_edge: usize,
+) -> Result<PdfiumAiPageWindowAttempt, PdfiumTextError> {
+    let runtime = shared_pdfium_runtime();
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium,
+        Err(details) => {
+            return Ok(PdfiumAiPageWindowAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let pdfium = pdfium
+        .lock()
+        .map_err(|_| PdfiumTextError::RuntimePoisoned)?;
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumTextError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let page_count = document.pages().len();
+    let pages_per_edge = i32::try_from(pages_per_edge).unwrap_or(i32::MAX);
+    let page_indices = edge_page_indices(page_count, pages_per_edge);
+
+    let mut pages = Vec::with_capacity(page_indices.len());
+    for page_index in page_indices {
+        let page_number = usize::try_from(page_index).unwrap_or_default() + 1;
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumTextError::ReadPage {
+                    page_number,
+                    source,
+                })?;
+        let has_images = page
+            .objects()
+            .iter()
+            .any(|object| object.as_image_object().is_some());
+        let text = page.text().map_err(|source| PdfiumTextError::ReadText {
+            page_number,
+            source,
+        })?;
+        let mut content = String::new();
+        for segment in text.segments().iter() {
+            let segment = segment.text();
+            let segment = segment.trim();
+            if segment.is_empty() || content.chars().count() >= max_text_characters_per_page {
+                continue;
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            let remaining = max_text_characters_per_page.saturating_sub(content.chars().count());
+            content.extend(segment.chars().take(remaining));
+        }
+        pages.push(PdfiumAiPageWindowContent {
+            page_number,
+            content: PdfiumAiPageContent {
+                text: content,
+                has_images,
+            },
+        });
+    }
+    Ok(PdfiumAiPageWindowAttempt::Extracted(pages))
+}
+
+fn edge_page_indices(page_count: i32, pages_per_edge: i32) -> Vec<i32> {
+    if page_count <= 0 || pages_per_edge <= 0 {
+        return Vec::new();
+    }
+    let mut page_indices = Vec::with_capacity(
+        usize::try_from(page_count).unwrap_or_default().min(
+            usize::try_from(pages_per_edge)
+                .unwrap_or_default()
+                .saturating_mul(2),
+        ),
+    );
+    for page_index in 0..page_count.min(pages_per_edge) {
+        page_indices.push(page_index);
+    }
+    for page_index in page_count.saturating_sub(pages_per_edge).max(0)..page_count {
+        if !page_indices.contains(&page_index) {
+            page_indices.push(page_index);
+        }
+    }
+    page_indices
+}
+
 fn truncate_characters(value: &str, max_characters: usize) -> String {
     value.chars().take(max_characters).collect()
 }
@@ -2064,7 +2357,7 @@ pub fn try_detect_largest_text_title(
     input_path: &Path,
     filename: &str,
 ) -> Result<PdfiumTitleAttempt, PdfiumTextError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2149,7 +2442,7 @@ pub fn try_merge_pdf_paths_to_file(
     generate_toc: bool,
     output_path: &Path,
 ) -> Result<PdfiumMergeAttempt, PdfiumMergeError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2226,7 +2519,7 @@ pub fn try_rotate_pdf_to_file(
     angle: i32,
     output_path: &Path,
 ) -> Result<PdfiumRotateAttempt, PdfiumRotateError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2262,7 +2555,7 @@ pub fn try_remove_pdf_pages_to_file(
     page_numbers: &str,
     output_path: &Path,
 ) -> Result<PdfiumRemoveAttempt, PdfiumRemoveError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2303,7 +2596,7 @@ pub fn try_detect_auto_crop_bounds(
     input_path: &Path,
     filename: &str,
 ) -> Result<PdfiumAutoCropAttempt, PdfiumAutoCropError> {
-    let runtime = PDFIUM.get_or_init(initialize_pdfium);
+    let runtime = shared_pdfium_runtime();
     let pdfium = match &runtime.instance {
         Ok(pdfium) => pdfium,
         Err(details) => {
@@ -2487,32 +2780,6 @@ fn toc_title(filename: &str, document_number: usize) -> String {
     }
 }
 
-fn initialize_pdfium() -> PdfiumRuntime {
-    let configured_path = env::var_os(PDFIUM_LIBRARY_PATH_ENV).map(PathBuf::from);
-    let explicitly_configured = configured_path.is_some();
-    let bindings = match configured_path {
-        Some(path) => Pdfium::bind_to_library(pdfium_library_path(&path)),
-        None => Pdfium::bind_to_system_library(),
-    };
-    PdfiumRuntime {
-        explicitly_configured,
-        instance: bindings.map(Pdfium::new).map(Mutex::new).map_err(|error| {
-            format!(
-                "{error}; set {PDFIUM_LIBRARY_PATH_ENV} to the PDFium shared library or its directory"
-            )
-        }),
-    }
-}
-
-fn pdfium_library_path(configured_path: &Path) -> PathBuf {
-    let path = if configured_path.is_dir() {
-        Pdfium::pdfium_platform_library_name_at_path(configured_path)
-    } else {
-        configured_path.to_owned()
-    };
-    path.canonicalize().unwrap_or(path)
-}
-
 fn load_input<'a>(
     pdfium: &'a Pdfium,
     input: &MergeInput,
@@ -2532,8 +2799,9 @@ mod tests {
     use pdfium_render::prelude::Pdfium;
 
     use super::{
-        add_page_to_auto_split_groups, detect_content_bounds, is_blank_rgba, pdfium_library_path,
+        add_page_to_auto_split_groups, detect_content_bounds, edge_page_indices, is_blank_rgba,
     };
+    use crate::pdfium_runtime::pdfium_library_path;
 
     #[test]
     fn auto_split_keeps_a_first_page_divider_and_drops_later_dividers() {
@@ -2547,6 +2815,15 @@ mod tests {
         }
         groups.retain(|group| !group.is_empty());
         assert_eq!(groups, [vec![0, 1], vec![3, 4]]);
+    }
+
+    #[test]
+    fn edge_page_window_is_bounded_and_de_duplicates_short_documents() {
+        assert_eq!(edge_page_indices(5, 2), [0, 1, 3, 4]);
+        assert_eq!(edge_page_indices(3, 2), [0, 1, 2]);
+        assert_eq!(edge_page_indices(1, 2), [0]);
+        assert!(edge_page_indices(0, 2).is_empty());
+        assert!(edge_page_indices(5, 0).is_empty());
     }
 
     #[test]

@@ -4,10 +4,11 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation:** `cargo fmt`, `cargo check`, and strict
-`cargo clippy --all-targets` pass, as does the full
-`cargo test -p stirling-processing --locked` regression suite. External-runtime
-happy paths remain conditional on their respective tools and services.
+**Latest validation:** `task rust:check` passes the full locked workspace with
+the pinned PDFium runtime: formatting, strict workspace/all-target clippy, 107
+AI-engine unit/binary/integration tests, 362 processing library unit tests, every endpoint
+integration suite, and doc tests. External-runtime happy paths remain
+conditional on their respective tools and services.
 
 ## Ported compatibility endpoints
 
@@ -36,6 +37,14 @@ auto-rename/auto-split, plus:
   Rust engine's examine/deliberate rounds with bounded PDFium text and ruled-table
   CSV evidence; OCR requests remain explicitly unauditable as in Java. See
   `contracts/math-auditor-agent.md`.
+- `ai/health`, `ai/pdf/edit`, `ai/orchestrate`, and `ai/orchestrate/stream` —
+  Java-compatible integration with the separately deployed Rust AI engine. The
+  multipart workflow routes drive bounded NDJSON turns, content extraction/RAG
+  ingest, local policy tool execution, report resume, owner-scoped multi-file
+  downloads, and SSE progress/heartbeat/result/error delivery with disconnect
+  cancellation. Engine auth and user identity come only from trusted runtime
+  state, and anonymous create/edit/draft orchestration remains available while
+  ACL-backed question/review routing requires identity. See `contracts/ai-proxy.md`.
 - `convert/file/pdf` — office/text → PDF via LibreOffice shell-out, with strict HTML
   sanitization and bounded OOXML/ODF package rewriting that removes external relationships.
 - `convert/pdf/word`, `convert/pdf/presentation`, `convert/pdf/xml` — PDF → office
@@ -66,7 +75,8 @@ auto-rename/auto-split, plus:
 - `convert/pdf/pdfa` — PDF/A-1b/2b/3b and PDF/X through Ghostscript, with embedded
   sRGB/Gray ICC profiles and optional strict veraPDF validation.
 - `misc/extract-image-scans` — PDFium page rasterization or raster upload → the
-  embedded OpenCV splitter, with bounded and link-safe PNG/ZIP output.
+  native Rust median-background, mask/contour, and Canny/Hough splitter, with
+  bounded and link-safe PNG/ZIP output and no Python/OpenCV runtime.
 - `convert/pdf/video` — PDFium-rendered frames, native embedded-font watermarking, and
   FFmpeg MP4/WebM encoding. The current Java mapping is commented out while FFmpeg CVEs are
   assessed; Rust exposes the route as a documented opt-in cutover endpoint.
@@ -107,15 +117,17 @@ auto-rename/auto-split, plus:
   link-safe storage, and administrator-only mutation. `security/cert-sign` now accepts
   `certType=SERVER`; an authenticated endpoint fixture independently verifies the returned PDF CMS.
 - `config/login-disclaimer` — live bounded markdown lookup with Java-compatible
-  locale fallback and authentication-safe rejection while login remains unported.
+  locale fallback. The reviewed secured router also exposes administrator-only
+  list/read/update/clear management under `admin/login-agreement`, using atomic
+  link-safe writes. See `contracts/login-agreement-admin.md`.
 - `info/status`, `info/health`, request/load counters, uptime, and `info/wau` —
   process-local Java-compatible metrics and no-login weekly-active-browser tracking,
   governed by `metrics.enabled`.
 - `ui-data/footer-info`, `home`, `licenses`, `pipeline`, `ocr-pdf`, and `sign` —
   read-only client metadata from the Rust runtime tree: legal/analytics settings,
   survey visibility, bundled notices, pipeline templates, Tesseract languages, and
-  shared-signature/font discovery. Personalized signatures remain authentication-owned;
-  the Rust dependency manifest is generated from `Cargo.lock` at build time, with
+  shared-signature/font discovery. The Rust dependency manifest is generated from
+  `Cargo.lock` at build time, with
   `UNKNOWN` and native-tool notices retained as release-compliance gates.
 - `GET /js/additionalLanguageCode.js` — legacy language-bootstrap JavaScript with
   build-time bundled locales and the configured `ui.languages` allowlist.
@@ -123,6 +135,11 @@ auto-rename/auto-split, plus:
   `system.googlevisibility` or `SYSTEM_GOOGLEVISIBILITY`.
 - `general/signatures/{filename}` — shared PNG/JPEG signature-asset retrieval in
   no-login mode, with basename validation and symlink rejection.
+- Secured `proprietary/signatures` management plus authenticated
+  `general/signatures/{filename}` lookup — bounded personal/shared PNG/JPEG assets,
+  Java-compatible JSON sidecars and legacy-image fallback, personal quotas,
+  personal-first reads, and administrator-only shared mutations. See
+  `contracts/personal-signatures.md`.
 - `mobile-scanner/*` — anonymous QR-session transfer with multipart upload,
   safe temporary storage, ten-minute inactivity expiry, download-after-read cleanup,
   and `system.enableMobileScanner` feature gating.
@@ -131,6 +148,38 @@ auto-rename/auto-split, plus:
   and confirmed SISO/MISO execution shapes. See `contracts/pipeline.md`.
 - Watched-folder pipelines — 60-second runtime-owned scans, stable-file and exclusive-lock
   readiness checks, safe `processing` handoff/rollback, and Java-compatible output naming.
+- Conditional `general/send-email` — bounded HTML MIME plus one attachment through the existing
+  `mail.*` SMTP relay settings, including authentication and plaintext/STARTTLS/implicit-TLS
+  modes. The same relay now delivers invitation links and administrator-generated password-change
+  notifications with optional temporary credentials. Rust deliberately rejects wildcard
+  certificate trust and disabled hostname verification.
+  See `contracts/send-email.md`.
+- Secured audit APIs — all six `/api/v1/audit/*` dashboard routes plus the eight proprietary
+  UI-data audit routes query the durable Rust store with Java-compatible pagination,
+  single/multi-value and local-date filters, chart/KPI aggregation, CSV/JSON exports, retention,
+  clear-all behavior, and endpoint-visit statistics. One post-handler production event now replaces
+  the old mutation pair, including Java's GET/type, WEB/API/AI/AUTOMATION, polling, and fail-open
+  semantics. Principal/source/JSON attribution survives user deletion and legacy Rust-schema
+  migration; queries and exports have explicit resource bounds. Every route and audit capture
+  itself require a verified Enterprise tier. See `contracts/audit.md`.
+- Secured self-hosted `usage/fleet-stats` — administrator-only deployed-editor, active-WEB-editor,
+  and cumulative processed-PDF aggregates with Java's STANDARD-audit nullability, internal-user
+  exclusion, active/deployed clamp, indexed durable queries, and live typed processing-event
+  capture, guarded by the verified Enterprise tier. See `contracts/fleet-usage.md`.
+- Commercial entitlement policy — exact Java `@PremiumEndpoint` and `@EnterpriseEndpoint`
+  method/path matrices, immutable Normal/Server/Enterprise tiers, Java-compatible license
+  ProblemDetails, and Enterprise-only audit capture. The reviewed runtime now derives its startup
+  tier from pinned-key Ed25519 certificate/`key/` verification or the fixed-account online Keygen
+  validation and floating-machine activation flow. Dynamic status refreshes every seven days while
+  route aspects retain Java's startup snapshot. See `contracts/license-entitlement.md`.
+- Secured administrator license lifecycle — installation fingerprint, direct-key save/clear,
+  one-shot resync, live license information, and bounded offline `.lic`/`.cert` upload with
+  backup-before-atomic-replacement. Mutations persist through the shared settings writer and update
+  the same live configuration consumed by weekly refresh without treating a configured key as an
+  entitlement. See `contracts/license-entitlement.md`.
+- Secured `ui-data/tessdata-languages` and `ui-data/tessdata/download` — administrator-only
+  installed/official language discovery with a ten-minute cache plus bounded, atomic, link-safe
+  `.traineddata` installation under the configured runtime directory. See `contracts/ui-data.md`.
 
 ## Remaining (not yet ported)
 
@@ -140,8 +189,9 @@ auto-rename/auto-split, plus:
   bounded page-font resource/program export, and an initial pure-Rust parser for page and Form
   XObject text-showing content streams are ported. Text runs preserve device fill/stroke colours,
   rendering mode, and simple-font `/Widths` geometry. Type0 `/ToUnicode` source codes and
-  horizontal descendant `/DW`/`/W` advances are now applied; Type3 outlines, vertical `/W2`,
-  arbitrary CMap fallback and embedded-font reconstruction remain. Direct and Form-nested image
+  horizontal descendant `/DW`/`/W` advances are now applied. Vertical Type0 writing applies
+  `/DW2` defaults and both `/W2` forms to glyph origins, displacement, and `TJ` movement; Type3
+  outlines, non-identity CMap code-to-CID mapping and embedded-font reconstruction remain. Direct and Form-nested image
   XObjects now export page-space transforms
   and bounded JPEG or 1/2/4/8/16-bit RGB/gray/CMYK image data, apply `/Decode` ranges and grayscale
   `/SMask` alpha, and expand packed 1/2/4/8-bit Indexed images with Gray/RGB/CMYK palettes;
@@ -179,6 +229,14 @@ auto-rename/auto-split, plus:
 
 Distributed job storage/backplane, cross-node queue/retry semantics, generic async execution for
 the Java-only/control routes, and generic OIDC/SAML/desktop identity remain. The
+opt-in Tauri native-launch path now receives an unconditional ephemeral-port
+handshake, desktop/base-path/login-agreement environment, legacy-workspace
+migration, a bounded startup wait, early-exit reporting, stale-port cleanup,
+PID/start-time parent-death enforcement, and atomic fresh-install settings/template
+initialization. Java remains the packaged/default backend; Java-compatible
+short-file backup and upgrade-template merging, PDFium/sidecar packaging,
+cross-platform upgrade proof, and the production default switch remain. See
+`contracts/desktop-native-startup.md`. The
 hardware-signing capability route reports desktop mode
 and safely discovers on-disk PKCS#11 libraries without loading them. Windows desktop builds can
 also enumerate current-user signing certificates without exporting key material or prompting for a
@@ -196,11 +254,22 @@ hardware signing remains desktop-loopback gated.
 
 An opt-in secured router now provides durable local BCrypt identities, persistent lockout,
 revocable rotating opaque sessions, digest-only one-time-issued API keys, AES-GCM-protected TOTP
-seeds with replay protection, roles, teams, one-time invitations, local-user administration, and
-mutation audit attempt/outcome records. Password, username, role, team, and account-state changes
+seeds with replay protection, roles, teams, one-time invitations, local-user administration,
+typed post-handler audit records, and administrator audit retrieval/export/retention/statistics.
+Password, username, role, team, and account-state changes
 revoke live sessions, and the repository preserves at least one enabled administrator. Existing
 foundation databases are backfilled into the Default team. Java-compatible local user/team/invite
-routes are covered by negative and end-to-end HTTP tests. API-key retrieval intentionally does not
+routes are covered by negative and end-to-end HTTP tests. Public self-registration now creates a
+disabled Default-team user under the Java-compatible five-user community ceiling; authenticated
+users can transactionally replace their durable settings and complete initial setup through the
+legacy route names. Administrator bulk invitations now create forced-change accounts, deliver
+Java-compatible generated credentials, preserve partial-result and missing-team behavior, and
+enforce the same community ceiling transactionally. See `contracts/account-lifecycle.md`.
+Optional invite-link delivery now reuses
+the bounded SMTP relay, reports confirmed delivery without discarding tokens on relay failure, and
+uses the configured frontend/backend URL precedence. Administrator password changes support random
+credentials, optional SMTP delivery, durable forced-change state, and atomic session revocation;
+self-service completion clears the flag. API-key retrieval intentionally does not
 recreate Java's recoverable plaintext storage: callers rotate to receive a new value exactly once.
 Supabase/SaaS bearer JWTs now use a strict public-key JWKS verifier with HTTPS issuer controls,
 bounded response/cache/key selection, explicit algorithm allowlisting, issuer/expiry/audience and
@@ -208,8 +277,8 @@ required-claim validation. Verified subjects are persisted by `(issuer, subject)
 email, receive isolated personal teams, support one-way anonymous upgrade, and retain live local
 role/disable policy on every request. Deleted external subjects receive tombstones so a still-live
 upstream token cannot silently recreate them. Async jobs, status, cancellation, metadata, and
-downloads are now owner-scoped by trusted `AuthContext`. SMTP invites/password delivery, recovery
-codes, generic OIDC login, SAML2, desktop callbacks, device identities, ownership for additional
+downloads are now owner-scoped by trusted `AuthContext`. Recovery codes, generic OIDC login,
+SAML2, desktop callbacks, device identities, ownership for additional
 durable proprietary resources, and independent security review remain.
 
 The standalone Rust runtime now performs bounded startup discovery for its optional
@@ -232,8 +301,8 @@ serialized login/sign/logout session. Windows-store signing similarly keeps the 
 provider and has an opt-in live endpoint fixture. Managed server signing uses an encrypted
 PKCS#12 file re-wrapped with a separately generated password (or an explicit deployment secret),
 rejects links and malformed key/certificate pairs, and is mounted only in the opt-in secured
-router. Java's proprietary license entitlement has not yet been ported, and Windows secret-file
-ACL hardening plus an external KMS/HSM option remain review gates. A live SoftHSM/token compatibility
+router. Static proprietary route entitlement and trusted Keygen tier derivation are ported; Windows
+secret-file ACL hardening plus an external KMS/HSM option remain review gates. A live SoftHSM/token compatibility
 matrix, broader Windows smart-card coverage, and uncommon legacy PEM ciphers/curves
 remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
@@ -261,6 +330,51 @@ binary now performs idempotent Python-store cutover to Rust SQLite or pgvector:
 it preserves pages, metadata, TTL and read ACLs while re-embedding content
 without loading the sqlite-vec extension, and fails closed on unreconstructable
 legacy records.
+
+The processing service now owns the complete Java-facing AI controller surface.
+Its orchestration routes are a real state-machine port rather than a multipart
+pass-through: uploads receive stable content IDs; requested pages are extracted
+or ingested; plans run through the same bounded internal policy dispatcher;
+structured reports can resume the engine; every output receives an owned file ID;
+and engine NDJSON is translated to sync JSON or SSE with disconnect cancellation.
+The engine defers identity enforcement until capability routing, allowing
+anonymous edit/create/draft work while still returning 401 before ACL-backed
+question/review delegation. See `contracts/ai-proxy.md`.
+
+The reviewed secured router now owns API-key MCP phase one at `POST /mcp`, including
+bounded JSON-RPC transport, protocol negotiation, trusted API-key identity, capability
+manifest caching/filtering, and the two executable AI tools. OAuth/JWT metadata,
+artifact upload/download storage, PDF category tools, and production secured-mode
+cutover remain explicit later phases. See `contracts/mcp.md`.
+
+The same reviewed router now owns resource-grant administration and encrypted
+S3/MCP/API integration-config CRUD. Ownership, team-leader/default/grant rules,
+disabled/locked behavior, recursive secret masking/merge, Java-compatible AES-GCM
+rows, and transactional cleanup are covered. Conditional team-scoped policy/source
+configuration now uses the Java logical tables, encrypted JSON rows, UUID/order semantics,
+folder allowlists, source document-count projections, S3 `connectionId` resolution, source/
+integration deletion conflicts, policy-overview projections, and schedule/folder-watch definition
+validation. Ad-hoc and stored uploaded runs now use the shared bounded job queue and pipeline
+dispatcher, including named supporting assets, owner-scoped status/listing, generic file downloads,
+result MIME preservation, and admitted editor-counter writes. A Java-compatible durable processed-
+file ledger now supplies atomic claims, bounded interrupted retries, settlement/output consensus,
+presence cleanup, and boot recovery. `FULL`/`LIGHT` folder and S3 source sweeps consume that ledger;
+inline, atomic folder, and conditional S3 sinks complete delivery. Manual trigger/history routes,
+trigger metadata, wall-clock schedules, debounced folder events, startup reconciliation, and
+periodic reconciliation are active in the reviewed runtime. Ad-hoc streamed runs emit
+Java-compatible started/completed step events and a terminal owner-scoped run view without
+cancelling work on disconnect. Java's dormant `WAITING_FOR_INPUT` scaffolding has no live resume
+route to port, while automatic trigger state is process-local pending the broader distributed
+runtime. See
+`contracts/resource-access-integrations.md` and
+`contracts/policy-config.md`.
+
+The processing service now also ports team-scoped classification-label CRUD
+and the `classify-and-label` PDF bridge. Label mutation is administrator-only in
+the reviewed secured router, open mode uses team sentinel `0`, and the bridge
+reads only a bounded de-duplicated first-two/last-two page window before writing
+the focused `StirlingPDFClassification` Info entry. See
+`contracts/classification-labels.md`.
 See `contracts/ai-engine-foundation.md` and
 `contracts/pdf-comment-agent.md`.
 
@@ -277,15 +391,15 @@ Rust AI engine receives only the two typed protocol messages. See
 
 The self-contained document-classifier route is also live:
 it is available at `POST /api/v1/documents/classify` only with a configured
-structured-output provider (Anthropic Messages or OpenAI-compatible). It remains
-absent from the MCP capability manifest while the rest of that agent surface is
-still Python-owned.
+structured-output provider (Anthropic Messages or OpenAI-compatible). The curated
+MCP capability manifest intentionally excludes this internal classification
+primitive; it advertises only the eight user-facing capabilities shared with the
+legacy oracle.
 
 ## How to find gaps precisely
 
-```bash
-# Java mapping paths:
-grep -rhoE '"/[a-zA-Z0-9/_-]+"' app/core/src/main/java/stirling/software/SPDF/controller/api/
-# Ported routes:
-grep -oE '"/api/v1/[a-zA-Z0-9/_-]+"' rust/crates/stirling-processing/src/lib.rs
-```
+Use `docs/contracts/legacy-runtime-baseline.md` for the cross-surface baseline and
+the contract files in `rust/contracts/` for implemented behavior and explicit
+gaps. Source-literal counts are not authoritative because Spring composes class
+and method mappings while the Rust service composes public, conditional, and
+review-only secured routers.

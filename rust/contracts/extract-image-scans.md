@@ -6,7 +6,7 @@ Rust compatibility contract for `ExtractImageScansController`.
 
 - Content type: `multipart/form-data`
 - `fileInput`: required PDF or raster upload. A `.pdf` filename is rendered page by
-  page; any other filename is passed to OpenCV as an image.
+  page; any other filename is decoded by the native Rust image pipeline.
 - Integer parameters: `angleThreshold`, `tolerance`, `minArea`,
   `minContourArea`, and `borderSize`. They preserve Java's primitive binding
   behavior: omitted values are `0`; malformed values return `400`.
@@ -17,29 +17,37 @@ ZIP entries are `<base>_processed_1.png`, `<base>_processed_2.png`, and so on.
 
 ## Processing and availability
 
-Rust embeds the repository's exact `split_photos.py` OpenCV script in the service
-binary and writes it into a request-scoped temporary directory. PDF input is first
-rendered to RGB PNG pages through PDFium at `SYSTEM_MAXDPI` (default 500), matching
-the Java controller's maximum-DPI rendering behavior. Each page, or the one raster
-input, is then passed to the script with the Java argument names.
+PDF input is first rendered to RGB PNG pages through PDFium at `SYSTEM_MAXDPI`
+(default 500), matching the Java controller's maximum-DPI rendering behavior. Each
+page, or the one raster input, is then processed entirely in Rust:
 
-Set `STIRLING_PROCESSING_PYTHON_COMMAND` to an exact Python command. Otherwise Rust
-tries `python.exe`, `python`, `py.exe`, then `py` on Windows, or `python3` then
-`python` elsewhere. An unconfigured absent interpreter returns `501`; a configured
-missing interpreter, a Python/OpenCV failure, or output I/O failure returns `500`.
-A missing PDFium runtime returns `501` when the input is PDF.
+- the channel-wise median of the four corners and centre estimates the background;
+- the tolerance range is inverted into a foreground mask, followed by two 5x5
+  dilations;
+- top-level external contours provide the scan bounds;
+- an optional constant background border is added before detection;
+- Canny edges at 50/150 feed a one-degree polar Hough transform with the script's
+  200-vote threshold. The median line angle is applied in a fixed-size bicubic
+  rotation with replicated border pixels when it meets `angleThreshold`;
+- the requested border is removed only when both output dimensions remain positive.
+
+No Python command or OpenCV module is required. Invalid raster data, dimensions,
+encoding, or output I/O returns `500`. A missing PDFium runtime returns `501` only
+when the input is PDF.
 
 ## Safety and parity
 
 Output files are sorted, limited to 100,000 files and 2,000 MiB, and symbolic links
-from the external script are rejected before copying or archiving. The script is the
-same implementation used by Java, including its current behavior where
-`minArea`/`minContourArea` are passed on the command line but not forwarded by the
-script's internal `find_photo_boundaries` call.
+are rejected before copying or archiving. Rust deliberately preserves the script's
+current effective thresholds: although `minArea` and `minContourArea` are accepted,
+the internal boundary call uses 10,000 bounding-box pixels and 500 contour-area
+pixels because the script never forwarded the supplied values.
 
 The Java endpoint does not impose a MIME-type restriction and neither does Rust.
 
 ## Verification
 
-Unit tests cover option spelling and output naming. HTTP tests cover the required
-upload and malformed integer options before any external runtime is started.
+Deterministic synthetic-image unit tests cover five-point background estimation,
+mask dilation and bounds, effective minimum thresholds, Hough median rotation, safe
+border removal, and output naming. HTTP tests cover required/malformed fields and
+successful native PNG extraction without an external runtime.

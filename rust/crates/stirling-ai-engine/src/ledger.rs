@@ -19,10 +19,13 @@ pub enum FolioType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FolioManifest {
+    #[serde(alias = "session_id")]
     pub session_id: String,
+    #[serde(alias = "page_count")]
     pub page_count: u32,
+    #[serde(alias = "folio_types")]
     pub folio_types: Vec<FolioType>,
     #[serde(default = "default_round")]
     pub round: u8,
@@ -84,16 +87,16 @@ pub struct Requisition {
 
 /// Extracted evidence for one page of the source PDF.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Folio {
     pub page: usize,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
     pub tables: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "ocr_text")]
     pub ocr_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "ocr_confidence")]
     pub ocr_confidence: Option<f64>,
 }
 
@@ -110,14 +113,15 @@ impl Folio {
 
 /// Java's fulfilment of a ledger-auditor requisition.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Evidence {
+    #[serde(alias = "session_id")]
     pub session_id: String,
     pub folios: Vec<Folio>,
     pub round: u8,
-    #[serde(default)]
+    #[serde(default, alias = "final_round")]
     pub final_round: bool,
-    #[serde(default)]
+    #[serde(default, alias = "unauditable_pages")]
     pub unauditable_pages: Vec<usize>,
 }
 

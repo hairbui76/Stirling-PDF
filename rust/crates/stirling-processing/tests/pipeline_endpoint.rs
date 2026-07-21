@@ -1,12 +1,13 @@
 use std::io::{Cursor, Read};
 
 use axum::{
+    Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
     response::Response,
 };
 use lopdf::{Document, Object, Stream, dictionary};
-use serde_json::json;
+use serde_json::{Value, json};
 use stirling_processing::app;
 use tower::ServiceExt;
 use zip::ZipArchive;
@@ -116,7 +117,67 @@ async fn rejects_operations_outside_the_internal_dispatch_allowlist()
     Ok(())
 }
 
+#[tokio::test]
+async fn pipeline_can_run_through_the_generic_async_job_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let router = app(4 * 1024 * 1024);
+    let response = post_pipeline_to(
+        &router,
+        "/api/v1/pipeline/handleData?async=true",
+        vec![("async.pdf", pdf_with_rotations(&[0, 90])?)],
+        json!({
+            "pipeline": [
+                { "operation": "/api/v1/general/rotate-pdf", "parameters": { "angle": 90 } }
+            ]
+        }),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let started: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+    let job_id = started["jobId"].as_str().ok_or("jobId missing")?;
+
+    let status = wait_for_completed_job(&router, job_id).await?;
+    assert!(status["error"].is_null());
+    let result = get(&router, &format!("/api/v1/general/job/{job_id}/result")).await?;
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(
+        result.headers()[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        page_rotations(&response_bytes(result).await?)?,
+        vec![90, 180]
+    );
+
+    let files = get(
+        &router,
+        &format!("/api/v1/general/job/{job_id}/result/files"),
+    )
+    .await?;
+    assert_eq!(files.status(), StatusCode::OK);
+    let files: Value = serde_json::from_slice(&response_bytes(files).await?)?;
+    assert_eq!(files["fileCount"], 1);
+    assert_eq!(files["files"][0]["contentType"], "application/octet-stream");
+    assert_eq!(files["files"][0]["fileName"], "async.pdf");
+    Ok(())
+}
+
 async fn post_pipeline(
+    files: Vec<(&str, Vec<u8>)>,
+    config: serde_json::Value,
+) -> Result<Response, Box<dyn std::error::Error>> {
+    post_pipeline_to(
+        &app(4 * 1024 * 1024),
+        "/api/v1/pipeline/handleData",
+        files,
+        config,
+    )
+    .await
+}
+
+async fn post_pipeline_to(
+    router: &Router,
+    uri: &str,
     files: Vec<(&str, Vec<u8>)>,
     config: serde_json::Value,
 ) -> Result<Response, Box<dyn std::error::Error>> {
@@ -127,11 +188,12 @@ async fn post_pipeline(
     }
     add_text_part(&mut body, boundary, "json", &config.to_string());
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Ok(app(4 * 1024 * 1024)
+    Ok(router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/pipeline/handleData")
+                .uri(uri)
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={boundary}"),
@@ -139,6 +201,31 @@ async fn post_pipeline(
                 .body(Body::from(body))?,
         )
         .await?)
+}
+
+async fn get(router: &Router, uri: &str) -> Result<Response, Box<dyn std::error::Error>> {
+    Ok(router
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty())?)
+        .await?)
+}
+
+async fn wait_for_completed_job(
+    router: &Router,
+    job_id: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    for _ in 0..100 {
+        let response = get(router, &format!("/api/v1/general/job/{job_id}")).await?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("job status returned HTTP {}", response.status()).into());
+        }
+        let status: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+        if status["complete"] == Value::Bool(true) {
+            return Ok(status);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Err(std::io::Error::other("job did not complete").into())
 }
 
 fn add_file_part(body: &mut Vec<u8>, boundary: &str, filename: &str, content: &[u8]) {

@@ -24,6 +24,7 @@ pub mod pdf_edit;
 pub mod pdf_question;
 pub mod pdf_review;
 pub mod pgvector_documents;
+mod progress;
 pub mod structured_output;
 pub mod user_spec;
 
@@ -55,7 +56,9 @@ use crate::{
     execution::{AgentExecutionRequest, ExecutionPlanningAgent},
     ledger_auditor::{AuditError, LedgerAuditor},
     openai::OpenAiClassifierModel,
-    orchestrator::{OrchestratorAgent, OrchestratorDelegates, OrchestratorRequest},
+    orchestrator::{
+        OrchestratorAgent, OrchestratorDelegates, OrchestratorError, OrchestratorRequest,
+    },
     pdf_comment::{PdfCommentAgent, PdfCommentError},
     pdf_create::PdfCreateAgent,
     pdf_edit::{PdfEditAgent, PdfEditError, PdfEditRequest},
@@ -1240,13 +1243,7 @@ async fn orchestrate(
     user_id: Option<Extension<UserId>>,
     Json(request): Json<OrchestratorRequest>,
 ) -> Response {
-    let Some(user_id) = document_user(user_id.as_ref()).map(str::to_owned) else {
-        return missing_document_user_response();
-    };
-    let documents = match &runtime.documents {
-        Ok(documents) => Arc::clone(documents),
-        Err(error) => return document_store_unavailable_response(error),
-    };
+    let user_id = document_user(user_id.as_ref()).map(str::to_owned);
     let worker_timeout =
         match Duration::try_from_secs_f64(runtime.settings.chunked_reasoner_worker_timeout_seconds)
         {
@@ -1258,26 +1255,55 @@ async fn orchestrate(
                 );
             }
         };
-    let agent = OrchestratorAgent::new(
-        runtime.model.clone(),
-        OrchestratorDelegates {
-            pdf_question: pdf_question_agent(&runtime, Arc::clone(&documents)),
-            pdf_edit: pdf_edit_agent(&runtime, worker_timeout),
-            pdf_review: pdf_review_agent(&runtime, documents, worker_timeout),
-            pdf_create: PdfCreateAgent::new(
-                runtime.smart_model.clone(),
-                runtime.settings.smart_model_max_tokens(),
-                worker_timeout,
-                10,
-            ),
-            user_spec: user_spec_agent(&runtime, worker_timeout),
-        },
-        runtime.settings.fast_model_max_tokens(),
-        worker_timeout,
-    );
+    let agent =
+        OrchestratorAgent::new(
+            runtime.model.clone(),
+            OrchestratorDelegates {
+                pdf_question: runtime
+                    .documents
+                    .as_ref()
+                    .ok()
+                    .map(|documents| pdf_question_agent(&runtime, Arc::clone(documents))),
+                pdf_edit: pdf_edit_agent(&runtime, worker_timeout),
+                pdf_review: runtime.documents.as_ref().ok().map(|documents| {
+                    pdf_review_agent(&runtime, Arc::clone(documents), worker_timeout)
+                }),
+                pdf_create: PdfCreateAgent::new(
+                    runtime.smart_model.clone(),
+                    runtime.settings.smart_model_max_tokens(),
+                    worker_timeout,
+                    10,
+                ),
+                user_spec: user_spec_agent(&runtime, worker_timeout),
+            },
+            runtime.settings.fast_model_max_tokens(),
+            worker_timeout,
+        );
+    let anonymous_route = if user_id.is_none() {
+        let route = match agent.resolve_route(&request).await {
+            Ok(route) => route,
+            Err(error) => return orchestrator_error_response(error),
+        };
+        if route.requires_principal() {
+            return missing_document_user_response();
+        }
+        Some(route)
+    } else {
+        None
+    };
     let (sender, receiver) = mpsc::channel::<String>(16);
     tokio::spawn(async move {
-        let operation = agent.handle(&request, &user_id);
+        let operation = progress::scope(sender.clone(), async move {
+            if let Some(route) = anonymous_route {
+                agent.handle_resolved(&request, None, route).await
+            } else if let Some(principal) = user_id.as_deref() {
+                agent.handle(&request, principal).await
+            } else {
+                Err(OrchestratorError::InvalidRequest(
+                    "X-User-Id header is required".to_owned(),
+                ))
+            }
+        });
         tokio::pin!(operation);
         let mut heartbeat =
             tokio::time::interval(Duration::from_secs(ORCHESTRATOR_HEARTBEAT_SECONDS));
@@ -1311,6 +1337,23 @@ async fn orchestrate(
     response
 }
 
+fn orchestrator_error_response(error: OrchestratorError) -> Response {
+    match error {
+        OrchestratorError::ModelUnavailable(message) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, message)
+        }
+        OrchestratorError::InvalidRequest(message) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+        }
+        OrchestratorError::Model(message)
+        | OrchestratorError::PdfQuestion(message)
+        | OrchestratorError::PdfEdit(message)
+        | OrchestratorError::PdfReview(message)
+        | OrchestratorError::PdfCreate(message)
+        | OrchestratorError::UserSpec(message) => error_response(StatusCode::BAD_GATEWAY, message),
+    }
+}
+
 async fn enforce_request_guards(
     axum::extract::State(settings): axum::extract::State<Arc<EngineSettings>>,
     mut request: Request,
@@ -1341,7 +1384,7 @@ async fn enforce_request_guards(
     if let Some(user_id) = user_id {
         request.extensions_mut().insert(UserId(user_id));
     } else if settings.require_user_id {
-        return error_response(StatusCode::BAD_REQUEST, "X-User-Id header is required");
+        return error_response(StatusCode::UNAUTHORIZED, "X-User-Id header is required");
     }
     next.run(request).await
 }
@@ -1419,7 +1462,7 @@ mod tests {
 
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        http::{Request, StatusCode},
     };
     use tower::ServiceExt;
 
@@ -1721,7 +1764,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(missing_user.status(), 400);
+        assert_eq!(missing_user.status(), 401);
         assert_eq!(invalid_secret.status(), 401);
         assert_eq!(accepted.status(), 200);
         Ok(())
@@ -1744,7 +1787,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(missing_user.status(), 400);
+        assert_eq!(missing_user.status(), 401);
         assert_eq!(accepted.status(), 200);
         Ok(())
     }
@@ -2421,6 +2464,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orchestrator_streams_long_document_progress_before_the_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app_with_classifier(
+            EngineSettings::new("smart", "fast", "", false)
+                .with_rag_limits(20, 1)
+                .with_chunked_reasoner_limits(20, 2, 60.0, 10_000),
+            Arc::new(StubClassifierModel),
+        );
+        let ingested = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/documents")
+                    .header("X-User-Id", "alice")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "documentId":"progress-report",
+                            "source":"progress-report.pdf",
+                            "pageText":[
+                                {"pageNumber":1,"text":"Invoice total: 120.00."},
+                                {"pageNumber":2,"text":"Payment is due in 30 days."}
+                            ],
+                            "ownerId":"alice",
+                            "readPrincipals":["alice"],
+                            "expiresAt":null
+                        }"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(ingested.status(), 200);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/orchestrator")
+                    .header("X-User-Id", "alice")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "userMessage":"What is the invoice total?",
+                            "files":[{"id":"progress-report","name":"progress-report.pdf"}]
+                        }"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), 200);
+        let body = to_bytes(response.into_body(), 65_536).await?;
+        let frames = std::str::from_utf8(&body)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let phases = frames
+            .iter()
+            .filter_map(|frame| frame["phase"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                "whole_doc_read_started",
+                "whole_doc_slice_done",
+                "whole_doc_slice_done",
+                "whole_doc_read_done"
+            ]
+        );
+        assert_eq!(frames[0]["event"], "progress");
+        assert_eq!(frames[0]["pages"], 2);
+        assert_eq!(frames[0]["slices"], 2);
+        assert!(frames[1].get("durationMs").is_some());
+        assert!(frames[3].get("durationSeconds").is_some());
+        assert_eq!(
+            frames.last().and_then(|frame| frame["event"].as_str()),
+            Some("result")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn orchestrator_pdf_review_math_resume_builds_anchored_comment_plan()
     -> Result<(), Box<dyn std::error::Error>> {
         let app = app_with_classifier(
@@ -2490,12 +2609,11 @@ mod tests {
     async fn orchestrator_pdf_create_assembles_structured_document_plan()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = app_with_classifier(
-            EngineSettings::new("smart", "fast", "", false),
+            EngineSettings::new("smart", "fast", "", false).with_documents_backend("unavailable"),
             Arc::new(StubClassifierModel),
         )
         .oneshot(
             Request::post("/api/v1/orchestrator")
-                .header("X-User-Id", "alice")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"userMessage":"Create an invoice for Acme Corp."}"#,
@@ -2552,7 +2670,6 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/api/v1/orchestrator")
-                    .header("X-User-Id", "alice")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{
@@ -2572,7 +2689,6 @@ mod tests {
         let resumed = app
             .oneshot(
                 Request::post("/api/v1/orchestrator")
-                    .header("X-User-Id", "alice")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{
@@ -2784,6 +2900,301 @@ mod tests {
         )
         .await?;
         assert_eq!(response.status(), 401);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table intentionally keeps every POST wire contract visible together"
+    )]
+    async fn post_routes_accept_python_field_names_and_reject_unknown_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct WireCase {
+            path: &'static str,
+            camel: serde_json::Value,
+            snake: serde_json::Value,
+        }
+
+        let cases = vec![
+            WireCase {
+                path: "/api/v1/documents",
+                camel: serde_json::json!({
+                    "documentId": "camel-document",
+                    "source": "camel.pdf",
+                    "pageText": [],
+                    "ownerId": "wire-user",
+                    "readPrincipals": ["wire-user"],
+                    "expiresAt": null
+                }),
+                snake: serde_json::json!({
+                    "document_id": "snake-document",
+                    "source": "snake.pdf",
+                    "page_text": [],
+                    "owner_id": "wire-user",
+                    "read_principals": ["wire-user"],
+                    "expires_at": null
+                }),
+            },
+            WireCase {
+                path: "/api/v1/documents/classify",
+                camel: serde_json::json!({
+                    "fileName": "camel.pdf",
+                    "pages": [{"pageNumber": 1, "text": "invoice"}],
+                    "labels": [{"id": "invoice", "name": "Invoice"}]
+                }),
+                snake: serde_json::json!({
+                    "file_name": "snake.pdf",
+                    "pages": [{"page_number": 1, "text": "invoice"}],
+                    "labels": [{"id": "invoice", "name": "Invoice"}]
+                }),
+            },
+            WireCase {
+                path: "/api/v1/ai/math-auditor-agent/examine",
+                camel: serde_json::json!({
+                    "sessionId": "camel-audit",
+                    "pageCount": 1,
+                    "folioTypes": ["text"],
+                    "round": 1
+                }),
+                snake: serde_json::json!({
+                    "session_id": "snake-audit",
+                    "page_count": 1,
+                    "folio_types": ["text"],
+                    "round": 1
+                }),
+            },
+            WireCase {
+                path: "/api/v1/ai/math-auditor-agent/deliberate",
+                camel: serde_json::json!({
+                    "sessionId": "camel-audit",
+                    "folios": [{
+                        "page": 1,
+                        "text": "Revenue: 500 + 300 = 900",
+                        "ocrText": null,
+                        "ocrConfidence": null
+                    }],
+                    "round": 1,
+                    "finalRound": false,
+                    "unauditablePages": []
+                }),
+                snake: serde_json::json!({
+                    "session_id": "snake-audit",
+                    "folios": [{
+                        "page": 1,
+                        "text": "Revenue: 500 + 300 = 900",
+                        "ocr_text": null,
+                        "ocr_confidence": null
+                    }],
+                    "round": 1,
+                    "final_round": false,
+                    "unauditable_pages": []
+                }),
+            },
+            WireCase {
+                path: "/api/v1/ai/pdf-comment-agent/generate",
+                camel: serde_json::json!({
+                    "sessionId": "camel-comment",
+                    "userMessage": "Review this PDF.",
+                    "chunks": []
+                }),
+                snake: serde_json::json!({
+                    "session_id": "snake-comment",
+                    "user_message": "Review this PDF.",
+                    "chunks": []
+                }),
+            },
+            WireCase {
+                path: "/api/v1/pdf/questions",
+                camel: serde_json::json!({
+                    "question": "What is this?",
+                    "files": [],
+                    "conversationHistory": [{"role": "user", "content": "Earlier"}]
+                }),
+                snake: serde_json::json!({
+                    "question": "What is this?",
+                    "files": [],
+                    "conversation_history": [{"role": "user", "content": "Earlier"}]
+                }),
+            },
+            WireCase {
+                path: "/api/v1/pdf/edit",
+                camel: serde_json::json!({
+                    "userMessage": "Rotate this PDF.",
+                    "conversationHistory": [],
+                    "pageText": [{
+                        "fileName": "camel.pdf",
+                        "pages": [{"pageNumber": 1, "text": "page"}]
+                    }],
+                    "enabledEndpoints": []
+                }),
+                snake: serde_json::json!({
+                    "user_message": "Rotate this PDF.",
+                    "conversation_history": [],
+                    "page_text": [{
+                        "file_name": "snake.pdf",
+                        "pages": [{"page_number": 1, "text": "page"}]
+                    }],
+                    "enabled_endpoints": []
+                }),
+            },
+            WireCase {
+                path: "/api/v1/agents/draft",
+                camel: serde_json::json!({
+                    "userMessage": "Build an agent that rotates PDFs.",
+                    "conversationHistory": []
+                }),
+                snake: serde_json::json!({
+                    "user_message": "Build an agent that rotates PDFs.",
+                    "conversation_history": []
+                }),
+            },
+            WireCase {
+                path: "/api/v1/agents/revise",
+                camel: serde_json::json!({
+                    "userMessage": "Keep this draft.",
+                    "conversationHistory": [],
+                    "currentDraft": {
+                        "name": "Rotator",
+                        "description": "Rotates PDFs.",
+                        "objective": "Rotate PDFs.",
+                        "steps": []
+                    }
+                }),
+                snake: serde_json::json!({
+                    "user_message": "Keep this draft.",
+                    "conversation_history": [],
+                    "current_draft": {
+                        "name": "Rotator",
+                        "description": "Rotates PDFs.",
+                        "objective": "Rotate PDFs.",
+                        "steps": []
+                    }
+                }),
+            },
+            WireCase {
+                path: "/api/v1/agents/next-action",
+                camel: serde_json::json!({
+                    "agentSpec": {
+                        "name": "Rotator",
+                        "description": "Rotates PDFs.",
+                        "objective": "Rotate PDFs.",
+                        "steps": []
+                    },
+                    "currentStepIndex": 1,
+                    "executionContext": {
+                        "triggerType": "manual",
+                        "inputFiles": ["camel.pdf"],
+                        "metadata": {}
+                    },
+                    "previousStepResults": [{
+                        "stepIndex": 0,
+                        "tool": null,
+                        "success": true,
+                        "outputSummary": "done",
+                        "outputData": {}
+                    }]
+                }),
+                snake: serde_json::json!({
+                    "agent_spec": {
+                        "name": "Rotator",
+                        "description": "Rotates PDFs.",
+                        "objective": "Rotate PDFs.",
+                        "steps": []
+                    },
+                    "current_step_index": 1,
+                    "execution_context": {
+                        "trigger_type": "manual",
+                        "input_files": ["snake.pdf"],
+                        "metadata": {}
+                    },
+                    "previous_step_results": [{
+                        "step_index": 0,
+                        "tool": null,
+                        "success": true,
+                        "output_summary": "done",
+                        "output_data": {}
+                    }]
+                }),
+            },
+            WireCase {
+                path: "/api/v1/orchestrator",
+                camel: serde_json::json!({
+                    "userMessage": "Rotate this PDF.",
+                    "conversationHistory": [],
+                    "artifacts": [{
+                        "kind": "extracted_text",
+                        "files": [{
+                            "fileName": "camel.pdf",
+                            "pages": [{"pageNumber": 1, "text": "page"}]
+                        }]
+                    }],
+                    "resumeWith": "pdf_edit",
+                    "enabledEndpoints": []
+                }),
+                snake: serde_json::json!({
+                    "user_message": "Rotate this PDF.",
+                    "conversation_history": [],
+                    "artifacts": [{
+                        "kind": "extracted_text",
+                        "files": [{
+                            "file_name": "snake.pdf",
+                            "pages": [{"page_number": 1, "text": "page"}]
+                        }]
+                    }],
+                    "resume_with": "pdf_edit",
+                    "enabled_endpoints": []
+                }),
+            },
+        ];
+        let app = app_with_classifier(
+            EngineSettings::new("smart", "fast", "", false),
+            Arc::new(StubClassifierModel),
+        );
+
+        for case in cases {
+            for (wire_name, body) in [
+                ("camelCase", case.camel.clone()),
+                ("snake_case", case.snake),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(case.path)
+                            .header("X-User-Id", "wire-user")
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                    .await?;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{} rejected its {wire_name} request",
+                    case.path
+                );
+            }
+
+            let mut unknown = case.camel;
+            unknown
+                .as_object_mut()
+                .ok_or("wire compatibility test body must be an object")?
+                .insert("unexpectedField".to_owned(), serde_json::Value::Bool(true));
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(case.path)
+                        .header("X-User-Id", "wire-user")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&unknown)?))?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{} accepted an unknown request field",
+                case.path
+            );
+        }
         Ok(())
     }
 }

@@ -31,7 +31,7 @@ Task `desc:` fields should describe **what** the task does, not **how** it does 
 - **Code formatting**: `task format` (or `task backend:format` for Java only)
 - **Full quality gate**: `task check` (runs lint + typecheck + test across all components)
 
-After modifying any files in the project, you must run the relevant `task check` command that covers that area of the code. For example, when editing frontend files run `task frontend:check`; for Python engine files run `task engine:check`; for Java backend files run `task backend:check`.
+After modifying any files in the project, you must run the relevant `task check` command that covers that area of the code. For example, when editing frontend files run `task frontend:check`; for Rust AI engine files run `task engine:check`; for legacy Python oracle files run `task engine:legacy:check`; for Java backend files run `task backend:check`.
 
 ### Docker Development
 - **Build standard**: `task docker:build` (or `docker build -t stirling-pdf -f docker/embedded/Dockerfile .`)
@@ -45,26 +45,38 @@ After modifying any files in the project, you must run the relevant `task check`
 ### Security Mode Development
 Set `DOCKER_ENABLE_SECURITY=true` environment variable to enable security features during development. This is required for testing the full version locally.
 
-### Python Development (AI Engine)
+### Rust AI Engine Development
 
-The engine is a Python reasoning service for Stirling: it plans and interprets work, but it does not own durable state, and it does not execute Stirling PDF operations directly. Keep the service narrow: typed contracts in, typed contracts out, with AI only where it adds reasoning value. The frontend calls the Python engine via Java as a proxy.
+The operational AI engine is `rust/crates/stirling-ai-engine`. It plans and interprets work, but it does not execute Stirling PDF operations directly. Keep the service narrow: typed contracts in, typed contracts out, with AI only where it adds reasoning value. The frontend calls the Rust engine through Java as a proxy.
 
-#### Python Commands
+#### AI Engine Commands
 All engine commands run from the repo root using Task:
-- `task engine:check` — run all checks (typecheck + lint + format-check + test)
-- `task engine:fix` — auto-fix lint + formatting
-- `task engine:install` — install Python dependencies via uv
-- `task engine:dev` — start FastAPI with hot reload (localhost:5001)
-- `task engine:test` — run pytest
-- `task engine:lint` — run ruff linting
-- `task engine:typecheck` — run pyright
-- `task engine:format` — format code with ruff
-- `task engine:tool-models` — generate `tool_models.py` from the Java OpenAPI spec
+- `task engine:check` — run the Rust engine quality gate
+- `task engine:fix` — auto-fix Rust lint and formatting issues
+- `task engine:install` — fetch Rust engine dependencies
+- `task engine:dev` — start the Rust engine on localhost:5001
+- `task engine:test` — run Rust engine tests
+- `task engine:lint` — run Clippy for the Rust engine
+- `task engine:typecheck` — type-check all Rust engine targets
+- `task engine:format` — format the Rust engine
+- `task engine:container:check` — verify container and operational wiring
+- `task engine:tool-models` — regenerate the Python tool models and Rust operation catalog from Java OpenAPI
 
-The project structure is defined in `engine/pyproject.toml`. Any new dependencies should be listed there, followed by running `task engine:install`.
+Rust dependencies belong in `rust/crates/stirling-ai-engine/Cargo.toml`, followed by `task engine:install`.
+
+#### Legacy Python AI Engine Oracle
+
+The previous Python implementation remains in `engine/` as a compatibility oracle, not the default runtime. Its commands are explicit:
+- `task engine:legacy:dev` — start the Python oracle with hot reload
+- `task engine:legacy:test` — run the Python oracle tests
+- `task engine:legacy:check` — run its full quality gate
+- `task engine:legacy:fix` — auto-fix its lint and formatting issues
+- `task engine:legacy:tool-models` — regenerate only its Java-derived models
+
+Any new legacy-oracle dependency should be listed in `engine/pyproject.toml`, followed by `task engine:legacy:install`.
 
 #### Python Code Style
-- Keep `task engine:check` passing.
+- Keep `task engine:legacy:check` passing.
 - Use modern Python when it improves clarity.
 - Prefer explicit names to cleverness.
 - Avoid nested functions and nested classes unless the language construct requires them.
