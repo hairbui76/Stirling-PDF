@@ -10,23 +10,35 @@ Rust compatibility contract for `ConvertPDFToMarkdown`.
 
 ## Behavior
 
-The native implementation extracts every PDF page in document order with `lopdf`,
-rebuilds text paragraphs, converts common bullet glyphs to Markdown list items,
-repairs lower-case soft hyphen line breaks, and escapes inline Markdown controls so
-text from the PDF remains literal. Empty pages produce no output block.
+When the `PDFium` runtime is available, the implementation reconstructs visual lines
+from page text geometry and infers headings by font size, porting Java's
+`HeadingDetector`: it computes the document's median glyph font size and median line
+height, then for each line compares its dominant glyph size (or line height when sizes
+are degenerate, i.e. ≤ 2.0) against the corresponding body median. A ratio above 1.4
+becomes `#`, above 1.2 becomes `##`; lines longer than twelve words or ending in
+`.`/`!`/`?` are never promoted (size/brevity signals only, never text matching).
+Non-heading lines are rebuilt into paragraphs (broken at vertical gaps and page
+boundaries), bullets become list items, lower-case soft-hyphen breaks are repaired, and
+inline Markdown controls are escaped so text stays literal.
 
-It has no external binary dependency and treats malformed PDFs as `400 Bad Request`.
+When `PDFium` is unavailable the route falls back to a text-only `lopdf` baseline that
+extracts each page in document order and applies the same paragraph, bullet,
+soft-hyphen, and escaping rules but does not infer headings. Empty pages produce no
+output block. Malformed PDFs are `400 Bad Request`.
 
 ## Parity gaps
 
-Java's `PdfMarkdownConverter` uses `PDFium` geometry to infer headings, two-column
-reading order, borderless/ruled tables, table continuation across pages, bold labels,
-and images. Those layout-specific features are deliberately not claimed by this
-baseline. The Rust route preserves textual content and page order while the geometry
-conversion slice is still pending.
+Java's `PdfMarkdownConverter` also infers two-column reading order, borderless/ruled
+tables, table continuation across pages, bold-label emphasis, and images. Those
+layout-specific features are deliberately not yet claimed; the ported slice covers
+size-based heading inference plus textual content and page order.
 
 ## Verification
 
-Unit tests cover paragraph assembly, literal Markdown escaping, bullet handling, and
-soft-hyphen repair. HTTP tests cover content type, output filename, page order, and
-missing/malformed uploads.
+Unit tests cover the ported `heading_prefix` decision (size-ratio thresholds, the
+word-count cap, sentence suppression, and the line-height fallback), the `median`
+helper, line-based Markdown assembly (headings, bullets, paragraph breaks, page
+separation), paragraph assembly, escaping, and soft-hyphen repair. An end-to-end test
+builds a PDF with a large-font line and body text and confirms the PDFium path promotes
+only the large line to a heading. HTTP tests cover content type, output filename, page
+order, and missing/malformed uploads.

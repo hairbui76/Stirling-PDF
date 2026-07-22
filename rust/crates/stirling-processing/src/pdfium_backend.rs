@@ -159,6 +159,34 @@ pub enum PdfiumTitleAttempt {
     },
 }
 
+/// A single reconstructed visual line of page text with the geometry the Markdown
+/// converter needs for heading inference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkdownTextLine {
+    /// Zero-based source page index, used to separate pages in the output.
+    pub page: usize,
+    pub text: String,
+    /// Most frequent glyph font size on the line (ties resolved toward the larger size).
+    pub dominant_font_size: f32,
+    /// Line bounding-box height, the fallback heading signal when font sizes are degenerate.
+    pub height: f32,
+    /// True when a vertical gap before this line suggests a paragraph break.
+    pub paragraph_break_before: bool,
+}
+
+#[derive(Debug)]
+pub enum PdfiumMarkdownAttempt {
+    Extracted {
+        lines: Vec<MarkdownTextLine>,
+        median_font_size: f32,
+        median_line_height: f32,
+    },
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
 #[derive(Debug)]
 pub enum PdfiumExtractImagesAttempt {
     Extracted,
@@ -2610,6 +2638,214 @@ pub fn try_detect_largest_text_title(
         }
     }
     Ok(PdfiumTitleAttempt::Detected(best.map(|(text, _)| text)))
+}
+
+/// Upper bounds keeping the Markdown line extraction memory-safe on pathological input.
+const MAX_MARKDOWN_LINES: usize = 200_000;
+const MAX_MARKDOWN_GLYPH_SAMPLES: usize = 1_000_000;
+
+/// A mutable visual line assembled from consecutive same-baseline text segments.
+struct LineAccumulator {
+    text: String,
+    sizes: Vec<f32>,
+    top: f32,
+    bottom: f32,
+    height: f32,
+}
+
+/// Extracts reconstructed visual lines with the glyph/line geometry the Markdown
+/// converter uses to infer headings, or a clean indication that `PDFium` is absent.
+///
+/// Lines are assembled by grouping consecutive segments that share a vertical
+/// baseline; the document median glyph size and line height are returned so the
+/// converter can apply Java's size-ratio heading thresholds.
+///
+/// # Errors
+///
+/// Returns [`PdfiumTextError`] when the runtime lock is poisoned or `PDFium` cannot
+/// read the document, a page, or its text.
+pub fn try_extract_markdown_lines(
+    input_path: &Path,
+    filename: &str,
+) -> Result<PdfiumMarkdownAttempt, PdfiumTextError> {
+    let runtime = shared_pdfium_runtime();
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium,
+        Err(details) => {
+            return Ok(PdfiumMarkdownAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let pdfium = pdfium
+        .lock()
+        .map_err(|_| PdfiumTextError::RuntimePoisoned)?;
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumTextError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let mut lines = Vec::new();
+    let mut glyph_sizes = Vec::new();
+    let mut line_heights = Vec::new();
+    for page_index in 0..document.pages().len() {
+        if lines.len() >= MAX_MARKDOWN_LINES {
+            break;
+        }
+        let page_number = usize::try_from(page_index).unwrap_or_default() + 1;
+        let page =
+            document
+                .pages()
+                .get(page_index)
+                .map_err(|source| PdfiumTextError::ReadPage {
+                    page_number,
+                    source,
+                })?;
+        let text = page.text().map_err(|source| PdfiumTextError::ReadText {
+            page_number,
+            source,
+        })?;
+        let mut accumulators: Vec<LineAccumulator> = Vec::new();
+        for segment in text.segments().iter() {
+            let value = segment.text();
+            if value.trim().is_empty() {
+                continue;
+            }
+            let bounds = segment.bounds();
+            let top = bounds.top().value;
+            let bottom = bounds.bottom().value;
+            let height = bounds.height().value;
+            if !top.is_finite() || !bottom.is_finite() || !height.is_finite() {
+                continue;
+            }
+            let mut sizes = Vec::new();
+            for character in segment
+                .chars()
+                .map_err(|source| PdfiumTextError::ReadText {
+                    page_number,
+                    source,
+                })?
+                .iter()
+            {
+                let whitespace = character.unicode_char().is_none_or(char::is_whitespace);
+                let size = character.unscaled_font_size().value;
+                if !whitespace && size.is_finite() && size > 0.0 {
+                    sizes.push(size);
+                }
+            }
+            merge_segment_into_line(&mut accumulators, &value, &sizes, top, bottom, height);
+        }
+        append_page_lines(
+            usize::try_from(page_index).unwrap_or_default(),
+            accumulators,
+            &mut lines,
+            &mut glyph_sizes,
+            &mut line_heights,
+        );
+    }
+    let median_font_size = crate::pdf_markdown::median(&glyph_sizes, 12.0);
+    let median_line_height = crate::pdf_markdown::median(&line_heights, 12.0);
+    Ok(PdfiumMarkdownAttempt::Extracted {
+        lines,
+        median_font_size,
+        median_line_height,
+    })
+}
+
+/// Appends a segment to the current line when it shares the line's vertical centre,
+/// otherwise starts a new line.
+fn merge_segment_into_line(
+    accumulators: &mut Vec<LineAccumulator>,
+    text: &str,
+    sizes: &[f32],
+    top: f32,
+    bottom: f32,
+    height: f32,
+) {
+    let center = f32::midpoint(top, bottom);
+    if let Some(current) = accumulators.last_mut() {
+        let current_center = f32::midpoint(current.top, current.bottom);
+        let tolerance = current.height.max(height) * 0.5;
+        if (center - current_center).abs() <= tolerance {
+            if !current.text.is_empty()
+                && !current.text.ends_with(char::is_whitespace)
+                && !text.starts_with(char::is_whitespace)
+            {
+                current.text.push(' ');
+            }
+            current.text.push_str(text);
+            current.sizes.extend_from_slice(sizes);
+            current.top = current.top.max(top);
+            current.bottom = current.bottom.min(bottom);
+            current.height = current.height.max(height);
+            return;
+        }
+    }
+    accumulators.push(LineAccumulator {
+        text: text.to_owned(),
+        sizes: sizes.to_vec(),
+        top,
+        bottom,
+        height,
+    });
+}
+
+/// Converts a page's accumulated lines into [`MarkdownTextLine`]s, flagging paragraph
+/// breaks from vertical gaps and feeding the document median samples.
+fn append_page_lines(
+    page: usize,
+    accumulators: Vec<LineAccumulator>,
+    lines: &mut Vec<MarkdownTextLine>,
+    glyph_sizes: &mut Vec<f32>,
+    line_heights: &mut Vec<f32>,
+) {
+    let mut previous_bottom: Option<f32> = None;
+    for accumulator in accumulators {
+        if lines.len() >= MAX_MARKDOWN_LINES {
+            break;
+        }
+        let paragraph_break_before = match previous_bottom {
+            Some(previous) if accumulator.height > 0.0 => {
+                (previous - accumulator.top) > accumulator.height * 0.6
+            }
+            _ => false,
+        };
+        previous_bottom = Some(accumulator.bottom);
+        if glyph_sizes.len() < MAX_MARKDOWN_GLYPH_SAMPLES {
+            let room = MAX_MARKDOWN_GLYPH_SAMPLES - glyph_sizes.len();
+            glyph_sizes.extend(accumulator.sizes.iter().take(room).copied());
+        }
+        if accumulator.height > 0.0 && !accumulator.text.trim().is_empty() {
+            line_heights.push(accumulator.height);
+        }
+        let dominant_font_size = dominant_font_size(&accumulator.sizes);
+        lines.push(MarkdownTextLine {
+            page,
+            text: accumulator.text,
+            dominant_font_size,
+            height: accumulator.height,
+            paragraph_break_before,
+        });
+    }
+}
+
+/// Returns the most frequent glyph font size, breaking ties toward the larger size.
+fn dominant_font_size(sizes: &[f32]) -> f32 {
+    let mut best = 0.0_f32;
+    let mut best_count = 0_usize;
+    for size in sizes {
+        let count = sizes
+            .iter()
+            .filter(|other| other.to_bits() == size.to_bits())
+            .count();
+        if count > best_count || (count == best_count && *size > best) {
+            best_count = count;
+            best = *size;
+        }
+    }
+    best
 }
 
 fn normalize_anchor_text(value: &str) -> String {

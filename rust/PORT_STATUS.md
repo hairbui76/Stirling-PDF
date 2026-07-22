@@ -68,9 +68,13 @@ auto-rename/auto-split, plus:
   Pro user-aware metadata substitution remains tied to the secured-mode cutover.
 - `convert/pdf/html` — PDF → HTML via `pdftohtml -c` shell-out, all output files
   bundled into a ZIP.
-- `convert/pdf/markdown` — native text-first Markdown in page order with literal
-  escaping, bullets, and soft-hyphen repair. Java's geometry-aware heading/table/
-  column/image inference remains a documented parity gap.
+- `convert/pdf/markdown` — Markdown in page order with literal escaping, bullets, and
+  soft-hyphen repair. When the PDFium runtime is available, headings are inferred from
+  text geometry, porting Java's `HeadingDetector` size-ratio thresholds (dominant glyph
+  size vs. the document body median, or line height when sizes are degenerate; ≤12-word,
+  non-sentence lines only). Falls back to the text-only lopdf baseline (no headings) when
+  PDFium is unavailable. Java's geometry-aware table/column/image inference and bold-label
+  emphasis remain documented parity gaps.
 - `convert/html/pdf` — sanitized HTML/ZIP package → PDF via WeasyPrint, including
   parser-backed active-content removal, resource SSRF restrictions, and ZIP limits.
 - `convert/markdown/pdf` — CommonMark/GFM table Markdown or Markdown ZIP package →
