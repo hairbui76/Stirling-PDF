@@ -102,10 +102,33 @@ tasks:
       - task: test
 
   tool-models:
-    desc: "Generate AI operation models from the Java OpenAPI spec"
+    desc: "Generate the Rust AI operation catalog from the Java OpenAPI spec"
+    deps: [":backend:swagger"]
     cmds:
-      - task: legacy:tool-models
-      - uv run --project engine python rust/tools/generate_ai_operation_catalog.py
+      - >
+        cargo run --manifest-path rust/Cargo.toml
+        -p stirling-operation-catalog --locked --
+        --spec SwaggerDoc.json
+        --output rust/crates/stirling-ai-engine/src/operation_catalog.json
+    sources:
+      - SwaggerDoc.json
+      - rust/Cargo.toml
+      - rust/Cargo.lock
+      - rust/crates/stirling-operation-catalog/Cargo.toml
+      - rust/crates/stirling-operation-catalog/src/**/*.rs
+    generates:
+      - rust/crates/stirling-ai-engine/src/operation_catalog.json
+
+  tool-models:check:
+    desc: "Fail if the Rust AI operation catalog is out of date"
+    deps: [":backend:swagger"]
+    cmds:
+      - >
+        cargo run --manifest-path rust/Cargo.toml
+        -p stirling-operation-catalog --locked --
+        --spec SwaggerDoc.json
+        --output rust/crates/stirling-ai-engine/src/operation_catalog.json
+        --check
 
   clean:
     desc: "Clean AI engine build artifacts"

@@ -25,6 +25,48 @@ const PARAMETER_PROMPT: &str = "Generate only the parameter object for the selec
 
 static OPERATION_CATALOG: LazyLock<Result<BTreeMap<String, Value>, serde_json::Error>> =
     LazyLock::new(|| serde_json::from_str(include_str!("operation_catalog.json")));
+static AGENT_OPERATION_CATALOG: LazyLock<BTreeMap<String, Value>> = LazyLock::new(|| {
+    BTreeMap::from([
+        (
+            "/api/v1/ai/tools/math-auditor-agent".to_owned(),
+            json!({
+                "type": "object",
+                "title": "MathAuditorAgentParams",
+                "additionalProperties": false,
+                "properties": {
+                    "tolerance": {"type": "string", "default": "0.01"}
+                }
+            }),
+        ),
+        (
+            "/api/v1/ai/tools/pdf-comment-agent".to_owned(),
+            json!({
+                "type": "object",
+                "title": "PdfCommentAgentParams",
+                "additionalProperties": false,
+                "properties": {
+                    "prompt": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": null
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/v1/ai/tools/create-pdf-from-html-agent".to_owned(),
+            json!({
+                "type": "object",
+                "title": "CreatePdfFromHtmlAgentParams",
+                "additionalProperties": false,
+                "properties": {
+                    "document": {"type": "string"},
+                    "filename": {"type": "string", "pattern": "^.+\\.pdf$"}
+                },
+                "required": ["document", "filename"]
+            }),
+        ),
+    ])
+});
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -301,11 +343,7 @@ impl PdfEditAgent {
                     &strict_schema,
                 )
                 .await?;
-            jsonschema::validate(schema, &parameters).map_err(|error| {
-                PdfEditError::Model(format!(
-                    "invalid parameters for operation {endpoint}: {error}"
-                ))
-            })?;
+            let parameters = validate_operation_parameters(endpoint, &parameters)?;
             steps.push(json!({
                 "kind": "tool",
                 "tool": endpoint,
@@ -393,10 +431,198 @@ pub(crate) fn catalogued_operations() -> Result<Vec<String>, PdfEditError> {
         .collect())
 }
 
+pub(crate) fn catalogued_operation_endpoints() -> Result<Vec<String>, PdfEditError> {
+    let mut endpoints = catalogued_processing_endpoints()?;
+    endpoints.extend(AGENT_OPERATION_CATALOG.keys().cloned());
+    endpoints.sort_unstable();
+    Ok(endpoints)
+}
+
+pub(crate) fn catalogued_processing_endpoints() -> Result<Vec<String>, PdfEditError> {
+    Ok(operation_catalog()?.keys().cloned().collect())
+}
+
+pub(crate) fn validate_operation_endpoint(endpoint: &str) -> Result<(), PdfEditError> {
+    operation_schema(endpoint).map(|_| ())
+}
+
+pub(crate) fn validate_processing_endpoint(endpoint: &str) -> Result<(), PdfEditError> {
+    operation_catalog()?
+        .get(endpoint)
+        .map(|_| ())
+        .ok_or_else(|| PdfEditError::Model(format!("unknown PDF processing endpoint {endpoint}")))
+}
+
+pub(crate) fn validate_operation_parameters(
+    endpoint: &str,
+    parameters: &Value,
+) -> Result<Value, PdfEditError> {
+    let schema = operation_schema(endpoint)?;
+    let mut parameters = canonicalise_parameter_aliases(schema, schema, parameters);
+    apply_schema_defaults(schema, schema, &mut parameters);
+    jsonschema::validate(schema, &parameters).map_err(|error| {
+        PdfEditError::Model(format!(
+            "invalid parameters for operation {endpoint}: {error}"
+        ))
+    })?;
+    Ok(parameters)
+}
+
 fn operation_catalog() -> Result<&'static BTreeMap<String, Value>, PdfEditError> {
     OPERATION_CATALOG
         .as_ref()
         .map_err(|error| PdfEditError::Catalog(error.to_string()))
+}
+
+fn operation_schema(endpoint: &str) -> Result<&'static Value, PdfEditError> {
+    operation_catalog()?
+        .get(endpoint)
+        .or_else(|| AGENT_OPERATION_CATALOG.get(endpoint))
+        .ok_or_else(|| PdfEditError::Model(format!("unknown PDF operation endpoint {endpoint}")))
+}
+
+fn canonicalise_parameter_aliases(root: &Value, schema: &Value, value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(name, value)| {
+                    let alias = snake_to_lower_camel(name);
+                    let canonical_name = if declared_property(root, schema, name).is_some() {
+                        name.clone()
+                    } else if declared_property(root, schema, &alias).is_some() {
+                        alias
+                    } else {
+                        name.clone()
+                    };
+                    let value = declared_property(root, schema, &canonical_name).map_or_else(
+                        || value.clone(),
+                        |property| canonicalise_parameter_aliases(root, property, value),
+                    );
+                    (canonical_name, value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => schema_items(root, schema).map_or_else(
+            || value.clone(),
+            |item_schema| {
+                Value::Array(
+                    items
+                        .iter()
+                        .map(|item| canonicalise_parameter_aliases(root, item_schema, item))
+                        .collect(),
+                )
+            },
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn declared_property<'a>(root: &'a Value, schema: &'a Value, name: &str) -> Option<&'a Value> {
+    resolve_local_reference(root, schema)
+        .and_then(|resolved| declared_property(root, resolved, name))
+        .or_else(|| schema.get("properties")?.get(name))
+        .or_else(|| {
+            ["allOf", "anyOf", "oneOf"].into_iter().find_map(|keyword| {
+                schema
+                    .get(keyword)?
+                    .as_array()?
+                    .iter()
+                    .find_map(|branch| declared_property(root, branch, name))
+            })
+        })
+}
+
+fn schema_items<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
+    resolve_local_reference(root, schema)
+        .and_then(|resolved| schema_items(root, resolved))
+        .or_else(|| schema.get("items"))
+        .or_else(|| {
+            ["allOf", "anyOf", "oneOf"].into_iter().find_map(|keyword| {
+                schema
+                    .get(keyword)?
+                    .as_array()?
+                    .iter()
+                    .find_map(|branch| schema_items(root, branch))
+            })
+        })
+}
+
+fn apply_schema_defaults(root: &Value, schema: &Value, value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let mut properties = BTreeMap::new();
+            collect_declared_properties(root, schema, &mut properties);
+            for (name, property) in &properties {
+                if !object.contains_key(name.as_str())
+                    && let Some(default) = property.get("default")
+                {
+                    object.insert((*name).clone(), default.clone());
+                }
+            }
+            for (name, value) in object {
+                if let Some(property) = properties.get(name) {
+                    apply_schema_defaults(root, property, value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            if let Some(item_schema) = schema_items(root, schema) {
+                for item in items {
+                    apply_schema_defaults(root, item_schema, item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_declared_properties<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    properties: &mut BTreeMap<String, &'a Value>,
+) {
+    if let Some(resolved) = resolve_local_reference(root, schema) {
+        collect_declared_properties(root, resolved, properties);
+    }
+    if let Some(declared) = schema.get("properties").and_then(Value::as_object) {
+        properties.extend(
+            declared
+                .iter()
+                .map(|(name, property)| (name.clone(), property)),
+        );
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            for branch in branches {
+                collect_declared_properties(root, branch, properties);
+            }
+        }
+    }
+}
+
+fn resolve_local_reference<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
+    schema
+        .get("$ref")?
+        .as_str()?
+        .strip_prefix('#')
+        .and_then(|pointer| root.pointer(pointer))
+}
+
+fn snake_to_lower_camel(name: &str) -> String {
+    let mut camel = String::with_capacity(name.len());
+    let mut uppercase_next = false;
+    for character in name.chars() {
+        if character == '_' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            camel.extend(character.to_uppercase());
+            uppercase_next = false;
+        } else {
+            camel.push(character);
+        }
+    }
+    camel
 }
 
 fn supported_operations(enabled: &[String], catalog: &BTreeMap<String, Value>) -> Vec<String> {
@@ -514,7 +740,10 @@ fn make_objects_strict(value: &mut Value) {
 mod tests {
     use serde_json::json;
 
-    use super::{operation_catalog, strict_tool_schema, supported_operations};
+    use super::{
+        operation_catalog, strict_tool_schema, supported_operations, validate_operation_endpoint,
+        validate_operation_parameters,
+    };
 
     #[test]
     fn generated_catalog_contains_all_current_operations() -> Result<(), Box<dyn std::error::Error>>
@@ -550,5 +779,62 @@ mod tests {
         }));
         assert_eq!(strict["required"], json!(["angle"]));
         assert_eq!(strict["additionalProperties"], false);
+    }
+
+    #[test]
+    fn operation_validation_uses_catalog_schema_and_canonicalises_python_field_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parameters = validate_operation_parameters(
+            "/api/v1/misc/flatten",
+            &json!({"flatten_only_forms": true, "render_dpi": 144}),
+        )?;
+        assert_eq!(
+            parameters,
+            json!({"flattenOnlyForms": true, "renderDpi": 144})
+        );
+        assert!(validate_operation_endpoint("/api/v1/not-real").is_err());
+        assert!(
+            validate_operation_parameters(
+                "/api/v1/general/rotate-pdf",
+                &json!({"flattenOnlyForms": false})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_operation_registry_validates_exact_parameters_and_materialises_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            validate_operation_parameters("/api/v1/ai/tools/math-auditor-agent", &json!({}))?,
+            json!({"tolerance": "0.01"})
+        );
+        assert_eq!(
+            validate_operation_parameters("/api/v1/ai/tools/pdf-comment-agent", &json!({}))?,
+            json!({"prompt": null})
+        );
+        assert_eq!(
+            validate_operation_parameters(
+                "/api/v1/ai/tools/create-pdf-from-html-agent",
+                &json!({"document": "<p>Hello</p>", "filename": "hello.pdf"})
+            )?,
+            json!({"document": "<p>Hello</p>", "filename": "hello.pdf"})
+        );
+        assert!(
+            validate_operation_parameters(
+                "/api/v1/ai/tools/math-auditor-agent",
+                &json!({"prompt": "wrong parameter type"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operation_parameters(
+                "/api/v1/ai/tools/create-pdf-from-html-agent",
+                &json!({"document": "<p>Hello</p>", "filename": "hello.txt"})
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

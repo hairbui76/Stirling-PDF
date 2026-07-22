@@ -26,11 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let settings = EngineSettings::from_environment()?;
     let address = bind_address_from_environment()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let bound_address = listener.local_addr()?;
     info!(address = %bound_address, "starting Stirling Rust AI engine foundation");
-    axum::serve(listener, app(EngineSettings::from_environment())).await?;
+    axum::serve(listener, app(settings)).await?;
     Ok(())
 }
 

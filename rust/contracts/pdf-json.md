@@ -71,8 +71,10 @@ DeviceCMYK colors. Generated font resources use fresh `RustFont*` names, so they
 not collide with existing resource names.
 
 **Deferred (font subsystem, later phases):** applying `textElements` as edits over
-an existing preserved source stream, Symbol/ZapfDingbats encodings, synthesizing new
+an existing preserved source stream in the full-document rebuild path, Symbol/ZapfDingbats
+encodings, synthesizing new
 embedded/CID/Type3 fonts, and glyph-level edits that cannot use a restored source encoding.
+The cached partial endpoint has the bounded regeneration path described below.
 
 The `PdfJsonCosValue` ↔ lopdf `Object` bridge (`cos_value_to_object`,
 `build_stream_from_model`) is reusable by Phases 3–4.
@@ -161,20 +163,30 @@ metadata response header; it is process-local and deliberately has no durable ba
 or expired key returns HTTP 400. The page endpoint returns the cached page's COS projection in
 `lightweight=true` mode; the font endpoint returns the cached page's resource-font models.
 
-Partial export preserves the cached source PDF when no pages are updated. For pages that include
-preserved `resources` or `contentStreams`, those COS values replace the cached ones and the PDF is
-rebuilt; the cached source is then refreshed. The initial Standard-14 text renderer is deliberately
-used only when a page has no preserved source streams, so it does not yet apply edits over an
-existing cached page.
+Partial export mutates the cached source PDF and refreshes that cache after each successful update,
+so untouched pages and the existing catalog, annotations, widgets, and form hierarchy remain in
+place. Its presence-aware request model distinguishes omitted page collections (preserve cached
+state) from explicit empty collections (clear that state). Complete `resources` and
+`contentStreams` projections replace their cached values; lightweight projections with missing
+stream bytes preserve the cached COS values. Likewise, incomplete lightweight annotation models
+preserve the source annotations, while an explicit empty annotation array clears non-widget
+annotations without removing form widgets and a complete raw-COS array replaces them.
+
+When `textElements` or `imageElements` are supplied without replacement content streams, Rust uses
+the Java regeneration fallback: it decodes bounded cached page content, removes represented text
+objects and image draws, retains other vector operators, and appends the editor-authored text and
+images in z-order. Explicitly empty text and image arrays select the clear-page case. Page geometry,
+document Info/XMP updates, complete page resources, and complete annotation replacements are applied
+in place; untouched pages and document-level graph objects survive.
 
 ## Remaining editor capability
 
 Glyph-accurate `textElements` extraction (including Type3 outline geometry and CMap collections
-not available through the configured Poppler data paths), applying editor-authored content over
-preserved source streams and in partial export, font-program round-trip, complex inline filter
-parameters, DCT DeviceN tint conversion, PostScript Type 4 tint functions, Lab/ICCBased DeviceN
-alternates, and external ICC conversion for DCT CMYK images, rich annotation appearance/
-reply graphs,
+not available through the configured Poppler data paths), token-level rewriting and mixed-stream
+editing in the full-document rebuild path, font-program round-trip, complex inline filter
+parameters, DCT DeviceN images with more than four JPEG source components, PostScript Type 4 tint
+functions, ICCBased DeviceN alternates, and external ICC conversion for DCT CMYK images, rich
+annotation appearance/reply graphs,
 nested/multi-widget form hierarchies and appearance
 streams remain outstanding. Direct and Form-nested image XObjects already export page-space
 transforms plus bounded JPEG or 1/2/4/8/16-bit DeviceRGB/DeviceGray/DeviceCMYK payloads, apply `/Decode`
@@ -192,12 +204,20 @@ Device-alternate DeviceN images use the same bounded evaluator for one to eight 
 including multilinear sample-table interpolation. A single-input DeviceN can also use Type 2 or
 Type 3.
 One-component DCT Separation images preserve their grayscale samples, apply `/Decode`, and evaluate
-their tint transforms. DCT DeviceN remains rejected because the decoder does not expose arbitrary
-source component planes.
+their tint transforms. DCT DeviceN images with one to four JPEG components likewise retain the
+source planes, perform Adobe/`ColorTransform` JPEG colour conversion, apply per-component `/Decode`
+mappings in the same order as PDF.js, and then evaluate the DeviceN tint function. Declared
+dimensions and component counts must match the JPEG header; mismatches and DeviceN JPEGs above four
+components are rejected rather than silently treating decoder-projected RGB as tint samples.
 Direct CalGray/CalRGB images, calibrated Indexed palette bases, compatible ICC fallbacks, and
 calibrated Separation/DeviceN alternates convert to sRGB with bounded gamma, matrix, black-point,
 Bradford-adaptation, and transfer-function math. Gray/RGB DCT calibrated images retain their source
 sample planes, apply `/Decode`, and are emitted as transformed PNG rather than raw JPEG.
+Direct Lab images, Lab Indexed palette bases, invalid-ICC Lab fallbacks, and Lab
+Separation/DeviceN alternates use the declared white point and bounded `Range` values with the
+PDF.js-compatible Lab→display-RGB conversion. Lab DCT images retain their three source planes and
+are emitted as transformed PNG; Lab's intrinsic component mapping remains authoritative over an
+image `/Decode` array, matching PDF.js.
 JSON-only pages rebuild ordered raster images
 and alpha soft masks. Both
 unfiltered and bounded single-filter Flate/LZW/ASCII85/DCT 8-bit device-colour inline images
@@ -208,7 +228,7 @@ separate 1-bit ImageMask streams are resized in image space and applied with the
 polarity. An `SMask`, when present, overrides that explicit mask as required by the PDF model.
 Bounded source font dictionaries/programs and existing Type3 CharProcs can be restored for
 JSON-only generated text. Normalizing them, synthesizing missing glyphs, or applying new text over
-preserved source streams is not yet implemented.
+preserved source streams outside the bounded cached-page regeneration path is not yet implemented.
 
 Font-program strategy chosen: **pure Rust** (ttf-parser/allsorts/freetype). Phases:
 2 = JSON→PDF for the Standard-14 / no-embedded-program case; 3 = PDF→JSON glyph
@@ -233,5 +253,9 @@ Type 2 interpolation, packed 4-bit sampled Type 0 interpolation, a Type 3 segmen
 Range clipping, plus one-component DCT `/Decode` handling into a DeviceRGB alternate. Calibrated
 fixtures cover CalGray gamma, a CalRGB D65 matrix, direct raw/DCT conversion, and reversed DCT
 `/Decode`. A two-colorant fixture proves DeviceN sample ordering and bilinear interpolation across a
-2×2 table. An HTTP test drives the metadata
-endpoint and checks the document Info and page dimensions/rotation of a built PDF.
+2×2 table. A four-component Adobe CMYK DCT fixture proves native-plane preservation, reversed
+per-component `/Decode`, DeviceN tint evaluation, and channel-count mismatch rejection. HTTP tests
+drive the lazy cache through complete content-stream replacement, bounded
+text/image regeneration over retained vectors, explicit empty text/annotation clearing, incomplete
+resource/annotation preservation, metadata/XMP updates, untouched-page/form survival, and cache
+refresh. The metadata coverage also checks document Info and page dimensions/rotation.

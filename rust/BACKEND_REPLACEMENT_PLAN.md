@@ -148,10 +148,10 @@ does not claim glyph-accurate extraction or font reconstruction yet.
   also handled. Device-alternate Separation and one-to-eight-component DeviceN images with bounded
   order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded single-input
   stitching Type 3 tint transforms are evaluated, including one-component DCT Separation images
-  after applying `/Decode`. CalGray/CalRGB direct images, Indexed bases, ICC fallbacks, and spot-color
-  alternates convert through bounded calibrated color math, including Gray/RGB DCT. DCT DeviceN tint
-  conversion, complex inline filter parameters, PostScript Type 4 functions, and Lab/ICCBased
-  DeviceN alternates remain.
+  after applying `/Decode`. CalGray/CalRGB/Lab direct images, Indexed bases, ICC fallbacks, and
+  spot-color alternates convert through bounded calibrated color math, including Gray/RGB/Lab DCT.
+  DCT DeviceN tint conversion, complex inline filter parameters, PostScript Type 4 functions, and
+  ICCBased DeviceN alternates remain.
   Full-document exports inspect root
   AcroForm fields and their first widget locations, plus structured page annotations. JSON→PDF
   reconstructs fresh root fields and one attached widget from the structured field model, and

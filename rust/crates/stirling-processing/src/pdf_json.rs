@@ -32,6 +32,10 @@ use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use zune_core::{
+    bytestream::ZCursor, colorspace::ColorSpace as JpegColorSpace, options::DecoderOptions,
+};
+use zune_jpeg::JpegDecoder;
 
 use crate::pdf_page_geometry::inherited_value;
 
@@ -472,6 +476,36 @@ pub struct PdfJsonPage {
     pub content_streams: Vec<PdfJsonStream>,
 }
 
+/// Presence-aware page payload used by the cached text-editor update endpoint.
+///
+/// The regular [`PdfJsonPage`] intentionally defaults its collection fields to
+/// empty arrays for full-document round trips. Incremental updates need to
+/// distinguish an omitted collection (preserve the cached value) from an
+/// explicit empty collection (clear that value).
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PdfJsonPartialPage {
+    pub page_number: Option<i32>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub rotation: Option<i32>,
+    pub text_elements: Option<Vec<PdfJsonTextElement>>,
+    pub image_elements: Option<Vec<PdfJsonImageElement>>,
+    pub annotations: Option<Vec<PdfJsonAnnotation>>,
+    pub resources: Option<PdfJsonCosValue>,
+    pub content_streams: Option<Vec<PdfJsonStream>>,
+}
+
+/// Presence-aware document payload used by cached text-editor updates.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PdfJsonPartialDocument {
+    pub metadata: Option<PdfJsonMetadata>,
+    pub xmp_metadata: Option<String>,
+    pub fonts: Option<Vec<PdfJsonFont>>,
+    pub pages: Vec<PdfJsonPartialPage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PdfJsonDocument {
@@ -610,11 +644,13 @@ pub fn pdf_to_json_metadata(
 /// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
 /// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
-/// converted to sRGB/device colour. One-component DCT Separation images preserve and transform
-/// their grayscale samples. CalGray/CalRGB direct images, Indexed palette bases, ICC fallbacks, and
-/// Separation/`DeviceN` alternates convert through bounded calibrated color math, including
-/// Gray/RGB DCT samples. DCT `DeviceN` images, PostScript Type 4 functions, Lab/ICCBased spot-color
-/// alternates, and complex inline filter parameters remain.
+/// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
+/// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
+/// `/Decode`, and then evaluate their tint transforms. CalGray/CalRGB/Lab direct images, Indexed
+/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
+/// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
+/// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
+/// complex inline filter parameters remain.
 ///
 /// `lightweight` omits the base64 stream payloads (ports the `omitStreamData`
 /// serialization context) for a smaller preview response.
@@ -631,23 +667,27 @@ pub fn pdf_to_json(
         filename: filename.to_owned(),
         source,
     })?;
+    Ok(document_to_json(&document, lightweight))
+}
+
+fn document_to_json(document: &Document, lightweight: bool) -> PdfJsonDocument {
     let pages = document
         .get_pages()
         .into_iter()
-        .map(|(page_number, page_id)| build_page(&document, page_number, page_id, lightweight))
+        .map(|(page_number, page_id)| build_page(document, page_number, page_id, lightweight))
         .collect();
-    Ok(PdfJsonDocument {
-        metadata: Some(extract_metadata(&document)),
-        xmp_metadata: extract_xmp_metadata(&document),
-        fonts: extract_fonts(&document),
+    PdfJsonDocument {
+        metadata: Some(extract_metadata(document)),
+        xmp_metadata: extract_xmp_metadata(document),
+        fonts: extract_fonts(document),
         pages,
         form_fields: if lightweight {
             None
         } else {
-            Some(extract_form_fields(&document))
+            Some(extract_form_fields(document))
         },
         ..PdfJsonDocument::default()
-    })
+    }
 }
 
 /// Builds the text-editor document model from cached PDF bytes.
@@ -664,23 +704,7 @@ pub fn pdf_bytes_to_json(
         filename: filename.to_owned(),
         source,
     })?;
-    let pages = document
-        .get_pages()
-        .into_iter()
-        .map(|(page_number, page_id)| build_page(&document, page_number, page_id, lightweight))
-        .collect();
-    Ok(PdfJsonDocument {
-        metadata: Some(extract_metadata(&document)),
-        xmp_metadata: extract_xmp_metadata(&document),
-        fonts: extract_fonts(&document),
-        pages,
-        form_fields: if lightweight {
-            None
-        } else {
-            Some(extract_form_fields(&document))
-        },
-        ..PdfJsonDocument::default()
-    })
+    Ok(document_to_json(&document, lightweight))
 }
 
 fn build_page(
@@ -727,12 +751,13 @@ fn build_page(
 /// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
 /// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
-/// converted to sRGB/device colour. One-component DCT Separation images preserve and transform
-/// their grayscale samples. CalGray/CalRGB direct images, Indexed palette bases, ICC fallbacks, and
-/// Separation/`DeviceN` alternates convert through bounded calibrated color math, including
-/// Gray/RGB DCT samples. DCT `DeviceN` images, PostScript Type 4 functions, Lab/ICCBased spot-color
-/// alternates, and complex inline filter parameters are skipped rather than serializing an unusable
-/// payload.
+/// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
+/// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
+/// `/Decode`, and then evaluate their tint transforms. CalGray/CalRGB/Lab direct images, Indexed
+/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
+/// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
+/// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
+/// complex inline filter parameters are skipped rather than serializing an unusable payload.
 fn extract_image_elements(
     document: &Document,
     page_number: u32,
@@ -1456,6 +1481,13 @@ fn decode_pdf_raster(
     let filters = image_filter_names(document, stream);
     let color_space = image_color_space(document, stream);
     if filters.as_slice() == ["DCTDecode"] {
+        if color_space.is_none() && image_uses_transformed_color_space(document, stream) {
+            return None;
+        }
+        if let Some(PdfImageColorSpace::DeviceN { channels, .. }) = &color_space {
+            let samples = decode_dct_device_n_samples(document, stream, width, height, *channels)?;
+            return decoded_samples_to_image(color_space?, width, height, samples);
+        }
         let image = image::load_from_memory(&stream.content).ok()?;
         let pixels = u64::from(image.width()).checked_mul(u64::from(image.height()))?;
         if pixels > MAX_EDITOR_IMAGE_PIXELS {
@@ -1476,10 +1508,10 @@ fn decode_pdf_raster(
                     return None;
                 };
                 let samples = apply_image_decode_to_u8(document, stream, 1, image.into_raw())?;
-                let samples = tint_transform.apply(&samples)?;
+                let samples = tint_transform.apply(&samples, alternate)?;
                 device_samples_to_image(alternate, width, height, samples)
             }
-            Some(PdfImageColorSpace::DeviceN { .. }) => None,
+            Some(PdfImageColorSpace::DeviceN { .. }) => unreachable!(),
             Some(PdfImageColorSpace::Calibrated(color_space)) => {
                 let channels = color_space.channels();
                 let samples = match (channels, image) {
@@ -1487,7 +1519,11 @@ fn decode_pdf_raster(
                     (3, DynamicImage::ImageRgb8(image)) => image.into_raw(),
                     _ => return None,
                 };
-                let samples = apply_image_decode_to_u8(document, stream, channels, samples)?;
+                let samples = if color_space.ignores_image_decode() {
+                    samples
+                } else {
+                    apply_image_decode_to_u8(document, stream, channels, samples)?
+                };
                 device_samples_to_image(color_space, width, height, samples)
             }
             _ => Some(image),
@@ -1524,8 +1560,177 @@ fn decode_pdf_raster(
         height,
         channels,
         u8::try_from(bits_per_component).ok()?,
+        !matches!(
+            &color_space,
+            PdfImageColorSpace::Calibrated(color_space) if color_space.ignores_image_decode()
+        ),
     )?;
     decoded_samples_to_image(color_space, width, height, samples)
+}
+
+fn decode_dct_device_n_samples(
+    document: &Document,
+    stream: &Stream,
+    width: u32,
+    height: u32,
+    channels: usize,
+) -> Option<Vec<u8>> {
+    if stream.content.len() > MAX_EDITOR_IMAGE_BYTES || !(1..=4).contains(&channels) {
+        return None;
+    }
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    let expected_length = width.checked_mul(height)?.checked_mul(channels)?;
+    if expected_length > MAX_EDITOR_IMAGE_BYTES {
+        return None;
+    }
+    let options = DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(width)
+        .set_max_height(height);
+    let mut decoder =
+        JpegDecoder::new_with_options(ZCursor::new(stream.content.as_slice()), options);
+    decoder.decode_headers().ok()?;
+    if decoder.dimensions()? != (width, height)
+        || usize::from(decoder.info()?.components) != channels
+    {
+        return None;
+    }
+    let source_color_space = decoder.input_colorspace()?;
+    if source_color_space.num_components() != channels
+        || !matches!(
+            source_color_space,
+            JpegColorSpace::Luma
+                | JpegColorSpace::RGB
+                | JpegColorSpace::YCbCr
+                | JpegColorSpace::CMYK
+                | JpegColorSpace::YCCK
+                | JpegColorSpace::MultiBand(_)
+        )
+    {
+        return None;
+    }
+    decoder.set_options(
+        decoder
+            .options()
+            .jpeg_set_out_colorspace(source_color_space),
+    );
+    if decoder.output_buffer_size()? != expected_length {
+        return None;
+    }
+    let mut samples = decoder.decode().ok()?;
+    if samples.len() != expected_length {
+        return None;
+    }
+    apply_dct_color_transform(document, stream, source_color_space, &mut samples)?;
+    apply_image_decode_to_u8(document, stream, channels, samples)
+}
+
+fn apply_dct_color_transform(
+    document: &Document,
+    stream: &Stream,
+    source_color_space: JpegColorSpace,
+    samples: &mut [u8],
+) -> Option<()> {
+    let color_transform = dct_color_transform(document, stream);
+    let needs_conversion = jpeg_adobe_transform(&stream.content).map_or_else(
+        || match source_color_space {
+            JpegColorSpace::YCbCr => color_transform != Some(0),
+            JpegColorSpace::YCCK | JpegColorSpace::CMYK => color_transform == Some(1),
+            _ => false,
+        },
+        |transform| transform != 0,
+    );
+    if !needs_conversion {
+        return Some(());
+    }
+    match source_color_space.num_components() {
+        3 => {
+            for pixel in samples.chunks_exact_mut(3) {
+                let luminance = f32::from(pixel[0]);
+                let blue_difference = f32::from(pixel[1]);
+                let red_difference = f32::from(pixel[2]);
+                pixel[0] = byte_sample(luminance - 179.456 + 1.402 * red_difference)?;
+                pixel[1] = byte_sample(
+                    luminance + 135.459 - 0.344 * blue_difference - 0.714 * red_difference,
+                )?;
+                pixel[2] = byte_sample(luminance - 226.816 + 1.772 * blue_difference)?;
+            }
+        }
+        4 => {
+            for pixel in samples.chunks_exact_mut(4) {
+                let luminance = f32::from(pixel[0]);
+                let blue_difference = f32::from(pixel[1]);
+                let red_difference = f32::from(pixel[2]);
+                pixel[0] = byte_sample(434.456 - luminance - 1.402 * red_difference)?;
+                pixel[1] = byte_sample(
+                    119.541 - luminance + 0.344 * blue_difference + 0.714 * red_difference,
+                )?;
+                pixel[2] = byte_sample(481.816 - luminance - 1.772 * blue_difference)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn dct_color_transform(document: &Document, stream: &Stream) -> Option<i32> {
+    let parameters = stream
+        .dict
+        .get(b"DecodeParms")
+        .or_else(|_| stream.dict.get(b"DP"))
+        .ok()
+        .and_then(|parameters| resolved_object(document, parameters))?;
+    let parameters = match parameters {
+        Object::Array(values) => values
+            .first()
+            .and_then(|parameters| resolved_object(document, parameters))?,
+        parameters => parameters,
+    };
+    parameters
+        .as_dict()
+        .ok()?
+        .get(b"ColorTransform")
+        .ok()
+        .and_then(|value| resolved_object(document, value))?
+        .as_i64()
+        .ok()
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn jpeg_adobe_transform(bytes: &[u8]) -> Option<u8> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut offset = 2_usize;
+    while offset < bytes.len() {
+        while bytes.get(offset) == Some(&0xff) {
+            offset = offset.checked_add(1)?;
+        }
+        let marker = *bytes.get(offset)?;
+        offset = offset.checked_add(1)?;
+        if matches!(marker, 0xd9 | 0xda) {
+            return None;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset.checked_add(1)?)?,
+        ]));
+        if length < 2 {
+            return None;
+        }
+        let payload_start = offset.checked_add(2)?;
+        let payload_end = offset.checked_add(length)?;
+        let payload = bytes.get(payload_start..payload_end)?;
+        if marker == 0xee && payload.len() >= 12 && payload.starts_with(b"Adobe") {
+            return payload.get(11).copied();
+        }
+        offset = payload_end;
+    }
+    None
 }
 
 fn decoded_samples_to_image(
@@ -1572,7 +1777,7 @@ fn decoded_samples_to_image(
             tint_transform,
             ..
         } => {
-            let samples = tint_transform.apply(&samples)?;
+            let samples = tint_transform.apply(&samples, alternate)?;
             device_samples_to_image(alternate, width, height, samples)
         }
         PdfImageColorSpace::Indexed { .. } => None,
@@ -1586,15 +1791,31 @@ enum IndexedBaseColorSpace {
     Cmyk,
     CalGray(CalGrayColorSpace),
     CalRgb(CalRgbColorSpace),
+    Lab(LabColorSpace),
 }
 
 impl IndexedBaseColorSpace {
     const fn channels(self) -> usize {
         match self {
             Self::Gray | Self::CalGray(_) => 1,
-            Self::Rgb | Self::CalRgb(_) => 3,
+            Self::Rgb | Self::CalRgb(_) | Self::Lab(_) => 3,
             Self::Cmyk => 4,
         }
+    }
+
+    fn native_component_to_byte(self, channel: usize, value: f32) -> Option<u8> {
+        let range = match self {
+            Self::Lab(color_space) => color_space.component_range(channel)?,
+            Self::Gray | Self::Rgb | Self::Cmyk | Self::CalGray(_) | Self::CalRgb(_) => {
+                (channel < self.channels()).then_some([0.0, 1.0])?
+            }
+        };
+        let normalized = interpolate(value, range, [0.0, 1.0])?;
+        Some(unit_sample_to_byte(normalized))
+    }
+
+    const fn ignores_image_decode(self) -> bool {
+        matches!(self, Self::Lab(_))
     }
 }
 
@@ -1609,6 +1830,12 @@ struct CalRgbColorSpace {
     black_point: [f32; 3],
     gamma: [f32; 3],
     matrix: [f32; 9],
+}
+
+#[derive(Clone, Copy)]
+struct LabColorSpace {
+    white_point: [f32; 3],
+    range: [f32; 4],
 }
 
 enum PdfImageColorSpace {
@@ -1682,10 +1909,13 @@ enum TintTransform {
 }
 
 impl TintTransform {
-    fn apply(&self, samples: &[u8]) -> Option<Vec<u8>> {
+    fn apply(&self, samples: &[u8], output_color_space: IndexedBaseColorSpace) -> Option<Vec<u8>> {
         let input_channels = self.input_channels();
         let output_channels = self.output_channels();
-        if input_channels == 0 || !samples.len().is_multiple_of(input_channels) {
+        if input_channels == 0
+            || output_channels != output_color_space.channels()
+            || !samples.len().is_multiple_of(input_channels)
+        {
             return None;
         }
         let pixel_count = samples.len().checked_div(input_channels)?;
@@ -1703,7 +1933,9 @@ impl TintTransform {
             if evaluated.len() != output_channels {
                 return None;
             }
-            output.extend(evaluated.into_iter().map(unit_sample_to_byte));
+            for (channel, value) in evaluated.into_iter().enumerate() {
+                output.push(output_color_space.native_component_to_byte(channel, value)?);
+            }
         }
         Some(output)
     }
@@ -1937,6 +2169,12 @@ fn device_samples_to_image(
                 width, height, rgb,
             )?))
         }
+        IndexedBaseColorSpace::Lab(color_space) => {
+            let rgb = color_space.samples_to_rgb(&samples)?;
+            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                width, height, rgb,
+            )?))
+        }
         IndexedBaseColorSpace::Cmyk => {
             let pixel_count = usize::try_from(
                 u64::from(width)
@@ -2013,6 +2251,82 @@ impl CalRgbColorSpace {
             unit_sample_to_byte(srgb_transfer(linear_rgb[2])?),
         ])
     }
+}
+
+impl LabColorSpace {
+    const fn component_range(self, channel: usize) -> Option<[f32; 2]> {
+        match channel {
+            0 => Some([0.0, 100.0]),
+            1 => Some([self.range[0], self.range[1]]),
+            2 => Some([self.range[2], self.range[3]]),
+            _ => None,
+        }
+    }
+
+    fn samples_to_rgb(self, samples: &[u8]) -> Option<Vec<u8>> {
+        if !samples.len().is_multiple_of(3) {
+            return None;
+        }
+        let mut rgb = Vec::with_capacity(samples.len());
+        for sample in samples.chunks_exact(3) {
+            rgb.extend_from_slice(&self.sample_to_rgb(sample)?);
+        }
+        Some(rgb)
+    }
+
+    fn sample_to_rgb(self, sample: &[u8]) -> Option<[u8; 3]> {
+        let lightness = interpolate(f32::from(*sample.first()?), [0.0, 255.0], [0.0, 100.0])?;
+        let a = interpolate(
+            f32::from(*sample.get(1)?),
+            [0.0, 255.0],
+            [self.range[0], self.range[1]],
+        )?
+        .clamp(self.range[0], self.range[1]);
+        let b = interpolate(
+            f32::from(*sample.get(2)?),
+            [0.0, 255.0],
+            [self.range[2], self.range[3]],
+        )?
+        .clamp(self.range[2], self.range[3]);
+        let middle = (lightness + 16.0) / 116.0;
+        let xyz = [
+            self.white_point[0] * lab_transfer(middle + a / 500.0),
+            self.white_point[1] * lab_transfer(middle),
+            self.white_point[2] * lab_transfer(middle - b / 200.0),
+        ];
+        let linear_rgb = if self.white_point[2] < 1.0 {
+            matrix_product(
+                [
+                    3.1339, -1.617, -0.4906, -0.9785, 1.916, 0.0333, 0.072, -0.229, 1.4057,
+                ],
+                xyz,
+            )
+        } else {
+            matrix_product(
+                [
+                    3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.204, 1.057,
+                ],
+                xyz,
+            )
+        };
+        Some([
+            lab_rgb_component_to_byte(linear_rgb[0])?,
+            lab_rgb_component_to_byte(linear_rgb[1])?,
+            lab_rgb_component_to_byte(linear_rgb[2])?,
+        ])
+    }
+}
+
+fn lab_transfer(value: f32) -> f32 {
+    if value >= 6.0 / 29.0 {
+        value.powi(3)
+    } else {
+        (108.0 / 841.0) * (value - 4.0 / 29.0)
+    }
+}
+
+fn lab_rgb_component_to_byte(value: f32) -> Option<u8> {
+    byte_sample(value.max(0.0).sqrt() * 255.0)
 }
 
 const BRADFORD_SCALE_MATRIX: [f32; 9] = [
@@ -2284,6 +2598,7 @@ fn decode_device_samples(
     height: u32,
     channels: usize,
     bits_per_component: u8,
+    apply_decode: bool,
 ) -> Option<Vec<u8>> {
     if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
         return None;
@@ -2316,7 +2631,11 @@ fn decode_device_samples(
             .checked_sub(1)?,
     )
     .ok()?;
-    let ranges = image_decode_ranges(document, stream, channels)?;
+    let ranges = if apply_decode {
+        image_decode_ranges(document, stream, channels)?
+    } else {
+        vec![(0.0, 1.0); channels]
+    };
     raw.into_iter()
         .enumerate()
         .map(|(index, sample)| {
@@ -2793,7 +3112,7 @@ fn image_uses_transformed_color_space(document: &Document, stream: &Stream) -> b
         .is_some_and(|family| {
             matches!(
                 family,
-                b"ICCBased" | b"Separation" | b"DeviceN" | b"CalGray" | b"CalRGB"
+                b"ICCBased" | b"Separation" | b"DeviceN" | b"CalGray" | b"CalRGB" | b"Lab"
             )
         })
 }
@@ -2884,6 +3203,25 @@ fn calibrated_image_color_space(
                 black_point,
                 gamma,
                 matrix,
+            }))
+        }
+        b"Lab" => {
+            let _black_point =
+                optional_color_space_vector(document, dictionary, b"BlackPoint", [0.0, 0.0, 0.0])?;
+            let range = if dictionary.get(b"Range").is_ok() {
+                let values = function_number_array(document, dictionary, b"Range")?;
+                let values = <[f32; 4]>::try_from(values).ok()?;
+                if values[0] <= values[1] && values[2] <= values[3] {
+                    values
+                } else {
+                    [-100.0, 100.0, -100.0, 100.0]
+                }
+            } else {
+                [-100.0, 100.0, -100.0, 100.0]
+            };
+            Some(IndexedBaseColorSpace::Lab(LabColorSpace {
+                white_point,
+                range,
             }))
         }
         _ => None,
@@ -6222,6 +6560,439 @@ fn number_as_f32(object: &Object) -> Option<f32> {
     }
 }
 
+/// Applies lazy text-editor page updates directly to a cached PDF.
+///
+/// Pages carrying complete replacement `contentStreams` keep that explicit
+/// representation. Pages carrying editor-authored `textElements` or
+/// `imageElements` follow Java's regeneration fallback: bounded source content
+/// is decoded, text objects and represented image draws are removed, remaining
+/// vector operators are retained, and the edited elements are appended in
+/// z-order. The original document graph remains in place, so untouched pages,
+/// annotations, form fields, outlines, and other catalog data survive the
+/// partial export.
+///
+/// # Errors
+///
+/// Returns [`PdfJsonError`] when the cached PDF is malformed, bounded content
+/// cannot be decoded, edited elements cannot be represented, or the result
+/// cannot be written.
+pub fn apply_partial_json_to_pdf(
+    source_bytes: &[u8],
+    filename: &str,
+    updates: PdfJsonPartialDocument,
+    output_path: &Path,
+) -> Result<(), PdfJsonError> {
+    let mut document =
+        Document::load_mem(source_bytes).map_err(|source| PdfJsonError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    let mut model = document_to_json(&document, false);
+    if let Some(metadata) = updates.metadata.as_ref() {
+        replace_document_metadata(&mut document, metadata);
+        model.metadata = Some(metadata.clone());
+    }
+    if let Some(xmp_metadata) = updates.xmp_metadata.as_deref() {
+        replace_document_xmp_metadata(&mut document, xmp_metadata)?;
+        model.xmp_metadata = Some(xmp_metadata.to_owned());
+    }
+    merge_partial_font_models(&mut model.fonts, updates.fonts.unwrap_or_default());
+    let pages = document.get_pages();
+
+    for update in updates.pages {
+        let Some(page_number) = update.page_number else {
+            continue;
+        };
+        let Ok(page_number_u32) = u32::try_from(page_number) else {
+            continue;
+        };
+        let Some(&page_id) = pages.get(&page_number_u32) else {
+            continue;
+        };
+        let Some(page_index) = model
+            .pages
+            .iter()
+            .position(|page| page.page_number == Some(page_number))
+        else {
+            continue;
+        };
+
+        let replaces_text = update.text_elements.is_some();
+        let replaces_images = update.image_elements.is_some();
+        let replaces_annotations = update.annotations.as_ref().is_some_and(|annotations| {
+            annotations.iter().all(|annotation| {
+                annotation
+                    .raw_data
+                    .as_ref()
+                    .is_some_and(|raw_data| !has_missing_stream_data(raw_data))
+            })
+        });
+        let replaces_resources = update
+            .resources
+            .as_ref()
+            .is_some_and(|resources| !has_missing_stream_data(resources));
+        let complete_stream_replacement = update.content_streams.as_ref().is_some_and(|streams| {
+            streams.is_empty() || streams.iter().all(|stream| stream.raw_data.is_some())
+        });
+        let mut represented_source_images = model.pages[page_index].image_elements.clone();
+        let mut merged_page = model.pages[page_index].clone();
+        merge_partial_page_model(
+            &mut merged_page,
+            update,
+            complete_stream_replacement,
+            replaces_resources,
+            replaces_annotations,
+        );
+        represented_source_images.extend(merged_page.image_elements.iter().cloned());
+        apply_partial_page_geometry(&mut document, page_id, &merged_page)?;
+        if replaces_resources {
+            replace_page_resources(&mut document, page_id, merged_page.resources.as_ref())?;
+        }
+
+        if complete_stream_replacement {
+            replace_page_content_streams(&mut document, page_id, &merged_page.content_streams)?;
+        }
+        if (replaces_text || replaces_images)
+            && merged_page.text_elements.is_empty()
+            && merged_page.image_elements.is_empty()
+        {
+            document
+                .get_dictionary_mut(page_id)?
+                .set("Contents", Vec::<Object>::new());
+        } else if replaces_text || replaces_images {
+            regenerate_page_with_vector_overlay(
+                &mut document,
+                page_id,
+                &model,
+                &merged_page,
+                &represented_source_images,
+                page_number,
+            )?;
+        }
+        if replaces_annotations {
+            replace_page_annotations(&mut document, page_id, &merged_page.annotations)?;
+        }
+        model.pages[page_index] = merged_page;
+    }
+
+    document.prune_objects();
+    document.save(output_path).map(|_| ())?;
+    Ok(())
+}
+
+fn replace_document_metadata(document: &mut Document, metadata: &PdfJsonMetadata) {
+    let info = build_info_dictionary(metadata);
+    if info.is_empty() {
+        document.trailer.remove(b"Info");
+    } else {
+        let info_id = document.add_object(info);
+        document.trailer.set("Info", info_id);
+    }
+}
+
+fn replace_document_xmp_metadata(
+    document: &mut Document,
+    xmp_metadata: &str,
+) -> Result<(), PdfJsonError> {
+    let catalog_id = document.trailer.get(b"Root")?.as_reference()?;
+    if xmp_metadata.trim().is_empty() {
+        document.catalog_mut()?.remove(b"Metadata");
+        return Ok(());
+    }
+    document.catalog_mut()?.remove(b"Metadata");
+    restore_xmp_metadata(document, catalog_id, Some(xmp_metadata))
+}
+
+fn merge_partial_font_models(current: &mut Vec<PdfJsonFont>, updates: Vec<PdfJsonFont>) {
+    for update in updates {
+        let existing = current
+            .iter()
+            .position(|font| same_font_model(font, &update));
+        if let Some(index) = existing {
+            current[index] = update;
+        } else {
+            current.push(update);
+        }
+    }
+}
+
+fn same_font_model(left: &PdfJsonFont, right: &PdfJsonFont) -> bool {
+    match (left.uid.as_deref(), right.uid.as_deref()) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.id.is_some() && left.id == right.id && left.page_number == right.page_number,
+    }
+}
+
+fn merge_partial_page_model(
+    current: &mut PdfJsonPage,
+    update: PdfJsonPartialPage,
+    complete_stream_replacement: bool,
+    replace_resources: bool,
+    replace_annotations: bool,
+) {
+    if update.width.is_some() {
+        current.width = update.width;
+    }
+    if update.height.is_some() {
+        current.height = update.height;
+    }
+    if update.rotation.is_some() {
+        current.rotation = update.rotation;
+    }
+    if replace_resources {
+        current.resources = update.resources;
+    }
+    if complete_stream_replacement {
+        current.content_streams = update.content_streams.unwrap_or_default();
+    }
+    if let Some(text_elements) = update.text_elements {
+        current.text_elements = text_elements;
+    }
+    if let Some(image_elements) = update.image_elements {
+        current.image_elements = image_elements;
+    }
+    if replace_annotations && let Some(annotations) = update.annotations {
+        current.annotations = annotations;
+    }
+}
+
+fn has_missing_stream_data(value: &PdfJsonCosValue) -> bool {
+    match value.cos_type {
+        Some(PdfJsonCosType::Stream) => value
+            .stream
+            .as_ref()
+            .is_none_or(|stream| stream.raw_data.is_none()),
+        Some(PdfJsonCosType::Array) => value
+            .items
+            .as_ref()
+            .is_some_and(|items| items.iter().any(has_missing_stream_data)),
+        Some(PdfJsonCosType::Dictionary) => value
+            .entries
+            .as_ref()
+            .is_some_and(|entries| entries.values().any(has_missing_stream_data)),
+        _ => false,
+    }
+}
+
+fn apply_partial_page_geometry(
+    document: &mut Document,
+    page_id: lopdf::ObjectId,
+    page: &PdfJsonPage,
+) -> Result<(), PdfJsonError> {
+    let current = page_media_box(document, page_id).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+    let current_width = current[2] - current[0];
+    let current_height = current[3] - current[1];
+    let width = page.width.unwrap_or(current_width);
+    let height = page.height.unwrap_or(current_height);
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err(PdfJsonError::UnsupportedText(
+            "page width and height must be finite positive numbers".to_owned(),
+        ));
+    }
+    let dictionary = document.get_dictionary_mut(page_id)?;
+    if page.width.is_some() || page.height.is_some() {
+        let bounds = vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(width),
+            Object::Real(height),
+        ];
+        dictionary.set("MediaBox", bounds.clone());
+        dictionary.set("CropBox", bounds);
+    }
+    if let Some(rotation) = page.rotation {
+        dictionary.set("Rotate", i64::from(rotation));
+    }
+    Ok(())
+}
+
+fn replace_page_resources(
+    document: &mut Document,
+    page_id: lopdf::ObjectId,
+    resources: Option<&PdfJsonCosValue>,
+) -> Result<(), PdfJsonError> {
+    let Some(resources) = resources.and_then(cos_value_to_object) else {
+        return Err(PdfJsonError::UnsupportedText(
+            "page resources must be a valid COS value".to_owned(),
+        ));
+    };
+    if !matches!(resources, Object::Dictionary(_)) {
+        return Err(PdfJsonError::UnsupportedText(
+            "page resources must be a dictionary".to_owned(),
+        ));
+    }
+    document
+        .get_dictionary_mut(page_id)?
+        .set("Resources", resources);
+    Ok(())
+}
+
+fn replace_page_annotations(
+    document: &mut Document,
+    page_id: lopdf::ObjectId,
+    annotations: &[PdfJsonAnnotation],
+) -> Result<(), PdfJsonError> {
+    let widgets = document
+        .get_dictionary(page_id)?
+        .get(b"Annots")
+        .ok()
+        .and_then(|object| resolved_object(document, object))
+        .and_then(|object| object.as_array().ok())
+        .map_or_else(Vec::new, |existing| {
+            existing
+                .iter()
+                .filter(|annotation| {
+                    resolved_dictionary(document, annotation)
+                        .and_then(|dictionary| dictionary.get(b"Subtype").ok())
+                        .and_then(|subtype| resolved_object(document, subtype))
+                        .and_then(|subtype| subtype.as_name().ok())
+                        == Some(b"Widget")
+                })
+                .cloned()
+                .collect()
+        });
+    document.get_dictionary_mut(page_id)?.set("Annots", widgets);
+    restore_annotations(document, page_id, annotations)
+}
+
+fn replace_page_content_streams(
+    document: &mut Document,
+    page_id: lopdf::ObjectId,
+    streams: &[PdfJsonStream],
+) -> Result<(), PdfJsonError> {
+    let contents = streams
+        .iter()
+        .map(|stream| {
+            Object::Reference(document.add_object(Object::Stream(build_stream_from_model(stream))))
+        })
+        .collect::<Vec<_>>();
+    document
+        .get_dictionary_mut(page_id)?
+        .set("Contents", contents);
+    Ok(())
+}
+
+fn regenerate_page_with_vector_overlay(
+    document: &mut Document,
+    page_id: lopdf::ObjectId,
+    document_model: &PdfJsonDocument,
+    page_model: &PdfJsonPage,
+    represented_source_images: &[PdfJsonImageElement],
+    page_number: i32,
+) -> Result<(), PdfJsonError> {
+    let retained = retained_vector_content(document, page_id, represented_source_images)?;
+    let resources = materialized_page_resources(document, page_id);
+    let generated = build_generated_page_content(
+        document,
+        document_model,
+        page_model,
+        page_number,
+        resources.as_ref(),
+    )?;
+    let mut contents = Vec::with_capacity(2);
+    if let Some(content) = retained {
+        contents.push(add_compressed_content_stream(document, content)?);
+    }
+    if let Some(generated) = generated {
+        if generated.content.len() > MAX_TEXT_CONTENT_BYTES {
+            return Err(PdfJsonError::UnsupportedText(format!(
+                "generated page content exceeds {MAX_TEXT_CONTENT_BYTES} bytes"
+            )));
+        }
+        contents.push(add_compressed_content_stream(document, generated.content)?);
+        let resources =
+            merge_generated_page_resources(resources, &generated.fonts, &generated.images)?;
+        document
+            .get_dictionary_mut(page_id)?
+            .set("Resources", resources);
+    }
+    document
+        .get_dictionary_mut(page_id)?
+        .set("Contents", contents);
+    Ok(())
+}
+
+fn retained_vector_content(
+    document: &Document,
+    page_id: lopdf::ObjectId,
+    represented_images: &[PdfJsonImageElement],
+) -> Result<Option<Vec<u8>>, PdfJsonError> {
+    let bytes = document.get_page_content_with_limit(page_id, MAX_TEXT_CONTENT_BYTES)?;
+    let content = Content::decode(&bytes)?;
+    let represented_image_names = represented_images
+        .iter()
+        .filter_map(|image| image.object_name.as_deref())
+        .map(str::as_bytes)
+        .collect::<BTreeSet<_>>();
+    let remove_inline_images = represented_images
+        .iter()
+        .any(|image| image.inline_image == Some(true));
+    let mut inside_text = false;
+    let mut operations = Vec::with_capacity(content.operations.len());
+    for operation in content.operations {
+        let retain = match operation.operator.as_str() {
+            "BT" => {
+                inside_text = true;
+                false
+            }
+            "ET" => {
+                inside_text = false;
+                false
+            }
+            _ if inside_text => false,
+            "BI" if remove_inline_images => false,
+            "Do" if operation
+                .operands
+                .first()
+                .and_then(|operand| operand.as_name().ok())
+                .is_some_and(|name| represented_image_names.contains(name)) =>
+            {
+                false
+            }
+            _ => true,
+        };
+        if retain {
+            operations.push(operation);
+        }
+    }
+    if operations.is_empty() {
+        return Ok(None);
+    }
+    let encoded = Content { operations }.encode()?;
+    if encoded.len() > MAX_TEXT_CONTENT_BYTES {
+        return Err(PdfJsonError::UnsupportedText(format!(
+            "retained page content exceeds {MAX_TEXT_CONTENT_BYTES} bytes"
+        )));
+    }
+    Ok(Some(encoded))
+}
+
+fn materialized_page_resources(document: &Document, page_id: lopdf::ObjectId) -> Option<Object> {
+    let resource = inherited_value(document, page_id, b"Resources").ok()?;
+    let mut resources = resolved_dictionary(document, &resource)?.clone();
+    for key in [b"Font".as_slice(), b"XObject".as_slice()] {
+        let Some(dictionary) = resources
+            .get(key)
+            .ok()
+            .and_then(|object| resolved_dictionary(document, object))
+            .cloned()
+        else {
+            continue;
+        };
+        resources.set(key.to_vec(), dictionary);
+    }
+    Some(Object::Dictionary(resources))
+}
+
+fn add_compressed_content_stream(
+    document: &mut Document,
+    content: Vec<u8>,
+) -> Result<Object, PdfJsonError> {
+    let mut stream = Stream::new(Dictionary::new(), content);
+    stream.compress()?;
+    Ok(Object::Reference(document.add_object(stream)))
+}
+
 /// Rebuilds a PDF from the editable JSON structure and writes it to `output_path`.
 ///
 /// Phase 2 reconstructs pages from the preserved COS data — document metadata,
@@ -8982,6 +9753,142 @@ end"
     }
 
     #[test]
+    fn converts_multicomponent_dct_device_n_images_after_decode_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        // Two CMYK pixels (white and registration black) encoded by Pillow at
+        // quality 100. The Adobe APP14 marker is transform 0, so, like PDF.js,
+        // the decoder must retain all four components rather than first
+        // projecting the JPEG into RGB.
+        let jpeg = STANDARD.decode(concat!(
+            "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgAAQAC",
+            "BEMRAE0RAFkRAEsRAP/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQ",
+            "AAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNi",
+            "coIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3",
+            "eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV",
+            "1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD+P7/grF/ylN/4",
+            "KWf9n/8A7ZH/AK0V8Rq/j+/4Kxf8pTf+Cln/AGf/APtkf+tFfEav4/v+CsX/AClN/wCC",
+            "ln/Z/wD+2R/60V8Rq/j+/wCCsX/KU3/gpZ/2f/8Atkf+tFfEav/Z"
+        ))?;
+
+        let mut document = Document::with_version("1.7");
+        let mut tint_samples = Vec::with_capacity(16 * 3);
+        for vertex in 0_u8..16 {
+            let value = if vertex == 0 { 255 } else { 0 };
+            tint_samples.extend_from_slice(&[value, value, value]);
+        }
+        let tint_transform = document.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 0,
+                "Domain" => vec![
+                    0.into(), 1.into(), 0.into(), 1.into(),
+                    0.into(), 1.into(), 0.into(), 1.into(),
+                ],
+                "Range" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+                "Size" => vec![2.into(), 2.into(), 2.into(), 2.into()],
+                "BitsPerSample" => 8,
+            },
+            tint_samples,
+        ));
+        let device_n_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"DeviceN".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"SpotC".to_vec()),
+                        Object::Name(b"SpotM".to_vec()),
+                        Object::Name(b"SpotY".to_vec()),
+                        Object::Name(b"SpotK".to_vec()),
+                    ]),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => vec![
+                    1.into(), 0.into(), 1.into(), 0.into(),
+                    1.into(), 0.into(), 1.into(), 0.into(),
+                ],
+                // PDF.js gives the embedded Adobe marker precedence over this
+                // contradictory stream parameter.
+                "DecodeParms" => dictionary! { "ColorTransform" => 1 },
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+
+        let (png, format) = encode_image_xobject(&document, &device_n_image, 2, 1)
+            .ok_or("DCT DeviceN image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 255, 255, 0, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dct_device_n_channel_mismatches_without_rgb_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let jpeg = STANDARD.decode(concat!(
+            "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgAAQAC",
+            "BEMRAE0RAFkRAEsRAP/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQ",
+            "AAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNi",
+            "coIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3",
+            "eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV",
+            "1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD+P7/grF/ylN/4",
+            "KWf9n/8A7ZH/AK0V8Rq/j+/4Kxf8pTf+Cln/AGf/APtkf+tFfEav4/v+CsX/AClN/wCC",
+            "ln/Z/wD+2R/60V8Rq/j+/wCCsX/KU3/gpZ/2f/8Atkf+tFfEav/Z"
+        ))?;
+        let mut document = Document::with_version("1.7");
+        let tint_transform = document.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 0,
+                "Domain" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+                "Range" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+                "Size" => vec![2.into(), 2.into(), 2.into()],
+                "BitsPerSample" => 8,
+            },
+            vec![0; 8 * 3],
+        ));
+        let mismatched_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"DeviceN".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"Spot1".to_vec()),
+                        Object::Name(b"Spot2".to_vec()),
+                        Object::Name(b"Spot3".to_vec()),
+                    ]),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+        assert!(encode_image_xobject(&document, &mismatched_image, 2, 1).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn converts_separation_images_with_stitching_tint_transforms()
     -> Result<(), Box<dyn std::error::Error>> {
         use super::encode_image_xobject;
@@ -9227,6 +10134,216 @@ end"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn converts_direct_indexed_and_icc_fallback_lab_images()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+        use lopdf::{Document, Object, Stream, StringFormat, dictionary};
+        use std::io::Cursor;
+
+        let lab_space = || {
+            Object::Array(vec![
+                Object::Name(b"Lab".to_vec()),
+                Object::Dictionary(dictionary! {
+                    "WhitePoint" => vec![
+                        Object::Real(0.95047),
+                        Object::Real(1.0),
+                        Object::Real(1.08883),
+                    ],
+                }),
+            ])
+        };
+        let assert_neutral_ends = |rgb: &[u8]| {
+            assert!(rgb[..3].iter().all(|component| *component <= 8));
+            assert!(rgb[3..6].iter().all(|component| *component >= 248));
+        };
+        let document = Document::with_version("1.7");
+        let direct = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => lab_space(),
+                "BitsPerComponent" => 8,
+                // PDF.js treats Lab's component mapping as the default decode.
+                "Decode" => vec![1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()],
+            },
+            vec![0, 128, 128, 255, 128, 128],
+        );
+        let (png, format) = encode_image_xobject(&document, &direct, 2, 1)
+            .ok_or("direct Lab image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_neutral_ends(image::load_from_memory(&png)?.to_rgb8().as_raw());
+
+        let mut jpeg_source = RgbImage::new(16, 8);
+        for (x, _, pixel) in jpeg_source.enumerate_pixels_mut() {
+            *pixel = if x < 8 {
+                Rgb([0, 128, 128])
+            } else {
+                Rgb([255, 128, 128])
+            };
+        }
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(jpeg_source)
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+        let direct_dct = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 16,
+                "Height" => 8,
+                "ColorSpace" => lab_space(),
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+        let (png, _) = encode_image_xobject(&document, &direct_dct, 16, 8)
+            .ok_or("direct DCT Lab image was not encoded")?;
+        let rgb = image::load_from_memory(&png)?.to_rgb8();
+        assert!(
+            rgb.get_pixel(1, 1)
+                .0
+                .iter()
+                .all(|component| *component <= 32)
+        );
+        assert!(
+            rgb.get_pixel(14, 1)
+                .0
+                .iter()
+                .all(|component| *component >= 224)
+        );
+
+        let indexed = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    lab_space(),
+                    Object::Integer(1),
+                    Object::String(
+                        vec![0, 128, 128, 255, 128, 128],
+                        StringFormat::Literal,
+                    ),
+                ]),
+                "BitsPerComponent" => 1,
+            },
+            vec![0b0100_0000],
+        );
+        let (png, _) = encode_image_xobject(&document, &indexed, 2, 1)
+            .ok_or("Indexed Lab image was not encoded")?;
+        assert_neutral_ends(image::load_from_memory(&png)?.to_rgb8().as_raw());
+
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => lab_space() },
+            b"not-an-icc-profile".to_vec(),
+        ));
+        let icc_fallback = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 128, 255, 128, 128],
+        );
+        let (png, _) = encode_image_xobject(&document, &icc_fallback, 2, 1)
+            .ok_or("ICCBased Lab fallback image was not encoded")?;
+        assert_neutral_ends(image::load_from_memory(&png)?.to_rgb8().as_raw());
+        Ok(())
+    }
+
+    #[test]
+    fn converts_lab_separation_and_device_n_alternates() -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let lab_space = || {
+            Object::Array(vec![
+                Object::Name(b"Lab".to_vec()),
+                Object::Dictionary(dictionary! {
+                    "WhitePoint" => vec![
+                        Object::Real(0.95047),
+                        Object::Real(1.0),
+                        Object::Real(1.08883),
+                    ],
+                }),
+            ])
+        };
+        let neutral_transform = || {
+            Object::Dictionary(dictionary! {
+                "FunctionType" => 2,
+                "Domain" => vec![0.into(), 1.into()],
+                "C0" => vec![0.into(), 0.into(), 0.into()],
+                "C1" => vec![100.into(), 0.into(), 0.into()],
+                "N" => 1,
+                "Range" => vec![
+                    0.into(), 100.into(),
+                    (-100).into(), 100.into(),
+                    (-100).into(), 100.into(),
+                ],
+            })
+        };
+        let assert_neutral_ends = |rgb: &[u8]| {
+            assert!(rgb[..3].iter().all(|component| *component <= 8));
+            assert!(rgb[3..6].iter().all(|component| *component >= 248));
+        };
+        let document = Document::with_version("1.7");
+        let separation = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"NeutralLab".to_vec()),
+                    lab_space(),
+                    neutral_transform(),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 255],
+        );
+        let (png, format) = encode_image_xobject(&document, &separation, 2, 1)
+            .ok_or("Lab Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_neutral_ends(image::load_from_memory(&png)?.to_rgb8().as_raw());
+
+        let device_n = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"DeviceN".to_vec()),
+                    Object::Array(vec![Object::Name(b"NeutralLab".to_vec())]),
+                    lab_space(),
+                    neutral_transform(),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 255],
+        );
+        let (png, _) = encode_image_xobject(&document, &device_n, 2, 1)
+            .ok_or("Lab DeviceN image was not encoded")?;
+        assert_neutral_ends(image::load_from_memory(&png)?.to_rgb8().as_raw());
+        Ok(())
+    }
+
+    #[test]
     fn extracts_cmyk_images_and_applies_soft_masks() -> Result<(), Box<dyn std::error::Error>> {
         use super::pdf_to_json;
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -9462,6 +10579,66 @@ q 20 0 0 10 5 7 cm BI /W 2 /H 1 /CS /RGB /BPC 8 ID\n"
         let encoded = image.image_data.as_deref().ok_or("image data missing")?;
         let decoded = image::load_from_memory(&STANDARD.decode(encoded)?)?;
         assert_eq!(decoded.to_rgb8().as_raw(), &[10, 20, 30, 40, 50, 60]);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_overlay_removes_represented_inline_images() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{PdfJsonImageElement, retained_vector_content};
+        use lopdf::{Document, Object, Stream, content::Content, dictionary};
+
+        let mut content =
+            b"0 1 0 rg 10 10 20 20 re f q 2 0 0 2 50 50 cm BI /W 1 /H 1 /CS /RGB /BPC 8 ID\n"
+                .to_vec();
+        content.extend_from_slice(&[10, 20, 30]);
+        content.extend_from_slice(b"\nEI\nQ");
+        let mut document = Document::with_version("1.7");
+        let page_tree_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(dictionary! {}, content));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page", "Parent" => page_tree_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! {}, "Contents" => content_id,
+        });
+        document.objects.insert(
+            page_tree_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => page_tree_id });
+        document.trailer.set("Root", catalog_id);
+
+        let retained = retained_vector_content(
+            &document,
+            page_id,
+            &[PdfJsonImageElement {
+                inline_image: Some(true),
+                ..PdfJsonImageElement::default()
+            }],
+        )?
+        .ok_or("vector content missing")?;
+        let retained = Content::decode(&retained)?;
+        assert!(
+            retained
+                .operations
+                .iter()
+                .any(|operation| operation.operator == "re")
+        );
+        assert!(
+            retained
+                .operations
+                .iter()
+                .any(|operation| operation.operator == "f")
+        );
+        assert!(
+            !retained
+                .operations
+                .iter()
+                .any(|operation| operation.operator == "BI")
+        );
         Ok(())
     }
 

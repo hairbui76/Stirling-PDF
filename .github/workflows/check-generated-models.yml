@@ -4,8 +4,9 @@ name: Check generated models
 # OpenAPI spec: the frontend tool API types
 # (frontend/editor/src/core/types/toolApiTypes.ts) and the engine tool
 # models (engine/src/stirling/models/tool_models.py), and the Rust AI operation
-# catalog. Regenerates all three with the single top-level `task tool-models`
-# and fails if any committed file is out of date. Called from build.yml when
+# catalog. The Rust catalog is regenerated directly from OpenAPI before Python
+# is installed; the legacy model is generated independently. The job fails if
+# any committed file is out of date. Called from build.yml when
 # the backend Java, frontend, or engine changes; also runs on push to main as a
 # post-merge safety net.
 on:
@@ -33,10 +34,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901d61fb841f559994984270fce7 # stable
         with:
-          enable-cache: true
+          toolchain: 1.94.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: rust -> target
 
       - name: Set up JDK 25
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
@@ -59,10 +65,20 @@ jobs:
       - name: Install Task
         uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
 
-      # Rebuilds the OpenAPI spec from the current Java and regenerates both the
-      # frontend types and the engine tool models from it.
-      - name: Regenerate generated models
-        run: task tool-models
+      # This runs before uv is installed so the Rust catalog cannot accidentally
+      # depend on the retained Python models or environment.
+      - name: Regenerate Rust AI operation catalog
+        run: task engine:tool-models
+
+      - name: Install uv for legacy model generation
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Regenerate frontend and legacy Python models
+        run: |
+          task frontend:tool-models
+          task engine:legacy:tool-models
 
       - name: Verify generated models are up to date
         id: models-check
@@ -88,7 +104,7 @@ jobs:
               '',
               'The generated frontend types, legacy Python engine models, and/or Rust AI operation catalog are out of date with the Java OpenAPI spec and will need to be regenerated before they can be merged in.',
               '',
-              'Run `task tool-models` to regenerate both, then commit the updated files.',
+              'Run `task tool-models` to regenerate all three artifacts, then commit the updated files.',
             ].join('\n');
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -123,7 +139,7 @@ jobs:
           echo "and/or Rust operation catalog are out of date and"
           echo "will need to be regenerated before they can be merged in."
           echo ""
-          echo "Run 'task tool-models' to regenerate both, then"
+          echo "Run 'task tool-models' to regenerate all three, then"
           echo "commit the updated files."
           echo "============================================"
           exit 1

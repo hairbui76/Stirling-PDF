@@ -198,6 +198,7 @@ tasks:
     cmds:
       - task: frontend:tool-models
       - task: engine:tool-models
+      - task: engine:legacy:tool-models
 
   # ============================================================
   # Quality Gate

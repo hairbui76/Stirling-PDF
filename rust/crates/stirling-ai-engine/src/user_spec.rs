@@ -2,13 +2,16 @@
 
 use std::{fmt, sync::Arc, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
 use crate::{
     orchestrator::OrchestratorRequest,
-    pdf_edit::{PdfEditAgent, PdfEditError, catalogued_operations},
+    pdf_edit::{
+        PdfEditAgent, PdfEditError, catalogued_operations, validate_operation_parameters,
+        validate_processing_endpoint,
+    },
     pdf_question::ConversationMessage,
     structured_output::{ModelError, StructuredOutputModel, ToolDefinition},
 };
@@ -16,7 +19,7 @@ use crate::{
 const USER_SPEC_TOOL: &str = "write_user_agent_spec_metadata";
 const USER_SPEC_PROMPT: &str = "Create or revise a saved agent draft from the provided request and edit plan. Return a concise name, description, and objective. Keep the workflow grounded and practical.";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentSpecStep {
     Tool {
@@ -29,6 +32,50 @@ pub enum AgentSpecStep {
         tool: String,
         instruction: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum UnvalidatedAgentSpecStep {
+    Tool {
+        tool: String,
+        parameters: Value,
+    },
+    AiTool {
+        title: String,
+        description: String,
+        tool: String,
+        instruction: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for AgentSpecStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match UnvalidatedAgentSpecStep::deserialize(deserializer)? {
+            UnvalidatedAgentSpecStep::Tool { tool, parameters } => {
+                let parameters =
+                    validate_operation_parameters(&tool, &parameters).map_err(de::Error::custom)?;
+                Ok(Self::Tool { tool, parameters })
+            }
+            UnvalidatedAgentSpecStep::AiTool {
+                title,
+                description,
+                tool,
+                instruction,
+            } => {
+                validate_processing_endpoint(&tool).map_err(de::Error::custom)?;
+                Ok(Self::AiTool {
+                    title,
+                    description,
+                    tool,
+                    instruction,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -335,7 +382,9 @@ fn metadata_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentDraft, AgentSpecStep};
+    use serde_json::json;
+
+    use super::{AgentDraft, AgentSpecStep, UserSpecError, parse_plan_or_terminal};
 
     #[test]
     fn agent_step_union_round_trips_ai_tools() -> Result<(), Box<dyn std::error::Error>> {
@@ -347,11 +396,100 @@ mod tests {
                 "kind": "ai_tool",
                 "title": "Audit",
                 "description": "Audit figures",
-                "tool": "/api/v1/ai/tools/math-auditor-agent",
+                "tool": "/api/v1/general/rotate-pdf",
                 "instruction": "Check all totals"
             }]
         }))?;
         assert!(matches!(draft.steps[0], AgentSpecStep::AiTool { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn agent_tool_steps_use_catalogued_endpoints_and_exact_parameter_schemas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let draft: AgentDraft = serde_json::from_value(json!({
+            "name": "Flatten",
+            "description": "Flatten documents",
+            "objective": "Normalise PDFs",
+            "steps": [{
+                "kind": "tool",
+                "tool": "/api/v1/misc/flatten",
+                "parameters": {"flatten_only_forms": true, "render_dpi": 144}
+            }]
+        }))?;
+        assert_eq!(
+            serde_json::to_value(&draft)?["steps"][0]["parameters"],
+            json!({"flattenOnlyForms": true, "renderDpi": 144})
+        );
+        let agent_step: AgentDraft = serde_json::from_value(json!({
+            "name": "Audit",
+            "description": "Audit documents",
+            "objective": "Check totals",
+            "steps": [{
+                "kind": "tool",
+                "tool": "/api/v1/ai/tools/math-auditor-agent",
+                "parameters": {}
+            }]
+        }))?;
+        assert_eq!(
+            serde_json::to_value(agent_step)?["steps"][0]["parameters"],
+            json!({"tolerance": "0.01"})
+        );
+
+        for invalid_step in [
+            json!({
+                "kind": "tool",
+                "tool": "/api/v1/not-real",
+                "parameters": {}
+            }),
+            json!({
+                "kind": "tool",
+                "tool": "/api/v1/general/rotate-pdf",
+                "parameters": {"flattenOnlyForms": false}
+            }),
+            json!({
+                "kind": "ai_tool",
+                "title": "Unknown",
+                "description": "Unknown",
+                "tool": "/api/v1/not-real",
+                "instruction": "Try an unknown endpoint"
+            }),
+            json!({
+                "kind": "ai_tool",
+                "title": "Wrong endpoint class",
+                "description": "Agent operations are deterministic tool steps",
+                "tool": "/api/v1/ai/tools/math-auditor-agent",
+                "instruction": "This endpoint is not a generated processing tool"
+            }),
+        ] {
+            let result = serde_json::from_value::<AgentDraft>(json!({
+                "name": "Invalid",
+                "description": "Invalid",
+                "objective": "Invalid",
+                "steps": [invalid_step]
+            }));
+            assert!(result.is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edit_plan_model_output_rejects_invalid_saved_agent_steps() {
+        for (tool, parameters) in [
+            ("/api/v1/not-real", json!({})),
+            (
+                "/api/v1/general/rotate-pdf",
+                json!({"flattenOnlyForms": false}),
+            ),
+        ] {
+            let result = parse_plan_or_terminal(&json!({
+                "outcome": "plan",
+                "summary": "Invalid model output",
+                "rationale": "Test",
+                "steps": [{"kind": "tool", "tool": tool, "parameters": parameters}],
+                "resumeWith": null
+            }));
+            assert!(matches!(result, Err(UserSpecError::Edit(_))));
+        }
     }
 }

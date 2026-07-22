@@ -20,6 +20,13 @@ sqlite-vec files.
   `X-User-Id` after shared-secret authentication. The identity is carried to
   handlers as the typed `UserId` request extension; a missing identity returns
   Python-compatible `401`.
+- Environment-backed booleans and numeric limits are parsed strictly before the
+  listener binds. A present malformed or non-Unicode value terminates startup
+  instead of substituting a default; this applies in particular to
+  `STIRLING_ENGINE_REQUIRE_AUTH` and `STIRLING_REQUIRE_USER_ID`, so a typo cannot
+  silently weaken either request gate. Existing chunk, worker, contradiction,
+  concurrency, token, document-backend, and pgvector-pool bounds are validated at the same
+  boundary.
 - Every JSON POST request accepts both the Python `ApiModel` camel-case aliases
   and its snake-case field names, including nested request models. Unknown
   fields are rejected with `422` instead of being silently ignored.
@@ -108,6 +115,18 @@ identifier may safely exist under multiple owners.
 providers. Voyage uses retrieval-specific `document`/`query` input types;
 OpenAI-compatible and Ollama endpoints retain their native wire contracts.
 Hosted providers fail closed when their native credential is missing.
+
+Structured model inference supports `anthropic:`, `openai:`, and the Python
+oracle's self-hosted `ollama:` model prefix for both the smart and fast tiers.
+`ollama:<model-id>` defaults to `http://localhost:11434`, honors
+`OLLAMA_BASE_URL`, and does not require a credential for a local server. An
+optional non-empty `OLLAMA_API_KEY` is sent as a bearer token for authenticated
+remote gateways. Ollama uses its OpenAI-compatible chat-completions surface;
+origins, `/v1` bases, and complete `/v1/chat/completions` URLs normalize to one
+endpoint. Rust sends the caller-supplied schema through the native
+`response_format.json_schema` contract, matching the Python oracle's
+`NativeOutput` behavior; response content may be a JSON string or object and is
+validated again by each typed agent after transport parsing.
 `STIRLING_DOCUMENTS_BACKEND=pgvector` uses the Python-compatible PostgreSQL
 tables, installs the `vector` extension, performs atomic replace-ingest, and
 resolves ACL ownership before pages or vectors are read. Connections use a
@@ -197,6 +216,14 @@ structured document model to the fixed processing renderer.
 are built from validated PDF edit plans; revision replaces deterministic tool
 steps and preserves existing `ai_tool` steps. Both `/api/v1/agents/...` and the
 Python manifest's `/api/v1/ai/agents/...` draft/revise paths are accepted.
+Every saved-agent step is validated at deserialization and model-output
+boundaries. Deterministic `tool` steps use the generated Java operation catalog
+plus the three Python-compatible agent operations (math audit, PDF comments,
+and HTML document creation), while `ai_tool` steps accept only generated Java
+processing endpoints. Unknown tool IDs and tool/parameter schema mismatches are
+rejected; Python snake-case parameter aliases are canonicalized and declared
+defaults are materialized. Previous-step tool IDs supplied to next-action use
+the combined deterministic-operation registry.
 `POST /api/v1/agents/next-action` intentionally preserves Python's current
 terminal `cannot_continue` behavior rather than pretending execution planning
 exists.
@@ -222,10 +249,14 @@ pinned Rust builder produces both the server and `migrate-sqlite-vec`; the
 non-Python Debian runtime installs only CA certificates, runs as a non-root
 user, and binds `0.0.0.0:5001`. PR demo builds use the same root context.
 
-Java OpenAPI generation still has one intentional Python dependency:
-`task engine:tool-models` regenerates the retained Python `tool_models.py`, then
-uses it to update Rust's compile-time `operation_catalog.json`. Generated-model
-CI diffs both artifacts.
+`task engine:tool-models` now reads Java's generated `SwaggerDoc.json` directly
+through the typed Rust `stirling-operation-catalog` generator and updates the
+compile-time `operation_catalog.json` without Python. The generator preserves
+the former endpoint allow/exclude rules, camel-case acronym aliases, optional
+field/default behavior, and transitive component schemas. The retained Python
+`tool_models.py` is generated independently by
+`task engine:legacy:tool-models`; generated-model CI builds the Rust catalog
+before installing the Python oracle and diffs both artifacts.
 
 ## Remaining cutover constraints
 
@@ -243,16 +274,20 @@ available through the Anthropic Messages adapter when
 `STIRLING_FAST_MODEL=anthropic:<model-id>` and `ANTHROPIC_API_KEY` are set. An
 OpenAI-compatible and self-hosted gateways can instead use
 `STIRLING_FAST_MODEL=openai:<model-id>`, `OPENAI_API_KEY`, and (when needed)
-`OPENAI_BASE_URL`. An invalid/missing provider configuration returns `503`;
-provider failures return `502`; invalid classifier input returns `422`.
+`OPENAI_BASE_URL`. Native keyless Ollama uses
+`STIRLING_FAST_MODEL=ollama:<model-id>` plus optional `OLLAMA_BASE_URL`. An
+invalid/missing provider configuration returns `503`; provider failures return
+`502`; invalid classifier input returns `422`.
 
-`app_with_classifier` remains the explicit seam for other provider adapters.
+`app_with_classifier` remains the explicit seam for provider adapters beyond
+Anthropic, OpenAI-compatible gateways, and Ollama.
 
 Provider adapters implement `stirling_ai_engine::structured_output`, which
-forces a named tool/function and returns only its JSON input to the agent. The
-classifier, ledger auditor, PDF comment agent, and PDF question synthesizer use
-that seam. Anthropic and OpenAI-compatible adapters both enforce the
-caller-supplied schema rather than carrying classifier-only response parsing.
+forces a named schema, tool, or function and returns only its JSON object to the
+agent. The classifier, ledger auditor, PDF comment agent, and PDF question
+synthesizer use that seam. Anthropic, OpenAI-compatible, and Ollama adapters all
+enforce the caller-supplied schema rather than carrying classifier-only response
+parsing.
 
 ## Required proof before cutover
 

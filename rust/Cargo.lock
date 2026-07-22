@@ -5106,6 +5106,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stirling-operation-catalog"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "stirling-processing"
 version = "0.1.0"
 dependencies = [
@@ -5182,6 +5190,8 @@ dependencies = [
  "x509-parser",
  "zeroize",
  "zip",
+ "zune-core 0.5.1",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

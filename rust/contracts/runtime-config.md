@@ -6,6 +6,13 @@ directory when unset). The custom file recursively overrides the base file.
 The corresponding all-caps Spring-style environment variables take precedence
 for the settings that this slice exposes.
 
+The standalone service binds loopback by default. `STIRLING_HOST`, followed by the
+Spring-compatible `SERVER_ADDRESS`, selects an explicit IPv4 or IPv6 bind address;
+`STIRLING_PORT`, followed by `SERVER_PORT`, selects the port. Port `0` requests an
+ephemeral port for desktop startup. A container can set `STIRLING_HOST=0.0.0.0`
+without weakening the loopback default used by local and desktop launches. Present
+malformed or non-Unicode bind values fail startup instead of falling back silently.
+
 The conditional SMTP route also resolves the existing `mail.*` tree and its
 `MAIL_*` overrides. See [`send-email.md`](send-email.md) for its supported TLS
 policy and multipart contract.

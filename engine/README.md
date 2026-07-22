@@ -42,7 +42,9 @@ task engine:legacy:dev
 task engine:legacy:check
 ```
 
-`task engine:tool-models` intentionally uses the Python environment to generate
-`engine/src/stirling/models/tool_models.py` from Java OpenAPI, then snapshots
-those schemas into the Rust engine's `operation_catalog.json`. Use
-`task engine:legacy:tool-models` only when the Python artifact alone is needed.
+`task engine:tool-models` runs the Rust `stirling-operation-catalog` generator
+directly against Java's `SwaggerDoc.json` and updates the Rust engine's
+`operation_catalog.json`; it does not install or import the Python oracle.
+`task engine:tool-models:check` performs the same translation without writing
+and fails on drift. Use `task engine:legacy:tool-models` separately when the
+retained Python `tool_models.py` artifact is needed.

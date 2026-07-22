@@ -82,6 +82,8 @@ x509-certificate = "0.25.0"
 x509-parser = "0.18.1"
 zeroize = { version = "1.9.0", features = ["serde"] }
 zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+zune-core = "0.5.1"
+zune-jpeg = "0.5.15"
 
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1.29"

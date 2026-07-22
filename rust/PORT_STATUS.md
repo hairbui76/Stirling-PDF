@@ -5,7 +5,7 @@ service lives in this `rust/` workspace as the `stirling-processing` crate — a
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-22):** `task rust:check` passes formatting, strict
-locked all-target workspace Clippy, all 98 AI-engine library tests, all 414
+locked all-target workspace Clippy, all 111 AI-engine library tests, all 419
 processing library tests, helper-binary and process-smoke tests, the complete
 endpoint/integration matrix, and doc tests with the pinned PDFium runtime.
 External-runtime happy paths remain conditional on their respective tools and
@@ -106,7 +106,10 @@ auto-rename/auto-split, plus:
   redaction plan, finalised as an image-only PDF regardless of legacy overlay strategy hints.
 - `convert/pdf/text-editor/{metadata,partial,page,fonts,clear-cache}` — lazy editor job cache with
   30-minute expiry, per-page COS projection, bounded page-scoped font resources/programs and
-  ToUnicode extraction, cache clear, and source-preserving partial export.
+  ToUnicode extraction, cache clear, and source-preserving partial export. Cached-page updates now
+  distinguish omitted from explicitly empty arrays, preserve incomplete lightweight COS payloads,
+  apply complete resource/content/annotation updates in place, and regenerate edited text/images
+  over bounded retained vector content while preserving untouched pages, forms, and catalog data.
 - `general/job/{jobId}`, its `/result` and `/result/files` children, and
   `general/files/{fileId}`/`metadata` — configurable-TTL private single-node async job storage and
   result download. `convert/pdf/text-editor?async=true` retains its specialized worker; the
@@ -278,10 +281,12 @@ auto-rename/auto-split, plus:
   color-key masks remain. Device-alternate Separation and one-to-eight-component DeviceN XObjects
   with bounded order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded
   single-input stitching Type 3 tint transforms are evaluated into Gray/RGB/CMYK, including
-  one-component DCT Separation images after applying `/Decode`. CalGray/CalRGB direct images,
+  one-component DCT Separation images after applying `/Decode`. CalGray/CalRGB/Lab direct images,
   Indexed bases, ICC fallbacks, and spot-color alternates use bounded calibrated conversion,
-  including Gray/RGB DCT; DCT DeviceN tint conversion, PostScript Type 4 functions, and
-  Lab/ICCBased DeviceN alternates remain.
+  including Gray/RGB/Lab DCT. One-to-four-component DCT DeviceN images retain native JPEG planes,
+  perform Adobe/`ColorTransform` conversion, apply `/Decode` in PDF.js order, and evaluate their
+  tint functions; DeviceN DCT above four components, PostScript Type 4 functions, and ICCBased
+  DeviceN alternates remain.
   Full editor responses also inspect root AcroForm fields plus their
   inherited metadata and first widget location, and export structured page annotations (with
   full-mode COS data). JSON→PDF rebuilds root fields/one fresh widget and non-widget page
@@ -289,7 +294,8 @@ auto-rename/auto-split, plus:
   with matrix/state/color data. Generated text can also restore bounded embedded font dictionaries,
   nested font-program streams, Type0/CID encodings, and existing Type3 CharProcs, refusing edits that
   cannot round-trip through the source encoding. Document XMP packets round-trip as bounded base64
-  metadata. Redrawing edits over preserved source streams, synthesizing new Type3 glyphs,
+  metadata. Cached partial export can redraw edited text/images over bounded retained vector content;
+  token-level/mixed-stream editing in the full-document rebuild path, synthesizing new Type3 glyphs,
   nested/multi-widget form hierarchies, and form/annotation appearance streams are still missing, so
   it cannot yet match Java's `PdfJsonConversionService`.
 - **Advanced text editing parity** (`edit-text`): selected-page content-stream replacements are
@@ -409,13 +415,32 @@ process-wide `STIRLING_MODEL_MAX_CONCURRENCY` ceiling, in addition to narrower
 per-agent worker limits. Its MCP manifest publishes all eight completed Python
 capabilities. Model-selected evidence and comment anchors are mapped back to
 trusted local indices, while edit parameters are validated against a generated
-snapshot of the Java operation schemas. PostgreSQL/pgvector now uses the
+snapshot of the Java operation schemas. Deterministic saved-agent steps reuse
+that catalog plus the three typed Python agent operations, while `ai_tool`
+steps remain restricted to generated processing endpoints; both reject unknown
+endpoints, and deterministic steps reject mismatched parameter objects on
+inbound requests and model output. PostgreSQL/pgvector now uses the
 Python-compatible schema with atomic replace-ingest, bounded pooled TLS
 connections, TTL and ACL-gated page/vector reads. The `migrate-sqlite-vec`
 binary now performs idempotent Python-store cutover to Rust SQLite or pgvector:
 it preserves pages, metadata, TTL and read ACLs while re-embedding content
 without loading the sqlite-vec extension, and fails closed on unreconstructable
 legacy records.
+
+Structured provider inference now includes the Python-compatible native
+`ollama:<model>` path for both model tiers: keyless local or optionally
+authenticated remote endpoints, normalized OpenAI-compatible URLs, and
+schema-constrained native JSON output. A compiled-binary process test proves an
+HTTP agent request completes through a fake Ollama server without inventing an
+authorization header. The generated operation snapshot no longer passes through
+Pydantic: the typed `stirling-operation-catalog` crate translates Java OpenAPI
+directly, retains validation/default semantics, and supplies a deterministic
+`--check` drift gate while the Python artifact remains an independent oracle.
+
+Environment-backed AI-engine booleans and numeric limits now parse strictly before the listener
+binds. Malformed or non-Unicode auth flags terminate startup instead of substituting the permissive
+default, and token/concurrency/chunking/contradiction/pgvector bounds plus the typed document-backend
+selection are validated at the same fail-closed boundary.
 
 The processing service now owns the complete Java-facing AI controller surface.
 Its orchestration routes are a real state-machine port rather than a multipart

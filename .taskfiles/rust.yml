@@ -25,6 +25,7 @@ tasks:
       - clean:deps
       - pdfium:install
     vars:
+      HOST: '{{.HOST | default "127.0.0.1"}}'
       PORT: '{{.PORT | default "8080"}}'
       AIENGINE_URL: '{{.AIENGINE_URL | default "http://localhost:5001"}}'
       AIENGINE_ENABLED: '{{.AIENGINE_ENABLED | default "false"}}'
@@ -33,6 +34,7 @@ tasks:
       POLICIES_ENABLED: '{{.POLICIES_ENABLED | default "false"}}'
     env:
       STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+      STIRLING_HOST: '{{.HOST}}'
       STIRLING_PORT: '{{.PORT}}'
       STIRLING_PROCESSING_PORT: '{{.PORT}}'
       AIENGINE_URL: '{{.AIENGINE_URL}}'

@@ -234,7 +234,7 @@ use crate::{
     pdf_info::pdf_info_report,
     pdf_javascript::{JavascriptError, extract_javascript},
     pdf_json::{
-        PdfJsonDocument, PdfJsonError, PdfJsonFont, PdfJsonPage, convert_json_to_pdf,
+        PdfJsonError, PdfJsonFont, PdfJsonPartialDocument, apply_partial_json_to_pdf,
         json_bytes_to_pdf, pdf_bytes_to_json, pdf_to_json, pdf_to_json_metadata,
     },
     pdf_json_cache::{
@@ -4738,7 +4738,7 @@ async fn pdf_text_editor_page_fonts(
 async fn pdf_text_editor_partial(
     AxumPath(job_id): AxumPath<String>,
     Query(query): Query<TextEditorPartialQuery>,
-    Json(updates): Json<PdfJsonDocument>,
+    Json(updates): Json<PdfJsonPartialDocument>,
 ) -> Result<Response, ApiError> {
     let cached = load_pdf_text_editor_job(job_id.clone(), PDF_TEXT_EDITOR_PARTIAL_PATH).await?;
     let output_filename = suffixed_filename(
@@ -4754,11 +4754,13 @@ async fn pdf_text_editor_partial(
             std::fs::write(&blocking_output_path, &cached.bytes)
                 .map_err(|error| error.to_string())?;
         } else {
-            let original = pdf_bytes_to_json(&cached.bytes, &cached.filename, false)
-                .map_err(|error| error.to_string())?;
-            let merged = merge_partial_pdf_json(original, updates);
-            convert_json_to_pdf(&merged, &blocking_output_path)
-                .map_err(|error| error.to_string())?;
+            apply_partial_json_to_pdf(
+                &cached.bytes,
+                &cached.filename,
+                updates,
+                &blocking_output_path,
+            )
+            .map_err(|error| error.to_string())?;
         }
         replace_cached_pdf_file(&job_id, &blocking_output_path).map_err(|error| error.to_string())
     })
@@ -4805,62 +4807,6 @@ async fn load_pdf_text_editor_job(
             ApiError::internal_at(api_path, format!("cached PDF task failed: {error}"))
         })?
         .map_err(|error| map_pdf_json_cache_error(&error, api_path))
-}
-
-fn merge_partial_pdf_json(
-    mut original: PdfJsonDocument,
-    updates: PdfJsonDocument,
-) -> PdfJsonDocument {
-    if updates.metadata.is_some() {
-        original.metadata = updates.metadata;
-    }
-    if updates.xmp_metadata.is_some() {
-        original.xmp_metadata = updates.xmp_metadata;
-    }
-    if !updates.fonts.is_empty() {
-        original.fonts = updates.fonts;
-    }
-    for update in updates.pages {
-        let Some(page_number) = update.page_number else {
-            continue;
-        };
-        let Some(original_page) = original
-            .pages
-            .iter_mut()
-            .find(|page| page.page_number == Some(page_number))
-        else {
-            continue;
-        };
-        merge_partial_pdf_page(original_page, update);
-    }
-    original
-}
-
-fn merge_partial_pdf_page(original: &mut PdfJsonPage, update: PdfJsonPage) {
-    if update.width.is_some() {
-        original.width = update.width;
-    }
-    if update.height.is_some() {
-        original.height = update.height;
-    }
-    if update.rotation.is_some() {
-        original.rotation = update.rotation;
-    }
-    if update.resources.is_some() {
-        original.resources = update.resources;
-    }
-    if !update.content_streams.is_empty() {
-        original.content_streams = update.content_streams;
-    }
-    if !update.text_elements.is_empty() {
-        original.text_elements = update.text_elements;
-    }
-    if !update.image_elements.is_empty() {
-        original.image_elements = update.image_elements;
-    }
-    if !update.annotations.is_empty() {
-        original.annotations = update.annotations;
-    }
 }
 
 async fn text_editor_to_pdf(mut multipart: Multipart) -> Result<Response, ApiError> {

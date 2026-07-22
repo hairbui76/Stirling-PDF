@@ -61,7 +61,10 @@ use crate::{
     },
     pdf_comment::{PdfCommentAgent, PdfCommentError},
     pdf_create::PdfCreateAgent,
-    pdf_edit::{PdfEditAgent, PdfEditError, PdfEditRequest},
+    pdf_edit::{
+        PdfEditAgent, PdfEditError, PdfEditRequest, catalogued_operation_endpoints,
+        catalogued_processing_endpoints,
+    },
     pdf_question::{
         PdfQuestionAgent, PdfQuestionError, PdfQuestionLimits, PdfQuestionModels,
         PdfQuestionRequest,
@@ -124,81 +127,185 @@ pub struct EngineSettings {
     documents_reaper_interval_seconds: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineSettingsError(String);
+
+impl EngineSettingsError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for EngineSettingsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EngineSettingsError {}
+
 impl EngineSettings {
-    #[must_use]
-    pub fn from_environment() -> Self {
-        Self {
+    /// Loads and validates the AI-engine settings from the process environment.
+    ///
+    /// Missing values retain the documented defaults. A present malformed or
+    /// non-Unicode value is an error rather than silently weakening an auth gate
+    /// or replacing a resource limit with its default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed environment value or settings whose
+    /// existing size, concurrency, timeout, or cross-field bounds are invalid.
+    pub fn from_environment() -> Result<Self, EngineSettingsError> {
+        let settings = Self {
             smart_model_name: environment_value(
                 "STIRLING_SMART_MODEL",
                 "anthropic:claude-haiku-4-5",
-            ),
-            fast_model_name: environment_value("STIRLING_FAST_MODEL", "anthropic:claude-haiku-4-5"),
-            shared_secret: environment_value("STIRLING_ENGINE_SHARED_SECRET", ""),
-            require_auth: environment_bool("STIRLING_ENGINE_REQUIRE_AUTH", false),
-            require_user_id: environment_bool("STIRLING_REQUIRE_USER_ID", false),
-            smart_model_max_tokens: environment_u32("STIRLING_SMART_MODEL_MAX_TOKENS", 8_192),
-            fast_model_max_tokens: environment_u32("STIRLING_FAST_MODEL_MAX_TOKENS", 2_048),
-            model_max_concurrency: environment_usize("STIRLING_MODEL_MAX_CONCURRENCY", 32),
-            documents_backend: environment_value("STIRLING_DOCUMENTS_BACKEND", "sqlite"),
+            )?,
+            fast_model_name: environment_value(
+                "STIRLING_FAST_MODEL",
+                "anthropic:claude-haiku-4-5",
+            )?,
+            shared_secret: environment_value("STIRLING_ENGINE_SHARED_SECRET", "")?,
+            require_auth: environment_bool("STIRLING_ENGINE_REQUIRE_AUTH", false)?,
+            require_user_id: environment_bool("STIRLING_REQUIRE_USER_ID", false)?,
+            smart_model_max_tokens: environment_u32("STIRLING_SMART_MODEL_MAX_TOKENS", 8_192)?,
+            fast_model_max_tokens: environment_u32("STIRLING_FAST_MODEL_MAX_TOKENS", 2_048)?,
+            model_max_concurrency: environment_usize("STIRLING_MODEL_MAX_CONCURRENCY", 32)?,
+            documents_backend: environment_value("STIRLING_DOCUMENTS_BACKEND", "sqlite")?,
             documents_sqlite_path: PathBuf::from(environment_value(
                 "STIRLING_DOCUMENTS_SQLITE_PATH",
                 "data/rag.db",
-            )),
-            documents_pgvector_dsn: environment_value("STIRLING_DOCUMENTS_PGVECTOR_DSN", ""),
+            )?),
+            documents_pgvector_dsn: environment_value("STIRLING_DOCUMENTS_PGVECTOR_DSN", "")?,
             documents_pgvector_pool_min_size: environment_usize(
                 "STIRLING_DOCUMENTS_PGVECTOR_POOL_MIN_SIZE",
                 1,
-            ),
+            )?,
             documents_pgvector_pool_max_size: environment_usize(
                 "STIRLING_DOCUMENTS_PGVECTOR_POOL_MAX_SIZE",
                 10,
-            ),
+            )?,
             rag_embedding_model: environment_value(
                 "STIRLING_RAG_EMBEDDING_MODEL",
                 "voyageai:voyage-4",
-            ),
-            rag_chunk_size: environment_usize("STIRLING_RAG_CHUNK_SIZE", 512),
-            rag_chunk_overlap: environment_usize("STIRLING_RAG_CHUNK_OVERLAP", 64),
-            rag_default_top_k: environment_usize("STIRLING_RAG_TOP_K", 20),
-            max_pages: environment_usize("STIRLING_MAX_PAGES", 200),
-            max_characters: environment_usize("STIRLING_MAX_CHARACTERS", 200_000),
+            )?,
+            rag_chunk_size: environment_usize("STIRLING_RAG_CHUNK_SIZE", 512)?,
+            rag_chunk_overlap: environment_usize("STIRLING_RAG_CHUNK_OVERLAP", 64)?,
+            rag_default_top_k: environment_usize("STIRLING_RAG_TOP_K", 20)?,
+            max_pages: environment_usize("STIRLING_MAX_PAGES", 200)?,
+            max_characters: environment_usize("STIRLING_MAX_CHARACTERS", 200_000)?,
             chunked_reasoner_chars_per_slice: environment_usize(
                 "STIRLING_CHUNKED_REASONER_CHARS_PER_SLICE",
                 16_000,
-            ),
+            )?,
             chunked_reasoner_concurrency: environment_usize(
                 "STIRLING_CHUNKED_REASONER_CONCURRENCY",
                 10,
-            ),
+            )?,
             chunked_reasoner_worker_timeout_seconds: environment_f64(
                 "STIRLING_CHUNKED_REASONER_WORKER_TIMEOUT_SECONDS",
                 60.0,
-            ),
+            )?,
             chunked_reasoner_notes_char_budget: environment_usize(
                 "STIRLING_CHUNKED_REASONER_NOTES_CHAR_BUDGET",
                 250_000,
-            ),
+            )?,
             contradiction_detect_concurrency: environment_usize(
                 "STIRLING_CONTRADICTION_DETECT_CONCURRENCY",
                 5,
-            ),
+            )?,
             contradiction_bucket_chunk_size: environment_usize(
                 "STIRLING_CONTRADICTION_BUCKET_CHUNK_SIZE",
                 12,
-            ),
+            )?,
             contradiction_bucket_chunk_overlap: environment_usize(
                 "STIRLING_CONTRADICTION_BUCKET_CHUNK_OVERLAP",
                 2,
-            ),
+            )?,
             contradiction_canonicaliser_batch_size: environment_usize(
                 "STIRLING_CONTRADICTION_CANONICALISER_BATCH_SIZE",
                 500,
-            ),
+            )?,
             documents_reaper_interval_seconds: environment_u64(
                 "STIRLING_DOCUMENTS_REAPER_INTERVAL_SECONDS",
                 900,
-            ),
+            )?,
+        };
+        settings.validate_environment_bounds()?;
+        Ok(settings)
+    }
+
+    fn validate_environment_bounds(&self) -> Result<(), EngineSettingsError> {
+        if self.smart_model_max_tokens == 0 {
+            return Err(EngineSettingsError::new(
+                "STIRLING_SMART_MODEL_MAX_TOKENS must be positive",
+            ));
         }
+        if self.fast_model_max_tokens == 0 {
+            return Err(EngineSettingsError::new(
+                "STIRLING_FAST_MODEL_MAX_TOKENS must be positive",
+            ));
+        }
+        if self.model_max_concurrency == 0 {
+            return Err(EngineSettingsError::new(
+                "STIRLING_MODEL_MAX_CONCURRENCY must be positive",
+            ));
+        }
+        if self.rag_chunk_size == 0 {
+            return Err(EngineSettingsError::new(
+                "STIRLING_RAG_CHUNK_SIZE must be positive",
+            ));
+        }
+        if self.rag_chunk_overlap >= self.rag_chunk_size {
+            return Err(EngineSettingsError::new(
+                "STIRLING_RAG_CHUNK_OVERLAP must be smaller than STIRLING_RAG_CHUNK_SIZE",
+            ));
+        }
+        if !matches!(self.documents_backend.as_str(), "sqlite" | "pgvector") {
+            return Err(EngineSettingsError::new(
+                "STIRLING_DOCUMENTS_BACKEND must be sqlite or pgvector",
+            ));
+        }
+        if self.documents_backend == "pgvector"
+            && (self.documents_pgvector_pool_min_size == 0
+                || self.documents_pgvector_pool_max_size == 0
+                || self.documents_pgvector_pool_min_size > self.documents_pgvector_pool_max_size)
+        {
+            return Err(EngineSettingsError::new(
+                "STIRLING_DOCUMENTS_PGVECTOR_POOL_MIN_SIZE and STIRLING_DOCUMENTS_PGVECTOR_POOL_MAX_SIZE must be positive, and min must not exceed max",
+            ));
+        }
+        if self.chunked_reasoner_chars_per_slice == 0
+            || self.chunked_reasoner_concurrency == 0
+            || self.chunked_reasoner_notes_char_budget == 0
+        {
+            return Err(EngineSettingsError::new(
+                "STIRLING_CHUNKED_REASONER_CHARS_PER_SLICE, STIRLING_CHUNKED_REASONER_CONCURRENCY, and STIRLING_CHUNKED_REASONER_NOTES_CHAR_BUDGET must be positive",
+            ));
+        }
+        let worker_timeout =
+            Duration::try_from_secs_f64(self.chunked_reasoner_worker_timeout_seconds).map_err(
+                |_| {
+                    EngineSettingsError::new(
+                        "STIRLING_CHUNKED_REASONER_WORKER_TIMEOUT_SECONDS must be a finite positive duration",
+                    )
+                },
+            )?;
+        if worker_timeout.is_zero() {
+            return Err(EngineSettingsError::new(
+                "STIRLING_CHUNKED_REASONER_WORKER_TIMEOUT_SECONDS must be a finite positive duration",
+            ));
+        }
+        if self.contradiction_detect_concurrency == 0
+            || self.contradiction_bucket_chunk_size == 0
+            || self.contradiction_bucket_chunk_overlap >= self.contradiction_bucket_chunk_size
+            || self.contradiction_canonicaliser_batch_size == 0
+        {
+            return Err(EngineSettingsError::new(
+                "contradiction limits must be positive and STIRLING_CONTRADICTION_BUCKET_CHUNK_OVERLAP must be smaller than STIRLING_CONTRADICTION_BUCKET_CHUNK_SIZE",
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -421,16 +528,20 @@ fn structured_model_from_environment(
         return OpenAiClassifierModel::from_environment(model_name)
             .map(|model| Arc::new(model) as Arc<dyn StructuredOutputModel>);
     }
+    if model_name.starts_with("ollama:") {
+        return OpenAiClassifierModel::from_ollama_environment(model_name)
+            .map(|model| Arc::new(model) as Arc<dyn StructuredOutputModel>);
+    }
     Err(ModelError::new(
-        "model must use an installed provider prefix: anthropic: or openai:",
+        "model must use an installed provider prefix: anthropic:, openai:, or ollama:",
     ))
 }
 
 /// Builds the engine router with any structured classifier model.
 ///
 /// This is the provider-integration seam for self-hosted and non-Anthropic
-/// models; the regular [`app`] constructor wires the Anthropic adapter from
-/// environment configuration.
+/// models; the regular [`app`] constructor infers the installed Anthropic,
+/// `OpenAI`-compatible, or `Ollama` adapter from environment configuration.
 pub fn app_with_classifier(
     settings: EngineSettings,
     classifier_model: Arc<dyn StructuredOutputModel>,
@@ -561,7 +672,21 @@ async fn health(Extension(runtime): Extension<Arc<EngineRuntime>>) -> impl IntoR
     })
 }
 
-async fn capabilities() -> Json<CapabilityManifest> {
+async fn capabilities() -> Response {
+    let (operation_endpoints, processing_endpoints) = match (
+        catalogued_operation_endpoints(),
+        catalogued_processing_endpoints(),
+    ) {
+        (Ok(operation_endpoints), Ok(processing_endpoints)) => {
+            (operation_endpoints, processing_endpoints)
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("PDF edit operation catalog failed: {error}"),
+            );
+        }
+    };
     Json(CapabilityManifest {
         version: 1,
         capabilities: vec![
@@ -592,7 +717,10 @@ async fn capabilities() -> Json<CapabilityManifest> {
             AgentCapability {
                 id: "agent-revise",
                 description: "Revise an existing saved-agent draft from user feedback or changed constraints.",
-                input_schema: agent_revision_capability_schema(),
+                input_schema: agent_revision_capability_schema(
+                    &operation_endpoints,
+                    &processing_endpoints,
+                ),
                 mode: "sync",
                 required_scope: "mcp.tools.read",
                 route: AI_AGENT_REVISE_PATH,
@@ -624,13 +752,17 @@ async fn capabilities() -> Json<CapabilityManifest> {
             AgentCapability {
                 id: "agent-next-action",
                 description: "Decide the next execution step for an in-progress saved-agent workflow.",
-                input_schema: agent_execution_capability_schema(),
+                input_schema: agent_execution_capability_schema(
+                    &operation_endpoints,
+                    &processing_endpoints,
+                ),
                 mode: "sync",
                 required_scope: "mcp.tools.read",
                 route: AGENT_NEXT_ACTION_PATH,
             },
         ],
     })
+    .into_response()
 }
 
 async fn ingest_document(
@@ -815,42 +947,45 @@ fn agent_draft_capability_schema() -> Value {
     })
 }
 
-fn agent_step_schema() -> Value {
+fn agent_step_schema(operation_endpoints: &[String], processing_endpoints: &[String]) -> Value {
     json!({"oneOf":[
         {
             "type":"object","additionalProperties":false,
-            "properties":{"kind":{"const":"tool"},"tool":{"type":"string"},"parameters":{"type":"object"}},
+            "properties":{"kind":{"const":"tool"},"tool":{"type":"string","enum":operation_endpoints},"parameters":{"type":"object"}},
             "required":["kind","tool","parameters"]
         },
         {
             "type":"object","additionalProperties":false,
             "properties":{
                 "kind":{"const":"ai_tool"},"title":{"type":"string"},"description":{"type":"string"},
-                "tool":{"type":"string"},"instruction":{"type":"string"}
+                "tool":{"type":"string","enum":processing_endpoints},"instruction":{"type":"string"}
             },
             "required":["kind","title","description","tool","instruction"]
         }
     ]})
 }
 
-fn agent_spec_schema() -> Value {
+fn agent_spec_schema(operation_endpoints: &[String], processing_endpoints: &[String]) -> Value {
     json!({
         "type":"object","additionalProperties":false,
         "properties":{
             "name":{"type":"string"},"description":{"type":"string"},"objective":{"type":"string"},
-            "steps":{"type":"array","items":agent_step_schema(),"default":[]}
+            "steps":{"type":"array","items":agent_step_schema(operation_endpoints, processing_endpoints),"default":[]}
         },
         "required":["name","description","objective"]
     })
 }
 
-fn agent_revision_capability_schema() -> Value {
+fn agent_revision_capability_schema(
+    operation_endpoints: &[String],
+    processing_endpoints: &[String],
+) -> Value {
     json!({
         "title":"AgentRevisionRequest","type":"object","additionalProperties":false,
         "properties":{
             "userMessage":{"type":"string"},
             "conversationHistory":{"type":"array","items":conversation_message_schema(),"default":[]},
-            "currentDraft":agent_spec_schema()
+            "currentDraft":agent_spec_schema(operation_endpoints, processing_endpoints)
         },
         "required":["userMessage","currentDraft"]
     })
@@ -876,11 +1011,14 @@ fn pdf_comment_capability_schema() -> Value {
     })
 }
 
-fn agent_execution_capability_schema() -> Value {
+fn agent_execution_capability_schema(
+    operation_endpoints: &[String],
+    processing_endpoints: &[String],
+) -> Value {
     json!({
         "title":"AgentExecutionRequest","type":"object","additionalProperties":false,
         "properties":{
-            "agentSpec":agent_spec_schema(),
+            "agentSpec":agent_spec_schema(operation_endpoints, processing_endpoints),
             "currentStepIndex":{"type":"integer"},
             "executionContext":{
                 "type":"object","additionalProperties":false,
@@ -893,7 +1031,7 @@ fn agent_execution_capability_schema() -> Value {
             "previousStepResults":{"type":"array","default":[],"items":{
                 "type":"object","additionalProperties":false,
                 "properties":{
-                    "stepIndex":{"type":"integer"},"tool":{"type":["string","null"],"default":null},
+                    "stepIndex":{"type":"integer"},"tool":{"oneOf":[{"type":"string","enum":operation_endpoints},{"type":"null"}],"default":null},
                     "success":{"type":"boolean"},"outputSummary":{"type":["string","null"],"default":null},
                     "outputData":{"type":"object","default":{}}
                 },
@@ -1437,52 +1575,100 @@ fn error_response(status: StatusCode, detail: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn environment_value(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_owned())
+fn optional_environment_value(name: &str) -> Result<Option<String>, EngineSettingsError> {
+    environment_result(name, env::var(name))
 }
 
-fn environment_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" | "" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
+fn environment_result(
+    name: &str,
+    result: Result<String, env::VarError>,
+) -> Result<Option<String>, EngineSettingsError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(EngineSettingsError::new(format!(
+            "{name} must contain valid Unicode"
+        ))),
+    }
 }
 
-fn environment_u32(name: &str, default: u32) -> u32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(default)
+fn environment_value(name: &str, default: &str) -> Result<String, EngineSettingsError> {
+    Ok(optional_environment_value(name)?.unwrap_or_else(|| default.to_owned()))
 }
 
-fn environment_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
+fn environment_bool(name: &str, default: bool) -> Result<bool, EngineSettingsError> {
+    let Some(value) = optional_environment_value(name)? else {
+        return Ok(default);
+    };
+    parse_environment_bool(name, &value)
 }
 
-fn environment_u64(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
+fn parse_environment_bool(name: &str, value: &str) -> Result<bool, EngineSettingsError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "t" | "y" => Ok(true),
+        "false" | "0" | "no" | "off" | "f" | "n" => Ok(false),
+        _ => Err(EngineSettingsError::new(format!(
+            "{name} must be a boolean (true/false, 1/0, yes/no, or on/off)"
+        ))),
+    }
 }
 
-fn environment_f64(name: &str, default: f64) -> f64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(default)
+fn environment_u32(name: &str, default: u32) -> Result<u32, EngineSettingsError> {
+    environment_integer(name, default)
+}
+
+fn environment_usize(name: &str, default: usize) -> Result<usize, EngineSettingsError> {
+    environment_integer(name, default)
+}
+
+fn environment_u64(name: &str, default: u64) -> Result<u64, EngineSettingsError> {
+    environment_integer(name, default)
+}
+
+fn environment_integer<T>(name: &str, default: T) -> Result<T, EngineSettingsError>
+where
+    T: std::str::FromStr,
+{
+    let Some(value) = optional_environment_value(name)? else {
+        return Ok(default);
+    };
+    parse_environment_integer(name, &value)
+}
+
+fn parse_environment_integer<T>(name: &str, value: &str) -> Result<T, EngineSettingsError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .trim()
+        .parse::<T>()
+        .map_err(|_| EngineSettingsError::new(format!("{name} must be a non-negative integer")))
+}
+
+fn environment_f64(name: &str, default: f64) -> Result<f64, EngineSettingsError> {
+    let Some(value) = optional_environment_value(name)? else {
+        return Ok(default);
+    };
+    parse_environment_f64(name, &value)
+}
+
+fn parse_environment_f64(name: &str, value: &str) -> Result<f64, EngineSettingsError> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| EngineSettingsError::new(format!("{name} must be a finite number")))?;
+    if !parsed.is_finite() {
+        return Err(EngineSettingsError::new(format!(
+            "{name} must be a finite number"
+        )));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         future::{Future, pending},
         pin::Pin,
         sync::Arc,
@@ -1501,7 +1687,101 @@ mod tests {
         structured_output::{StructuredOutputModel, ToolDefinition},
     };
 
-    use super::{EngineSettings, app, app_with_classifier};
+    use super::{
+        EngineSettings, app, app_with_classifier, environment_result, parse_environment_bool,
+        parse_environment_f64, parse_environment_integer,
+    };
+
+    #[test]
+    fn environment_value_parsers_are_strict_and_python_compatible() {
+        assert_eq!(
+            parse_environment_bool("STIRLING_ENGINE_REQUIRE_AUTH", " yes "),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_environment_bool("STIRLING_REQUIRE_USER_ID", "F"),
+            Ok(false)
+        );
+        assert!(
+            parse_environment_bool("STIRLING_ENGINE_REQUIRE_AUTH", "sometimes")
+                .is_err_and(|error| error.to_string().contains("STIRLING_ENGINE_REQUIRE_AUTH"))
+        );
+        assert_eq!(
+            parse_environment_integer::<usize>("STIRLING_MODEL_MAX_CONCURRENCY", " 32 "),
+            Ok(32)
+        );
+        assert!(
+            parse_environment_integer::<usize>("STIRLING_MODEL_MAX_CONCURRENCY", "many")
+                .is_err_and(|error| error.to_string().contains("STIRLING_MODEL_MAX_CONCURRENCY"))
+        );
+        assert!(
+            parse_environment_f64("STIRLING_CHUNKED_REASONER_WORKER_TIMEOUT_SECONDS", "NaN")
+                .is_err()
+        );
+        for name in [
+            "STIRLING_ENGINE_REQUIRE_AUTH",
+            "STIRLING_MODEL_MAX_CONCURRENCY",
+        ] {
+            let result = environment_result(
+                name,
+                Err(std::env::VarError::NotUnicode(OsString::from("invalid"))),
+            );
+            let error = match result {
+                Ok(value) => panic!("non-Unicode environment value produced {value:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("valid Unicode"));
+        }
+    }
+
+    #[test]
+    fn environment_settings_validate_existing_runtime_bounds() {
+        assert!(
+            EngineSettings::new("smart", "fast", "", false)
+                .validate_environment_bounds()
+                .is_ok()
+        );
+        let zero_concurrency =
+            EngineSettings::new("smart", "fast", "", false).with_model_max_concurrency(0);
+        assert!(
+            zero_concurrency
+                .validate_environment_bounds()
+                .is_err_and(|error| error.to_string().contains("STIRLING_MODEL_MAX_CONCURRENCY"))
+        );
+        let invalid_chunking =
+            EngineSettings::new("smart", "fast", "", false).with_rag_chunking(64, 64);
+        assert!(
+            invalid_chunking
+                .validate_environment_bounds()
+                .is_err_and(|error| error.to_string().contains("STIRLING_RAG_CHUNK_OVERLAP"))
+        );
+        let invalid_pool =
+            EngineSettings::new("smart", "fast", "", false).with_pgvector("dsn", 5, 4);
+        assert!(
+            invalid_pool
+                .validate_environment_bounds()
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("STIRLING_DOCUMENTS_PGVECTOR_POOL_MIN_SIZE"))
+        );
+        let invalid_backend =
+            EngineSettings::new("smart", "fast", "", false).with_documents_backend("unavailable");
+        assert!(
+            invalid_backend
+                .validate_environment_bounds()
+                .is_err_and(|error| error.to_string().contains("STIRLING_DOCUMENTS_BACKEND"))
+        );
+        let invalid_contradiction =
+            EngineSettings::new("smart", "fast", "", false).with_contradiction_limits(1, 8, 8, 1);
+        assert!(
+            invalid_contradiction
+                .validate_environment_bounds()
+                .is_err_and(|error| error
+                    .to_string()
+                    .contains("STIRLING_CONTRADICTION_BUCKET_CHUNK_OVERLAP"))
+        );
+    }
 
     struct StubClassifierModel;
 
@@ -1929,6 +2209,41 @@ mod tests {
         assert_eq!(
             body["capabilities"][5]["input_schema"]["properties"]["round"],
             serde_json::json!({"type": "integer", "minimum": 1, "maximum": 3}),
+        );
+        let tool_step_endpoints = body["capabilities"][3]["input_schema"]["properties"]
+            ["currentDraft"]["properties"]["steps"]["items"]["oneOf"][0]["properties"]
+            ["tool"]["enum"]
+            .as_array()
+            .ok_or("saved-agent tool endpoint enum must be an array")?;
+        assert!(
+            tool_step_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/api/v1/general/rotate-pdf")
+        );
+        assert!(
+            tool_step_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/api/v1/ai/tools/math-auditor-agent")
+        );
+        assert!(
+            !tool_step_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/api/v1/not-real")
+        );
+        let ai_tool_step_endpoints = body["capabilities"][3]["input_schema"]["properties"]
+            ["currentDraft"]["properties"]["steps"]["items"]["oneOf"][1]["properties"]
+            ["tool"]["enum"]
+            .as_array()
+            .ok_or("saved-agent AI-tool endpoint enum must be an array")?;
+        assert!(
+            ai_tool_step_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/api/v1/general/rotate-pdf")
+        );
+        assert!(
+            !ai_tool_step_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/api/v1/ai/tools/math-auditor-agent")
         );
         Ok(())
     }
@@ -2891,7 +3206,7 @@ mod tests {
                                 "objective":"Normalize documents.",
                                 "steps":[
                                     {"kind":"tool","tool":"/api/v1/general/rotate-pdf","parameters":{"angle":90}},
-                                    {"kind":"ai_tool","title":"Audit","description":"Audit totals","tool":"/api/v1/ai/tools/math-auditor-agent","instruction":"Check every total"}
+                                    {"kind":"ai_tool","title":"Rotate","description":"Choose rotation","tool":"/api/v1/general/rotate-pdf","instruction":"Choose the angle from the document context"}
                                 ]
                             }
                         }"#,
@@ -2931,6 +3246,104 @@ mod tests {
                 "reason":"Execution planning is not implemented yet for step 0."
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saved_agent_routes_reject_unknown_tools_and_mismatched_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new("smart", "fast", "", false));
+        for (tool, parameters, expected_error) in [
+            (
+                "/api/v1/not-real",
+                serde_json::json!({}),
+                "unknown PDF operation endpoint /api/v1/not-real",
+            ),
+            (
+                "/api/v1/general/rotate-pdf",
+                serde_json::json!({"flattenOnlyForms": false}),
+                "invalid parameters for operation /api/v1/general/rotate-pdf",
+            ),
+        ] {
+            let step = serde_json::json!({
+                "kind": "tool",
+                "tool": tool,
+                "parameters": parameters
+            });
+            let requests = [
+                (
+                    "/api/v1/agents/revise",
+                    serde_json::json!({
+                        "userMessage": "Keep this draft.",
+                        "currentDraft": {
+                            "name": "Invalid",
+                            "description": "Invalid",
+                            "objective": "Invalid",
+                            "steps": [step.clone()]
+                        }
+                    }),
+                ),
+                (
+                    "/api/v1/agents/next-action",
+                    serde_json::json!({
+                        "agentSpec": {
+                            "name": "Invalid",
+                            "description": "Invalid",
+                            "objective": "Invalid",
+                            "steps": [step]
+                        },
+                        "currentStepIndex": 0,
+                        "executionContext": {"inputFiles": [], "metadata": {}}
+                    }),
+                ),
+            ];
+            for (path, body) in requests {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                    .await?;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{path} accepted {tool} with {parameters}"
+                );
+                let body = to_bytes(response.into_body(), 8_192).await?;
+                assert!(
+                    String::from_utf8_lossy(&body).contains(expected_error),
+                    "{path} did not expose the validation error: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+
+        let accepted = app
+            .oneshot(
+                Request::post("/api/v1/agents/next-action")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                        "agent_spec": {
+                            "name": "Flatten",
+                            "description": "Flatten documents",
+                            "objective": "Normalise PDFs",
+                            "steps": [{
+                                "kind": "tool",
+                                "tool": "/api/v1/misc/flatten",
+                                "parameters": {
+                                    "flatten_only_forms": true,
+                                    "render_dpi": 144
+                                }
+                            }]
+                        },
+                        "current_step_index": 0,
+                        "execution_context": {"input_files": [], "metadata": {}}
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
         Ok(())
     }
 

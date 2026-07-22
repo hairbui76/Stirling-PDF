@@ -81,7 +81,9 @@ fn task_surface_defaults_to_rust_and_names_the_legacy_oracle() {
     assert!(ENGINE_TASKFILE.contains("  legacy:dev:"));
     assert!(ENGINE_TASKFILE.contains("  legacy:check:"));
     assert!(ENGINE_TASKFILE.contains("  legacy:tool-models:"));
-    assert!(ENGINE_TASKFILE.contains("rust/tools/generate_ai_operation_catalog.py"));
+    assert!(ENGINE_TASKFILE.contains("  tool-models:check:"));
+    assert!(ENGINE_TASKFILE.contains("-p stirling-operation-catalog --locked"));
+    assert!(!ENGINE_TASKFILE.contains("generate_ai_operation_catalog.py"));
     assert!(DOCKER_TASKFILE.contains("docker build -t stirling-pdf-engine -f engine/Dockerfile ."));
 }
 

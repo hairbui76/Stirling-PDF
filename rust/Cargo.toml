@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/stirling-ai-engine", "crates/stirling-processing"]
+members = [
+    "crates/stirling-ai-engine",
+    "crates/stirling-operation-catalog",
+    "crates/stirling-processing",
+]
 resolver = "3"
 
 [workspace.package]

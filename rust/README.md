@@ -292,6 +292,10 @@ production-container cutover: Java remains the packaged route owner until every
 documented limit in the per-route contracts is removed and the production proof
 matrix passes.
 
+The binary remains loopback-only unless `STIRLING_HOST` or the Spring-compatible
+`SERVER_ADDRESS` is set to an explicit IP address. Container-shaped runs use
+`STIRLING_HOST=0.0.0.0`; malformed or non-Unicode host/port values fail startup.
+
 For desktop migration validation only, set `STIRLING_NATIVE_BACKEND_PATH` to an
 absolute path for a Rust processing executable. The Tauri host then starts it
 with an ephemeral port and explicit desktop/base-path settings, migrates the
