@@ -167,6 +167,8 @@ Any new legacy-oracle dependency should be listed in `engine/pyproject.toml`, fo
 
 For a broader explanation of the frontend layering and override architecture, read @frontend/editor/DeveloperGuide.md
 
+Before touching colours or theming (tokens, dark mode, accent colours), read @frontend/editor/src/core/theme/README.md — it explains the palette/`--c-*` token system and the rule that literal colours live only in `primitives.css`.
+
 ```typescript
 // ✅ CORRECT - Use @app/* for all imports
 import { AppLayout } from "@app/components/AppLayout";
