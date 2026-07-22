@@ -146,11 +146,12 @@ does not claim glyph-accurate extraction or font reconstruction yet.
   device-`/Alternate` fallback; the external profile cannot yet be applied to DCT CMYK after decoder
   projection. Bounded filtered inline images, color-key `/Mask` arrays, and 1-bit stencil masks are
   also handled. Device-alternate Separation and one-to-eight-component DeviceN images with bounded
-  order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded single-input
-  stitching Type 3 tint transforms are evaluated, including one-component DCT Separation images
+  order-1 sampled Type 0, single-input exponential Type 2, recursively bounded single-input
+  stitching Type 3, or bounded PostScript calculator Type 4 tint transforms are evaluated, including
+  one-component DCT Separation images
   after applying `/Decode`. CalGray/CalRGB/Lab direct images, Indexed bases, ICC fallbacks, and
   spot-color alternates convert through bounded calibrated color math, including Gray/RGB/Lab DCT.
-  DCT DeviceN tint conversion, complex inline filter parameters, PostScript Type 4 functions, and
+  DCT DeviceN tint conversion, complex inline filter parameters, and
   ICCBased DeviceN alternates remain.
   Full-document exports inspect root
   AcroForm fields and their first widget locations, plus structured page annotations. JSON→PDF

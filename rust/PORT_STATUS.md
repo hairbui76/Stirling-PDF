@@ -279,13 +279,16 @@ auto-rename/auto-split, plus:
   images, with compatible declared device-`/Alternate` fallback for invalid profiles. Complex inline
   filter parameters, external ICC conversion after DCT CMYK decoder projection, and DCT CMYK
   color-key masks remain. Device-alternate Separation and one-to-eight-component DeviceN XObjects
-  with bounded order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded
-  single-input stitching Type 3 tint transforms are evaluated into Gray/RGB/CMYK, including
-  one-component DCT Separation images after applying `/Decode`. CalGray/CalRGB/Lab direct images,
+  with bounded order-1 sampled Type 0, single-input exponential Type 2, recursively bounded
+  single-input stitching Type 3, or bounded PostScript calculator Type 4 tint transforms are
+  evaluated into Gray/RGB/CMYK, including
+  one-component DCT Separation images after applying `/Decode`. The Type 4 interpreter implements the
+  full PDF 7.10.5.2 operator set (arithmetic, relational/boolean/bitwise, `if`/`ifelse`, and stack
+  operators) over bounded token, step, and stack limits. CalGray/CalRGB/Lab direct images,
   Indexed bases, ICC fallbacks, and spot-color alternates use bounded calibrated conversion,
   including Gray/RGB/Lab DCT. One-to-four-component DCT DeviceN images retain native JPEG planes,
   perform Adobe/`ColorTransform` conversion, apply `/Decode` in PDF.js order, and evaluate their
-  tint functions; DeviceN DCT above four components, PostScript Type 4 functions, and ICCBased
+  tint functions; DeviceN DCT above four components and ICCBased
   DeviceN alternates remain.
   Full editor responses also inspect root AcroForm fields plus their
   inherited metadata and first widget location, and export structured page annotations (with

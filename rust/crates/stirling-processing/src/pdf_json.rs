@@ -1906,6 +1906,7 @@ enum TintTransform {
     Exponential(ExponentialTintTransform),
     Sampled(SampledTintTransform),
     Stitching(StitchingTintTransform),
+    PostScript(PostScriptTintTransform),
 }
 
 impl TintTransform {
@@ -1944,6 +1945,7 @@ impl TintTransform {
         match self {
             Self::Exponential(_) | Self::Stitching(_) => 1,
             Self::Sampled(transform) => transform.domain.len(),
+            Self::PostScript(transform) => transform.domain.len(),
         }
     }
 
@@ -1952,6 +1954,7 @@ impl TintTransform {
             Self::Exponential(transform) => transform.start.len(),
             Self::Sampled(transform) => transform.range.len(),
             Self::Stitching(transform) => transform.output_channels,
+            Self::PostScript(transform) => transform.range.len(),
         }
     }
 
@@ -1960,6 +1963,7 @@ impl TintTransform {
             Self::Exponential(transform) => transform.evaluate(input),
             Self::Sampled(transform) => transform.evaluate(input),
             Self::Stitching(transform) => transform.evaluate(input),
+            Self::PostScript(transform) => transform.evaluate(input),
         }
     }
 }
@@ -2096,6 +2100,555 @@ impl StitchingTintTransform {
         }
         Some(output)
     }
+}
+
+/// Maximum number of tokens permitted in a parsed PostScript (Type 4) calculator
+/// program, and the maximum number of operator/operand steps a single evaluation may
+/// execute. Both bound the pure-Rust interpreter against adversarial inputs.
+const MAX_POSTSCRIPT_TOKENS: usize = 65_536;
+const MAX_POSTSCRIPT_STEPS: usize = 1_000_000;
+const MAX_POSTSCRIPT_STACK: usize = 4_096;
+
+/// A parsed PostScript (Type 4) calculator tint transform. The program mirrors the
+/// restricted PostScript subset from the PDF specification (7.10.5.2); evaluation is a
+/// bounded pure-Rust interpreter over an operand stack.
+struct PostScriptTintTransform {
+    domain: Vec<[f32; 2]>,
+    range: Vec<[f32; 2]>,
+    program: Vec<PostScriptToken>,
+}
+
+enum PostScriptToken {
+    Number(f32),
+    Operator(PostScriptOperator),
+    Block(Vec<PostScriptToken>),
+}
+
+#[derive(Clone, Copy)]
+enum PostScriptOperator {
+    Abs,
+    Add,
+    Atan,
+    Ceiling,
+    Cos,
+    Cvi,
+    Cvr,
+    Div,
+    Exp,
+    Floor,
+    Idiv,
+    Ln,
+    Log,
+    Mod,
+    Mul,
+    Neg,
+    Round,
+    Sin,
+    Sqrt,
+    Sub,
+    Truncate,
+    And,
+    Bitshift,
+    Eq,
+    False,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+    Ne,
+    Not,
+    Or,
+    True,
+    Xor,
+    If,
+    Ifelse,
+    Copy,
+    Dup,
+    Exch,
+    Index,
+    Pop,
+    Roll,
+}
+
+enum PostScriptValue<'a> {
+    Number(f32),
+    Boolean(bool),
+    Procedure(&'a [PostScriptToken]),
+}
+
+impl PostScriptValue<'_> {
+    fn as_number(&self) -> Option<f32> {
+        match self {
+            PostScriptValue::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn as_boolean(&self) -> Option<bool> {
+        match self {
+            PostScriptValue::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+impl PostScriptTintTransform {
+    fn evaluate(&self, input: &[f32]) -> Option<Vec<f32>> {
+        if input.len() != self.domain.len() {
+            return None;
+        }
+        let mut stack: Vec<PostScriptValue> = Vec::new();
+        for (value, bounds) in input.iter().zip(&self.domain) {
+            stack.push(PostScriptValue::Number(value.clamp(bounds[0], bounds[1])));
+        }
+        let mut steps = 0_usize;
+        run_postscript_program(&self.program, &mut stack, &mut steps)?;
+        if stack.len() < self.range.len() {
+            return None;
+        }
+        let start = stack.len() - self.range.len();
+        let mut output = Vec::with_capacity(self.range.len());
+        for (value, bounds) in stack[start..].iter().zip(&self.range) {
+            let number = value.as_number()?;
+            if !number.is_finite() {
+                return None;
+            }
+            output.push(number.clamp(bounds[0], bounds[1]));
+        }
+        Some(output)
+    }
+}
+
+fn run_postscript_program<'a>(
+    tokens: &'a [PostScriptToken],
+    stack: &mut Vec<PostScriptValue<'a>>,
+    steps: &mut usize,
+) -> Option<()> {
+    for token in tokens {
+        *steps = steps.checked_add(1)?;
+        if *steps > MAX_POSTSCRIPT_STEPS || stack.len() > MAX_POSTSCRIPT_STACK {
+            return None;
+        }
+        match token {
+            PostScriptToken::Number(value) => stack.push(PostScriptValue::Number(*value)),
+            PostScriptToken::Block(block) => stack.push(PostScriptValue::Procedure(block)),
+            PostScriptToken::Operator(operator) => {
+                apply_postscript_operator(*operator, stack, steps)?;
+            }
+        }
+    }
+    Some(())
+}
+
+// PostScript `div` treats an exactly-zero divisor as an error; the exact float
+// comparison is the correct semantics, not an approximate one.
+#[allow(clippy::too_many_lines, clippy::float_cmp)]
+fn apply_postscript_operator(
+    operator: PostScriptOperator,
+    stack: &mut Vec<PostScriptValue<'_>>,
+    steps: &mut usize,
+) -> Option<()> {
+    use PostScriptOperator as Op;
+    match operator {
+        Op::Abs => unary_number(stack, f32::abs),
+        Op::Neg => unary_number(stack, |value| -value),
+        Op::Sqrt => unary_number(stack, f32::sqrt),
+        Op::Sin => unary_number(stack, |value| value.to_radians().sin()),
+        Op::Cos => unary_number(stack, |value| value.to_radians().cos()),
+        Op::Ln => unary_number(stack, f32::ln),
+        Op::Log => unary_number(stack, f32::log10),
+        Op::Ceiling => unary_number(stack, f32::ceil),
+        Op::Floor => unary_number(stack, f32::floor),
+        Op::Round => unary_number(stack, f32::round),
+        Op::Truncate => unary_number(stack, f32::trunc),
+        Op::Cvr => unary_number(stack, |value| value),
+        Op::Cvi => {
+            let value = pop_number(stack)?;
+            let truncated = postscript_to_int(value)?;
+            stack.push(PostScriptValue::Number(int_as_f32(truncated)?));
+            Some(())
+        }
+        Op::Atan => {
+            let denominator = pop_number(stack)?;
+            let numerator = pop_number(stack)?;
+            let mut degrees = numerator.atan2(denominator).to_degrees();
+            if degrees < 0.0 {
+                degrees += 360.0;
+            }
+            stack.push(PostScriptValue::Number(degrees));
+            Some(())
+        }
+        Op::Add => binary_number(stack, |a, b| a + b),
+        Op::Sub => binary_number(stack, |a, b| a - b),
+        Op::Mul => binary_number(stack, |a, b| a * b),
+        Op::Div => {
+            let divisor = pop_number(stack)?;
+            let dividend = pop_number(stack)?;
+            if divisor == 0.0 {
+                return None;
+            }
+            stack.push(PostScriptValue::Number(dividend / divisor));
+            Some(())
+        }
+        Op::Idiv => {
+            let divisor = postscript_to_int(pop_number(stack)?)?;
+            let dividend = postscript_to_int(pop_number(stack)?)?;
+            let quotient = dividend.checked_div(divisor)?;
+            stack.push(PostScriptValue::Number(int_as_f32(quotient)?));
+            Some(())
+        }
+        Op::Mod => {
+            let divisor = postscript_to_int(pop_number(stack)?)?;
+            let dividend = postscript_to_int(pop_number(stack)?)?;
+            let remainder = dividend.checked_rem(divisor)?;
+            stack.push(PostScriptValue::Number(int_as_f32(remainder)?));
+            Some(())
+        }
+        Op::Exp => {
+            let exponent = pop_number(stack)?;
+            let base = pop_number(stack)?;
+            stack.push(PostScriptValue::Number(base.powf(exponent)));
+            Some(())
+        }
+        Op::And => bitwise_or_boolean(stack, |a, b| a & b, |a, b| a && b),
+        Op::Or => bitwise_or_boolean(stack, |a, b| a | b, |a, b| a || b),
+        Op::Xor => bitwise_or_boolean(stack, |a, b| a ^ b, |a, b| a != b),
+        Op::Not => {
+            let top = stack.pop()?;
+            match top {
+                PostScriptValue::Boolean(value) => stack.push(PostScriptValue::Boolean(!value)),
+                PostScriptValue::Number(value) => {
+                    let integer = postscript_to_int(value)?;
+                    stack.push(PostScriptValue::Number(int_as_f32(!integer)?));
+                }
+                PostScriptValue::Procedure(_) => return None,
+            }
+            Some(())
+        }
+        Op::Bitshift => {
+            let shift = postscript_to_int(pop_number(stack)?)?;
+            let value = postscript_to_int(pop_number(stack)?)?;
+            let shifted = if shift >= 0 {
+                value.checked_shl(u32::try_from(shift).ok()?).unwrap_or(0)
+            } else {
+                value.checked_shr(u32::try_from(-shift).ok()?).unwrap_or(0)
+            };
+            stack.push(PostScriptValue::Number(int_as_f32(shifted)?));
+            Some(())
+        }
+        Op::Eq => equality(stack, true),
+        Op::Ne => equality(stack, false),
+        Op::Gt => comparison(stack, |ordering| ordering == std::cmp::Ordering::Greater),
+        Op::Ge => comparison(stack, |ordering| ordering != std::cmp::Ordering::Less),
+        Op::Lt => comparison(stack, |ordering| ordering == std::cmp::Ordering::Less),
+        Op::Le => comparison(stack, |ordering| ordering != std::cmp::Ordering::Greater),
+        Op::True => {
+            stack.push(PostScriptValue::Boolean(true));
+            Some(())
+        }
+        Op::False => {
+            stack.push(PostScriptValue::Boolean(false));
+            Some(())
+        }
+        Op::Pop => stack.pop().map(|_| ()),
+        Op::Dup => {
+            let value = match stack.last()? {
+                PostScriptValue::Number(value) => PostScriptValue::Number(*value),
+                PostScriptValue::Boolean(value) => PostScriptValue::Boolean(*value),
+                PostScriptValue::Procedure(block) => PostScriptValue::Procedure(block),
+            };
+            stack.push(value);
+            Some(())
+        }
+        Op::Exch => {
+            let length = stack.len();
+            let first = length.checked_sub(1)?;
+            let second = length.checked_sub(2)?;
+            stack.swap(first, second);
+            Some(())
+        }
+        Op::Copy => {
+            let count = postscript_to_int(pop_number(stack)?)?;
+            let count = usize::try_from(count).ok()?;
+            let length = stack.len();
+            let start = length.checked_sub(count)?;
+            if length.checked_add(count)? > MAX_POSTSCRIPT_STACK {
+                return None;
+            }
+            for index in start..length {
+                let value = match &stack[index] {
+                    PostScriptValue::Number(value) => PostScriptValue::Number(*value),
+                    PostScriptValue::Boolean(value) => PostScriptValue::Boolean(*value),
+                    PostScriptValue::Procedure(block) => PostScriptValue::Procedure(block),
+                };
+                stack.push(value);
+            }
+            Some(())
+        }
+        Op::Index => {
+            let offset = postscript_to_int(pop_number(stack)?)?;
+            let offset = usize::try_from(offset).ok()?;
+            let index = stack.len().checked_sub(offset)?.checked_sub(1)?;
+            let value = match stack.get(index)? {
+                PostScriptValue::Number(value) => PostScriptValue::Number(*value),
+                PostScriptValue::Boolean(value) => PostScriptValue::Boolean(*value),
+                PostScriptValue::Procedure(block) => PostScriptValue::Procedure(block),
+            };
+            stack.push(value);
+            Some(())
+        }
+        Op::Roll => postscript_roll(stack),
+        Op::If => {
+            let procedure = pop_procedure(stack)?;
+            let condition = stack.pop()?.as_boolean()?;
+            if condition {
+                run_postscript_program(procedure, stack, steps)?;
+            }
+            Some(())
+        }
+        Op::Ifelse => {
+            let else_procedure = pop_procedure(stack)?;
+            let then_procedure = pop_procedure(stack)?;
+            let condition = stack.pop()?.as_boolean()?;
+            let chosen = if condition {
+                then_procedure
+            } else {
+                else_procedure
+            };
+            run_postscript_program(chosen, stack, steps)
+        }
+    }
+}
+
+fn pop_number(stack: &mut Vec<PostScriptValue>) -> Option<f32> {
+    stack.pop()?.as_number()
+}
+
+fn pop_procedure<'a>(stack: &mut Vec<PostScriptValue<'a>>) -> Option<&'a [PostScriptToken]> {
+    match stack.pop()? {
+        PostScriptValue::Procedure(block) => Some(block),
+        _ => None,
+    }
+}
+
+fn unary_number(stack: &mut Vec<PostScriptValue>, operation: impl Fn(f32) -> f32) -> Option<()> {
+    let value = pop_number(stack)?;
+    stack.push(PostScriptValue::Number(operation(value)));
+    Some(())
+}
+
+fn binary_number(
+    stack: &mut Vec<PostScriptValue>,
+    operation: impl Fn(f32, f32) -> f32,
+) -> Option<()> {
+    let right = pop_number(stack)?;
+    let left = pop_number(stack)?;
+    stack.push(PostScriptValue::Number(operation(left, right)));
+    Some(())
+}
+
+fn bitwise_or_boolean(
+    stack: &mut Vec<PostScriptValue>,
+    integer_operation: impl Fn(i32, i32) -> i32,
+    boolean_operation: impl Fn(bool, bool) -> bool,
+) -> Option<()> {
+    let right = stack.pop()?;
+    let left = stack.pop()?;
+    match (left, right) {
+        (PostScriptValue::Boolean(left), PostScriptValue::Boolean(right)) => {
+            stack.push(PostScriptValue::Boolean(boolean_operation(left, right)));
+            Some(())
+        }
+        (PostScriptValue::Number(left), PostScriptValue::Number(right)) => {
+            let value = integer_operation(postscript_to_int(left)?, postscript_to_int(right)?);
+            stack.push(PostScriptValue::Number(int_as_f32(value)?));
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+// PostScript `eq`/`ne` compare numbers for exact equality by definition.
+#[allow(clippy::float_cmp)]
+fn equality(stack: &mut Vec<PostScriptValue>, expect_equal: bool) -> Option<()> {
+    let right = stack.pop()?;
+    let left = stack.pop()?;
+    let equal = match (left, right) {
+        (PostScriptValue::Number(left), PostScriptValue::Number(right)) => left == right,
+        (PostScriptValue::Boolean(left), PostScriptValue::Boolean(right)) => left == right,
+        _ => return None,
+    };
+    stack.push(PostScriptValue::Boolean(equal == expect_equal));
+    Some(())
+}
+
+fn comparison(
+    stack: &mut Vec<PostScriptValue>,
+    accept: impl Fn(std::cmp::Ordering) -> bool,
+) -> Option<()> {
+    let right = pop_number(stack)?;
+    let left = pop_number(stack)?;
+    let ordering = left.partial_cmp(&right)?;
+    stack.push(PostScriptValue::Boolean(accept(ordering)));
+    Some(())
+}
+
+fn postscript_roll(stack: &mut Vec<PostScriptValue>) -> Option<()> {
+    let shift = postscript_to_int(pop_number(stack)?)?;
+    let count = postscript_to_int(pop_number(stack)?)?;
+    let count = usize::try_from(count).ok()?;
+    if count == 0 {
+        return Some(());
+    }
+    let length = stack.len();
+    let start = length.checked_sub(count)?;
+    let window = &mut stack[start..];
+    let shift = shift.rem_euclid(i32::try_from(count).ok()?);
+    let shift = usize::try_from(shift).ok()?;
+    window.rotate_right(shift);
+    Some(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn postscript_to_int(value: f32) -> Option<i32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let truncated = value.trunc();
+    if truncated < f32::from(i16::MIN) * 65_536.0 || truncated > f32::from(i16::MAX) * 65_536.0 {
+        return None;
+    }
+    Some(truncated as i32)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn int_as_f32(value: i32) -> Option<f32> {
+    let value = value as f32;
+    value.is_finite().then_some(value)
+}
+
+fn parse_postscript_program(bytes: &[u8]) -> Option<Vec<PostScriptToken>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut tokens = tokenize_postscript(text);
+    // The outermost function body is a single `{ ... }` procedure.
+    let first = tokens.next()?;
+    if first != "{" {
+        return None;
+    }
+    let mut count = 0_usize;
+    let program = parse_postscript_block(&mut tokens, &mut count)?;
+    // Nothing meaningful may follow the top-level procedure.
+    if tokens.any(|lexeme| !lexeme.trim().is_empty()) {
+        return None;
+    }
+    Some(program)
+}
+
+fn parse_postscript_block<'a>(
+    tokens: &mut impl Iterator<Item = &'a str>,
+    count: &mut usize,
+) -> Option<Vec<PostScriptToken>> {
+    let mut block = Vec::new();
+    loop {
+        let lexeme = tokens.next()?;
+        *count = count.checked_add(1)?;
+        if *count > MAX_POSTSCRIPT_TOKENS {
+            return None;
+        }
+        match lexeme {
+            "}" => return Some(block),
+            "{" => block.push(PostScriptToken::Block(parse_postscript_block(
+                tokens, count,
+            )?)),
+            other => block.push(parse_postscript_lexeme(other)?),
+        }
+    }
+}
+
+fn parse_postscript_lexeme(lexeme: &str) -> Option<PostScriptToken> {
+    use PostScriptOperator as Op;
+    if let Ok(number) = lexeme.parse::<f32>() {
+        return number
+            .is_finite()
+            .then_some(PostScriptToken::Number(number));
+    }
+    let operator = match lexeme {
+        "abs" => Op::Abs,
+        "add" => Op::Add,
+        "atan" => Op::Atan,
+        "ceiling" => Op::Ceiling,
+        "cos" => Op::Cos,
+        "cvi" => Op::Cvi,
+        "cvr" => Op::Cvr,
+        "div" => Op::Div,
+        "exp" => Op::Exp,
+        "floor" => Op::Floor,
+        "idiv" => Op::Idiv,
+        "ln" => Op::Ln,
+        "log" => Op::Log,
+        "mod" => Op::Mod,
+        "mul" => Op::Mul,
+        "neg" => Op::Neg,
+        "round" => Op::Round,
+        "sin" => Op::Sin,
+        "sqrt" => Op::Sqrt,
+        "sub" => Op::Sub,
+        "truncate" => Op::Truncate,
+        "and" => Op::And,
+        "bitshift" => Op::Bitshift,
+        "eq" => Op::Eq,
+        "false" => Op::False,
+        "ge" => Op::Ge,
+        "gt" => Op::Gt,
+        "le" => Op::Le,
+        "lt" => Op::Lt,
+        "ne" => Op::Ne,
+        "not" => Op::Not,
+        "or" => Op::Or,
+        "true" => Op::True,
+        "xor" => Op::Xor,
+        "if" => Op::If,
+        "ifelse" => Op::Ifelse,
+        "copy" => Op::Copy,
+        "dup" => Op::Dup,
+        "exch" => Op::Exch,
+        "index" => Op::Index,
+        "pop" => Op::Pop,
+        "roll" => Op::Roll,
+        _ => return None,
+    };
+    Some(PostScriptToken::Operator(operator))
+}
+
+/// Splits a PostScript calculator program into lexemes, isolating `{`/`}` braces and
+/// dropping `%` line comments as required by the PDF specification.
+fn tokenize_postscript(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        loop {
+            rest = rest.trim_start_matches(|character: char| character.is_ascii_whitespace());
+            let bytes = rest.as_bytes();
+            let first = *bytes.first()?;
+            if first == b'%' {
+                let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+                rest = &rest[end..];
+                continue;
+            }
+            if first == b'{' || first == b'}' {
+                let (token, remainder) = rest.split_at(1);
+                rest = remainder;
+                return Some(token);
+            }
+            let end = rest
+                .find(|character: char| {
+                    character.is_ascii_whitespace() || character == '{' || character == '}'
+                })
+                .unwrap_or(rest.len());
+            let (token, remainder) = rest.split_at(end);
+            rest = remainder;
+            return Some(token);
+        }
+    })
 }
 
 fn icc_dynamic_image_to_rgb(
@@ -3465,8 +4018,42 @@ fn tint_transform_at_depth(
             stitching_tint_transform(document, function, output_channels, depth)
                 .map(TintTransform::Stitching)
         }
+        4 => postscript_tint_transform(document, function, input_channels, output_channels)
+            .map(TintTransform::PostScript),
         _ => None,
     }
+}
+
+fn postscript_tint_transform(
+    document: &Document,
+    function: &Object,
+    input_channels: usize,
+    output_channels: usize,
+) -> Option<PostScriptTintTransform> {
+    if !(1..=8).contains(&input_channels) || output_channels == 0 {
+        return None;
+    }
+    let stream = resolved_stream(document, function)?;
+    if dictionary_i32(document, &stream.dict, b"FunctionType")? != 4 {
+        return None;
+    }
+    let domain = function_pairs(document, &stream.dict, b"Domain", input_channels)?;
+    if domain.iter().any(|bounds| bounds[0] > bounds[1]) {
+        return None;
+    }
+    let range = function_pairs(document, &stream.dict, b"Range", output_channels)?;
+    if range.iter().any(|bounds| bounds[0] > bounds[1]) {
+        return None;
+    }
+    let bytes = stream
+        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
+        .ok()?;
+    let program = parse_postscript_program(&bytes)?;
+    Some(PostScriptTintTransform {
+        domain,
+        range,
+        program,
+    })
 }
 
 fn stitching_tint_transform(
@@ -9701,6 +10288,139 @@ end"
                 255, 255, 255, 0, 255, 255, 255, 0, 255, 0, 0, 255, 127, 127, 255,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_separation_images_with_a_postscript_tint_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        // Mirrors the Type 2 case: output = [1, 1 - tint, 1 - tint].
+        let mut document = Document::with_version("1.7");
+        let tint_transform = document.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 4,
+                "Domain" => vec![0.into(), 1.into()],
+                "Range" => vec![
+                    0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()
+                ],
+            },
+            b"{ 1.0 exch 1.0 exch sub dup }".to_vec(),
+        ));
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 3,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotRed".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 255],
+        );
+        let (png, format) = encode_image_xobject(&document, &separation_image, 3, 1)
+            .ok_or("PostScript Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 255, 255, 255, 127, 127, 255, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_postscript_calculator_operators() -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PostScriptTintTransform, parse_postscript_program};
+
+        fn evaluate(
+            program: &str,
+            domain: Vec<[f32; 2]>,
+            range: Vec<[f32; 2]>,
+            input: &[f32],
+        ) -> Option<Vec<f32>> {
+            let transform = PostScriptTintTransform {
+                domain,
+                range,
+                program: parse_postscript_program(program.as_bytes())?,
+            };
+            transform.evaluate(input)
+        }
+
+        fn assert_close(actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(expected) {
+                assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+            }
+        }
+
+        // Arithmetic: (a + b) * 2.
+        assert_close(
+            &evaluate(
+                "{ add 2 mul }",
+                vec![[0.0, 1.0], [0.0, 1.0]],
+                vec![[0.0, 10.0]],
+                &[0.1, 0.2],
+            )
+            .ok_or("arithmetic program failed")?,
+            &[0.6],
+        );
+
+        // Single-channel invert with domain clamping applied to the input.
+        assert_close(
+            &evaluate(
+                "{ 1.0 exch sub }",
+                vec![[0.0, 1.0]],
+                vec![[0.0, 1.0]],
+                &[2.0],
+            )
+            .ok_or("invert program failed")?,
+            &[0.0],
+        );
+
+        // ifelse branch selection.
+        let threshold = "{ dup 0.5 lt { pop 0.0 } { pop 1.0 } ifelse }";
+        assert_close(
+            &evaluate(threshold, vec![[0.0, 1.0]], vec![[0.0, 1.0]], &[0.2])
+                .ok_or("ifelse low branch failed")?,
+            &[0.0],
+        );
+        assert_close(
+            &evaluate(threshold, vec![[0.0, 1.0]], vec![[0.0, 1.0]], &[0.8])
+                .ok_or("ifelse high branch failed")?,
+            &[1.0],
+        );
+
+        // `n j roll` rotates the top n operands: [a b c] 3 1 roll -> [c a b].
+        assert_close(
+            &evaluate(
+                "{ 3 1 roll }",
+                vec![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+                vec![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+                &[0.1, 0.2, 0.3],
+            )
+            .ok_or("roll program failed")?,
+            &[0.3, 0.1, 0.2],
+        );
+
+        // Range clamping bounds the final outputs.
+        assert_close(
+            &evaluate("{ 5 mul }", vec![[0.0, 1.0]], vec![[0.0, 1.0]], &[0.5])
+                .ok_or("range clamp program failed")?,
+            &[1.0],
+        );
+
+        // Comments and unknown operators are handled: `%` skips to end of line,
+        // and an unsupported operator makes the whole program unparseable.
+        assert!(parse_postscript_program(b"{ 1.0 % trailing comment\n exch sub }").is_some(),);
+        assert!(parse_postscript_program(b"{ 1.0 bogusop }").is_none());
+
         Ok(())
     }
 

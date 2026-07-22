@@ -184,8 +184,8 @@ in place; untouched pages and document-level graph objects survive.
 Glyph-accurate `textElements` extraction (including Type3 outline geometry and CMap collections
 not available through the configured Poppler data paths), token-level rewriting and mixed-stream
 editing in the full-document rebuild path, font-program round-trip, complex inline filter
-parameters, DCT DeviceN images with more than four JPEG source components, PostScript Type 4 tint
-functions, ICCBased DeviceN alternates, and external ICC conversion for DCT CMYK images, rich
+parameters, DCT DeviceN images with more than four JPEG source components,
+ICCBased DeviceN alternates, and external ICC conversion for DCT CMYK images, rich
 annotation appearance/reply graphs,
 nested/multi-widget form hierarchies and appearance
 streams remain outstanding. Direct and Form-nested image XObjects already export page-space
@@ -196,13 +196,18 @@ embedded profile for pure-Rust conversion to sRGB, including Gray/RGB DCT images
 a compatible declared device `/Alternate` when the profile cannot be parsed. DCT CMYK decoding
 does not expose its original four sample planes, so an external ICC profile cannot yet be applied
 there. Device-alternate Separation XObjects with bounded order-1 sampled Type 0, exponential Type 2,
-or stitching Type 3 tint functions are evaluated into display-ready Gray/RGB/CMYK output. Sample
+stitching Type 3, or PostScript calculator Type 4 tint functions are evaluated into display-ready
+Gray/RGB/CMYK output. Sample
 tables accept the PDF-defined 1/2/4/8/12/16/24/32-bit widths and apply Domain, Encode, Decode, and
 Range mappings. Type 3 functions apply Bounds, Encode, and optional Range mappings while recursively
 combining supported child functions, capped at eight levels and 64 children per stitching function.
+Type 4 functions run a bounded pure-Rust interpreter over the full PDF 7.10.5.2 operator set —
+arithmetic, relational/boolean/bitwise, `if`/`ifelse`, and stack operators — with token, step, and
+stack ceilings, `%` comment handling, and Domain/Range clamping; any unsupported operator makes the
+program unparseable rather than silently mis-evaluating.
 Device-alternate DeviceN images use the same bounded evaluator for one to eight input colorants,
 including multilinear sample-table interpolation. A single-input DeviceN can also use Type 2 or
-Type 3.
+Type 3, and any DeviceN colorant count can use Type 4.
 One-component DCT Separation images preserve their grayscale samples, apply `/Decode`, and evaluate
 their tint transforms. DCT DeviceN images with one to four JPEG components likewise retain the
 source planes, perform Adobe/`ColorTransform` JPEG colour conversion, apply per-component `/Decode`
@@ -250,7 +255,10 @@ rebuild. A synthetic Adobe collection fixture proves predefined named-CMap looku
 fixture proves ICCBased RGB-to-sRGB conversion, referenced profile resolution, and invalid-profile
 `/Alternate` fallback for both direct samples and an Indexed palette base. Separation fixtures prove
 Type 2 interpolation, packed 4-bit sampled Type 0 interpolation, a Type 3 segment boundary and outer
-Range clipping, plus one-component DCT `/Decode` handling into a DeviceRGB alternate. Calibrated
+Range clipping, plus one-component DCT `/Decode` handling into a DeviceRGB alternate. A Type 4
+fixture proves a PostScript calculator tint transform reproduces the Type 2 Separation output, and a
+direct interpreter test covers arithmetic, `ifelse` branch selection, `roll` rotation, Domain/Range
+clamping, `%` comment handling, and unsupported-operator rejection. Calibrated
 fixtures cover CalGray gamma, a CalRGB D65 matrix, direct raw/DCT conversion, and reversed DCT
 `/Decode`. A two-colorant fixture proves DeviceN sample ordering and bilinear interpolation across a
 2×2 table. A four-component Adobe CMYK DCT fixture proves native-plane preservation, reversed
