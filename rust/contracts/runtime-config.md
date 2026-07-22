@@ -51,11 +51,20 @@ unavailable, matching Java's minimum-version gates. Image-scan extraction is nat
 and no longer probes Python or OpenCV. Each process probe has a five-second kill
 timeout. Missing groups feed the same endpoint-alternative logic as configured group
 removal and surface as reason `DEPENDENCY`; explicit configuration still takes
-precedence as reason `CONFIG`.
+precedence as reason `CONFIG`. The exact executable paths accepted by discovery
+are retained for runtime-owned native adapters such as PDF repair, preventing a
+later request from resolving a different binary.
 
 `dependenciesReady` means startup probing has completed, not that every optional
 tool is installed. Embedded/test router constructors intentionally remain
 process-free; the service binary selects the discovery-enabled constructor.
+
+The PDF editor's predefined Type0 CID mappings are passive data rather than an
+executable dependency. It searches the path list in
+`STIRLING_PROCESSING_CMAP_PATH`, then the standard Poppler locations
+`/usr/share/poppler/cMap` and `/usr/local/share/poppler/cMap`. The production
+image already supplies the first location through `poppler-data`. Missing data
+does not prevent startup; affected fonts retain conservative source-code metrics.
 
 ## Commercial license configuration
 

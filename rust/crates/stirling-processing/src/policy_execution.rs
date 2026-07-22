@@ -20,11 +20,11 @@ use crate::{
     job_queue::{JobAdmission, JobQueue, JobQueueError},
     pipeline::{
         self, PipelineDispatcher, PipelineFile, PipelineOperation, PipelineProgress,
-        PipelineProgressPhase, SupportingFiles,
+        PipelineProgressPhase, PolicyAuditRecorder, PolicyDispatchAudit, SupportingFiles,
     },
     policy_config::{OutputSpec, PolicyConfigService, PolicyDefinition, PolicyFailure, PolicyStep},
     policy_outputs::PolicyOutputService,
-    security::AuthContext,
+    security::{AuthContext, SecurityAuditContext},
 };
 
 const POLICY_JSON_LIMIT_BYTES: usize = 1024 * 1024;
@@ -50,6 +50,8 @@ pub(crate) struct PolicyStreamUpdate {
 #[serde(rename_all = "camelCase")]
 struct AdHocDefinition {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     steps: Vec<PolicyStep>,
     #[serde(default)]
     output: Option<OutputSpec>,
@@ -70,6 +72,13 @@ struct PreparedRun {
     output: OutputSpec,
     policy_id: Option<String>,
     stream: Option<PolicyStreamSender>,
+}
+
+struct RunDefinition {
+    policy_id: Option<String>,
+    policy_name: String,
+    steps: Vec<PolicyStep>,
+    output: OutputSpec,
 }
 
 impl PreparedRun {
@@ -146,6 +155,7 @@ pub(crate) struct PolicyExecutionService {
     jobs: Arc<JobManager>,
     queue: Arc<JobQueue>,
     outputs: Arc<PolicyOutputService>,
+    policy_audit: Option<PolicyAuditRecorder>,
     runs: Arc<Mutex<HashMap<String, RunRecord>>>,
 }
 
@@ -156,6 +166,7 @@ impl PolicyExecutionService {
         jobs: Arc<JobManager>,
         queue: Arc<JobQueue>,
         outputs: Arc<PolicyOutputService>,
+        policy_audit: Option<PolicyAuditRecorder>,
     ) -> Self {
         Self {
             config,
@@ -163,6 +174,7 @@ impl PolicyExecutionService {
             jobs,
             queue,
             outputs,
+            policy_audit,
             runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -171,8 +183,9 @@ impl PolicyExecutionService {
         &self,
         multipart: Multipart,
         context: &AuthContext,
+        audit_context: Option<&SecurityAuditContext>,
     ) -> Result<String, PolicyExecutionFailure> {
-        self.submit_ad_hoc_with_stream(multipart, context, None)
+        self.submit_ad_hoc_with_stream(multipart, context, audit_context, None)
             .await
     }
 
@@ -180,9 +193,10 @@ impl PolicyExecutionService {
         &self,
         multipart: Multipart,
         context: &AuthContext,
+        audit_context: Option<&SecurityAuditContext>,
     ) -> Result<PolicyStreamReceiver, PolicyExecutionFailure> {
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.submit_ad_hoc_with_stream(multipart, context, Some(sender))
+        self.submit_ad_hoc_with_stream(multipart, context, audit_context, Some(sender))
             .await?;
         Ok(receiver)
     }
@@ -191,6 +205,7 @@ impl PolicyExecutionService {
         &self,
         multipart: Multipart,
         context: &AuthContext,
+        audit_context: Option<&SecurityAuditContext>,
         stream: Option<PolicyStreamSender>,
     ) -> Result<String, PolicyExecutionFailure> {
         let mut prepared = self.prepare_multipart(multipart, context, true).await?;
@@ -198,6 +213,13 @@ impl PolicyExecutionService {
         let definition = prepared.definition.take().ok_or_else(|| {
             PolicyExecutionFailure::BadRequest("json pipeline definition is required".to_owned())
         })?;
+        if let Some(audit_context) = audit_context {
+            audit_context.set_policy(
+                &definition.name,
+                definition.steps.iter().map(|step| step.operation.clone()),
+            );
+        }
+        let policy_name = definition.name.clone();
         let output = definition.output.unwrap_or_default();
         if let Err(error) = self.config.validate_run_output(&output, context) {
             let _ = self.jobs.discard(&prepared.submission.job_id);
@@ -207,9 +229,12 @@ impl PolicyExecutionService {
         self.start_run(
             prepared,
             context,
-            None,
-            definition.steps,
-            output,
+            RunDefinition {
+                policy_id: None,
+                policy_name,
+                steps: definition.steps,
+                output,
+            },
             Some((context.team_id, document_count)),
         )
         .await
@@ -220,8 +245,15 @@ impl PolicyExecutionService {
         policy_id: &str,
         multipart: Multipart,
         context: &AuthContext,
+        audit_context: Option<&SecurityAuditContext>,
     ) -> Result<String, PolicyExecutionFailure> {
         let policy = self.config.get_policy_for_run(policy_id, context)?;
+        if let Some(audit_context) = audit_context {
+            audit_context.set_policy(
+                &policy.name,
+                policy.steps.iter().map(|step| step.operation.clone()),
+            );
+        }
         self.config.validate_run_output(&policy.output, context)?;
         let prepared = self.prepare_multipart(multipart, context, false).await?;
         let document_count = prepared.primary.len();
@@ -229,9 +261,12 @@ impl PolicyExecutionService {
         self.start_run(
             prepared,
             context,
-            Some(policy.id),
-            policy.steps,
-            output,
+            RunDefinition {
+                policy_id: Some(policy.id),
+                policy_name: policy.name,
+                steps: policy.steps,
+                output,
+            },
             Some((policy.team_id, document_count)),
         )
         .await
@@ -272,9 +307,12 @@ impl PolicyExecutionService {
                 stream: None,
             },
             context,
-            Some(policy.id.clone()),
-            policy.steps.clone(),
-            policy.output.clone(),
+            RunDefinition {
+                policy_id: Some(policy.id.clone()),
+                policy_name: policy.name.clone(),
+                steps: policy.steps.clone(),
+                output: policy.output.clone(),
+            },
             None,
         )
         .await
@@ -325,9 +363,12 @@ impl PolicyExecutionService {
                 stream: None,
             },
             context,
-            Some(policy.id.clone()),
-            policy.steps.clone(),
-            policy.output.clone(),
+            RunDefinition {
+                policy_id: Some(policy.id.clone()),
+                policy_name: policy.name.clone(),
+                steps: policy.steps.clone(),
+                output: policy.output.clone(),
+            },
             None,
         )
         .await
@@ -421,26 +462,24 @@ impl PolicyExecutionService {
         &self,
         mut prepared: PreparedRun,
         context: &AuthContext,
-        policy_id: Option<String>,
-        steps: Vec<PolicyStep>,
-        output: OutputSpec,
+        definition: RunDefinition,
         editor_documents: Option<(Option<i64>, usize)>,
     ) -> Result<String, PolicyExecutionFailure> {
-        if steps.is_empty() {
+        if definition.steps.is_empty() {
             let _ = self.jobs.discard(&prepared.submission.job_id);
             prepared.finish(false).await;
             return Err(PolicyExecutionFailure::BadRequest(
                 "Pipeline definition has no steps".to_owned(),
             ));
         }
-        let operations = pipeline_operations(steps);
+        let operations = pipeline_operations(definition.steps);
         let job_id = prepared.submission.job_id.clone();
-        prepared.output = output;
-        prepared.policy_id.clone_from(&policy_id);
+        prepared.output = definition.output;
+        prepared.policy_id.clone_from(&definition.policy_id);
         if let Err(error) = self.register_run(
             &job_id,
             JobOwner::from_auth_context(Some(context)),
-            policy_id,
+            definition.policy_id,
             operations.len(),
         ) {
             let _ = self.jobs.discard(&job_id);
@@ -470,7 +509,13 @@ impl PolicyExecutionService {
                 return Ok(job_id);
             }
         };
-        self.spawn_worker(prepared, context.clone(), operations, admission);
+        self.spawn_worker(
+            prepared,
+            context.clone(),
+            definition.policy_name,
+            operations,
+            admission,
+        );
         Ok(job_id)
     }
 
@@ -506,13 +551,14 @@ impl PolicyExecutionService {
         &self,
         prepared: PreparedRun,
         context: AuthContext,
+        policy_name: String,
         operations: Vec<PipelineOperation>,
         admission: JobAdmission,
     ) {
         let service = self.clone();
         tokio::spawn(async move {
             service
-                .run_worker(prepared, context, operations, admission)
+                .run_worker(prepared, context, policy_name, operations, admission)
                 .await;
         });
     }
@@ -521,6 +567,7 @@ impl PolicyExecutionService {
         &self,
         mut prepared: PreparedRun,
         context: AuthContext,
+        policy_name: String,
         operations: Vec<PipelineOperation>,
         admission: JobAdmission,
     ) {
@@ -579,6 +626,10 @@ impl PolicyExecutionService {
             &operations,
             &prepared.supporting,
             &context,
+            PolicyDispatchAudit {
+                policy_name,
+                recorder: self.policy_audit.clone(),
+            },
             progress,
         )
         .await;
@@ -756,6 +807,9 @@ async fn read_run_multipart(
             primary.push(file);
         } else if field_name == "json" && accepts_definition {
             let bytes = read_bounded_field(&mut field, POLICY_JSON_LIMIT_BYTES).await?;
+            if let Ok(value) = std::str::from_utf8(&bytes) {
+                SecurityAuditContext::record_current_form_param(&field_name, value);
+            }
             definition = Some(serde_json::from_slice(&bytes).map_err(|_| {
                 PolicyExecutionFailure::BadRequest(
                     "json is not a valid pipeline definition".to_owned(),
@@ -771,6 +825,7 @@ async fn read_run_multipart(
                             "supporting asset key is not UTF-8".to_owned(),
                         )
                     })?;
+                    SecurityAuditContext::record_current_form_param(&field_name, &key);
                     draft.key = Some(key.trim().to_owned());
                 }
                 "file" => {
@@ -830,11 +885,13 @@ async fn persist_field(
     let mut output = File::create(&path)
         .await
         .map_err(|_| PolicyExecutionFailure::Unavailable)?;
+    let mut written = 0_u64;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|error| PolicyExecutionFailure::BadRequest(error.body_text()))?
     {
+        written = written.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         output
             .write_all(&chunk)
             .await
@@ -844,6 +901,13 @@ async fn persist_field(
         .flush()
         .await
         .map_err(|_| PolicyExecutionFailure::Unavailable)?;
+    SecurityAuditContext::record_current_file_path(
+        &filename,
+        written,
+        content_type.as_deref(),
+        &path,
+    )
+    .await;
     Ok(PipelineFile {
         filename,
         path,

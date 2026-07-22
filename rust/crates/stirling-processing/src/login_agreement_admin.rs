@@ -233,6 +233,8 @@ fn error_response(error: &LoginAgreementAdminError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::LoginAgreementAdminService;
 
     #[test]

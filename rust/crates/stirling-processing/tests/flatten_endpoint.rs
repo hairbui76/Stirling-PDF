@@ -4,7 +4,7 @@ use axum::{
     response::Response,
 };
 use lopdf::{Document, Object, ObjectId, Stream, dictionary};
-use stirling_processing::app;
+use stirling_processing::{app, runtime_metrics::application_version};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -41,6 +41,7 @@ async fn rasterizes_each_page_and_preserves_page_size() -> Result<(), Box<dyn st
             .is_some_and(|subtype| subtype.as_name().is_ok_and(|name| name == b"Image"))
     }));
     assert!(output.extract_text(&[1])?.trim().is_empty());
+    assert_rebuilt_metadata(&output)?;
     Ok(())
 }
 
@@ -79,6 +80,7 @@ async fn flattens_form_widgets_into_page_content() -> Result<(), Box<dyn std::er
         });
     assert_eq!(widget_count, 0);
     assert_eq!(output.get_pages().len(), 1);
+    assert_loaded_metadata(&output)?;
     Ok(())
 }
 
@@ -232,8 +234,52 @@ fn pdf_with_text_and_form(with_form: bool) -> Result<Vec<u8>, Box<dyn std::error
         catalog.set("AcroForm", acroform_id);
     }
     let catalog_id = document.add_object(catalog);
+    let info_id = document.add_object(dictionary! {
+        "Title" => Object::string_literal("Source title"),
+        "Creator" => Object::string_literal("Source creator"),
+        "Producer" => Object::string_literal("Source producer"),
+        "CreationDate" => Object::string_literal("D:20240102030405+00'00'"),
+        "ModDate" => Object::string_literal("D:20240203040506+00'00'"),
+        "Custom" => Object::string_literal("source custom value"),
+    });
     document.trailer.set("Root", catalog_id);
+    document.trailer.set("Info", info_id);
     let mut bytes = Vec::new();
     document.save_to(&mut bytes)?;
     Ok(bytes)
+}
+
+fn assert_rebuilt_metadata(document: &Document) -> Result<(), Box<dyn std::error::Error>> {
+    let info = info_dictionary(document)?;
+    let label = format!("Stirling-PDF v{}", application_version());
+    assert_eq!(info.get(b"Title")?.as_str()?, b"Source title");
+    assert_eq!(info.get(b"Creator")?.as_str()?, label.as_bytes());
+    assert_eq!(info.get(b"Producer")?.as_str()?, label.as_bytes());
+    assert_eq!(
+        info.get(b"CreationDate")?.as_str()?,
+        b"D:20240102030405+00'00'"
+    );
+    assert_eq!(info.get(b"ModDate")?.as_str()?, b"D:20240203040506+00'00'");
+    assert!(info.get(b"Custom").is_err());
+    Ok(())
+}
+
+fn assert_loaded_metadata(document: &Document) -> Result<(), Box<dyn std::error::Error>> {
+    let info = info_dictionary(document)?;
+    let label = format!("Stirling-PDF v{}", application_version());
+    assert_eq!(info.get(b"Title")?.as_str()?, b"Source title");
+    assert_eq!(info.get(b"Creator")?.as_str()?, b"Source creator");
+    assert_eq!(info.get(b"Producer")?.as_str()?, label.as_bytes());
+    assert_eq!(
+        info.get(b"CreationDate")?.as_str()?,
+        b"D:20240102030405+00'00'"
+    );
+    assert_eq!(info.get(b"ModDate")?.as_str()?, b"D:20240203040506+00'00'");
+    assert_eq!(info.get(b"Custom")?.as_str()?, b"source custom value");
+    Ok(())
+}
+
+fn info_dictionary(document: &Document) -> Result<&lopdf::Dictionary, lopdf::Error> {
+    let (_, info) = document.dereference(document.trailer.get(b"Info")?)?;
+    info.as_dict()
 }

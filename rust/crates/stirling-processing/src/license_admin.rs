@@ -33,6 +33,7 @@ use crate::{
         LicenseConfig, LicenseConfigState, LicenseError, LicenseState, LicenseVerification,
         LicenseVerifier, generate_machine_fingerprint,
     },
+    security::SecurityAuditContext,
 };
 
 const MAX_LICENSE_FILE_BYTES: usize = 1024 * 1024;
@@ -376,10 +377,17 @@ async fn read_upload(multipart: &mut Multipart) -> Result<UploadedLicenseFile, S
             continue;
         }
         let filename = field.file_name().unwrap_or_default().to_owned();
+        let content_type = field.content_type().map(ToOwned::to_owned);
         let bytes = field
             .bytes()
             .await
             .map_err(|_| "File is empty".to_owned())?;
+        SecurityAuditContext::record_current_file_bytes(
+            &filename,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            content_type.as_deref(),
+            &bytes,
+        );
         return Ok(UploadedLicenseFile {
             filename,
             bytes: bytes.to_vec(),

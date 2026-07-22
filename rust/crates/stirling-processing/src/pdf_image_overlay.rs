@@ -257,7 +257,11 @@ fn append_overlay_content(
     Ok(())
 }
 
-fn install_font(document: &mut Document, page_id: ObjectId, name: &[u8]) -> Result<(), lopdf::Error> {
+fn install_font(
+    document: &mut Document,
+    page_id: ObjectId,
+    name: &[u8],
+) -> Result<(), lopdf::Error> {
     let font_id = document.add_object(dictionary! {
         "Type" => "Font",
         "Subtype" => "Type1",

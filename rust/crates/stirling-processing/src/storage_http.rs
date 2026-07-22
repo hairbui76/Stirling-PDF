@@ -15,7 +15,7 @@ use tokio::{io::AsyncWriteExt as _, task};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    security::AuthContext,
+    security::{AuthContext, SecurityAuditContext},
     storage::{
         FolderResponse, PendingFileBundle, PendingObject, ShareLinkAccessResponse,
         ShareLinkMetadataResponse, ShareLinkResponse, ShareRole, StorageError, StorageService,
@@ -537,6 +537,13 @@ async fn stream_object(
     }
     file.sync_all().await?;
     object.set_size(object_bytes);
+    SecurityAuditContext::record_current_file_path(
+        &object.original_filename,
+        object_bytes,
+        object.content_type.as_deref(),
+        object.path(),
+    )
+    .await;
     Ok(object)
 }
 

@@ -42,7 +42,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::{
@@ -68,7 +68,7 @@ use crate::{
     },
     pdf_review::{PdfReviewAgent, PdfReviewLimits},
     pgvector_documents::PgVectorDocumentStore,
-    structured_output::{ModelError, StructuredOutputModel},
+    structured_output::{ConcurrencyLimitedModel, ModelError, StructuredOutputModel},
     user_spec::{AgentDraftRequest, AgentRevisionRequest, UserSpecAgent, UserSpecError},
 };
 
@@ -101,6 +101,7 @@ pub struct EngineSettings {
     require_user_id: bool,
     smart_model_max_tokens: u32,
     fast_model_max_tokens: u32,
+    model_max_concurrency: usize,
     documents_backend: String,
     documents_sqlite_path: PathBuf,
     documents_pgvector_dsn: String,
@@ -137,6 +138,7 @@ impl EngineSettings {
             require_user_id: environment_bool("STIRLING_REQUIRE_USER_ID", false),
             smart_model_max_tokens: environment_u32("STIRLING_SMART_MODEL_MAX_TOKENS", 8_192),
             fast_model_max_tokens: environment_u32("STIRLING_FAST_MODEL_MAX_TOKENS", 2_048),
+            model_max_concurrency: environment_usize("STIRLING_MODEL_MAX_CONCURRENCY", 32),
             documents_backend: environment_value("STIRLING_DOCUMENTS_BACKEND", "sqlite"),
             documents_sqlite_path: PathBuf::from(environment_value(
                 "STIRLING_DOCUMENTS_SQLITE_PATH",
@@ -214,6 +216,7 @@ impl EngineSettings {
             require_user_id: false,
             smart_model_max_tokens: 8_192,
             fast_model_max_tokens: 2_048,
+            model_max_concurrency: 32,
             documents_backend: "sqlite".to_owned(),
             documents_sqlite_path: PathBuf::from(":memory:"),
             documents_pgvector_dsn: String::new(),
@@ -252,6 +255,12 @@ impl EngineSettings {
     #[must_use]
     pub fn with_smart_model_max_tokens(mut self, smart_model_max_tokens: u32) -> Self {
         self.smart_model_max_tokens = smart_model_max_tokens;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_model_max_concurrency(mut self, model_max_concurrency: usize) -> Self {
+        self.model_max_concurrency = model_max_concurrency;
         self
     }
 
@@ -439,6 +448,9 @@ fn app_with_runtime(
     model: Result<Arc<dyn StructuredOutputModel>, ModelError>,
     smart_model: Result<Arc<dyn StructuredOutputModel>, ModelError>,
 ) -> Router {
+    let model_semaphore = Arc::new(Semaphore::new(settings.model_max_concurrency));
+    let model = concurrency_limited_model(model, Arc::clone(&model_semaphore));
+    let smart_model = concurrency_limited_model(smart_model, model_semaphore);
     let embedder = EmbeddingClient::from_environment(&settings.rag_embedding_model).map(Arc::new);
     let documents: Result<Arc<dyn DocumentRepository>, DocumentError> =
         match settings.documents_backend.as_str() {
@@ -504,6 +516,15 @@ fn app_with_runtime(
             settings,
             enforce_request_guards,
         ))
+}
+
+fn concurrency_limited_model(
+    model: Result<Arc<dyn StructuredOutputModel>, ModelError>,
+    semaphore: Arc<Semaphore>,
+) -> Result<Arc<dyn StructuredOutputModel>, ModelError> {
+    model.map(|model| {
+        Arc::new(ConcurrencyLimitedModel::new(model, semaphore)) as Arc<dyn StructuredOutputModel>
+    })
 }
 
 fn start_document_reaper(store: std::sync::Weak<dyn DocumentRepository>, interval_seconds: u64) {
@@ -1324,6 +1345,9 @@ async fn orchestrate(
                         break;
                     }
                 }
+                () = sender.closed() => {
+                    break;
+                }
             }
         }
     });
@@ -1458,12 +1482,18 @@ fn environment_f64(name: &str, default: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, pin::Pin, sync::Arc};
+    use std::{
+        future::{Future, pending},
+        pin::Pin,
+        sync::Arc,
+        time::Duration,
+    };
 
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use tokio::sync::Notify;
     use tower::ServiceExt;
 
     use crate::{
@@ -1474,6 +1504,54 @@ mod tests {
     use super::{EngineSettings, app, app_with_classifier};
 
     struct StubClassifierModel;
+
+    struct DisconnectProbeModel {
+        started: Notify,
+        cancelled: Notify,
+    }
+
+    struct CancellationSignal<'notification>(&'notification Notify);
+
+    impl Drop for CancellationSignal<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    impl DisconnectProbeModel {
+        fn new() -> Self {
+            Self {
+                started: Notify::new(),
+                cancelled: Notify::new(),
+            }
+        }
+    }
+
+    impl StructuredOutputModel for DisconnectProbeModel {
+        fn complete<'request>(
+            &'request self,
+            _system_prompt: &'request str,
+            _prompt: &'request str,
+            _max_tokens: u32,
+            tool: ToolDefinition<'request>,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ModelError>> + Send + 'request>>
+        {
+            Box::pin(async move {
+                if tool.name == "route_orchestrator_request" {
+                    let _cancellation = CancellationSignal(&self.cancelled);
+                    self.started.notify_one();
+                    return pending().await;
+                }
+                if tool.name == "submit_classifier_labels" {
+                    return Ok(serde_json::json!({"labels": ["Invoice"]}));
+                }
+                Err(ModelError::new(format!(
+                    "unexpected probe tool {}",
+                    tool.name
+                )))
+            })
+        }
+    }
 
     fn stub_orchestrator_output(tool_name: &str, prompt: &str) -> Option<serde_json::Value> {
         match tool_name {
@@ -2883,6 +2961,45 @@ mod tests {
             frame["response"]["draft"]["steps"][0]["tool"],
             "/api/v1/general/rotate-pdf"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orchestrator_disconnect_cancels_provider_and_releases_global_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let probe = Arc::new(DisconnectProbeModel::new());
+        let model: Arc<dyn StructuredOutputModel> = probe.clone();
+        let app = app_with_classifier(
+            EngineSettings::new("smart", "fast", "", false).with_model_max_concurrency(1),
+            model,
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/orchestrator")
+                    .header("X-User-Id", "alice")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"userMessage":"Rotate this PDF."}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), probe.started.notified()).await?;
+
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), probe.cancelled.notified()).await?;
+
+        let classification = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::post("/api/v1/documents/classify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"fileName":"invoice.pdf","pages":[],"labels":[{"id":"invoice","name":"Invoice"}]}"#,
+                    ))?,
+            ),
+        )
+        .await??;
+        assert_eq!(classification.status(), StatusCode::OK);
         Ok(())
     }
 

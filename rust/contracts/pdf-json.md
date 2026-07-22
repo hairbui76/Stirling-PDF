@@ -34,7 +34,10 @@ Currently populated:
   (inherited `Rotate`, normalized to 0/90/180/270)
 - `fonts`: page-scoped resource entries, including nested Form XObjects, resource IDs,
   encoding, descriptor metrics, `ToUnicode`, and bounded (16 MiB decoded) embedded font
-  programs. CFF conversion, Type3 glyph payloads, and CID rendering are still deferred.
+  programs. Type3 entries also carry up to 256 Java-shaped glyph mappings
+  (`charCode`, `charCodeRaw`, `glyphName`, `unicode`) derived from `/CharProcs`,
+  `/Encoding`, and `/ToUnicode`. CFF conversion, Type3 normalization candidates,
+  and complete CID rendering are still deferred.
 - an `X-Job-Id` response header and a process-local, disk-backed cache for the lazy page,
   fonts, partial-export, and clear-cache endpoints. Entries expire after 30 minutes and the
   least-recently used entry is evicted once 16 documents are cached.
@@ -99,10 +102,22 @@ Form XObjects. It follows `q`/`Q`, `cm`, and Form `/Matrix` transforms, and expo
 decoded text, source character codes, resource font ID, point size, spacing, horizontal
 scale, leading/rise/render mode, and the resulting text matrix. Simple-font `/Widths`
 and Type0 `/ToUnicode` source-code segmentation plus horizontal descendant `/DW`/`/W`
-advances are applied. Type0 `Identity-V` and vertical CMap writing modes also apply `/DW2`
+advances are applied. Embedded Type0 encoding CMaps and installed Poppler Adobe CMap resources
+apply bounded `cidchar` and `cidrange` source-code-to-CID mappings before those descendant
+metrics. Named maps recursively resolve bounded `/Name usecmap` inheritance, with child entries
+overriding the base map. Type0 `Identity-V` and vertical CMap writing modes also apply `/DW2`
 defaults and both `/W2` forms to glyph-origin vectors, vertical displacement, and `TJ`
-adjustments. Type3 outlines, non-identity CMap code-to-CID mapping, and full glyph layout
-remain conservative.
+adjustments. Type3 code/name/Unicode metadata is exported, but outline-derived geometry and
+normalization candidates, unavailable predefined CMaps, and full glyph layout remain
+conservative.
+
+Predefined CMaps are selected from the descendant font's `/CIDSystemInfo` collection. Rust checks
+the platform path list in `STIRLING_PROCESSING_CMAP_PATH` first, followed by
+`/usr/share/poppler/cMap` and `/usr/local/share/poppler/cMap`. Each canonicalized lookup stays
+inside its collection directory, reads at most 16 MiB, follows at most eight files/depth levels,
+caps the resulting map at 65,536 entries, and uses an eight-map process cache. The production
+image's existing `poppler-data` package supplies these resources; installations without the data
+retain the conservative source-code fallback.
 
 The full response also exports each root AcroForm field: fully-qualified and
 partial names, inherited `/FT`, `/V`, `/DV`, and `/Ff`, alternate/mapping names,
@@ -125,9 +140,10 @@ which prevents duplicate controls. Rich appearance streams, reply/destination
 relationships, and orphan widgets without a root field are not reconstructed and
 remain a parity gap.
 
-**Deferred (font/graphics subsystem, Phase 4):** Type3/vertical/custom-CID glyph metadata,
-embedded-font reconstruction, rich annotation appearance/reply graphs, and re-encoded CFF
-payloads. Raster image elements are implemented for the bounded cases described below.
+**Deferred (font/graphics subsystem, Phase 4):** Type3 outline-derived normalization,
+font synthesis beyond restored source dictionaries, rich annotation appearance/reply graphs,
+and re-encoded CFF payloads. Raster image elements are implemented for the bounded cases
+described below.
 The top-level `fonts` collection contains bounded source resource/program data,
 including fonts found in nested Form XObjects.
 
@@ -153,23 +169,46 @@ existing cached page.
 
 ## Remaining editor capability
 
-Glyph-accurate `textElements` extraction (including Type3 outlines, non-identity CMap code-to-CID
-mapping, and embedded font reconstruction), applying editor-authored content over preserved source streams and in
-partial export, font-program round-trip, complex inline filter parameters, ICC/Separation/DeviceN colour
-spaces,
-rich annotation appearance/reply graphs, nested/multi-widget form hierarchies and appearance
+Glyph-accurate `textElements` extraction (including Type3 outline geometry and CMap collections
+not available through the configured Poppler data paths), applying editor-authored content over
+preserved source streams and in partial export, font-program round-trip, complex inline filter
+parameters, DCT DeviceN tint conversion, PostScript Type 4 tint functions, Lab/ICCBased DeviceN
+alternates, and external ICC conversion for DCT CMYK images, rich annotation appearance/
+reply graphs,
+nested/multi-widget form hierarchies and appearance
 streams remain outstanding. Direct and Form-nested image XObjects already export page-space
 transforms plus bounded JPEG or 1/2/4/8/16-bit DeviceRGB/DeviceGray/DeviceCMYK payloads, apply `/Decode`
 ranges and grayscale `/SMask` alpha, and expand packed 1/2/4/8-bit Indexed images with Gray/RGB/
-CMYK palettes; JSON-only pages rebuild ordered raster images and alpha soft masks. Both
+CMYK palettes. ICCBased Gray/RGB/CMYK XObjects and ICCBased Indexed palette bases use their bounded
+embedded profile for pure-Rust conversion to sRGB, including Gray/RGB DCT images, and fall back to
+a compatible declared device `/Alternate` when the profile cannot be parsed. DCT CMYK decoding
+does not expose its original four sample planes, so an external ICC profile cannot yet be applied
+there. Device-alternate Separation XObjects with bounded order-1 sampled Type 0, exponential Type 2,
+or stitching Type 3 tint functions are evaluated into display-ready Gray/RGB/CMYK output. Sample
+tables accept the PDF-defined 1/2/4/8/12/16/24/32-bit widths and apply Domain, Encode, Decode, and
+Range mappings. Type 3 functions apply Bounds, Encode, and optional Range mappings while recursively
+combining supported child functions, capped at eight levels and 64 children per stitching function.
+Device-alternate DeviceN images use the same bounded evaluator for one to eight input colorants,
+including multilinear sample-table interpolation. A single-input DeviceN can also use Type 2 or
+Type 3.
+One-component DCT Separation images preserve their grayscale samples, apply `/Decode`, and evaluate
+their tint transforms. DCT DeviceN remains rejected because the decoder does not expose arbitrary
+source component planes.
+Direct CalGray/CalRGB images, calibrated Indexed palette bases, compatible ICC fallbacks, and
+calibrated Separation/DeviceN alternates convert to sRGB with bounded gamma, matrix, black-point,
+Bradford-adaptation, and transfer-function math. Gray/RGB DCT calibrated images retain their source
+sample planes, apply `/Decode`, and are emitted as transformed PNG rather than raw JPEG.
+JSON-only pages rebuild ordered raster images
+and alpha soft masks. Both
 unfiltered and bounded single-filter Flate/LZW/ASCII85/DCT 8-bit device-colour inline images
 are extracted; candidate `EI` markers are accepted only when decoding matches the declared raster.
 Color-key `/Mask` arrays are applied to supported device and Indexed samples, including DCT
 Gray/RGB images (DCT CMYK color-key masks remain unsupported);
 separate 1-bit ImageMask streams are resized in image space and applied with their `/Decode`
 polarity. An `SMask`, when present, overrides that explicit mask as required by the PDF model.
-Source font resources/programs are only exported; rebuilding or normalizing them is not yet
-implemented.
+Bounded source font dictionaries/programs and existing Type3 CharProcs can be restored for
+JSON-only generated text. Normalizing them, synthesizing missing glyphs, or applying new text over
+preserved source streams is not yet implemented.
 
 Font-program strategy chosen: **pure Rust** (ttf-parser/allsorts/freetype). Phases:
 2 = JSON→PDF for the Standard-14 / no-embedded-program case; 3 = PDF→JSON glyph
@@ -184,5 +223,15 @@ cluster-sticky-session semantics. See `contracts/job-management.md`.
 ## Verification
 
 Unit tests assert the serde model matches Jackson's NON_NULL / NON_DEFAULT / UPPERCASE
-behavior and round-trips. An HTTP test drives the metadata endpoint and checks the
-document Info and page dimensions/rotation of a built PDF.
+behavior and round-trips. Type3 fixtures prove exact `/Differences` code/name export,
+`/ToUnicode` precedence for custom glyph names, and CharProc-preserving JSON→PDF generated-text
+rebuild. A synthetic Adobe collection fixture proves predefined named-CMap lookup, recursive
+`usecmap` inheritance, child overrides, and cache reuse. A deterministic valid BT.2020 profile
+fixture proves ICCBased RGB-to-sRGB conversion, referenced profile resolution, and invalid-profile
+`/Alternate` fallback for both direct samples and an Indexed palette base. Separation fixtures prove
+Type 2 interpolation, packed 4-bit sampled Type 0 interpolation, a Type 3 segment boundary and outer
+Range clipping, plus one-component DCT `/Decode` handling into a DeviceRGB alternate. Calibrated
+fixtures cover CalGray gamma, a CalRGB D65 matrix, direct raw/DCT conversion, and reversed DCT
+`/Decode`. A two-colorant fixture proves DeviceN sample ordering and bilinear interpolation across a
+2×2 table. An HTTP test drives the metadata
+endpoint and checks the document Info and page dimensions/rotation of a built PDF.

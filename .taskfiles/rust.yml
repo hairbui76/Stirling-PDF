@@ -24,10 +24,24 @@ tasks:
     deps:
       - clean:deps
       - pdfium:install
+    vars:
+      PORT: '{{.PORT | default "8080"}}'
+      AIENGINE_URL: '{{.AIENGINE_URL | default "http://localhost:5001"}}'
+      AIENGINE_ENABLED: '{{.AIENGINE_ENABLED | default "false"}}'
+      AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS | default "120"}}'
+      SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN | default "false"}}'
+      POLICIES_ENABLED: '{{.POLICIES_ENABLED | default "false"}}'
     env:
       STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+      STIRLING_PORT: '{{.PORT}}'
+      STIRLING_PROCESSING_PORT: '{{.PORT}}'
+      AIENGINE_URL: '{{.AIENGINE_URL}}'
+      AIENGINE_ENABLED: '{{.AIENGINE_ENABLED}}'
+      AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS}}'
+      SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN}}'
+      POLICIES_ENABLED: '{{.POLICIES_ENABLED}}'
     cmds:
-      - cargo run -p stirling-processing
+      - cargo run -p stirling-processing --locked
 
   ai-engine:run:
     desc: "Run the Rust AI engine"

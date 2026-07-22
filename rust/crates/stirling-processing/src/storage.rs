@@ -182,6 +182,10 @@ impl PendingObject {
         self.size_bytes = size_bytes;
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn commit(&mut self) {
         self.committed = true;
     }

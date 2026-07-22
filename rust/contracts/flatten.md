@@ -24,12 +24,17 @@ clamped to at least 72 and at most `SYSTEM_MAXDPI`; a missing or invalid
 positive system limit defaults to the Java application default of 500 DPI.
 Pixel dimensions and total pixel count are checked before allocation.
 
-The Java path JPEG-encodes rendered pages and runs newly created documents
-through its metadata policy. The Rust/PDFium path currently uses PDFium's image
-embedding and does not yet reproduce that metadata policy. Visual page content,
-page count, page size, and loss of selectable text are covered now; encoding,
-metadata, rotated/cropped-page corpora, and non-widget annotation preservation
-remain explicit parity gates.
+The Java path JPEG-encodes rendered pages, while the Rust/PDFium path uses
+PDFium's image embedding. Both Rust branches now apply Java's default non-Pro
+metadata policy after PDFium writes the result. Form-only output preserves the
+source creator, valid dates, standard values, and custom Info keys while
+rewriting producer to `Stirling-PDF v<version>`. Full rasterization copies only
+Java's selected standard source values and valid dates into a fresh Info
+dictionary, drops custom keys, and writes the Stirling creator/producer label.
+Visual page content, page count, page size, metadata, and loss of selectable
+text are covered now; image encoding, rotated/cropped-page corpora, and
+non-widget annotation preservation remain explicit parity gates. Pro
+user-aware custom metadata substitution remains tied to secured-mode cutover.
 
 `PDFium` is required for both branches. A development runtime without a
 configured library returns `501 Not Implemented`; an explicitly configured but

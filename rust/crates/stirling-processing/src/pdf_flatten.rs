@@ -1,8 +1,14 @@
 use std::{env, path::Path};
 
+use lopdf::Document;
 use thiserror::Error;
 
-use crate::pdfium_backend::{PdfiumFlattenAttempt, PdfiumFlattenError, try_flatten_pdf_to_file};
+use crate::{
+    pdf_metadata::{
+        apply_default_loaded_document_metadata, normalize_rebuilt_document_metadata_from_source,
+    },
+    pdfium_backend::{PdfiumFlattenAttempt, PdfiumFlattenError, try_flatten_pdf_to_file},
+};
 
 const DEFAULT_MAX_RENDER_DPI: i32 = 500;
 
@@ -15,6 +21,10 @@ pub enum FlattenError {
     },
     #[error(transparent)]
     Pdfium(#[from] PdfiumFlattenError),
+    #[error("could not read flattened PDF metadata: {0}")]
+    Metadata(#[from] lopdf::Error),
+    #[error("could not write flattened PDF metadata: {0}")]
+    Write(#[from] std::io::Error),
 }
 
 /// Flattens form fields or rasterizes every page using the Java-compatible DPI limits.
@@ -39,7 +49,9 @@ pub fn flatten_pdf_to_file(
         render_dpi,
         output_path,
     )? {
-        PdfiumFlattenAttempt::Flattened => Ok(()),
+        PdfiumFlattenAttempt::Flattened => {
+            normalize_flattened_metadata(input_path, flatten_only_forms, output_path)
+        }
         PdfiumFlattenAttempt::Unavailable {
             explicitly_configured,
             details,
@@ -48,6 +60,23 @@ pub fn flatten_pdf_to_file(
             details,
         }),
     }
+}
+
+fn normalize_flattened_metadata(
+    input_path: &Path,
+    flatten_only_forms: bool,
+    output_path: &Path,
+) -> Result<(), FlattenError> {
+    let source = Document::load(input_path)?;
+    let mut output = Document::load(output_path)?;
+    if flatten_only_forms {
+        apply_default_loaded_document_metadata(&mut output);
+    } else {
+        normalize_rebuilt_document_metadata_from_source(&mut output, &source);
+    }
+    output.prune_objects();
+    output.save(output_path)?;
+    Ok(())
 }
 
 pub(crate) fn configured_max_render_dpi() -> i32 {

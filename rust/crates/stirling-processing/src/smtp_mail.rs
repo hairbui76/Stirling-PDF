@@ -19,7 +19,10 @@ use lettre::{
 };
 use thiserror::Error;
 
-use crate::runtime_config::{SmtpHostnameVerification, SmtpMailConfig, SmtpTransportSecurity};
+use crate::{
+    runtime_config::{SmtpHostnameVerification, SmtpMailConfig, SmtpTransportSecurity},
+    security::SecurityAuditContext,
+};
 
 pub(crate) const SEND_EMAIL_PATH: &str = "/api/v1/general/send-email";
 
@@ -237,11 +240,14 @@ async fn read_request(mut multipart: Multipart) -> Result<OutgoingMail, MailErro
         .map_err(|_| MailError::InvalidText)?
     {
         match field.name().unwrap_or_default() {
-            "to" => recipient = Some(read_text(field, MAX_ADDRESS_BYTES).await?),
-            "subject" => subject = Some(read_text(field, MAX_SUBJECT_BYTES).await?),
-            "body" => body = Some(read_text(field, MAX_BODY_BYTES).await?),
+            "to" => recipient = Some(read_text(field, "to", MAX_ADDRESS_BYTES).await?),
+            "subject" => {
+                subject = Some(read_text(field, "subject", MAX_SUBJECT_BYTES).await?);
+            }
+            "body" => body = Some(read_text(field, "body", MAX_BODY_BYTES).await?),
             "fileInput" => {
                 let filename = safe_attachment_filename(field.file_name())?;
+                let audit_content_type = field.content_type().map(ToOwned::to_owned);
                 let content_type = field
                     .content_type()
                     .and_then(|value| ContentType::parse(value).ok())
@@ -250,6 +256,12 @@ async fn read_request(mut multipart: Multipart) -> Result<OutgoingMail, MailErro
                             .map_err(|_| MailError::Message)?,
                     );
                 let bytes = field.bytes().await.map_err(|_| MailError::InvalidText)?;
+                SecurityAuditContext::record_current_file_bytes(
+                    &filename,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    audit_content_type.as_deref(),
+                    &bytes,
+                );
                 if bytes.is_empty() {
                     return Err(MailError::MissingAttachment);
                 }
@@ -456,13 +468,16 @@ fn escape_html(value: &str) -> String {
 
 async fn read_text(
     field: axum::extract::multipart::Field<'_>,
+    name: &str,
     limit: usize,
 ) -> Result<String, MailError> {
     let bytes = field.bytes().await.map_err(|_| MailError::InvalidText)?;
     if bytes.len() > limit {
         return Err(MailError::InputTooLarge);
     }
-    String::from_utf8(bytes.to_vec()).map_err(|_| MailError::InvalidText)
+    let value = String::from_utf8(bytes.to_vec()).map_err(|_| MailError::InvalidText)?;
+    SecurityAuditContext::record_current_form_param(name, &value);
+    Ok(value)
 }
 
 fn safe_attachment_filename(filename: Option<&str>) -> Result<String, MailError> {

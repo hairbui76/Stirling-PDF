@@ -16,7 +16,7 @@ use tokio::{io::AsyncWriteExt as _, task};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    security::AuthContext,
+    security::{AuthContext, SecurityAuditContext},
     storage::{PendingFileBundle, PendingObject, StorageError, StorageService, StoredFileObject},
     workflow_signing::{
         CertificateValidationResponse, ParticipantRequest, SignatureSubmission, WetSignature,
@@ -401,6 +401,7 @@ async fn read_creation_form(
         }
         let value = read_text_field(
             &mut field,
+            &name,
             MAX_FORM_VALUE_BYTES,
             &mut total_bytes,
             storage.max_upload_bytes(),
@@ -524,6 +525,7 @@ async fn read_submission_form_inner(
             _ => {
                 let value = read_text_field(
                     &mut field,
+                    &name,
                     MAX_FORM_VALUE_BYTES,
                     &mut total_bytes,
                     total_limit,
@@ -561,8 +563,18 @@ async fn set_file_field(
     if destination.is_some() {
         return Err(WorkflowSigningError::InvalidInput.into());
     }
+    let audit_filename = field.file_name().map(ToOwned::to_owned);
+    let audit_content_type = field.content_type().map(ToOwned::to_owned);
     let value =
         read_bytes_field(field, MAX_SIGNING_MATERIAL_BYTES, total_bytes, total_limit).await?;
+    if let Some(filename) = audit_filename {
+        SecurityAuditContext::record_current_file_bytes(
+            &filename,
+            u64::try_from(value.len()).unwrap_or(u64::MAX),
+            audit_content_type.as_deref(),
+            &value,
+        );
+    }
     if !value.is_empty() {
         *destination = Some(value);
     }
@@ -571,12 +583,15 @@ async fn set_file_field(
 
 async fn read_text_field(
     field: &mut axum::extract::multipart::Field<'_>,
+    name: &str,
     field_limit: usize,
     total_bytes: &mut u64,
     total_limit: u64,
 ) -> Result<String, WorkflowApiError> {
     let bytes = read_bytes_field(field, field_limit, total_bytes, total_limit).await?;
-    String::from_utf8(bytes).map_err(|_| WorkflowSigningError::InvalidInput.into())
+    let value = String::from_utf8(bytes).map_err(|_| WorkflowSigningError::InvalidInput)?;
+    SecurityAuditContext::record_current_form_param(name, &value);
+    Ok(value)
 }
 
 async fn read_bytes_field(
@@ -626,6 +641,13 @@ async fn stream_object(
     }
     file.sync_all().await?;
     object.set_size(object_bytes);
+    SecurityAuditContext::record_current_file_path(
+        &object.original_filename,
+        object_bytes,
+        object.content_type.as_deref(),
+        object.path(),
+    )
+    .await;
     Ok(object)
 }
 

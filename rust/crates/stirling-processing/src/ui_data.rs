@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::runtime_config::RuntimeConfig;
+use crate::{runtime_config::RuntimeConfig, tessdata::available_tesseract_languages};
 
 const PACKAGED_LICENSES: &str = include_str!(concat!(env!("OUT_DIR"), "/3rdPartyLicenses.json"));
 const PACKAGED_FONT_FILES: &[&str] = &[
@@ -172,13 +172,9 @@ pub fn pipeline_data(runtime_config: &RuntimeConfig) -> PipelineData {
 
 #[must_use]
 pub fn ocr_data(runtime_config: &RuntimeConfig) -> OcrData {
-    let mut languages = read_directory_names(&runtime_config.tessdata_dir())
-        .into_iter()
-        .filter_map(|name| name.strip_suffix(".traineddata").map(ToOwned::to_owned))
-        .filter(|language| !language.eq_ignore_ascii_case("osd"))
-        .collect::<Vec<_>>();
-    languages.sort_unstable();
-    OcrData { languages }
+    OcrData {
+        languages: available_tesseract_languages(&runtime_config.tessdata_dir()),
+    }
 }
 
 #[must_use]

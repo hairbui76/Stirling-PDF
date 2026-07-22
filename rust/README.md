@@ -124,8 +124,9 @@ right-to-left ordering and rotation-aware CropBox normalization. The
 QR auto-split route detects the three Stirling divider values with ZXing-compatible
 hybrid/global binarization, native 150/high-DPI rendering, and duplex back-page
 removal. The
-`repair` route also owns the dependency-free parse-and-rewrite fallback;
-its Ghostscript/qpdf adapters remain a documented cutover item. `auto-rename`
+`repair` route follows Java's Ghostscript-first, qpdf-second recovery chain with
+bounded shared process pools and uses the dependency-free parse-and-rewrite
+fallback when startup discovery finds neither tool. `auto-rename`
 selects a largest-font title through the native text layer
 while retaining a no-native development fallback. Native embedded-image
 extraction now emits deduplicated PNG/JPEG/GIF ZIPs through `extract-images`.
@@ -134,7 +135,9 @@ output, color/greyscale/binary rendering, annotation control, per-page ZIPs,
 and vertically combined images without the legacy Python WebP helper.
 The inverse image-to-PDF route accepts ordered PNG/JPEG/GIF/WebP/BMP uploads
 and multi-frame TIFF, applies EXIF orientation, color modes, alpha masks, all
-three fit policies, and A4 auto-rotation without Java or PDFium.
+three fit policies, A4 auto-rotation, and the Java-compatible default Stirling
+Info metadata without Java or PDFium. Booklet and poster output also rebuild
+source Info dictionaries through that same fresh-document policy.
 Comic-book conversion now supports CBZ and CBR in both directions: naturally
 sorted archive images become pixel-sized PDF pages, while PDFium renders ordered
 RGB PNG pages into the existing numbered archive contracts. CBR extraction uses
@@ -273,16 +276,21 @@ Install the pinned PDFium runtime and run locally from the repository root:
 
 ```powershell
 task rust:install
-task rust:run
+task backend:dev
 ```
 
-It listens on `127.0.0.1:8081` by default. Set `STIRLING_PORT` (or the
-Spring-compatible `SERVER_PORT`) to a fixed port or `0` for an OS-assigned
-ephemeral port; the startup log reports the bound port in the desktop-compatible
-`Stirling-PDF running on port: <port>` format. The service is not yet wired as
-the production route owner; the Java implementation remains the compatibility
-oracle until every documented limit in the per-route files under `contracts/`
-is removed and parity tests pass.
+`task backend:dev`, `task dev`, and the default `task dev:all` now select the
+Rust processing service for open-mode local development. `backend:dev` listens
+on `127.0.0.1:8080` by default; `task rust:run` provides the same direct Rust
+entry point. Set `PORT` on either Task command, or set `STIRLING_PORT` (or the
+Spring-compatible `SERVER_PORT`) when invoking the binary directly. Port `0`
+requests an OS-assigned ephemeral port, and startup reports the bound port in
+the desktop-compatible `Stirling-PDF running on port: <port>` format. The Java
+oracle remains available as `task backend:dev:java`; portal and SaaS development
+also remain on their explicit Java profiles. This local default is not the
+production-container cutover: Java remains the packaged route owner until every
+documented limit in the per-route contracts is removed and the production proof
+matrix passes.
 
 For desktop migration validation only, set `STIRLING_NATIVE_BACKEND_PATH` to an
 absolute path for a Rust processing executable. The Tauri host then starts it

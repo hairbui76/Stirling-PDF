@@ -7,6 +7,8 @@ use lopdf::{
 };
 use thiserror::Error;
 
+use crate::pdf_metadata::normalize_rebuilt_document_metadata;
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BookletOptions {
@@ -187,6 +189,7 @@ pub fn impose_booklet_to_file(
         )?);
     }
     install_fresh_page_tree(&mut document, root_pages_id, output_pages)?;
+    normalize_rebuilt_document_metadata(&mut document);
     document.prune_objects();
     document.save(output_path)?;
     Ok(())

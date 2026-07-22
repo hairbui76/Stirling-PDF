@@ -22,7 +22,7 @@ use crate::{
     policy_ledger::ProcessedLedger,
     policy_sources::PolicySourceRunner,
     policy_triggers::{PolicyChangeNotifier, trigger_metadata},
-    security::AuthContext,
+    security::{AuthContext, SecurityAuditContext},
 };
 
 #[derive(Clone, Copy)]
@@ -252,9 +252,17 @@ async fn clear_processed_history(
 async fn run_ad_hoc(
     Extension(service): Extension<Arc<PolicyExecutionService>>,
     Extension(context): Extension<AuthContext>,
+    audit_context: Option<Extension<SecurityAuditContext>>,
     multipart: Multipart,
 ) -> Response {
-    match service.submit_ad_hoc(multipart, &context).await {
+    match service
+        .submit_ad_hoc(
+            multipart,
+            &context,
+            audit_context.as_ref().map(|Extension(context)| context),
+        )
+        .await
+    {
         Ok(job_id) => (
             StatusCode::ACCEPTED,
             Json(json!({"async":true,"jobId":job_id,"result":null})),
@@ -268,9 +276,17 @@ async fn run_ad_hoc_stream(
     Extension(service): Extension<Arc<PolicyExecutionService>>,
     Extension(settings): Extension<PolicyHttpSettings>,
     Extension(context): Extension<AuthContext>,
+    audit_context: Option<Extension<SecurityAuditContext>>,
     multipart: Multipart,
 ) -> Response {
-    let receiver = match service.submit_ad_hoc_stream(multipart, &context).await {
+    let receiver = match service
+        .submit_ad_hoc_stream(
+            multipart,
+            &context,
+            audit_context.as_ref().map(|Extension(context)| context),
+        )
+        .await
+    {
         Ok(receiver) => receiver,
         Err(error) => return execution_error(error),
     };
@@ -291,9 +307,18 @@ async fn run_stored(
     Extension(service): Extension<Arc<PolicyExecutionService>>,
     Extension(context): Extension<AuthContext>,
     Path(policy_id): Path<String>,
+    audit_context: Option<Extension<SecurityAuditContext>>,
     multipart: Multipart,
 ) -> Response {
-    match service.submit_stored(&policy_id, multipart, &context).await {
+    match service
+        .submit_stored(
+            &policy_id,
+            multipart,
+            &context,
+            audit_context.as_ref().map(|Extension(context)| context),
+        )
+        .await
+    {
         Ok(job_id) => (
             StatusCode::ACCEPTED,
             Json(json!({"async":true,"jobId":job_id,"result":null})),

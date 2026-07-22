@@ -89,7 +89,7 @@ tasks:
       BACKEND_PORT: '{{index (splitList "\n" .PORTS) 0}}'
       EDITOR_PORT: '{{index (splitList "\n" .PORTS) 1}}'
     deps:
-      - task: backend:dev
+      - task: backend:dev:proprietary
         vars:
           PORT: '{{.BACKEND_PORT}}'
           SECURITY_ENABLELOGIN: "true"
@@ -115,7 +115,7 @@ tasks:
     internal: true
     vars:
       FRONTEND: '{{.FRONTEND | default "proprietary"}}'
-      BACKEND: '{{.BACKEND | default "proprietary"}}'
+      BACKEND: '{{.BACKEND | default "rust"}}'
       PORTS:
         sh: '{{if eq OS "windows"}}{{.FIND_FREE_PORT_PS}} 8080 5173 5001{{else}}{{.FIND_FREE_PORT_SH}} 8080 5173 5001{{end}}'
       BACKEND_PORT: '{{index (splitList "\n" .PORTS) 0}}'

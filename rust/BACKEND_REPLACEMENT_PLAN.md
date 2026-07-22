@@ -41,7 +41,8 @@ logic and each is a track of its own.
   any code. Do NOT auto-generate in a loop. Recommend: port with security disabled
   first (matches OSS default), design the secured mode separately.
 - **Design:** [`SECURITY_MIGRATION_DESIGN.md`](SECURITY_MIGRATION_DESIGN.md). The
-  Rust binary currently fails closed when `DOCKER_ENABLE_SECURITY=true` is set.
+  Rust binary currently fails closed when `DOCKER_ENABLE_SECURITY=true` or the
+  compatible `SECURITY_ENABLELOGIN=true` alias is set.
 
 ### A3. Pipeline
 - **Java:** `PipelineController`, `PipelineProcessor`, `PipelineDirectoryProcessor` —
@@ -131,20 +132,33 @@ does not claim glyph-accurate extraction or font reconstruction yet.
 - **Phase 3 (in progress):** PDF→JSON text extraction. Page and invoked Form-XObject
   content-stream text/state, resource scopes, and affine transforms are now exported. Type0
   `/ToUnicode` source-code segmentation plus horizontal descendant `/DW`/`/W` advances are
-  applied. Vertical writing now applies `/DW2` defaults plus both `/W2` forms to glyph origins,
-  displacement, and `TJ` movement; Type3 outlines, non-identity CMap code-to-CID mapping, and full
-  layout remain.
+  applied. Embedded encoding CMaps apply bounded `cidchar`/`cidrange` source-code-to-CID mappings
+  before those metrics. Installed Poppler Adobe collections also resolve bounded named CMaps and
+  recursive `usecmap` inheritance. Vertical writing applies `/DW2` defaults plus both `/W2` forms to
+  glyph origins, displacement, and `TJ` movement. Type3 code/name/Unicode metadata and source
+  CharProcs round-trip; outline-derived normalization, unavailable CMap collections, and full layout
+  remain.
   Direct and Form-nested image XObjects export
-  page-space transforms plus bounded JPEG or 8-bit DeviceRGB/DeviceGray/DeviceCMYK payloads,
+  page-space transforms plus bounded JPEG or 1/2/4/8/16-bit DeviceRGB/DeviceGray/DeviceCMYK payloads,
   applying `/Decode` ranges and grayscale `/SMask` alpha, and expanding packed 1/2/4/8-bit
-  Indexed images with Gray/RGB/CMYK palettes; unfiltered device-colour inline images are also
-  extracted. Filtered inline images, ICC/Separation/DeviceN colour spaces, explicit `/Mask`, and
-  non-8-bit device samples remain. Full-document exports also inspect root
+  Indexed images with Gray/RGB/CMYK palettes. ICCBased Gray/RGB/CMYK XObjects convert through their
+  bounded embedded profiles to sRGB, including ICCBased Indexed palette bases, with compatible
+  device-`/Alternate` fallback; the external profile cannot yet be applied to DCT CMYK after decoder
+  projection. Bounded filtered inline images, color-key `/Mask` arrays, and 1-bit stencil masks are
+  also handled. Device-alternate Separation and one-to-eight-component DeviceN images with bounded
+  order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded single-input
+  stitching Type 3 tint transforms are evaluated, including one-component DCT Separation images
+  after applying `/Decode`. CalGray/CalRGB direct images, Indexed bases, ICC fallbacks, and spot-color
+  alternates convert through bounded calibrated color math, including Gray/RGB DCT. DCT DeviceN tint
+  conversion, complex inline filter parameters, PostScript Type 4 functions, and Lab/ICCBased
+  DeviceN alternates remain.
+  Full-document exports inspect root
   AcroForm fields and their first widget locations, plus structured page annotations. JSON→PDF
   reconstructs fresh root fields and one attached widget from the structured field model, and
   recreates non-widget page annotations. Nested/multi-widget hierarchies, annotation reply/
   appearance graphs, and appearance streams remain.
-- **Phase 4:** embedded font-program round-trip, Type3 glyphs, vertical/custom CID — full fidelity.
+- **Phase 4:** outline-derived Type3 normalization, broader font synthesis, complex CID/layout, and
+  preserved-stream editing — full fidelity.
 - **Job cache** (`partial`/`page`/`fonts`/`clear-cache`): an in-memory `jobId`→state
   store; straightforward once the model exists.
 

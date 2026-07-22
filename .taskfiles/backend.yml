@@ -19,6 +19,37 @@ tasks:
   dev:
     desc: "Start backend dev server"
     cmds:
+      - task: dev:rust
+        vars:
+          PORT: '{{.PORT}}'
+          AIENGINE_URL: '{{.AIENGINE_URL}}'
+          AIENGINE_ENABLED: '{{.AIENGINE_ENABLED}}'
+          AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS}}'
+          SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN}}'
+          POLICIES_ENABLED: '{{.POLICIES_ENABLED}}'
+
+  dev:rust:
+    desc: "Start backend dev server in open mode"
+    vars:
+      PORT: '{{.PORT | default "8080"}}'
+      AIENGINE_URL: '{{.AIENGINE_URL | default "http://localhost:5001"}}'
+      AIENGINE_ENABLED: '{{.AIENGINE_ENABLED | default "false"}}'
+      AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS | default "120"}}'
+      SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN | default "false"}}'
+      POLICIES_ENABLED: '{{.POLICIES_ENABLED | default "false"}}'
+    cmds:
+      - task: :rust:run
+        vars:
+          PORT: '{{.PORT}}'
+          AIENGINE_URL: '{{.AIENGINE_URL}}'
+          AIENGINE_ENABLED: '{{.AIENGINE_ENABLED}}'
+          AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS}}'
+          SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN}}'
+          POLICIES_ENABLED: '{{.POLICIES_ENABLED}}'
+
+  dev:java:
+    desc: "Start backend compatibility server"
+    cmds:
       - task: dev:proprietary
         vars:
           PORT: '{{.PORT}}'

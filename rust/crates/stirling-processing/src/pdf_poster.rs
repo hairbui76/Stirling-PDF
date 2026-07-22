@@ -12,6 +12,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use crate::pdf_booklet::{
     ImportedPage, import_page_form_with_normalized_crop, install_fresh_page_tree,
 };
+use crate::pdf_metadata::normalize_rebuilt_document_metadata;
 
 const A4: (f32, f32) = (595.275_63, 841.889_8);
 const A3: (f32, f32) = (841.889_8, 1_190.551_1);
@@ -96,6 +97,7 @@ pub fn split_pdf_for_poster_to_zip(
         )?;
     }
     install_fresh_page_tree(&mut document, root_pages_id, output_pages)?;
+    normalize_rebuilt_document_metadata(&mut document);
     document.prune_objects();
 
     let directory = tempdir()?;

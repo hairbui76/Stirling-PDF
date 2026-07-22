@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::job_queue::JobQueueConfig;
 use crate::license::LicenseConfig;
-use crate::runtime_dependencies::discover_dependency_groups;
+use crate::runtime_dependencies::discover_dependencies;
 use crate::security_jwt::SupabaseJwtConfig;
 use crate::server_certificate::ServerCertificateConfig;
 use crate::storage::{StorageConfig, StorageSharingConfig};
@@ -173,6 +173,22 @@ pub(crate) struct PolicyTriggerSettings {
     pub(crate) watch_quiet_period: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OcrProcessSettings {
+    pub(crate) ocrmypdf_session_limit: usize,
+    pub(crate) ocrmypdf_timeout: Duration,
+    pub(crate) tesseract_session_limit: usize,
+    pub(crate) tesseract_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RepairProcessSettings {
+    pub(crate) qpdf_session_limit: usize,
+    pub(crate) qpdf_timeout: Duration,
+    pub(crate) ghostscript_session_limit: usize,
+    pub(crate) ghostscript_timeout: Duration,
+}
+
 pub struct RuntimeConfig {
     settings: Value,
     settings_path: PathBuf,
@@ -180,6 +196,7 @@ pub struct RuntimeConfig {
     custom_files_dir: PathBuf,
     analytics_override: Mutex<Option<bool>>,
     dependency_disabled_groups: BTreeSet<String>,
+    dependency_commands: BTreeMap<String, PathBuf>,
     dependencies_checked: bool,
 }
 
@@ -313,6 +330,7 @@ impl Clone for RuntimeConfig {
             custom_files_dir: self.custom_files_dir.clone(),
             analytics_override: Mutex::new(analytics_override),
             dependency_disabled_groups: self.dependency_disabled_groups.clone(),
+            dependency_commands: self.dependency_commands.clone(),
             dependencies_checked: self.dependencies_checked,
         }
     }
@@ -338,7 +356,9 @@ impl RuntimeConfig {
     /// probe-free so embedded routers and tests cannot unexpectedly start processes.
     #[must_use]
     pub fn with_dependency_discovery(mut self) -> Self {
-        self.dependency_disabled_groups = discover_dependency_groups();
+        let discovery = discover_dependencies();
+        self.dependency_disabled_groups = discovery.disabled_groups;
+        self.dependency_commands = discovery.commands;
         self.dependencies_checked = true;
         self
     }
@@ -724,7 +744,13 @@ impl RuntimeConfig {
     /// serving protected routes without their authentication middleware.
     #[must_use]
     pub fn security_mode_is_requested() -> bool {
-        security_mode_requested_from_value(env::var("DOCKER_ENABLE_SECURITY").ok().as_deref())
+        [
+            "DOCKER_ENABLE_SECURITY",
+            "SECURITY_ENABLELOGIN",
+            "SECURITY_ENABLE_LOGIN",
+        ]
+        .into_iter()
+        .any(|variable| security_mode_requested_from_value(env::var(variable).ok().as_deref()))
     }
 
     /// Returns whether team classification policies are enabled.
@@ -941,6 +967,38 @@ impl RuntimeConfig {
             )
             .clamp(0, 3);
         u8::try_from(level).unwrap_or(2)
+    }
+
+    #[must_use]
+    pub fn security_audit_capture_file_hash(&self) -> bool {
+        self.boolean(
+            &["premium", "enterpriseFeatures", "audit", "captureFileHash"],
+            "PREMIUM_ENTERPRISEFEATURES_AUDIT_CAPTUREFILEHASH",
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn security_audit_capture_pdf_author(&self) -> bool {
+        self.boolean(
+            &["premium", "enterpriseFeatures", "audit", "capturePdfAuthor"],
+            "PREMIUM_ENTERPRISEFEATURES_AUDIT_CAPTUREPDFAUTHOR",
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn security_audit_capture_operation_results(&self) -> bool {
+        self.boolean(
+            &[
+                "premium",
+                "enterpriseFeatures",
+                "audit",
+                "captureOperationResults",
+            ],
+            "PREMIUM_ENTERPRISEFEATURES_AUDIT_CAPTUREOPERATIONRESULTS",
+            false,
+        )
     }
 
     /// Reports whether STANDARD enterprise audit events are configured. Fleet
@@ -1221,6 +1279,110 @@ impl RuntimeConfig {
                 || PathBuf::from("/usr/share/tesseract-ocr/5/tessdata"),
                 PathBuf::from,
             )
+    }
+
+    /// Returns the maximum page-rendering DPI used by Java's OCR fallback.
+    #[must_use]
+    pub fn max_render_dpi(&self) -> i32 {
+        let configured = self.signed_integer(&["system", "maxDPI"], "SYSTEM_MAXDPI", 500);
+        i32::try_from(configured.clamp(1, i64::from(i32::MAX))).unwrap_or(500)
+    }
+
+    /// Returns the two Java `ProcessExecutor` pools used by the OCR controller.
+    #[must_use]
+    pub(crate) fn ocr_process_settings(&self) -> OcrProcessSettings {
+        let positive = |path: &[&str], environment: &str, default: u64| {
+            let signed_default = i64::try_from(default).unwrap_or(i64::MAX);
+            u64::try_from(self.signed_integer(path, environment, signed_default))
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let ocrmypdf_session_limit = positive(
+            &["processExecutor", "sessionLimit", "ocrMyPdfSessionLimit"],
+            "PROCESS_EXECUTOR_SESSION_LIMIT_OCR_MY_PDF_SESSION_LIMIT",
+            2,
+        );
+        let tesseract_session_limit = positive(
+            &["processExecutor", "sessionLimit", "tesseractSessionLimit"],
+            "PROCESS_EXECUTOR_SESSION_LIMIT_TESSERACT_SESSION_LIMIT",
+            1,
+        );
+        let ocrmypdf_timeout_minutes = positive(
+            &[
+                "processExecutor",
+                "timeoutMinutes",
+                "ocrMyPdfTimeoutMinutes",
+            ],
+            "PROCESS_EXECUTOR_TIMEOUT_MINUTES_OCR_MY_PDF_TIMEOUT_MINUTES",
+            30,
+        );
+        let tesseract_timeout_minutes = positive(
+            &[
+                "processExecutor",
+                "timeoutMinutes",
+                "tesseractTimeoutMinutes",
+            ],
+            "PROCESS_EXECUTOR_TIMEOUT_MINUTES_TESSERACT_TIMEOUT_MINUTES",
+            30,
+        );
+        OcrProcessSettings {
+            ocrmypdf_session_limit: usize::try_from(ocrmypdf_session_limit).unwrap_or(2),
+            ocrmypdf_timeout: Duration::from_secs(ocrmypdf_timeout_minutes.saturating_mul(60)),
+            tesseract_session_limit: usize::try_from(tesseract_session_limit).unwrap_or(1),
+            tesseract_timeout: Duration::from_secs(tesseract_timeout_minutes.saturating_mul(60)),
+        }
+    }
+
+    /// Returns the Java `ProcessExecutor` pools used by the repair controller.
+    #[must_use]
+    pub(crate) fn repair_process_settings(&self) -> RepairProcessSettings {
+        let positive = |path: &[&str], environment: &str, default: u64| {
+            let signed_default = i64::try_from(default).unwrap_or(i64::MAX);
+            u64::try_from(self.signed_integer(path, environment, signed_default))
+                .ok()
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let qpdf_session_limit = positive(
+            &["processExecutor", "sessionLimit", "qpdfSessionLimit"],
+            "PROCESS_EXECUTOR_SESSION_LIMIT_QPDF_SESSION_LIMIT",
+            2,
+        );
+        let ghostscript_session_limit = positive(
+            &["processExecutor", "sessionLimit", "ghostscriptSessionLimit"],
+            "PROCESS_EXECUTOR_SESSION_LIMIT_GHOSTSCRIPT_SESSION_LIMIT",
+            8,
+        );
+        let qpdf_timeout_minutes = positive(
+            &["processExecutor", "timeoutMinutes", "qpdfTimeoutMinutes"],
+            "PROCESS_EXECUTOR_TIMEOUT_MINUTES_QPDF_TIMEOUT_MINUTES",
+            30,
+        );
+        let ghostscript_timeout_minutes = positive(
+            &[
+                "processExecutor",
+                "timeoutMinutes",
+                "ghostscriptTimeoutMinutes",
+            ],
+            "PROCESS_EXECUTOR_TIMEOUT_MINUTES_GHOSTSCRIPT_TIMEOUT_MINUTES",
+            30,
+        );
+        RepairProcessSettings {
+            qpdf_session_limit: usize::try_from(qpdf_session_limit).unwrap_or(2),
+            qpdf_timeout: Duration::from_secs(qpdf_timeout_minutes.saturating_mul(60)),
+            ghostscript_session_limit: usize::try_from(ghostscript_session_limit).unwrap_or(8),
+            ghostscript_timeout: Duration::from_secs(
+                ghostscript_timeout_minutes.saturating_mul(60),
+            ),
+        }
+    }
+
+    /// Returns the exact executable accepted by startup dependency discovery.
+    #[must_use]
+    pub(crate) fn dependency_command(&self, group: &str) -> Option<PathBuf> {
+        self.is_group_enabled(group).then_some(())?;
+        self.dependency_commands.get(group).cloned()
     }
 
     /// Returns the root directory for Java-compatible saved signature assets.
@@ -1830,6 +1992,7 @@ impl RuntimeConfig {
             custom_files_dir,
             analytics_override: Mutex::new(None),
             dependency_disabled_groups: BTreeSet::new(),
+            dependency_commands: BTreeMap::new(),
             dependencies_checked: true,
         }
     }
@@ -2280,6 +2443,93 @@ mod tests {
     }
 
     #[test]
+    fn maximum_render_dpi_matches_java_default_and_yaml() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert_eq!(config.max_render_dpi(), 500);
+
+        fs::write(&settings, "system:\n  maxDPI: 360\n")?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert_eq!(config.max_render_dpi(), 360);
+        Ok(())
+    }
+
+    #[test]
+    fn ocr_process_limits_and_timeouts_match_java_defaults_and_yaml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        let defaults = config.ocr_process_settings();
+        assert_eq!(defaults.ocrmypdf_session_limit, 2);
+        assert_eq!(defaults.ocrmypdf_timeout.as_secs(), 30 * 60);
+        assert_eq!(defaults.tesseract_session_limit, 1);
+        assert_eq!(defaults.tesseract_timeout.as_secs(), 30 * 60);
+
+        fs::write(
+            &settings,
+            "processExecutor:\n  sessionLimit:\n    ocrMyPdfSessionLimit: 4\n    tesseractSessionLimit: 3\n  timeoutMinutes:\n    ocrMyPdfTimeoutMinutes: 12\n    tesseractTimeoutMinutes: 9\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let configured = config.ocr_process_settings();
+        assert_eq!(configured.ocrmypdf_session_limit, 4);
+        assert_eq!(configured.ocrmypdf_timeout.as_secs(), 12 * 60);
+        assert_eq!(configured.tesseract_session_limit, 3);
+        assert_eq!(configured.tesseract_timeout.as_secs(), 9 * 60);
+        Ok(())
+    }
+
+    #[test]
+    fn repair_process_limits_and_timeouts_match_java_defaults_and_yaml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        let defaults = config.repair_process_settings();
+        assert_eq!(defaults.qpdf_session_limit, 2);
+        assert_eq!(defaults.qpdf_timeout.as_secs(), 30 * 60);
+        assert_eq!(defaults.ghostscript_session_limit, 8);
+        assert_eq!(defaults.ghostscript_timeout.as_secs(), 30 * 60);
+
+        fs::write(
+            &settings,
+            "processExecutor:\n  sessionLimit:\n    qpdfSessionLimit: 5\n    ghostscriptSessionLimit: 6\n  timeoutMinutes:\n    qpdfTimeoutMinutes: 11\n    ghostscriptTimeoutMinutes: 13\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let configured = config.repair_process_settings();
+        assert_eq!(configured.qpdf_session_limit, 5);
+        assert_eq!(configured.qpdf_timeout.as_secs(), 11 * 60);
+        assert_eq!(configured.ghostscript_session_limit, 6);
+        assert_eq!(configured.ghostscript_timeout.as_secs(), 13 * 60);
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_commands_are_available_only_for_enabled_discovered_groups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let mut config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let command = directory.path().join("gs");
+        config
+            .dependency_commands
+            .insert("Ghostscript".to_owned(), command.clone());
+        assert_eq!(config.dependency_command("Ghostscript"), Some(command));
+
+        config
+            .dependency_disabled_groups
+            .insert("Ghostscript".to_owned());
+        assert_eq!(config.dependency_command("Ghostscript"), None);
+        Ok(())
+    }
+
+    #[test]
     fn mcp_configuration_defaults_match_java() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let settings = directory.path().join("settings.yml");
@@ -2566,6 +2816,25 @@ mod tests {
     }
 
     #[test]
+    fn audit_operation_result_capture_defaults_off_and_reads_java_setting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "premium:\n  enterpriseFeatures:\n    audit:\n      captureOperationResults: true\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert!(config.security_audit_capture_operation_results());
+
+        let defaults = directory.path().join("defaults.yml");
+        fs::write(&defaults, "{}\n")?;
+        let config = RuntimeConfig::from_files(defaults, directory.path().join("also-missing.yml"));
+        assert!(!config.security_audit_capture_operation_results());
+        Ok(())
+    }
+
+    #[test]
     fn security_bootstrap_rejects_partial_initial_credentials()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -2612,6 +2881,29 @@ mod tests {
         assert!(!availability["file-to-pdf"].enabled);
         assert_eq!(availability["file-to-pdf"].reason, Some("DEPENDENCY"));
         assert_eq!(config.app_config(None, None)["dependenciesReady"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn ocr_availability_requires_at_least_one_discovered_tool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(&settings, "{}\n")?;
+        let mut config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        config
+            .dependency_disabled_groups
+            .insert("OCRmyPDF".to_owned());
+        assert!(config.is_endpoint_enabled("ocr-pdf"));
+
+        config
+            .dependency_disabled_groups
+            .insert("tesseract".to_owned());
+        assert!(!config.is_endpoint_enabled("ocr-pdf"));
+        assert_eq!(
+            config.endpoint_availability(&["ocr-pdf".to_owned()])["ocr-pdf"].reason,
+            Some("DEPENDENCY")
+        );
         Ok(())
     }
 

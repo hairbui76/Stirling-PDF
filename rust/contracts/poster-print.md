@@ -39,6 +39,10 @@ left-to-right column order.
 - The output uses a fresh page tree and catalog. Source outlines, form state,
   page labels, JavaScript, and other document-navigation entries are dropped,
   and unreachable source objects are pruned.
+- The output Info dictionary matches Java's default non-Pro fresh-document
+  policy: title, author, subject, keywords, and valid source dates are retained;
+  custom keys are dropped; missing dates receive the current time; and creator
+  and producer become `Stirling-PDF v<version>`.
 
 ## Known Boundaries
 
@@ -48,10 +52,8 @@ left-to-right column order.
 - The Rust ZIP entry uses stored compression while Java's `ZipOutputStream`
   normally deflates it. Entry names, bytes after decompression, response
   headers, and content type are compatible.
-- The Rust path retains the loaded Info dictionary. Java copies selected
-  source metadata into a fresh document and applies configured default
-  producer/creator values; metadata policy normalization remains a
-  cross-route cutover item.
+- Pro custom-metadata substitution, including authenticated `username`
+  expansion in the configured author, remains part of the secured-mode cutover.
 - Server-side asynchronous `fileId` resolution belongs to the later job and
   storage migration slice; this additive route currently accepts
   `fileInput` only.

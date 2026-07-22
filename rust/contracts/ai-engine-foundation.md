@@ -177,7 +177,10 @@ drafting requests. Long-document reasoning emits the Python-compatible
 `whole_doc_read_started`, `whole_doc_slice_done`,
 `whole_doc_compression_round`, and `whole_doc_read_done` phases. The progress
 emitter is request-scoped and is a no-op outside an orchestrator stream, so
-concurrent requests cannot receive each other's events.
+concurrent requests cannot receive each other's events. Dropping the NDJSON
+response immediately cancels the active workflow instead of waiting for the
+next heartbeat; any in-flight provider future is dropped and releases its shared
+model-concurrency permit.
 Identity is enforced after capability routing: PDF question and review require
 `X-User-Id` before any ACL-backed delegate runs, while edit, create, saved-agent
 drafting, and unsupported-capability responses can run anonymously unless the
@@ -208,6 +211,11 @@ oracle comparisons and are still validated by a separately named CI step.
 The run and development tasks load the optional `engine/.env.local` with
 precedence over `engine/.env`, preserving local provider credentials without
 requiring the Rust binary itself to parse dotenv files.
+
+`STIRLING_MODEL_MAX_CONCURRENCY` defaults to `32` and limits all structured
+model completions through one process-wide semaphore shared by the smart and
+fast model tiers. Agent-specific worker limits remain additional, narrower
+bounds; switching tiers cannot bypass the provider-account ceiling.
 
 The engine image builds from the repository root with `engine/Dockerfile`. Its
 pinned Rust builder produces both the server and `migrate-sqlite-vec`; the

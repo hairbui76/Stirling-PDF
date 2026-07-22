@@ -8,7 +8,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary,
 };
-use stirling_processing::app;
+use stirling_processing::{app, runtime_metrics::application_version};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -35,6 +35,7 @@ async fn creates_default_saddle_stitch_sides_and_fresh_catalog()
     let catalog = document.catalog()?;
     assert!(catalog.get(b"AcroForm").is_err());
     assert!(catalog.get(b"Outlines").is_err());
+    assert_rebuilt_metadata(&document)?;
     Ok(())
 }
 
@@ -298,8 +299,33 @@ fn labeled_pdf(
         "Outlines" => outlines_id,
         "AcroForm" => acroform_id,
     });
+    let info_id = document.add_object(dictionary! {
+        "Title" => Object::string_literal("Source title"),
+        "Creator" => Object::string_literal("Source creator"),
+        "Producer" => Object::string_literal("Source producer"),
+        "CreationDate" => Object::string_literal("D:20240102030405+00'00'"),
+        "ModDate" => Object::string_literal("D:20240203040506+00'00'"),
+        "Custom" => Object::string_literal("discard me"),
+    });
     document.trailer.set("Root", catalog_id);
+    document.trailer.set("Info", info_id);
     let mut bytes = Vec::new();
     document.save_to(&mut bytes)?;
     Ok(bytes)
+}
+
+fn assert_rebuilt_metadata(document: &Document) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, info) = document.dereference(document.trailer.get(b"Info")?)?;
+    let info = info.as_dict()?;
+    let label = format!("Stirling-PDF v{}", application_version());
+    assert_eq!(info.get(b"Title")?.as_str()?, b"Source title");
+    assert_eq!(info.get(b"Creator")?.as_str()?, label.as_bytes());
+    assert_eq!(info.get(b"Producer")?.as_str()?, label.as_bytes());
+    assert_eq!(
+        info.get(b"CreationDate")?.as_str()?,
+        b"D:20240102030405+00'00'"
+    );
+    assert_eq!(info.get(b"ModDate")?.as_str()?, b"D:20240203040506+00'00'");
+    assert!(info.get(b"Custom").is_err());
+    Ok(())
 }

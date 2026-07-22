@@ -31,7 +31,7 @@ Java `ScannerEffectController`:
 1. optional grayscale conversion (average of the three channels),
 2. a random grey gradient border (`border` px on every side),
 3. a random rotation (`baseRotation ± rotateVariance`) rendered over the same
-   gradient, via inverse-mapped bilinear sampling (Java uses bicubic),
+   gradient, via inverse-mapped four-by-four Catmull–Rom bicubic sampling,
 4. edge feathering that blends toward the gradient,
 5. a two-pass box-blur approximation of a Gaussian blur,
 6. a combined brightness/contrast/optional-yellowing/Gaussian-noise pass
@@ -49,15 +49,15 @@ server error.
 
 ## Parity gaps
 
-Rotation interpolation is bilinear rather than bicubic, and the per-page random
-values cannot match Java bit-for-bit. Java renders pages in parallel across a
-`ForkJoinPool`; the Rust path renders serially under the shared `PDFium` lock.
-Structural properties (page count, page size, image-only content, DPI limit,
-preset resolution) are covered by tests; exact pixels are not.
+The per-page random values cannot match Java bit-for-bit. Java renders pages in
+parallel across a `ForkJoinPool`; the Rust path renders serially under the shared
+`PDFium` lock. Structural properties (page count, page size, image-only content,
+DPI limit, preset resolution) are covered by tests; exact pixels are not.
 
 ## Verification
 
 Unit tests cover option parsing, preset resolution, advanced-mode passthrough,
-and the safe-resolution clamp. HTTP tests cover required-field validation,
-invalid enum rejection, the DPI-limit rejection, and the full render against
-both the no-native boundary (`501`) and the pinned native runtime.
+the safe-resolution clamp, and bicubic sampling beyond the bilinear
+neighbourhood. HTTP tests cover required-field validation, invalid enum
+rejection, the DPI-limit rejection, and the full render against both the
+no-native boundary (`501`) and the pinned native runtime.

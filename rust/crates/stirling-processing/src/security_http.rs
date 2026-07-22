@@ -6,14 +6,15 @@
 
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    body::to_bytes,
-    extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State},
+    body::{Body, HttpBody as _, to_bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Multipart, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -21,6 +22,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
+use futures_util::StreamExt as _;
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -31,8 +33,9 @@ use crate::{
     license::LicenseError,
     runtime_config::RuntimeConfig,
     security::{
-        AuthContext, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityError,
-        SecurityHttpAuditRecord, SecurityStore, SessionTokens,
+        AuthContext, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityAuditContext,
+        SecurityAuditFileCapture, SecurityError, SecurityHttpAuditRecord, SecurityStore,
+        SessionTokens,
     },
     security_crypto::{ProtectedSecretCipher, totp_auth_uri},
     security_jwt::{SupabaseJwtError, SupabaseJwtVerifier},
@@ -52,6 +55,9 @@ const AUDIT_LEVEL_OFF: u8 = 0;
 const AUDIT_LEVEL_BASIC: u8 = 1;
 const AUDIT_LEVEL_STANDARD: u8 = 2;
 const AUDIT_LEVEL_VERBOSE: u8 = 3;
+const MAX_AUDIT_CLIENT_IP_CHARS: usize = 512;
+const MAX_AUDIT_RESULT_CHARS: usize = 1_000;
+const MAX_AUDIT_RESULT_BODY_BYTES: u64 = 64 * 1_024;
 
 #[derive(Clone)]
 struct RequestCorrelation(String);
@@ -65,8 +71,16 @@ pub struct SecurityHttpConfig {
     pub backend_url: String,
     pub audit_enabled: bool,
     pub audit_level: u8,
+    pub audit_file_capture: SecurityAuditFileCaptureConfig,
+    pub audit_capture_operation_results: bool,
     pub license_tier: LicenseTier,
     pub external_jwt: Option<Arc<SupabaseJwtVerifier>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SecurityAuditFileCaptureConfig {
+    pub file_hash: bool,
+    pub pdf_author: bool,
 }
 
 #[derive(Clone, Default)]
@@ -80,6 +94,8 @@ struct SecurityMiddlewareState {
     external_jwt: Option<Arc<SupabaseJwtVerifier>>,
     audit_enabled: bool,
     audit_level: u8,
+    audit_file_capture: SecurityAuditFileCapture,
+    audit_capture_operation_results: bool,
     license_tier: LicenseTier,
 }
 
@@ -288,6 +304,8 @@ pub fn secure_router(router: Router, store: Arc<SecurityStore>) -> Router {
             backend_url: String::new(),
             audit_enabled: true,
             audit_level: AUDIT_LEVEL_STANDARD,
+            audit_file_capture: SecurityAuditFileCaptureConfig::default(),
+            audit_capture_operation_results: false,
             license_tier: LicenseTier::Normal,
             external_jwt: None,
         },
@@ -318,6 +336,11 @@ pub(crate) fn secure_router_with_mail(
         audit_level: config
             .audit_level
             .clamp(AUDIT_LEVEL_OFF, AUDIT_LEVEL_VERBOSE),
+        audit_file_capture: SecurityAuditFileCapture {
+            hash: config.audit_file_capture.file_hash,
+            pdf_author: config.audit_file_capture.pdf_author,
+        },
+        audit_capture_operation_results: config.audit_capture_operation_results,
         license_tier: config.license_tier,
     };
     router
@@ -447,36 +470,217 @@ async fn enforce_security(
     }
     let audit_plan =
         audit_capture_plan(&state, &method, &path, request.headers(), context.as_ref());
-    let audit_context = context.clone();
+    let audit_client_ip = audit_plan.and_then(|_| audit_client_ip(&request));
+    let audit_principal_context = context.clone();
+    let audit_enrichment_context = audit_plan.map(|plan| {
+        SecurityAuditContext::with_file_capture(
+            plan.include_standard_data,
+            state.audit_file_capture,
+        )
+    });
+    if let Some(context) = &audit_enrichment_context {
+        request.extensions_mut().insert(context.clone());
+    }
     if let Some(context) = context {
         request.extensions_mut().insert(context);
     }
     let started_at = Instant::now();
-    let response = next.run(request).await;
+    let response = if let Some(audit_context) = &audit_enrichment_context {
+        audit_context.scope(next.run(request)).await
+    } else {
+        next.run(request).await
+    };
     if let Some(plan) = audit_plan {
-        let now = Utc::now();
-        let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let record = SecurityHttpAuditRecord {
-            context: audit_context,
-            correlation_id: correlation.0.clone(),
-            source: plan.source.to_owned(),
-            event_type: plan.event_type.to_owned(),
-            method: method.as_str().to_owned(),
-            path,
-            status_code: response.status().as_u16(),
-            latency_ms,
-            include_standard_data: plan.include_standard_data,
-            annotated: plan.annotated,
-            created_at: now.timestamp(),
-            timestamp: now.to_rfc3339(),
-        };
-        let store_for_audit = Arc::clone(&state.store);
-        // Java persists controller audit events asynchronously and fail-open.
-        // Await the bounded SQLite write for deterministic request tests, but
-        // never replace the handler response when audit persistence fails.
-        let _ = task::spawn_blocking(move || store_for_audit.record_http_audit(&record)).await;
+        return finish_http_audit(
+            PendingHttpAudit {
+                store: Arc::clone(&state.store),
+                capture_operation_results: state.audit_capture_operation_results,
+                plan,
+                context: audit_principal_context,
+                client_ip: audit_client_ip,
+                correlation_id: correlation.0,
+                method: method.as_str().to_owned(),
+                path,
+                started_at,
+                enrichment_context: audit_enrichment_context,
+            },
+            response,
+        )
+        .await;
     }
     with_request_id(response, &correlation.0)
+}
+
+struct PendingHttpAudit {
+    store: Arc<SecurityStore>,
+    capture_operation_results: bool,
+    plan: AuditCapturePlan,
+    context: Option<AuthContext>,
+    client_ip: Option<String>,
+    correlation_id: String,
+    method: String,
+    path: String,
+    started_at: Instant,
+    enrichment_context: Option<SecurityAuditContext>,
+}
+
+async fn finish_http_audit(pending: PendingHttpAudit, response: Response) -> Response {
+    let now = Utc::now();
+    let latency_ms = u64::try_from(pending.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let status_code = response.status().as_u16();
+    let capture_result = pending.capture_operation_results
+        && !pending.plan.annotated
+        && pending.plan.event_type != "UI_DATA";
+    let (response, result) = if capture_result {
+        capture_text_operation_result(response).await
+    } else {
+        (response, None)
+    };
+    let mut record = SecurityHttpAuditRecord {
+        context: pending.context,
+        client_ip: pending.client_ip,
+        correlation_id: pending.correlation_id.clone(),
+        source: pending.plan.source.to_owned(),
+        event_type: pending.plan.event_type.to_owned(),
+        method: pending.method,
+        path: pending.path,
+        status_code,
+        latency_ms,
+        include_standard_data: pending.plan.include_standard_data,
+        annotated: pending.plan.annotated,
+        result,
+        enrichment: pending
+            .enrichment_context
+            .as_ref()
+            .map(SecurityAuditContext::snapshot)
+            .unwrap_or_default(),
+        created_at: now.timestamp(),
+        timestamp: now.to_rfc3339(),
+    };
+    let store_for_audit = pending.store;
+    // Java persists controller audit events asynchronously and fail-open.
+    // Generic asynchronous jobs keep enriching the request context after
+    // this submission response. Defer only that write until the worker
+    // signals completion; normal handlers retain deterministic persistence.
+    if let Some(audit_context) = pending
+        .enrichment_context
+        .filter(SecurityAuditContext::is_deferred)
+    {
+        task::spawn(async move {
+            audit_context.wait_for_deferred_completion().await;
+            record.enrichment = audit_context.snapshot();
+            let _ = task::spawn_blocking(move || store_for_audit.record_http_audit(&record)).await;
+        });
+    } else {
+        // Await the bounded SQLite write for deterministic request tests,
+        // but never replace the handler response when persistence fails.
+        let _ = task::spawn_blocking(move || store_for_audit.record_http_audit(&record)).await;
+    }
+    with_request_id(response, &pending.correlation_id)
+}
+
+async fn capture_text_operation_result(response: Response) -> (Response, Option<String>) {
+    if !is_text_operation_result(&response)
+        || response
+            .body()
+            .size_hint()
+            .exact()
+            .is_none_or(|size| size == 0 || size > MAX_AUDIT_RESULT_BODY_BYTES)
+    {
+        return (response, None);
+    }
+
+    let (parts, body) = response.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut chunks = Vec::new();
+    let mut captured = Vec::new();
+    let mut complete = true;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                captured.extend_from_slice(&bytes);
+                chunks.push(Ok(bytes));
+            }
+            Err(error) => {
+                chunks.push(Err(error));
+                complete = false;
+                break;
+            }
+        }
+    }
+    let response =
+        Response::from_parts(parts, Body::from_stream(futures_util::stream::iter(chunks)));
+    let result = complete
+        .then(|| String::from_utf8(captured).ok())
+        .flatten()
+        .map(|value| bounded_operation_result(&value));
+    (response, result)
+}
+
+fn is_text_operation_result(response: &Response) -> bool {
+    let Some(content_type) = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let content_type = content_type.to_ascii_lowercase();
+    content_type.starts_with("text/")
+        || content_type == "application/json"
+        || content_type.ends_with("+json")
+        || content_type == "application/xml"
+        || content_type.ends_with("+xml")
+        || content_type == "application/x-www-form-urlencoded"
+}
+
+fn bounded_operation_result(value: &str) -> String {
+    let mut chars = value.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_AUDIT_RESULT_CHARS)
+        .collect::<String>();
+    if chars.next().is_none() {
+        return prefix;
+    }
+    let mut bounded = prefix
+        .chars()
+        .take(MAX_AUDIT_RESULT_CHARS.saturating_sub(3))
+        .collect::<String>();
+    bounded.push_str("...");
+    bounded
+}
+
+fn audit_client_ip(request: &Request) -> Option<String> {
+    let forwarded_for = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(forwarded_for) = forwarded_for {
+        return Some(
+            forwarded_for
+                .chars()
+                .take(MAX_AUDIT_CLIENT_IP_CHARS)
+                .collect(),
+        );
+    }
+    let real_ip = request
+        .headers()
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty());
+    if let Some(real_ip) = real_ip {
+        return Some(real_ip.chars().take(MAX_AUDIT_CLIENT_IP_CHARS).collect());
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|address| address.0.ip().to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -535,7 +739,7 @@ fn explicit_audit_event(method: &axum::http::Method, path: &str) -> Option<&'sta
     }
 }
 
-fn inferred_audit_event(method: &axum::http::Method, path: &str) -> &'static str {
+pub(crate) fn inferred_audit_event(method: &axum::http::Method, path: &str) -> &'static str {
     if method == axum::http::Method::GET {
         return if is_ui_data_get(path) {
             "UI_DATA"
@@ -553,6 +757,7 @@ fn inferred_audit_event(method: &axum::http::Method, path: &str) -> &'static str
     } else {
         let lowercase = path.to_ascii_lowercase();
         if lowercase.starts_with("/api/v1/files/")
+            || lowercase.starts_with("/api/v1/storage/files")
             || lowercase.contains("/upload/")
             || lowercase.contains("/download/")
         {
@@ -2148,6 +2353,7 @@ async fn bounded_multipart_fields(
         if value.len() > 4096 {
             return Err(invalid_form_response());
         }
+        SecurityAuditContext::record_current_form_param(&name, &value);
         fields.insert(name, Zeroizing::new(value));
     }
     Ok(fields)
@@ -2468,21 +2674,24 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
 mod tests {
     use super::{
         API_KEY_HEADER, AUDIT_LEVEL_STANDARD, AUDIT_LEVEL_VERBOSE, AUTOMATION_HEADER,
-        SecurityHttpConfig, SecurityStartupError, initialize_security_store,
-        random_temporary_password, secure_router, secure_router_with_config,
+        MAX_AUDIT_RESULT_CHARS, SecurityAuditFileCaptureConfig, SecurityHttpConfig,
+        SecurityStartupError, audit_client_ip, bounded_operation_result, inferred_audit_event,
+        initialize_security_store, random_temporary_password, secure_router,
+        secure_router_with_config,
     };
     use crate::admin_settings::AdminSettingsService;
     use crate::job_manager::{JobManager, JobOwner};
     use crate::job_queue::{JobQueue, JobQueueConfig};
     use crate::runtime_config::RuntimeConfig;
-    use crate::security::{SecurityAuditFilter, SecurityStore};
+    use crate::security::{SecurityAuditContext, SecurityAuditFilter, SecurityStore};
     use crate::security_crypto::totp_code_at;
     use crate::security_jwt::{SupabaseJwtConfig, SupabaseJwtVerifier};
     use crate::security_policy::LicenseTier;
     use axum::{
         Extension, Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        extract::ConnectInfo,
+        http::{HeaderValue, Request, StatusCode, header},
         routing::{get, post},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -2492,9 +2701,45 @@ mod tests {
     use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey as _, traits::PublicKeyParts as _};
     use serde::Serialize;
     use serde_json::Value;
-    use std::{fs, sync::Arc};
+    use std::{fs, net::SocketAddr, sync::Arc};
     use tempfile::tempdir;
     use tower::ServiceExt as _;
+
+    #[test]
+    fn storage_file_mutations_use_java_file_operation_category() {
+        assert_eq!(
+            inferred_audit_event(&axum::http::Method::POST, "/api/v1/storage/files"),
+            "FILE_OPERATION"
+        );
+        assert_eq!(
+            inferred_audit_event(&axum::http::Method::PUT, "/api/v1/storage/files/42"),
+            "FILE_OPERATION"
+        );
+    }
+
+    #[test]
+    fn audit_client_ip_uses_java_proxy_then_peer_precedence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut request = Request::get("/").body(Body::empty())?;
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("192.0.2.44:8443".parse::<SocketAddr>()?));
+        request
+            .headers_mut()
+            .insert("x-real-ip", HeaderValue::from_static("198.51.100.8"));
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 198.51.100.8"),
+        );
+        assert_eq!(audit_client_ip(&request).as_deref(), Some("203.0.113.9"));
+
+        request.headers_mut().remove("x-forwarded-for");
+        assert_eq!(audit_client_ip(&request).as_deref(), Some("198.51.100.8"));
+
+        request.headers_mut().remove("x-real-ip");
+        assert_eq!(audit_client_ip(&request).as_deref(), Some("192.0.2.44"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn protects_default_routes_and_leaves_health_public()
@@ -2650,8 +2895,13 @@ mod tests {
             .as_str()
             .ok_or("missing access token")?;
 
-        let returned_error =
-            authorized_post(&app, "/api/v1/general/process", access_token, None).await?;
+        let returned_error = authorized_post(
+            &app,
+            "/api/v1/general/process",
+            access_token,
+            Some(("x-forwarded-for", "203.0.113.9, 198.51.100.8")),
+        )
+        .await?;
         assert_eq!(returned_error.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             authorized_post(&app, "/api/v1/ai/test", access_token, None)
@@ -2708,6 +2958,8 @@ mod tests {
         )?;
         assert_eq!(web_details["outcome"], "success");
         assert_eq!(web_details["statusCode"], 400);
+        assert_eq!(web_details["clientIp"], "203.0.113.9");
+        assert_eq!(web_details["__ipAddress"], "203.0.113.9");
 
         let ai_sources = events
             .iter()
@@ -2724,10 +2976,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_audit_merges_bounded_policy_context_after_handler_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, store) = test_router_with_store()?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let access_token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+
+        let response = authorized_post(&app, "/api/v1/policies/run", access_token, None).await?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        let event = events
+            .iter()
+            .find(|event| audit_event_has_path(event, "/api/v1/policies/run"))
+            .ok_or("missing policy audit event")?;
+        let details: Value = serde_json::from_str(&event.data)?;
+        assert_eq!(details["policyName"], "Nightly  run");
+        assert_eq!(details["policySteps"].as_array().map(Vec::len), Some(50));
+        assert_eq!(details["policySteps"][0], "/api/v1/general/rotate-pdf");
+        assert!(details.get("automation").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn controller_audit_honors_enabled_level_and_exact_standard_polling()
     -> Result<(), Box<dyn std::error::Error>> {
         for (enabled, level) in [(false, AUDIT_LEVEL_VERBOSE), (true, 0)] {
-            let (app, store) = test_router_with_audit_config(enabled, level)?;
+            let (app, store) = test_router_with_audit_config(enabled, level, false)?;
             let login = response_json(login_request(&app, None).await?).await?;
             let token = login["session"]["access_token"]
                 .as_str()
@@ -2742,7 +3018,7 @@ mod tests {
         }
 
         let (standard_app, standard_store) =
-            test_router_with_audit_config(true, AUDIT_LEVEL_STANDARD)?;
+            test_router_with_audit_config(true, AUDIT_LEVEL_STANDARD, false)?;
         let standard_login = response_json(login_request(&standard_app, None).await?).await?;
         let standard_token = standard_login["session"]["access_token"]
             .as_str()
@@ -2756,7 +3032,7 @@ mod tests {
         assert_eq!(standard_store.audit_event_count()?, 1);
 
         let (verbose_app, verbose_store) =
-            test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE)?;
+            test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE, false)?;
         let verbose_login = response_json(login_request(&verbose_app, None).await?).await?;
         let verbose_token = verbose_login["session"]["access_token"]
             .as_str()
@@ -2772,6 +3048,55 @@ mod tests {
             event.event_type == "UI_DATA" && audit_event_has_path(event, "/api/v1/auth/me")
         }));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn controller_audit_captures_only_enabled_non_ui_text_results()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, store) = test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE, true)?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+
+        let response = authorized_post(&app, "/api/v1/general/process", token, None).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await?.as_ref(),
+            b"invalid"
+        );
+        let me = authorized_get(&app, "/api/v1/auth/me", token).await?;
+        assert_eq!(me.status(), StatusCode::OK);
+
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        let process = events
+            .iter()
+            .find(|event| audit_event_has_path(event, "/api/v1/general/process"))
+            .ok_or("missing process audit event")?;
+        let process_data: Value = serde_json::from_str(&process.data)?;
+        assert_eq!(process_data["result"], "invalid");
+
+        let me = events
+            .iter()
+            .find(|event| audit_event_has_path(event, "/api/v1/auth/me"))
+            .ok_or("missing UI-data audit event")?;
+        let me_data: Value = serde_json::from_str(&me.data)?;
+        assert!(me_data.get("result").is_none());
+        let login = events
+            .iter()
+            .find(|event| audit_event_has_path(event, "/api/v1/auth/login"))
+            .ok_or("missing login audit event")?;
+        let login_data: Value = serde_json::from_str(&login.data)?;
+        assert!(login_data.get("result").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_result_bounds_match_java_safe_string_limit() {
+        let value = "a".repeat(MAX_AUDIT_RESULT_CHARS + 1);
+        let bounded = bounded_operation_result(&value);
+        assert_eq!(bounded.chars().count(), MAX_AUDIT_RESULT_CHARS);
+        assert!(bounded.ends_with("..."));
     }
 
     #[tokio::test]
@@ -3635,6 +3960,8 @@ mod tests {
                 backend_url: String::new(),
                 audit_enabled: true,
                 audit_level: AUDIT_LEVEL_STANDARD,
+                audit_file_capture: SecurityAuditFileCaptureConfig::default(),
+                audit_capture_operation_results: false,
                 license_tier: LicenseTier::Enterprise,
                 external_jwt: Some(verifier),
             },
@@ -3697,6 +4024,24 @@ mod tests {
                 "/api/v1/general/process",
                 post(|| async { (StatusCode::BAD_REQUEST, "invalid") }),
             )
+            .route(
+                "/api/v1/policies/run",
+                post(
+                    |Extension(audit): Extension<SecurityAuditContext>| async move {
+                        audit.set_policy(
+                            "  Nightly\r\nrun  ",
+                            (0..51).map(|index| {
+                                if index == 0 {
+                                    "/api/v1/general/rotate-pdf".to_owned()
+                                } else {
+                                    format!("/api/v1/tool/{index}")
+                                }
+                            }),
+                        );
+                        StatusCode::ACCEPTED
+                    },
+                ),
+            )
             .route("/api/v1/ai/test", post(|| async { "ok" }));
         let app = secure_router_with_config(
             router,
@@ -3709,6 +4054,8 @@ mod tests {
                 backend_url: String::new(),
                 audit_enabled: true,
                 audit_level: AUDIT_LEVEL_STANDARD,
+                audit_file_capture: SecurityAuditFileCaptureConfig::default(),
+                audit_capture_operation_results: false,
                 license_tier,
                 external_jwt: None,
             },
@@ -3719,6 +4066,7 @@ mod tests {
     fn test_router_with_audit_config(
         audit_enabled: bool,
         audit_level: u8,
+        capture_operation_results: bool,
     ) -> Result<(Router, Arc<SecurityStore>), Box<dyn std::error::Error>> {
         let store = Arc::new(SecurityStore::in_memory()?);
         assert!(store.bootstrap_admin("admin", "test password")?);
@@ -3739,6 +4087,8 @@ mod tests {
                 backend_url: String::new(),
                 audit_enabled,
                 audit_level,
+                audit_file_capture: SecurityAuditFileCaptureConfig::default(),
+                audit_capture_operation_results: capture_operation_results,
                 license_tier: LicenseTier::Enterprise,
                 external_jwt: None,
             },

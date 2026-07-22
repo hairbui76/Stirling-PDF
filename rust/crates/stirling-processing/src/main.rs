@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     desktop_settings::initialize_from_environment()?;
     if RuntimeConfig::security_mode_is_requested() {
         return Err(std::io::Error::other(
-            "DOCKER_ENABLE_SECURITY=true is not supported by the Rust runtime yet; refusing to start without authentication and authorization middleware",
+            "secured login mode is not supported by the Rust runtime yet; refusing to start without authentication and authorization middleware",
         )
         .into());
     }
@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // variable is absent, which would otherwise leave the desktop waiting
     // forever for an INFO event that never reaches the child-process pipe.
     println!("Stirling-PDF running on port: {}", address.port());
-    let server = axum::serve(listener, runtime.into_router());
+    let service = runtime
+        .into_router()
+        .into_make_service_with_connect_info::<SocketAddr>();
+    let server = axum::serve(listener, service);
     if let Some(parent_process) = parent_process {
         tokio::select! {
             result = server => result?,

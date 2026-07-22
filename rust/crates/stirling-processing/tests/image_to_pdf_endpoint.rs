@@ -7,7 +7,7 @@ use axum::{
 };
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use lopdf::{Document, Object, ObjectId};
-use stirling_processing::app;
+use stirling_processing::{app, runtime_metrics::application_version};
 use tiff::encoder::{TiffEncoder, colortype};
 use tower::ServiceExt;
 
@@ -42,6 +42,7 @@ async fn converts_png_jpeg_gif_webp_and_bmp_in_upload_order()
     );
     let document = Document::load_mem(&response_bytes(response).await?)?;
     assert_eq!(document.get_pages().len(), inputs.len());
+    assert_default_metadata(&document)?;
     for page_id in document.get_pages().values() {
         let (width, height) = page_size(&document, *page_id)?;
         assert!((width - 595.275_63).abs() < 0.01);
@@ -313,4 +314,15 @@ fn page_image(
     let xobjects = resources.get(b"XObject")?.as_dict()?;
     let image_id = xobjects.get(b"Im0")?.as_reference()?;
     Ok(document.get_object(image_id)?.as_stream()?)
+}
+
+fn assert_default_metadata(document: &Document) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, info) = document.dereference(document.trailer.get(b"Info")?)?;
+    let info = info.as_dict()?;
+    let label = format!("Stirling-PDF v{}", application_version());
+    assert_eq!(info.get(b"Creator")?.as_str()?, label.as_bytes());
+    assert_eq!(info.get(b"Producer")?.as_str()?, label.as_bytes());
+    assert!(info.get(b"CreationDate")?.as_datetime().is_some());
+    assert!(info.get(b"ModDate")?.as_datetime().is_some());
+    Ok(())
 }

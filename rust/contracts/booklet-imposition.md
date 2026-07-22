@@ -43,16 +43,18 @@ enabled, both passes, and no short-edge flip.
   properties but dropping source outlines, form fields, annotations, page
   labels, JavaScript, and other source navigation state just like the Java
   fresh-document path. Unreachable source objects are pruned.
+- The output Info dictionary matches Java's default non-Pro fresh-document
+  policy: title, author, subject, keywords, and valid source dates are retained;
+  custom keys are dropped; missing dates receive the current time; and creator
+  and producer become `Stirling-PDF v<version>`.
 
 ## Known Boundaries
 
 - Rust rejects an empty PDF, malformed/non-finite page boxes, and a non-finite
   gutter with HTTP 400 rather than allowing the Java code to fail later while
   indexing or serializing the document.
-- The current Rust path retains the loaded Info dictionary. Java constructs a
-  fresh Info dictionary from selected standard metadata and applies configured
-  Stirling producer/creator values; metadata policy normalization remains a
-  cross-route cutover item.
+- Pro custom-metadata substitution, including authenticated `username`
+  expansion in the configured author, remains part of the secured-mode cutover.
 - Server-side asynchronous `fileId` resolution belongs to the later job and
   storage migration slice; this additive service currently accepts
   `fileInput` only.

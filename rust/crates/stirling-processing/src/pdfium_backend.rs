@@ -3,7 +3,7 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::{self, Cursor, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
@@ -222,6 +222,30 @@ pub enum PdfiumToImageAttempt {
     },
 }
 
+#[derive(Debug)]
+pub enum PdfiumOcrPrepareAttempt {
+    Prepared(Vec<PdfiumOcrPageArtifact>),
+    Unavailable {
+        explicitly_configured: bool,
+        details: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfiumOcrMode {
+    AllPages,
+    SkipTextPages,
+}
+
+#[derive(Debug)]
+pub struct PdfiumOcrPageArtifact {
+    pub page_number: usize,
+    pub original_pdf_path: PathBuf,
+    pub image_path: Option<PathBuf>,
+    pub ocr_output_base: PathBuf,
+    pub expected_ocr_pdf_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PdfToImageFormat {
     Png,
@@ -370,6 +394,47 @@ pub enum PdfiumToImageError {
     Io(#[from] io::Error),
     #[error("could not build converted image archive: {0}")]
     Zip(#[from] zip::result::ZipError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PdfiumOcrError {
+    #[error("could not lock the PDFium runtime because another operation panicked")]
+    RuntimePoisoned,
+    #[error("could not read '{filename}' as a PDF with PDFium: {source}")]
+    ReadPdf {
+        filename: String,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("the PDF has no pages to OCR")]
+    NoPages,
+    #[error("could not {operation} page {page_number} with PDFium: {source}")]
+    Page {
+        operation: &'static str,
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not create the retained PDF for page {page_number}: {source}")]
+    CreatePageDocument {
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not retain original page {page_number}: {source}")]
+    ImportPage {
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error("could not write retained original page {page_number}: {source}")]
+    SavePage {
+        page_number: usize,
+        #[source]
+        source: PdfiumError,
+    },
+    #[error(transparent)]
+    Render(#[from] PdfiumToImageError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1059,6 +1124,124 @@ fn render_dimension(points: f32, dpi: i32) -> u64 {
 
 fn page_number(page_index: i32) -> usize {
     usize::try_from(page_index).map_or(usize::MAX, |index| index.saturating_add(1))
+}
+
+/// Creates the bounded per-page artifacts needed by the Tesseract OCR fallback.
+///
+/// The source PDF is loaded once. Every page is retained as a one-page PDF, and
+/// pages selected for OCR are additionally rendered to PNG without retaining a
+/// full-document raster set in memory.
+pub fn try_prepare_tesseract_pages(
+    input_path: &Path,
+    filename: &str,
+    mode: PdfiumOcrMode,
+    render_dpi: i32,
+    images_dir: &Path,
+    pages_dir: &Path,
+) -> Result<PdfiumOcrPrepareAttempt, PdfiumOcrError> {
+    let runtime = shared_pdfium_runtime();
+    let pdfium = match &runtime.instance {
+        Ok(pdfium) => pdfium.lock().map_err(|_| PdfiumOcrError::RuntimePoisoned)?,
+        Err(details) => {
+            return Ok(PdfiumOcrPrepareAttempt::Unavailable {
+                explicitly_configured: runtime.explicitly_configured,
+                details: details.clone(),
+            });
+        }
+    };
+    let document = pdfium
+        .load_pdf_from_file(input_path, None)
+        .map_err(|source| PdfiumOcrError::ReadPdf {
+            filename: filename.to_owned(),
+            source,
+        })?;
+    if document.pages().is_empty() {
+        return Err(PdfiumOcrError::NoPages);
+    }
+
+    let mut artifacts = Vec::new();
+    for page_index in document.pages().as_range() {
+        let page_number = page_number(page_index);
+        let page = document
+            .pages()
+            .get(page_index)
+            .map_err(|source| PdfiumOcrError::Page {
+                operation: "read",
+                page_number,
+                source,
+            })?;
+        let has_text = if mode == PdfiumOcrMode::SkipTextPages {
+            let text = page.text().map_err(|source| PdfiumOcrError::Page {
+                operation: "extract text from",
+                page_number,
+                source,
+            })?;
+            text.segments()
+                .iter()
+                .any(|segment| !segment.text().trim().is_empty())
+        } else {
+            false
+        };
+
+        let original_pdf_path = pages_dir.join(format!("original-page-{page_index}.pdf"));
+        let mut original =
+            pdfium
+                .create_new_pdf()
+                .map_err(|source| PdfiumOcrError::CreatePageDocument {
+                    page_number,
+                    source,
+                })?;
+        original
+            .pages_mut()
+            .copy_pages_from_document(&document, &page_number.to_string(), 0)
+            .map_err(|source| PdfiumOcrError::ImportPage {
+                page_number,
+                source,
+            })?;
+        original
+            .save_to_file(&original_pdf_path)
+            .map_err(|source| PdfiumOcrError::SavePage {
+                page_number,
+                source,
+            })?;
+
+        let should_ocr = mode == PdfiumOcrMode::AllPages || !has_text;
+        let image_path = if should_ocr {
+            let page_index = usize::try_from(page_index)
+                .map_err(|_| PdfiumOcrError::Render(PdfiumToImageError::PageCount))?;
+            let (width, height) = selected_page_dimensions(&document, page_index, render_dpi)?;
+            let rendered = render_pdf_page(
+                &document,
+                page_index,
+                width,
+                height,
+                PdfToImageColor::Color,
+                render_dpi,
+                true,
+            )?;
+            let encoded = encode_pdf_image(rendered, PdfToImageFormat::Png).map_err(|source| {
+                PdfiumToImageError::Encode {
+                    image_number: page_number,
+                    source,
+                }
+            })?;
+            let image_path = images_dir.join(format!("page_{page_index}.png"));
+            std::fs::write(&image_path, encoded).map_err(PdfiumToImageError::Io)?;
+            Some(image_path)
+        } else {
+            None
+        };
+        let ocr_output_base = pages_dir.join(format!("page_{page_index}"));
+        let expected_ocr_pdf_path = ocr_output_base.with_extension("pdf");
+        artifacts.push(PdfiumOcrPageArtifact {
+            page_number,
+            original_pdf_path,
+            image_path,
+            ocr_output_base,
+            expected_ocr_pdf_path,
+        });
+    }
+    Ok(PdfiumOcrPrepareAttempt::Prepared(artifacts))
 }
 
 pub fn try_auto_split_pdf_to_zip(

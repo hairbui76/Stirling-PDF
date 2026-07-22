@@ -17,7 +17,7 @@ Rust compatibility contract for `OCRController`.
 
 ## Behavior
 
-Shells out to OCRmyPDF, the same primary tool the Java service uses:
+Prefers OCRmyPDF, the same primary tool the Java service uses:
 
 ```
 ocrmypdf --verbose 2 --output-type pdf --pdf-renderer <hocr|sandwich> \
@@ -27,30 +27,56 @@ ocrmypdf --verbose 2 --output-type pdf --pdf-renderer <hocr|sandwich> \
 ```
 
 The `ocrmypdf` binary is resolved from `STIRLING_PROCESSING_OCRMYPDF_COMMAND` when
-set, otherwise platform defaults. When `removeImagesAfter` is set the OCR'd PDF is
-post-processed with Ghostscript (`-sDEVICE=pdfwrite -dFILTERIMAGE`), matching the
-Java behavior.
+set, otherwise platform defaults. The known restricted-kernel multiprocessing
+failure is retried once with `--jobs 1`. When `removeImagesAfter` is set the OCR'd
+PDF is post-processed with Ghostscript (`-sDEVICE=pdfwrite -dFILTERIMAGE`), matching
+the Java behavior.
 
-Empty `languages` → `400`; an invalid `ocrRenderType` → `400`.
+When OCRmyPDF is disabled or cannot be found, Rust uses Java's Tesseract fallback.
+PDFium loads the source once, detects text for `skip-text`, retains every original
+page as a one-page PDF, and renders selected pages to bounded PNGs at
+`system.maxDPI` (default 500). Each selected page runs:
 
-## Parity gaps
+```
+tesseract <page.png> <zero-based-output-base> -l <l1+l2+…> pdf
+```
 
-- **Tesseract fallback is not ported.** Java falls back to a page-by-page Tesseract
-  pipeline (render each page → per-page `tesseract` → merge) when OCRmyPDF is
-  unavailable. The Rust port returns `501 Not Implemented` instead.
-- Language availability is not pre-validated against a local `tessdata` directory;
-  OCRmyPDF validates the requested languages itself and fails if unavailable.
-- The niche OCRmyPDF `--jobs 1` retry (for a specific multiprocessing error on some
-  kernels) is not reproduced.
+The generated and retained page PDFs are merged in source order. Exit zero without
+the expected generated PDF retains the source page. `force-ocr` and all values
+other than `skip-text` OCR every page. Matching Java, fallback mode ignores the
+OCRmyPDF-only cleanup flags and creates an empty text member when `sidecar=true`.
+`STIRLING_PROCESSING_TESSERACT_COMMAND` can select an explicit executable.
+
+Both command paths use shared process pools with the same Java configuration
+surface. `processExecutor.sessionLimit.ocrMyPdfSessionLimit` defaults to 2 and
+`tesseractSessionLimit` defaults to 1; both matching timeout values under
+`processExecutor.timeoutMinutes` default to 30 minutes. Timeout terminates the
+command and its discovered descendants before releasing the pool slot. The
+equivalent Spring relaxed-binding environment names are also honored.
+
+Before starting OCRmyPDF, Rust discovers the immediate `*.traineddata` entries in
+the configured tessdata directory (`system.tessdataDir`, then `TESSDATA_PREFIX`,
+then the packaged default), excluding `osd` case-insensitively. Requested
+languages are matched case-sensitively and unavailable values are discarded while
+request order and duplicates are preserved. Empty `languages`, an invalid
+`ocrRenderType`, or no remaining installed language each return `400` in the same
+validation order as Java.
 
 ## Availability
 
-When no `ocrmypdf` binary is found the endpoint returns `501 Not Implemented`. A
-process that starts but fails returns a server error. If `removeImagesAfter` is
-requested but Ghostscript is unavailable, `501` is returned.
+Startup discovery probes OCRmyPDF and Tesseract independently, and the endpoint is
+advertised when either tool remains enabled. If neither executable is available,
+the endpoint returns `501 Not Implemented`. A process that starts but fails returns
+a server error. If `removeImagesAfter` is requested on the OCRmyPDF path but
+Ghostscript is unavailable, `501` is returned.
 
 ## Verification
 
-Unit tests cover the empty-language and invalid-render-type rejections. HTTP tests
-assert those `400`s and a full OCR run when OCRmyPDF is present on the host
-(otherwise `501`).
+Unit tests cover tessdata discovery, empty-language and invalid-render-type
+rejections, exact untrimmed multipart strings, case-sensitive availability
+filtering, and preservation of selected language order and duplicates. A fake
+Tesseract runner exercises bounded rendering, exact arguments, generated-page
+selection, and ordered PDF reassembly without a host dependency. Process-executor
+tests verify pool serialization and timeout cleanup of a spawned descendant. HTTP
+tests assert all validation `400`s and follow the combined OCRmyPDF/Tesseract
+availability contract.

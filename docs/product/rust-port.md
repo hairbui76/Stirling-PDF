@@ -51,6 +51,13 @@ which must count conditional and nested routers by method and path. This is
 implementation progress, not cutover evidence: Java remains the production route
 owner and the much larger non-UI inventory below remains in scope.
 
+Open-mode local development now exercises that additive service by default:
+`task backend:dev`, `task dev`, and default `task dev:all` launch
+`stirling-processing`. The explicit Java oracle (`task backend:dev:java`),
+secured portal development, SaaS development, desktop bundles, and production
+containers remain Java-owned until their separate contract and packaging gates
+are satisfied.
+
 The same Rust runtime now owns the six read-only `/api/v1/ui-data/*` metadata
 endpoints used by the unchanged client (footer, home, licenses, pipeline templates,
 OCR languages, and shared signature/font metadata). This does not port the UI;

@@ -117,7 +117,7 @@ All JSON field names are camelCase to match the Java Lombok DTOs.
 | `event.timestamp()` (Instant) | `SecurityAuditEvent.timestamp` (unix seconds) |
 | `data.__origin` | `SecurityAuditEvent.source` column (`API`/`SYSTEM`/`WEB`/...) |
 | `data.path`, `data.statusCode`, `data.status`, `data.latencyMs` | same keys in `SecurityAuditEvent.data` |
-| `data.files`, `data.automation`, `data.policyName`, `data.policySteps` | same keys in `SecurityAuditEvent.data` |
+| `data.files`, including optional `fileHash` / `pdfAuthor`, plus `data.formParams`, `data.automation`, `data.policyName`, `data.policySteps` | same keys in `SecurityAuditEvent.data` |
 
 ## Parity gaps
 
@@ -125,14 +125,26 @@ All JSON field names are camelCase to match the Java Lombok DTOs.
   `data`; the reviewed store carries the same request origin in the durable
   `source` column, so the origin is read from `event.source` instead. This is a
   faithful behavioral mapping, not a divergence.
-- **Data keys the standard recorder never writes.** The reviewed HTTP audit
-  recorder persists only request-shaped data (`path`, `statusCode`, `latencyMs`,
-  ...); it never writes `files`, `automation`, `policyName`, or `policySteps`.
-  Real recorder-produced events therefore yield no documents and no automation /
-  policy shaping. Java's audit aspect enriches events with those keys; the Rust
-  port would need equivalent enrichment for those surfaces to be non-empty from
-  live traffic. `SecurityStore::insert_audit_event` is provided so callers/tests
-  can persist events that do carry them.
+- **Direct-controller file enrichment.** Live ad-hoc/stored policy dispatches
+  carry bounded `policyName`/`policySteps`, and every internal tool call records
+  `automation` plus its input/referenced supporting `files` at
+  STANDARD/VERBOSE level. Direct processing uploads that use the shared
+  streamed file/byte reader, direct pipelines, AI workflow uploads, and policy
+  inputs now record bounded name/size/type metadata through the same
+  request-scoped context. When Java's optional audit flags are enabled, these
+  file entries also retain lowercase SHA-256 and PDF Info Author metadata; the
+  documents projection ignores those extra fields, as Java does. A secured real
+  `misc/repair` request is covered all the way through the durable event and
+  this documents projection, including hash/author persistence, and a direct
+  pipeline independently verifies its persisted file context and outer JSON
+  `formParams`. The projection ignores form parameters, as Java does. Generic
+  `?async=true` processing jobs share the context with their background replay
+  and defer event persistence until it completes, preserving the same metadata
+  without a second upload pass. Custom storage, collaborative-signing,
+  server-certificate, license, mail-attachment,
+  and mobile-scanner readers use the same hook. Storage file mutations also use
+  Java's `FILE_OPERATION` category. Rust does not buffer every request body in
+  middleware; each typed streaming boundary reports completed uploads directly.
 - **Positive event-type allow-list vs `NOT IN`.** Excluding noise via a positive
   `IN` of the seven known standard types means a hypothetical unknown/custom
   event type (never emitted by the reviewed recorder, whose universe is the nine

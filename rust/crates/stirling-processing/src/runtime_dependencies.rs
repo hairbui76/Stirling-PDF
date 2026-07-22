@@ -1,7 +1,7 @@
 //! Startup discovery for optional native command-line dependencies.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
@@ -20,8 +20,14 @@ struct DependencySpec {
     minimum_version: Option<[u64; 3]>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct DependencyDiscovery {
+    pub(crate) disabled_groups: BTreeSet<String>,
+    pub(crate) commands: BTreeMap<String, PathBuf>,
+}
+
 /// Finds unavailable or too-old tool groups using the same startup model as Java.
-pub(crate) fn discover_dependency_groups() -> BTreeSet<String> {
+pub(crate) fn discover_dependencies() -> DependencyDiscovery {
     let specs = [
         DependencySpec {
             group: "Ghostscript",
@@ -35,6 +41,13 @@ pub(crate) fn discover_dependency_groups() -> BTreeSet<String> {
             environment: "STIRLING_PROCESSING_OCRMYPDF_COMMAND",
             unix_candidates: &["ocrmypdf"],
             windows_candidates: &["ocrmypdf.exe", "ocrmypdf"],
+            minimum_version: None,
+        },
+        DependencySpec {
+            group: "tesseract",
+            environment: "STIRLING_PROCESSING_TESSERACT_COMMAND",
+            unix_candidates: &["tesseract"],
+            windows_candidates: &["tesseract.exe", "tesseract"],
             minimum_version: None,
         },
         DependencySpec {
@@ -81,22 +94,24 @@ pub(crate) fn discover_dependency_groups() -> BTreeSet<String> {
         },
     ];
 
-    let mut disabled = BTreeSet::new();
+    let mut discovery = DependencyDiscovery::default();
     for spec in specs {
         let Some(command) = resolve_dependency(&spec) else {
-            disabled.insert(spec.group.to_owned());
+            discovery.disabled_groups.insert(spec.group.to_owned());
             continue;
         };
         if let Some(required) = spec.minimum_version
             && probe_version(&command).is_some_and(|installed| installed < required)
         {
-            disabled.insert(spec.group.to_owned());
+            discovery.disabled_groups.insert(spec.group.to_owned());
+            continue;
         }
+        discovery.commands.insert(spec.group.to_owned(), command);
     }
 
     // Rust deliberately does not use Java's unoconvert server pool.
-    disabled.insert("Unoconvert".to_owned());
-    disabled
+    discovery.disabled_groups.insert("Unoconvert".to_owned());
+    discovery
 }
 
 fn resolve_dependency(spec: &DependencySpec) -> Option<PathBuf> {

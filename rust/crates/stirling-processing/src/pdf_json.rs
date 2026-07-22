@@ -15,8 +15,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env, fs,
     io::Cursor,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -26,6 +28,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary,
 };
+use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -38,6 +41,14 @@ const MAX_XMP_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EDITOR_IMAGE_PIXELS: u64 = 50_000_000;
 const MAX_EDITOR_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CID_WIDTH_ENTRIES: usize = 65_536;
+const MAX_PREDEFINED_CMAP_DEPTH: usize = 8;
+const MAX_PREDEFINED_CMAP_FILES: usize = 8;
+const MAX_PREDEFINED_CMAP_USECMAP_NAMES: usize = 8;
+const MAX_PREDEFINED_CMAP_CACHE_ENTRIES: usize = 8;
+const PREDEFINED_CMAP_PATH_ENV: &str = "STIRLING_PROCESSING_CMAP_PATH";
+const DEFAULT_PREDEFINED_CMAP_ROOTS: &[&str] =
+    &["/usr/share/poppler/cMap", "/usr/local/share/poppler/cMap"];
+const MAX_TYPE3_GLYPHS: usize = 256;
 const IDENTITY_AFFINE_MATRIX: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 const STANDARD14_FONT_NAMES: &[&str] = &[
     "Courier",
@@ -55,6 +66,10 @@ const STANDARD14_FONT_NAMES: &[&str] = &[
     "Symbol",
     "ZapfDingbats",
 ];
+
+type CodeToCidMap = Arc<BTreeMap<u32, u32>>;
+
+static PREDEFINED_CMAP_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CodeToCidMap>>> = OnceLock::new();
 
 // serde's `skip_serializing_if` requires a `&T` predicate signature.
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -592,8 +607,14 @@ pub fn pdf_to_json_metadata(
 /// `/Indexed` images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
 /// colour spaces are projected both unfiltered and through bounded single Flate/LZW/
 /// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
-/// samples and explicit 1-bit stencil masks are applied. ICC/Separation/`DeviceN`
-/// colour spaces and complex inline filter parameters remain.
+/// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
+/// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
+/// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
+/// converted to sRGB/device colour. One-component DCT Separation images preserve and transform
+/// their grayscale samples. CalGray/CalRGB direct images, Indexed palette bases, ICC fallbacks, and
+/// Separation/`DeviceN` alternates convert through bounded calibrated color math, including
+/// Gray/RGB DCT samples. DCT `DeviceN` images, PostScript Type 4 functions, Lab/ICCBased spot-color
+/// alternates, and complex inline filter parameters remain.
 ///
 /// `lightweight` omits the base64 stream payloads (ports the `omitStreamData`
 /// serialization context) for a smaller preview response.
@@ -703,9 +724,15 @@ fn build_page(
 /// images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
 /// colour spaces are emitted both unfiltered and through bounded single Flate/LZW/
 /// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
-/// samples and explicit 1-bit stencil masks are applied. ICC/Separation/`DeviceN`
-/// colour spaces and complex inline filter parameters are skipped rather than serializing
-/// an unusable payload.
+/// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
+/// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
+/// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
+/// converted to sRGB/device colour. One-component DCT Separation images preserve and transform
+/// their grayscale samples. CalGray/CalRGB direct images, Indexed palette bases, ICC fallbacks, and
+/// Separation/`DeviceN` alternates convert through bounded calibrated color math, including
+/// Gray/RGB DCT samples. DCT `DeviceN` images, PostScript Type 4 functions, Lab/ICCBased spot-color
+/// alternates, and complex inline filter parameters are skipped rather than serializing an unusable
+/// payload.
 fn extract_image_elements(
     document: &Document,
     page_number: u32,
@@ -1400,6 +1427,7 @@ fn encode_image_xobject(
     if filters.as_slice() == ["DCTDecode"]
         && !has_soft_mask
         && !has_explicit_mask
+        && !image_uses_transformed_color_space(document, stream)
         && stream.content.len() <= MAX_EDITOR_IMAGE_BYTES
     {
         return Some((stream.content.clone(), "jpeg".to_owned()));
@@ -1426,15 +1454,49 @@ fn decode_pdf_raster(
         return None;
     }
     let filters = image_filter_names(document, stream);
+    let color_space = image_color_space(document, stream);
     if filters.as_slice() == ["DCTDecode"] {
         let image = image::load_from_memory(&stream.content).ok()?;
         let pixels = u64::from(image.width()).checked_mul(u64::from(image.height()))?;
-        return (pixels <= MAX_EDITOR_IMAGE_PIXELS).then_some(image);
+        if pixels > MAX_EDITOR_IMAGE_PIXELS {
+            return None;
+        }
+        return match color_space {
+            Some(PdfImageColorSpace::Icc {
+                channels, profile, ..
+            }) => profile
+                .as_deref()
+                .and_then(|profile| icc_dynamic_image_to_rgb(&image, channels, profile))
+                .or(Some(image)),
+            Some(PdfImageColorSpace::Separation {
+                alternate,
+                tint_transform,
+            }) => {
+                let DynamicImage::ImageLuma8(image) = image else {
+                    return None;
+                };
+                let samples = apply_image_decode_to_u8(document, stream, 1, image.into_raw())?;
+                let samples = tint_transform.apply(&samples)?;
+                device_samples_to_image(alternate, width, height, samples)
+            }
+            Some(PdfImageColorSpace::DeviceN { .. }) => None,
+            Some(PdfImageColorSpace::Calibrated(color_space)) => {
+                let channels = color_space.channels();
+                let samples = match (channels, image) {
+                    (1, DynamicImage::ImageLuma8(image)) => image.into_raw(),
+                    (3, DynamicImage::ImageRgb8(image)) => image.into_raw(),
+                    _ => return None,
+                };
+                let samples = apply_image_decode_to_u8(document, stream, channels, samples)?;
+                device_samples_to_image(color_space, width, height, samples)
+            }
+            _ => Some(image),
+        };
     }
     if filters.iter().any(|filter| filter == "DCTDecode") {
         return None;
     }
-    let color_space = image_color_space(document, stream)?;
+    let color_space = color_space?;
     let bits_per_component =
         dictionary_i32_alias(document, &stream.dict, b"BitsPerComponent", b"BPC").unwrap_or(8);
     if let PdfImageColorSpace::Indexed {
@@ -1463,36 +1525,58 @@ fn decode_pdf_raster(
         channels,
         u8::try_from(bits_per_component).ok()?,
     )?;
+    decoded_samples_to_image(color_space, width, height, samples)
+}
+
+fn decoded_samples_to_image(
+    color_space: PdfImageColorSpace,
+    width: u32,
+    height: u32,
+    samples: Vec<u8>,
+) -> Option<DynamicImage> {
     match color_space {
-        PdfImageColorSpace::Rgb => {
-            DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, samples)?)
-        }
         PdfImageColorSpace::Gray => {
-            DynamicImage::ImageLuma8(GrayImage::from_raw(width, height, samples)?)
+            device_samples_to_image(IndexedBaseColorSpace::Gray, width, height, samples)
+        }
+        PdfImageColorSpace::Rgb => {
+            device_samples_to_image(IndexedBaseColorSpace::Rgb, width, height, samples)
         }
         PdfImageColorSpace::Cmyk => {
-            let mut rgb = Vec::with_capacity(
-                usize::try_from(
-                    u64::from(width)
-                        .checked_mul(u64::from(height))?
-                        .checked_mul(3)?,
-                )
-                .ok()?,
-            );
-            for pixel in samples.chunks_exact(4) {
-                let cyan = u16::from(pixel[0]);
-                let magenta = u16::from(pixel[1]);
-                let yellow = u16::from(pixel[2]);
-                let black = u16::from(pixel[3]);
-                rgb.push(u8::try_from(((255 - cyan) * (255 - black) + 127) / 255).ok()?);
-                rgb.push(u8::try_from(((255 - magenta) * (255 - black) + 127) / 255).ok()?);
-                rgb.push(u8::try_from(((255 - yellow) * (255 - black) + 127) / 255).ok()?);
-            }
-            DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, rgb)?)
+            device_samples_to_image(IndexedBaseColorSpace::Cmyk, width, height, samples)
         }
-        PdfImageColorSpace::Indexed { .. } => return None,
+        PdfImageColorSpace::Calibrated(color_space) => {
+            device_samples_to_image(color_space, width, height, samples)
+        }
+        PdfImageColorSpace::Icc {
+            channels,
+            profile,
+            alternate,
+        } => {
+            if let Some(rgb) = profile
+                .as_deref()
+                .and_then(|profile| icc_samples_to_rgb(&samples, channels, profile))
+            {
+                Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                    width, height, rgb,
+                )?))
+            } else {
+                device_samples_to_image(alternate, width, height, samples)
+            }
+        }
+        PdfImageColorSpace::Separation {
+            alternate,
+            tint_transform,
+        }
+        | PdfImageColorSpace::DeviceN {
+            alternate,
+            tint_transform,
+            ..
+        } => {
+            let samples = tint_transform.apply(&samples)?;
+            device_samples_to_image(alternate, width, height, samples)
+        }
+        PdfImageColorSpace::Indexed { .. } => None,
     }
-    .into()
 }
 
 #[derive(Clone, Copy)]
@@ -1500,37 +1584,545 @@ enum IndexedBaseColorSpace {
     Gray,
     Rgb,
     Cmyk,
+    CalGray(CalGrayColorSpace),
+    CalRgb(CalRgbColorSpace),
 }
 
 impl IndexedBaseColorSpace {
     const fn channels(self) -> usize {
         match self {
-            Self::Gray => 1,
-            Self::Rgb => 3,
+            Self::Gray | Self::CalGray(_) => 1,
+            Self::Rgb | Self::CalRgb(_) => 3,
             Self::Cmyk => 4,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CalGrayColorSpace {
+    gamma: f32,
+}
+
+#[derive(Clone, Copy)]
+struct CalRgbColorSpace {
+    white_point: [f32; 3],
+    black_point: [f32; 3],
+    gamma: [f32; 3],
+    matrix: [f32; 9],
 }
 
 enum PdfImageColorSpace {
     Gray,
     Rgb,
     Cmyk,
+    Calibrated(IndexedBaseColorSpace),
+    Icc {
+        channels: usize,
+        profile: Option<Vec<u8>>,
+        alternate: IndexedBaseColorSpace,
+    },
+    Separation {
+        alternate: IndexedBaseColorSpace,
+        tint_transform: TintTransform,
+    },
+    DeviceN {
+        channels: usize,
+        alternate: IndexedBaseColorSpace,
+        tint_transform: TintTransform,
+    },
     Indexed {
-        base: IndexedBaseColorSpace,
+        base: IndexedPaletteColorSpace,
         high_value: u8,
         lookup: Vec<u8>,
     },
 }
 
+enum IndexedPaletteColorSpace {
+    Device(IndexedBaseColorSpace),
+    Icc {
+        channels: usize,
+        profile: Option<Vec<u8>>,
+        alternate: IndexedBaseColorSpace,
+    },
+}
+
+impl IndexedPaletteColorSpace {
+    const fn channels(&self) -> usize {
+        match self {
+            Self::Device(color_space) => color_space.channels(),
+            Self::Icc { channels, .. } => *channels,
+        }
+    }
+}
+
 impl PdfImageColorSpace {
     const fn channels(&self) -> usize {
         match self {
-            Self::Gray | Self::Indexed { .. } => 1,
+            Self::Gray | Self::Separation { .. } | Self::Indexed { .. } => 1,
             Self::Rgb => 3,
             Self::Cmyk => 4,
+            Self::Calibrated(color_space) => color_space.channels(),
+            Self::Icc { channels, .. } | Self::DeviceN { channels, .. } => *channels,
         }
     }
+}
+
+struct ExponentialTintTransform {
+    domain: [f32; 2],
+    range: Option<Vec<[f32; 2]>>,
+    start: Vec<f32>,
+    end: Vec<f32>,
+    exponent: f32,
+}
+
+enum TintTransform {
+    Exponential(ExponentialTintTransform),
+    Sampled(SampledTintTransform),
+    Stitching(StitchingTintTransform),
+}
+
+impl TintTransform {
+    fn apply(&self, samples: &[u8]) -> Option<Vec<u8>> {
+        let input_channels = self.input_channels();
+        let output_channels = self.output_channels();
+        if input_channels == 0 || !samples.len().is_multiple_of(input_channels) {
+            return None;
+        }
+        let pixel_count = samples.len().checked_div(input_channels)?;
+        let output_len = pixel_count.checked_mul(output_channels)?;
+        if output_len > MAX_EDITOR_IMAGE_BYTES {
+            return None;
+        }
+        let mut output = Vec::with_capacity(output_len);
+        for input in samples.chunks_exact(input_channels) {
+            let input = input
+                .iter()
+                .map(|sample| f32::from(*sample) / 255.0)
+                .collect::<Vec<_>>();
+            let evaluated = self.evaluate(&input)?;
+            if evaluated.len() != output_channels {
+                return None;
+            }
+            output.extend(evaluated.into_iter().map(unit_sample_to_byte));
+        }
+        Some(output)
+    }
+
+    const fn input_channels(&self) -> usize {
+        match self {
+            Self::Exponential(_) | Self::Stitching(_) => 1,
+            Self::Sampled(transform) => transform.domain.len(),
+        }
+    }
+
+    fn output_channels(&self) -> usize {
+        match self {
+            Self::Exponential(transform) => transform.start.len(),
+            Self::Sampled(transform) => transform.range.len(),
+            Self::Stitching(transform) => transform.output_channels,
+        }
+    }
+
+    fn evaluate(&self, input: &[f32]) -> Option<Vec<f32>> {
+        match self {
+            Self::Exponential(transform) => transform.evaluate(input),
+            Self::Sampled(transform) => transform.evaluate(input),
+            Self::Stitching(transform) => transform.evaluate(input),
+        }
+    }
+}
+
+struct SampledTintTransform {
+    domain: Vec<[f32; 2]>,
+    range: Vec<[f32; 2]>,
+    size: Vec<usize>,
+    encode: Vec<[f32; 2]>,
+    decode: Vec<[f32; 2]>,
+    samples: Vec<f32>,
+}
+
+impl SampledTintTransform {
+    fn evaluate(&self, input: &[f32]) -> Option<Vec<f32>> {
+        let input_channels = self.domain.len();
+        let output_channels = self.range.len();
+        if input_channels == 0 || input.len() != input_channels {
+            return None;
+        }
+        let mut output = Vec::with_capacity(output_channels);
+        let vertex_count = 1_usize.checked_shl(u32::try_from(input_channels).ok()?)?;
+        let mut lower_indices = Vec::with_capacity(input_channels);
+        let mut upper_indices = Vec::with_capacity(input_channels);
+        let mut fractions = Vec::with_capacity(input_channels);
+        for (channel, sample) in input.iter().enumerate() {
+            let domain = self.domain[channel];
+            let clipped = sample.clamp(domain[0], domain[1]);
+            let encoded = interpolate(clipped, domain, self.encode[channel])?
+                .clamp(0.0, usize_as_f32(self.size[channel] - 1)?);
+            let lower = bounded_floor_to_usize(encoded, self.size[channel] - 1)?;
+            let upper = lower.saturating_add(1).min(self.size[channel] - 1);
+            lower_indices.push(lower);
+            upper_indices.push(upper);
+            fractions.push(if lower == upper {
+                0.0
+            } else {
+                encoded - usize_as_f32(lower)?
+            });
+        }
+        for output_channel in 0..output_channels {
+            let mut value = 0.0;
+            for vertex in 0..vertex_count {
+                let mut sample_index = output_channel;
+                let mut stride = output_channels;
+                let mut weight = 1.0;
+                for channel in 0..input_channels {
+                    let upper = vertex & (1 << channel) != 0;
+                    let coordinate = if upper {
+                        weight *= fractions[channel];
+                        upper_indices[channel]
+                    } else {
+                        weight *= 1.0 - fractions[channel];
+                        lower_indices[channel]
+                    };
+                    sample_index = sample_index.checked_add(coordinate.checked_mul(stride)?)?;
+                    stride = stride.checked_mul(self.size[channel])?;
+                }
+                value += self.samples.get(sample_index)? * weight;
+            }
+            let decoded = interpolate(value, [0.0, 1.0], self.decode[output_channel])?;
+            output
+                .push(decoded.clamp(self.range[output_channel][0], self.range[output_channel][1]));
+        }
+        Some(output)
+    }
+}
+
+fn interpolate(value: f32, source: [f32; 2], target: [f32; 2]) -> Option<f32> {
+    let source_width = source[1] - source[0];
+    if !source_width.is_finite() || source_width == 0.0 {
+        return None;
+    }
+    let value = ((value - source[0]) / source_width).mul_add(target[1] - target[0], target[0]);
+    value.is_finite().then_some(value)
+}
+
+impl ExponentialTintTransform {
+    fn evaluate(&self, input: &[f32]) -> Option<Vec<f32>> {
+        if input.len() != 1 {
+            return None;
+        }
+        let output_channels = self.start.len();
+        let mut output = Vec::with_capacity(output_channels);
+        let input = input[0].clamp(self.domain[0], self.domain[1]);
+        let interpolation = input.powf(self.exponent);
+        if !interpolation.is_finite() {
+            return None;
+        }
+        for channel in 0..output_channels {
+            let value =
+                interpolation.mul_add(self.end[channel] - self.start[channel], self.start[channel]);
+            let value = self.range.as_ref().map_or(value, |range| {
+                value.clamp(range[channel][0], range[channel][1])
+            });
+            output.push(value);
+        }
+        Some(output)
+    }
+}
+
+struct StitchingTintTransform {
+    domain: [f32; 2],
+    range: Option<Vec<[f32; 2]>>,
+    functions: Vec<TintTransform>,
+    bounds: Vec<f32>,
+    encode: Vec<[f32; 2]>,
+    output_channels: usize,
+}
+
+impl StitchingTintTransform {
+    fn evaluate(&self, input: &[f32]) -> Option<Vec<f32>> {
+        if input.len() != 1 {
+            return None;
+        }
+        let input = input[0].clamp(self.domain[0], self.domain[1]);
+        let segment = self.bounds.partition_point(|bound| input >= *bound);
+        let source = [
+            segment
+                .checked_sub(1)
+                .and_then(|index| self.bounds.get(index).copied())
+                .unwrap_or(self.domain[0]),
+            self.bounds.get(segment).copied().unwrap_or(self.domain[1]),
+        ];
+        let encoded = interpolate(input, source, *self.encode.get(segment)?)?;
+        let mut output = self.functions.get(segment)?.evaluate(&[encoded])?;
+        if output.len() != self.output_channels {
+            return None;
+        }
+        if let Some(range) = &self.range {
+            for (value, bounds) in output.iter_mut().zip(range) {
+                *value = value.clamp(bounds[0], bounds[1]);
+            }
+        }
+        Some(output)
+    }
+}
+
+fn icc_dynamic_image_to_rgb(
+    image: &DynamicImage,
+    channels: usize,
+    profile: &[u8],
+) -> Option<DynamicImage> {
+    let samples = match channels {
+        1 => image.to_luma8().into_raw(),
+        3 => image.to_rgb8().into_raw(),
+        // The image decoder has already projected a CMYK JPEG into RGB, so the
+        // original four source channels are unavailable for an ICC transform.
+        _ => return None,
+    };
+    let rgb = icc_samples_to_rgb(&samples, channels, profile)?;
+    Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+        image.width(),
+        image.height(),
+        rgb,
+    )?))
+}
+
+fn icc_samples_to_rgb(samples: &[u8], channels: usize, profile: &[u8]) -> Option<Vec<u8>> {
+    if channels == 0 || !samples.len().is_multiple_of(channels) {
+        return None;
+    }
+    let source_profile = ColorProfile::new_from_slice(profile).ok()?;
+    let source_layout = match (channels, source_profile.color_space) {
+        (1, DataColorSpace::Gray) => Layout::Gray,
+        (3, DataColorSpace::Rgb) => Layout::Rgb,
+        (4, DataColorSpace::Cmyk) => Layout::Rgba,
+        _ => return None,
+    };
+    let destination_profile = ColorProfile::new_srgb();
+    let transform = source_profile
+        .create_transform_8bit(
+            source_layout,
+            &destination_profile,
+            Layout::Rgb,
+            TransformOptions::default(),
+        )
+        .ok()?;
+    let pixel_count = samples.len().checked_div(channels)?;
+    let mut rgb = vec![0; pixel_count.checked_mul(3)?];
+    transform.transform(samples, &mut rgb).ok()?;
+    Some(rgb)
+}
+
+fn device_samples_to_image(
+    color_space: IndexedBaseColorSpace,
+    width: u32,
+    height: u32,
+    samples: Vec<u8>,
+) -> Option<DynamicImage> {
+    match color_space {
+        IndexedBaseColorSpace::Gray => Some(DynamicImage::ImageLuma8(GrayImage::from_raw(
+            width, height, samples,
+        )?)),
+        IndexedBaseColorSpace::Rgb => Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+            width, height, samples,
+        )?)),
+        IndexedBaseColorSpace::CalGray(color_space) => {
+            let rgb = color_space.samples_to_rgb(&samples)?;
+            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                width, height, rgb,
+            )?))
+        }
+        IndexedBaseColorSpace::CalRgb(color_space) => {
+            let rgb = color_space.samples_to_rgb(&samples)?;
+            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                width, height, rgb,
+            )?))
+        }
+        IndexedBaseColorSpace::Cmyk => {
+            let pixel_count = usize::try_from(
+                u64::from(width)
+                    .checked_mul(u64::from(height))?
+                    .checked_mul(3)?,
+            )
+            .ok()?;
+            let mut rgb = Vec::with_capacity(pixel_count);
+            for pixel in samples.chunks_exact(4) {
+                append_cmyk_as_rgb(&mut rgb, pixel)?;
+            }
+            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                width, height, rgb,
+            )?))
+        }
+    }
+}
+
+impl CalGrayColorSpace {
+    fn samples_to_rgb(self, samples: &[u8]) -> Option<Vec<u8>> {
+        let mut rgb = Vec::with_capacity(samples.len().checked_mul(3)?);
+        for sample in samples {
+            let luminance = (f32::from(*sample) / 255.0).powf(self.gamma);
+            if !luminance.is_finite() {
+                return None;
+            }
+            let value = (295.8 * luminance.cbrt() - 40.8).max(0.0);
+            let value = byte_sample(value)?;
+            rgb.extend_from_slice(&[value, value, value]);
+        }
+        Some(rgb)
+    }
+}
+
+impl CalRgbColorSpace {
+    fn samples_to_rgb(self, samples: &[u8]) -> Option<Vec<u8>> {
+        if !samples.len().is_multiple_of(3) {
+            return None;
+        }
+        let mut rgb = Vec::with_capacity(samples.len());
+        for sample in samples.chunks_exact(3) {
+            rgb.extend_from_slice(&self.sample_to_rgb(sample)?);
+        }
+        Some(rgb)
+    }
+
+    fn sample_to_rgb(self, sample: &[u8]) -> Option<[u8; 3]> {
+        let calibrated = [
+            component_power(sample[0], self.gamma[0])?,
+            component_power(sample[1], self.gamma[1])?,
+            component_power(sample[2], self.gamma[2])?,
+        ];
+        let xyz = [
+            self.matrix[0].mul_add(
+                calibrated[0],
+                self.matrix[3].mul_add(calibrated[1], self.matrix[6] * calibrated[2]),
+            ),
+            self.matrix[1].mul_add(
+                calibrated[0],
+                self.matrix[4].mul_add(calibrated[1], self.matrix[7] * calibrated[2]),
+            ),
+            self.matrix[2].mul_add(
+                calibrated[0],
+                self.matrix[5].mul_add(calibrated[1], self.matrix[8] * calibrated[2]),
+            ),
+        ];
+        let xyz_flat = normalize_white_point_to_flat(self.white_point, xyz)?;
+        let xyz_black = compensate_black_point(self.black_point, xyz_flat)?;
+        let xyz_d65 = normalize_white_point_to_d65([1.0, 1.0, 1.0], xyz_black)?;
+        let linear_rgb = matrix_product(SRGB_D65_XYZ_TO_RGB_MATRIX, xyz_d65);
+        Some([
+            unit_sample_to_byte(srgb_transfer(linear_rgb[0])?),
+            unit_sample_to_byte(srgb_transfer(linear_rgb[1])?),
+            unit_sample_to_byte(srgb_transfer(linear_rgb[2])?),
+        ])
+    }
+}
+
+const BRADFORD_SCALE_MATRIX: [f32; 9] = [
+    0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296,
+];
+const BRADFORD_SCALE_INVERSE_MATRIX: [f32; 9] = [
+    0.986_992_9,
+    -0.147_054_3,
+    0.159_962_7,
+    0.432_305_3,
+    0.518_360_3,
+    0.049_291_2,
+    -0.008_528_7,
+    0.040_042_8,
+    0.968_486_7,
+];
+const SRGB_D65_XYZ_TO_RGB_MATRIX: [f32; 9] = [
+    3.240_454_2,
+    -1.537_138_5,
+    -0.498_531_4,
+    -0.969_266,
+    1.876_010_8,
+    0.041_556,
+    0.055_643_4,
+    -0.204_025_9,
+    1.057_225_2,
+];
+
+fn component_power(sample: u8, gamma: f32) -> Option<f32> {
+    let value = if sample == u8::MAX {
+        1.0
+    } else {
+        (f32::from(sample) / 255.0).powf(gamma)
+    };
+    value.is_finite().then_some(value)
+}
+
+fn matrix_product(matrix: [f32; 9], value: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0].mul_add(value[0], matrix[1].mul_add(value[1], matrix[2] * value[2])),
+        matrix[3].mul_add(value[0], matrix[4].mul_add(value[1], matrix[5] * value[2])),
+        matrix[6].mul_add(value[0], matrix[7].mul_add(value[1], matrix[8] * value[2])),
+    ]
+}
+
+fn normalize_white_point_to_flat(source_white_point: [f32; 3], xyz: [f32; 3]) -> Option<[f32; 3]> {
+    let lms = matrix_product(BRADFORD_SCALE_MATRIX, xyz);
+    let lms_flat = [
+        lms[0] / source_white_point[0],
+        lms[1] / source_white_point[1],
+        lms[2] / source_white_point[2],
+    ];
+    finite_vector(matrix_product(BRADFORD_SCALE_INVERSE_MATRIX, lms_flat))
+}
+
+fn normalize_white_point_to_d65(source_white_point: [f32; 3], xyz: [f32; 3]) -> Option<[f32; 3]> {
+    let lms = matrix_product(BRADFORD_SCALE_MATRIX, xyz);
+    let lms_d65 = [
+        lms[0] * 0.950_47 / source_white_point[0],
+        lms[1] / source_white_point[1],
+        lms[2] * 1.088_83 / source_white_point[2],
+    ];
+    finite_vector(matrix_product(BRADFORD_SCALE_INVERSE_MATRIX, lms_d65))
+}
+
+fn compensate_black_point(source_black_point: [f32; 3], xyz_flat: [f32; 3]) -> Option<[f32; 3]> {
+    if source_black_point == [0.0, 0.0, 0.0] {
+        return Some(xyz_flat);
+    }
+    let source = source_black_point.map(decode_cal_rgb_luminance);
+    let scale = source.map(|value| 1.0 / (1.0 - value));
+    let result = [
+        xyz_flat[0].mul_add(scale[0], 1.0 - scale[0]),
+        xyz_flat[1].mul_add(scale[1], 1.0 - scale[1]),
+        xyz_flat[2].mul_add(scale[2], 1.0 - scale[2]),
+    ];
+    finite_vector(result)
+}
+
+fn decode_cal_rgb_luminance(value: f32) -> f32 {
+    const DECODE_L_CONSTANT: f32 = 0.001_107_056_5;
+    if value < 0.0 {
+        -decode_cal_rgb_luminance(-value)
+    } else if value > 8.0 {
+        ((value + 16.0) / 116.0).powi(3)
+    } else {
+        value * DECODE_L_CONSTANT
+    }
+}
+
+fn srgb_transfer(color: f32) -> Option<f32> {
+    let color = if color <= 0.003_130_8 {
+        12.92 * color
+    } else if color >= 0.995_545_25 {
+        1.0
+    } else {
+        1.055 * color.powf(1.0 / 2.4) - 0.055
+    };
+    color.is_finite().then_some(color.clamp(0.0, 1.0))
+}
+
+fn finite_vector(value: [f32; 3]) -> Option<[f32; 3]> {
+    value.iter().all(|value| value.is_finite()).then_some(value)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn byte_sample(sample: f32) -> Option<u8> {
+    sample
+        .is_finite()
+        .then(|| sample.clamp(0.0, 255.0).round() as u8)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1540,7 +2132,7 @@ fn decode_indexed_raster(
     width: u32,
     height: u32,
     bits_per_component: i32,
-    base: IndexedBaseColorSpace,
+    base: IndexedPaletteColorSpace,
     high_value: u8,
     lookup: &[u8],
 ) -> Option<DynamicImage> {
@@ -1584,36 +2176,31 @@ fn decode_indexed_raster(
     if lookup.len() < palette_size {
         return None;
     }
+    let channels = base.channels();
+    let mut pixels = Vec::with_capacity(indices.len().checked_mul(channels)?);
+    for index in indices {
+        let offset = usize::from(index).checked_mul(channels)?;
+        pixels.extend_from_slice(lookup.get(offset..offset + channels)?);
+    }
     match base {
-        IndexedBaseColorSpace::Gray => {
-            let pixels = indices
-                .into_iter()
-                .map(|index| lookup[usize::from(index)])
-                .collect();
-            Some(DynamicImage::ImageLuma8(GrayImage::from_raw(
-                width, height, pixels,
-            )?))
+        IndexedPaletteColorSpace::Device(color_space) => {
+            device_samples_to_image(color_space, width, height, pixels)
         }
-        IndexedBaseColorSpace::Rgb => {
-            let mut pixels = Vec::with_capacity(indices.len().checked_mul(3)?);
-            for index in indices {
-                let offset = usize::from(index).checked_mul(3)?;
-                pixels.extend_from_slice(lookup.get(offset..offset + 3)?);
+        IndexedPaletteColorSpace::Icc {
+            channels,
+            profile,
+            alternate,
+        } => {
+            if let Some(rgb) = profile
+                .as_deref()
+                .and_then(|profile| icc_samples_to_rgb(&pixels, channels, profile))
+            {
+                Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                    width, height, rgb,
+                )?))
+            } else {
+                device_samples_to_image(alternate, width, height, pixels)
             }
-            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
-                width, height, pixels,
-            )?))
-        }
-        IndexedBaseColorSpace::Cmyk => {
-            let mut pixels = Vec::with_capacity(indices.len().checked_mul(3)?);
-            for index in indices {
-                let offset = usize::from(index).checked_mul(4)?;
-                let sample = lookup.get(offset..offset + 4)?;
-                append_cmyk_as_rgb(&mut pixels, sample)?;
-            }
-            Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
-                width, height, pixels,
-            )?))
         }
     }
 }
@@ -1735,6 +2322,29 @@ fn decode_device_samples(
         .map(|(index, sample)| {
             let (minimum, maximum_value) = ranges[index % channels];
             let normalized = f32::from(sample) / f32::from(maximum);
+            Some(unit_sample_to_byte(
+                minimum + normalized * (maximum_value - minimum),
+            ))
+        })
+        .collect()
+}
+
+fn apply_image_decode_to_u8(
+    document: &Document,
+    stream: &Stream,
+    channels: usize,
+    samples: Vec<u8>,
+) -> Option<Vec<u8>> {
+    if channels == 0 || !samples.len().is_multiple_of(channels) {
+        return None;
+    }
+    let ranges = image_decode_ranges(document, stream, channels)?;
+    samples
+        .into_iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let (minimum, maximum_value) = ranges[index % channels];
+            let normalized = f32::from(sample) / 255.0;
             Some(unit_sample_to_byte(
                 minimum + normalized * (maximum_value - minimum),
             ))
@@ -1891,29 +2501,7 @@ fn color_key_samples(
         if image.width() != width || image.height() != height {
             return None;
         }
-        return match color_space {
-            PdfImageColorSpace::Gray => Some((
-                image
-                    .to_luma8()
-                    .into_raw()
-                    .into_iter()
-                    .map(u16::from)
-                    .collect(),
-                1,
-                255,
-            )),
-            PdfImageColorSpace::Rgb => Some((
-                image
-                    .to_rgb8()
-                    .into_raw()
-                    .into_iter()
-                    .map(u16::from)
-                    .collect(),
-                3,
-                255,
-            )),
-            PdfImageColorSpace::Cmyk | PdfImageColorSpace::Indexed { .. } => None,
-        };
+        return dct_color_key_samples(&color_space, &image);
     }
     if filters.iter().any(|filter| filter == "DCTDecode") {
         return None;
@@ -1962,6 +2550,60 @@ fn color_key_samples(
             )?;
             Some((samples, channels, maximum))
         }
+    }
+}
+
+fn dct_color_key_samples(
+    color_space: &PdfImageColorSpace,
+    image: &DynamicImage,
+) -> Option<(Vec<u16>, usize, u16)> {
+    match color_space {
+        PdfImageColorSpace::Gray | PdfImageColorSpace::Icc { channels: 1, .. } => Some((
+            image
+                .to_luma8()
+                .into_raw()
+                .into_iter()
+                .map(u16::from)
+                .collect(),
+            1,
+            255,
+        )),
+        PdfImageColorSpace::Rgb | PdfImageColorSpace::Icc { channels: 3, .. } => Some((
+            image
+                .to_rgb8()
+                .into_raw()
+                .into_iter()
+                .map(u16::from)
+                .collect(),
+            3,
+            255,
+        )),
+        PdfImageColorSpace::Calibrated(color_space) if color_space.channels() == 1 => Some((
+            image
+                .to_luma8()
+                .into_raw()
+                .into_iter()
+                .map(u16::from)
+                .collect(),
+            1,
+            255,
+        )),
+        PdfImageColorSpace::Calibrated(color_space) if color_space.channels() == 3 => Some((
+            image
+                .to_rgb8()
+                .into_raw()
+                .into_iter()
+                .map(u16::from)
+                .collect(),
+            3,
+            255,
+        )),
+        PdfImageColorSpace::Cmyk
+        | PdfImageColorSpace::Calibrated(_)
+        | PdfImageColorSpace::Icc { .. }
+        | PdfImageColorSpace::Separation { .. }
+        | PdfImageColorSpace::DeviceN { .. }
+        | PdfImageColorSpace::Indexed { .. } => None,
     }
 }
 
@@ -2126,9 +2768,34 @@ fn image_color_space(document: &Document, stream: &Stream) -> Option<PdfImageCol
         .and_then(|color_space| resolved_object(document, color_space))?;
     match color_space {
         Object::Name(name) => device_image_color_space(name),
-        Object::Array(values) => indexed_image_color_space(document, values),
+        Object::Array(values) => indexed_image_color_space(document, values)
+            .or_else(|| icc_image_color_space(document, values))
+            .or_else(|| separation_image_color_space(document, values))
+            .or_else(|| device_n_image_color_space(document, values))
+            .or_else(|| {
+                calibrated_image_color_space(document, values).map(PdfImageColorSpace::Calibrated)
+            }),
         _ => None,
     }
+}
+
+fn image_uses_transformed_color_space(document: &Document, stream: &Stream) -> bool {
+    stream
+        .dict
+        .get(b"ColorSpace")
+        .or_else(|_| stream.dict.get(b"CS"))
+        .ok()
+        .and_then(|color_space| resolved_object(document, color_space))
+        .and_then(|color_space| color_space.as_array().ok())
+        .and_then(|values| values.first())
+        .and_then(|family| resolved_object(document, family))
+        .and_then(|family| family.as_name().ok())
+        .is_some_and(|family| {
+            matches!(
+                family,
+                b"ICCBased" | b"Separation" | b"DeviceN" | b"CalGray" | b"CalRGB"
+            )
+        })
 }
 
 fn device_image_color_space(name: &[u8]) -> Option<PdfImageColorSpace> {
@@ -2137,6 +2804,110 @@ fn device_image_color_space(name: &[u8]) -> Option<PdfImageColorSpace> {
         b"RGB" | b"DeviceRGB" => Some(PdfImageColorSpace::Rgb),
         b"CMYK" | b"DeviceCMYK" => Some(PdfImageColorSpace::Cmyk),
         _ => None,
+    }
+}
+
+fn base_image_color_space(
+    document: &Document,
+    color_space: &Object,
+) -> Option<IndexedBaseColorSpace> {
+    match resolved_object(document, color_space)? {
+        Object::Name(name) => match device_image_color_space(name)? {
+            PdfImageColorSpace::Gray => Some(IndexedBaseColorSpace::Gray),
+            PdfImageColorSpace::Rgb => Some(IndexedBaseColorSpace::Rgb),
+            PdfImageColorSpace::Cmyk => Some(IndexedBaseColorSpace::Cmyk),
+            PdfImageColorSpace::Icc { .. }
+            | PdfImageColorSpace::Calibrated(_)
+            | PdfImageColorSpace::Separation { .. }
+            | PdfImageColorSpace::DeviceN { .. }
+            | PdfImageColorSpace::Indexed { .. } => None,
+        },
+        Object::Array(values) => calibrated_image_color_space(document, values),
+        _ => None,
+    }
+}
+
+fn calibrated_image_color_space(
+    document: &Document,
+    values: &[Object],
+) -> Option<IndexedBaseColorSpace> {
+    let family = values
+        .first()
+        .and_then(|family| resolved_object(document, family))?
+        .as_name()
+        .ok()?;
+    let dictionary = values
+        .get(1)
+        .and_then(|parameters| resolved_object(document, parameters))?
+        .as_dict()
+        .ok()?;
+    let white_point = color_space_vector(document, dictionary, b"WhitePoint")?;
+    if white_point[0] < 0.0 || white_point[1].to_bits() != 1.0_f32.to_bits() || white_point[2] < 0.0
+    {
+        return None;
+    }
+    match family {
+        b"CalGray" => {
+            let gamma = dictionary
+                .get(b"Gamma")
+                .ok()
+                .and_then(|gamma| resolved_object(document, gamma))
+                .and_then(number_as_f32)
+                .filter(|gamma| gamma.is_finite())
+                .unwrap_or(1.0)
+                .max(1.0);
+            Some(IndexedBaseColorSpace::CalGray(CalGrayColorSpace { gamma }))
+        }
+        b"CalRGB" if white_point[0] > 0.0 && white_point[2] > 0.0 => {
+            let black_point =
+                optional_color_space_vector(document, dictionary, b"BlackPoint", [0.0, 0.0, 0.0])?;
+            let black_point = if black_point.iter().any(|component| *component < 0.0) {
+                [0.0, 0.0, 0.0]
+            } else {
+                black_point
+            };
+            let gamma =
+                optional_color_space_vector(document, dictionary, b"Gamma", [1.0, 1.0, 1.0])?;
+            let gamma = if gamma.iter().any(|component| *component < 0.0) {
+                [1.0, 1.0, 1.0]
+            } else {
+                gamma
+            };
+            let matrix = if dictionary.get(b"Matrix").is_ok() {
+                let values = function_number_array(document, dictionary, b"Matrix")?;
+                <[f32; 9]>::try_from(values).ok()?
+            } else {
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            };
+            Some(IndexedBaseColorSpace::CalRgb(CalRgbColorSpace {
+                white_point,
+                black_point,
+                gamma,
+                matrix,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn color_space_vector(
+    document: &Document,
+    dictionary: &Dictionary,
+    key: &[u8],
+) -> Option<[f32; 3]> {
+    <[f32; 3]>::try_from(function_number_array(document, dictionary, key)?).ok()
+}
+
+fn optional_color_space_vector(
+    document: &Document,
+    dictionary: &Dictionary,
+    key: &[u8],
+    default: [f32; 3],
+) -> Option<[f32; 3]> {
+    if dictionary.get(key).is_ok() {
+        color_space_vector(document, dictionary, key)
+    } else {
+        Some(default)
     }
 }
 
@@ -2149,17 +2920,10 @@ fn indexed_image_color_space(document: &Document, values: &[Object]) -> Option<P
     if !matches!(family, b"Indexed" | b"I") {
         return None;
     }
-    let base_name = values
+    let base = values
         .get(1)
-        .and_then(|value| resolved_object(document, value))?
-        .as_name()
-        .ok()?;
-    let base = match base_name {
-        b"G" | b"Gray" | b"DeviceGray" => IndexedBaseColorSpace::Gray,
-        b"RGB" | b"DeviceRGB" => IndexedBaseColorSpace::Rgb,
-        b"CMYK" | b"DeviceCMYK" => IndexedBaseColorSpace::Cmyk,
-        _ => return None,
-    };
+        .and_then(|value| resolved_object(document, value))
+        .and_then(|base| indexed_palette_color_space(document, base))?;
     let high_value = values
         .get(2)
         .and_then(|value| resolved_object(document, value))?
@@ -2181,6 +2945,496 @@ fn indexed_image_color_space(document: &Document, values: &[Object]) -> Option<P
         high_value,
         lookup,
     })
+}
+
+fn indexed_palette_color_space(
+    document: &Document,
+    base: &Object,
+) -> Option<IndexedPaletteColorSpace> {
+    match base {
+        Object::Name(name) => match device_image_color_space(name)? {
+            PdfImageColorSpace::Gray => Some(IndexedPaletteColorSpace::Device(
+                IndexedBaseColorSpace::Gray,
+            )),
+            PdfImageColorSpace::Rgb => {
+                Some(IndexedPaletteColorSpace::Device(IndexedBaseColorSpace::Rgb))
+            }
+            PdfImageColorSpace::Cmyk => Some(IndexedPaletteColorSpace::Device(
+                IndexedBaseColorSpace::Cmyk,
+            )),
+            PdfImageColorSpace::Icc { .. }
+            | PdfImageColorSpace::Calibrated(_)
+            | PdfImageColorSpace::Separation { .. }
+            | PdfImageColorSpace::DeviceN { .. }
+            | PdfImageColorSpace::Indexed { .. } => None,
+        },
+        Object::Array(values) => calibrated_image_color_space(document, values)
+            .map(IndexedPaletteColorSpace::Device)
+            .or_else(|| match icc_image_color_space(document, values)? {
+                PdfImageColorSpace::Icc {
+                    channels,
+                    profile,
+                    alternate,
+                } => Some(IndexedPaletteColorSpace::Icc {
+                    channels,
+                    profile,
+                    alternate,
+                }),
+                PdfImageColorSpace::Gray
+                | PdfImageColorSpace::Rgb
+                | PdfImageColorSpace::Cmyk
+                | PdfImageColorSpace::Calibrated(_)
+                | PdfImageColorSpace::Separation { .. }
+                | PdfImageColorSpace::DeviceN { .. }
+                | PdfImageColorSpace::Indexed { .. } => None,
+            }),
+        _ => None,
+    }
+}
+
+fn icc_image_color_space(document: &Document, values: &[Object]) -> Option<PdfImageColorSpace> {
+    let family = values
+        .first()
+        .and_then(|value| resolved_object(document, value))?
+        .as_name()
+        .ok()?;
+    if family != b"ICCBased" {
+        return None;
+    }
+    let profile_stream = values
+        .get(1)
+        .and_then(|value| resolved_stream(document, value))?;
+    let channels = dictionary_i32(document, &profile_stream.dict, b"N")
+        .and_then(|channels| usize::try_from(channels).ok())?;
+    let default_alternate = match channels {
+        1 => IndexedBaseColorSpace::Gray,
+        3 => IndexedBaseColorSpace::Rgb,
+        4 => IndexedBaseColorSpace::Cmyk,
+        _ => return None,
+    };
+    let alternate = profile_stream
+        .dict
+        .get(b"Alternate")
+        .ok()
+        .and_then(|alternate| base_image_color_space(document, alternate))
+        .filter(|alternate| alternate.channels() == channels)
+        .unwrap_or(default_alternate);
+    let profile = profile_stream
+        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
+        .ok()
+        .filter(|profile| !profile.is_empty());
+    Some(PdfImageColorSpace::Icc {
+        channels,
+        profile,
+        alternate,
+    })
+}
+
+fn separation_image_color_space(
+    document: &Document,
+    values: &[Object],
+) -> Option<PdfImageColorSpace> {
+    let family = values
+        .first()
+        .and_then(|value| resolved_object(document, value))?
+        .as_name()
+        .ok()?;
+    if family != b"Separation" {
+        return None;
+    }
+    values
+        .get(1)
+        .and_then(|value| resolved_object(document, value))?
+        .as_name()
+        .ok()?;
+    let alternate = base_image_color_space(document, values.get(2)?)?;
+    let tint_transform = tint_transform(document, values.get(3)?, 1, alternate.channels())?;
+    Some(PdfImageColorSpace::Separation {
+        alternate,
+        tint_transform,
+    })
+}
+
+fn device_n_image_color_space(
+    document: &Document,
+    values: &[Object],
+) -> Option<PdfImageColorSpace> {
+    let family = values
+        .first()
+        .and_then(|value| resolved_object(document, value))?
+        .as_name()
+        .ok()?;
+    if family != b"DeviceN" {
+        return None;
+    }
+    let colorants = values
+        .get(1)
+        .and_then(|value| resolved_object(document, value))?
+        .as_array()
+        .ok()?;
+    if !(1..=8).contains(&colorants.len())
+        || colorants.iter().any(|colorant| {
+            resolved_object(document, colorant)
+                .and_then(|colorant| colorant.as_name().ok())
+                .is_none()
+        })
+    {
+        return None;
+    }
+    let alternate = base_image_color_space(document, values.get(2)?)?;
+    let channels = colorants.len();
+    let tint_transform = tint_transform(document, values.get(3)?, channels, alternate.channels())?;
+    Some(PdfImageColorSpace::DeviceN {
+        channels,
+        alternate,
+        tint_transform,
+    })
+}
+
+fn tint_transform(
+    document: &Document,
+    function: &Object,
+    input_channels: usize,
+    output_channels: usize,
+) -> Option<TintTransform> {
+    tint_transform_at_depth(document, function, input_channels, output_channels, 0)
+}
+
+const MAX_TINT_FUNCTION_DEPTH: usize = 8;
+const MAX_STITCHING_FUNCTIONS: usize = 64;
+
+fn tint_transform_at_depth(
+    document: &Document,
+    function: &Object,
+    input_channels: usize,
+    output_channels: usize,
+    depth: usize,
+) -> Option<TintTransform> {
+    if depth >= MAX_TINT_FUNCTION_DEPTH {
+        return None;
+    }
+    let dictionary = match resolved_object(document, function)? {
+        Object::Dictionary(dictionary) => dictionary,
+        Object::Stream(stream) => &stream.dict,
+        _ => return None,
+    };
+    match dictionary_i32(document, dictionary, b"FunctionType")? {
+        0 => sampled_tint_transform(document, function, input_channels, output_channels)
+            .map(TintTransform::Sampled),
+        2 if input_channels == 1 => exponential_tint_transform(document, function, output_channels)
+            .map(TintTransform::Exponential),
+        3 if input_channels == 1 => {
+            stitching_tint_transform(document, function, output_channels, depth)
+                .map(TintTransform::Stitching)
+        }
+        _ => None,
+    }
+}
+
+fn stitching_tint_transform(
+    document: &Document,
+    function: &Object,
+    output_channels: usize,
+    depth: usize,
+) -> Option<StitchingTintTransform> {
+    let function = resolved_object(document, function)?;
+    let dictionary = match function {
+        Object::Dictionary(dictionary) => dictionary,
+        Object::Stream(stream) => &stream.dict,
+        _ => return None,
+    };
+    if dictionary_i32(document, dictionary, b"FunctionType")? != 3 || output_channels == 0 {
+        return None;
+    }
+    let domain = function_pairs(document, dictionary, b"Domain", 1)?;
+    let domain = *domain.first()?;
+    if domain[0] >= domain[1] {
+        return None;
+    }
+    let function_objects = dictionary
+        .get(b"Functions")
+        .ok()
+        .and_then(|functions| resolved_object(document, functions))?
+        .as_array()
+        .ok()?;
+    if function_objects.is_empty() || function_objects.len() > MAX_STITCHING_FUNCTIONS {
+        return None;
+    }
+    let bounds = function_number_array(document, dictionary, b"Bounds")?;
+    if bounds.len() != function_objects.len().checked_sub(1)?
+        || bounds
+            .iter()
+            .try_fold(domain[0], |previous, bound| {
+                (*bound > previous && *bound < domain[1]).then_some(*bound)
+            })
+            .is_none()
+    {
+        return None;
+    }
+    let encode = function_pairs(document, dictionary, b"Encode", function_objects.len())?;
+    let range = if dictionary.get(b"Range").is_ok() {
+        let range = function_pairs(document, dictionary, b"Range", output_channels)?;
+        if range.iter().any(|bounds| bounds[0] > bounds[1]) {
+            return None;
+        }
+        Some(range)
+    } else {
+        None
+    };
+    let functions = function_objects
+        .iter()
+        .map(|function| {
+            tint_transform_at_depth(
+                document,
+                function,
+                1,
+                output_channels,
+                depth.checked_add(1)?,
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(StitchingTintTransform {
+        domain,
+        range,
+        functions,
+        bounds,
+        encode,
+        output_channels,
+    })
+}
+
+fn exponential_tint_transform(
+    document: &Document,
+    function: &Object,
+    output_channels: usize,
+) -> Option<ExponentialTintTransform> {
+    let function = resolved_object(document, function)?;
+    let dictionary = match function {
+        Object::Dictionary(dictionary) => dictionary,
+        Object::Stream(stream) => &stream.dict,
+        _ => return None,
+    };
+    if dictionary_i32(document, dictionary, b"FunctionType")? != 2 {
+        return None;
+    }
+    let domain = function_number_array(document, dictionary, b"Domain")?;
+    if domain.len() != 2 || domain[0] > domain[1] {
+        return None;
+    }
+    let exponent = dictionary
+        .get(b"N")
+        .ok()
+        .and_then(|value| resolved_object(document, value))
+        .and_then(number_as_f32)?;
+    if !exponent.is_finite() || exponent < 0.0 {
+        return None;
+    }
+    let start = function_number_array(document, dictionary, b"C0").unwrap_or_else(|| vec![0.0]);
+    let end = function_number_array(document, dictionary, b"C1").unwrap_or_else(|| vec![1.0]);
+    if start.len() != output_channels || end.len() != output_channels {
+        return None;
+    }
+    let range = if dictionary.get(b"Range").is_ok() {
+        let range = function_number_array(document, dictionary, b"Range")?;
+        if range.len() != output_channels.checked_mul(2)? {
+            return None;
+        }
+        Some(
+            range
+                .chunks_exact(2)
+                .map(|bounds| (bounds[0] <= bounds[1]).then_some([bounds[0], bounds[1]]))
+                .collect::<Option<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
+    Some(ExponentialTintTransform {
+        domain: [domain[0], domain[1]],
+        range,
+        start,
+        end,
+        exponent,
+    })
+}
+
+fn sampled_tint_transform(
+    document: &Document,
+    function: &Object,
+    input_channels: usize,
+    output_channels: usize,
+) -> Option<SampledTintTransform> {
+    if !(1..=8).contains(&input_channels) || output_channels == 0 {
+        return None;
+    }
+    let stream = resolved_stream(document, function)?;
+    if dictionary_i32(document, &stream.dict, b"FunctionType")? != 0 {
+        return None;
+    }
+    let domain = function_pairs(document, &stream.dict, b"Domain", input_channels)?;
+    if domain.iter().any(|bounds| bounds[0] >= bounds[1]) {
+        return None;
+    }
+    let range = function_pairs(document, &stream.dict, b"Range", output_channels)?;
+    if range.iter().any(|bounds| bounds[0] > bounds[1]) {
+        return None;
+    }
+    let size = function_integer_array(document, &stream.dict, b"Size")?;
+    if size.len() != input_channels || size.contains(&0) {
+        return None;
+    }
+    let bits_per_sample = dictionary_i32(document, &stream.dict, b"BitsPerSample")?;
+    if !matches!(bits_per_sample, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+        return None;
+    }
+    if dictionary_i32(document, &stream.dict, b"Order").unwrap_or(1) != 1 {
+        return None;
+    }
+    let encode = if stream.dict.get(b"Encode").is_ok() {
+        function_pairs(document, &stream.dict, b"Encode", input_channels)?
+    } else {
+        size.iter()
+            .map(|size| Some([0.0, usize_as_f32(size.checked_sub(1)?)?]))
+            .collect::<Option<Vec<_>>>()?
+    };
+    let decode = if stream.dict.get(b"Decode").is_ok() {
+        function_pairs(document, &stream.dict, b"Decode", output_channels)?
+    } else {
+        range.clone()
+    };
+    let sample_count = size
+        .iter()
+        .try_fold(output_channels, |count, size| count.checked_mul(*size))?;
+    if sample_count.checked_mul(std::mem::size_of::<f32>())? > MAX_EDITOR_IMAGE_BYTES {
+        return None;
+    }
+    let bits_per_sample = usize::try_from(bits_per_sample).ok()?;
+    let required_bytes = sample_count
+        .checked_mul(bits_per_sample)?
+        .checked_add(7)?
+        .checked_div(8)?;
+    if required_bytes > MAX_EDITOR_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = stream
+        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
+        .ok()?;
+    if bytes.len() < required_bytes {
+        return None;
+    }
+    let samples = unpack_function_samples(&bytes, sample_count, bits_per_sample)?;
+    Some(SampledTintTransform {
+        domain,
+        range,
+        size,
+        encode,
+        decode,
+        samples,
+    })
+}
+
+fn function_pairs(
+    document: &Document,
+    dictionary: &Dictionary,
+    key: &[u8],
+    channels: usize,
+) -> Option<Vec<[f32; 2]>> {
+    let values = function_number_array(document, dictionary, key)?;
+    if values.len() != channels.checked_mul(2)? {
+        return None;
+    }
+    Some(
+        values
+            .chunks_exact(2)
+            .map(|bounds| [bounds[0], bounds[1]])
+            .collect(),
+    )
+}
+
+fn function_integer_array(
+    document: &Document,
+    dictionary: &Dictionary,
+    key: &[u8],
+) -> Option<Vec<usize>> {
+    let values = dictionary
+        .get(key)
+        .ok()
+        .and_then(|value| resolved_object(document, value))?
+        .as_array()
+        .ok()?;
+    values
+        .iter()
+        .map(|value| {
+            resolved_object(document, value)?
+                .as_i64()
+                .ok()
+                .and_then(|value| usize::try_from(value).ok())
+        })
+        .collect()
+}
+
+fn unpack_function_samples(
+    bytes: &[u8],
+    sample_count: usize,
+    bits_per_sample: usize,
+) -> Option<Vec<f32>> {
+    let maximum = if bits_per_sample == 32 {
+        u64::from(u32::MAX)
+    } else {
+        1_u64.checked_shl(u32::try_from(bits_per_sample).ok()?)? - 1
+    };
+    let mut samples = Vec::with_capacity(sample_count);
+    for sample_index in 0..sample_count {
+        let bit_offset = sample_index.checked_mul(bits_per_sample)?;
+        let mut sample = 0_u64;
+        for bit in 0..bits_per_sample {
+            let position = bit_offset.checked_add(bit)?;
+            let byte = *bytes.get(position / 8)?;
+            sample = (sample << 1) | u64::from((byte >> (7 - position % 8)) & 1);
+        }
+        samples.push(u64_as_f32(sample)? / u64_as_f32(maximum)?);
+    }
+    Some(samples)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn usize_as_f32(value: usize) -> Option<f32> {
+    let value = value as f32;
+    value.is_finite().then_some(value)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn bounded_floor_to_usize(value: f32, maximum: usize) -> Option<usize> {
+    let maximum_as_f32 = usize_as_f32(maximum)?;
+    if !value.is_finite() || value < 0.0 || value > maximum_as_f32 {
+        return None;
+    }
+    Some(value.floor() as usize)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn u64_as_f32(value: u64) -> Option<f32> {
+    let value = value as f32;
+    value.is_finite().then_some(value)
+}
+
+fn function_number_array(
+    document: &Document,
+    dictionary: &Dictionary,
+    key: &[u8],
+) -> Option<Vec<f32>> {
+    let values = dictionary
+        .get(key)
+        .ok()
+        .and_then(|value| resolved_object(document, value))?
+        .as_array()
+        .ok()?;
+    values
+        .iter()
+        .map(|value| {
+            let number = resolved_object(document, value).and_then(number_as_f32)?;
+            number.is_finite().then_some(number)
+        })
+        .collect()
 }
 
 fn affine_unit_bounds(transform: [f32; 6]) -> Option<(f32, f32, f32, f32)> {
@@ -2595,6 +3849,7 @@ fn build_font_model(
         Some(_) => program.clone(),
     };
     let pdf_program_format = pdf_program.as_ref().and(program_format.clone());
+    let type3_glyphs = type3_glyph_metadata(document, dictionary);
     let mut visited = Vec::new();
     Some(PdfJsonFont {
         id: Some(font_id.to_owned()),
@@ -2610,6 +3865,7 @@ fn build_font_model(
         program_format,
         pdf_program,
         pdf_program_format,
+        type3_glyphs,
         to_unicode: font_to_unicode(document, dictionary),
         standard14_name: standard14_font_name(document, dictionary),
         font_descriptor_flags: descriptor
@@ -2623,6 +3879,118 @@ fn build_font_model(
         cos_dictionary: object_to_cos_value(document, font_object, &mut visited),
         ..PdfJsonFont::default()
     })
+}
+
+fn type3_glyph_metadata(
+    document: &Document,
+    font: &Dictionary,
+) -> Option<Vec<PdfJsonFontType3Glyph>> {
+    if dictionary_name(document, font, b"Subtype").as_deref() != Some("Type3") {
+        return None;
+    }
+    let char_procs = dictionary_entry(document, font, b"CharProcs")?;
+    let encoding = font
+        .get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
+        .ok();
+    let to_unicode = font_to_unicode_encoding(document, font);
+    let difference_codes = type3_difference_codes(document, font);
+    let glyphs = char_procs
+        .into_iter()
+        .take(MAX_TYPE3_GLYPHS)
+        .map(|(name, _)| {
+            let char_code = difference_codes
+                .get(name)
+                .copied()
+                .or_else(|| type3_base_encoding_code(name, encoding.as_ref()));
+            let unicode = char_code.map(|code| {
+                to_unicode
+                    .as_ref()
+                    .and_then(|encoding| decoded_code_point(encoding, code))
+                    .or_else(|| {
+                        encoding
+                            .as_ref()
+                            .and_then(|encoding| decoded_code_point(encoding, code))
+                    })
+                    .unwrap_or(i32::from(code))
+            });
+            PdfJsonFontType3Glyph {
+                char_code: Some(char_code.map_or(-1, i32::from)),
+                glyph_name: Some(String::from_utf8_lossy(name).into_owned()),
+                unicode,
+                char_code_raw: char_code.map(i32::from),
+            }
+        })
+        .collect::<Vec<_>>();
+    (!glyphs.is_empty()).then_some(glyphs)
+}
+
+fn type3_difference_codes(document: &Document, font: &Dictionary) -> BTreeMap<Vec<u8>, u8> {
+    let Some(differences) = font
+        .get(b"Encoding")
+        .ok()
+        .and_then(|encoding| resolved_dictionary(document, encoding))
+        .and_then(|encoding| encoding.get(b"Differences").ok())
+        .and_then(|differences| resolved_object(document, differences))
+        .and_then(|differences| differences.as_array().ok())
+    else {
+        return BTreeMap::new();
+    };
+    let mut codes = BTreeMap::new();
+    let mut current_code = None;
+    for difference in differences {
+        match difference {
+            Object::Integer(code) => current_code = u8::try_from(*code).ok(),
+            Object::Name(name) => {
+                if let Some(code) = current_code {
+                    codes.insert(name.clone(), code);
+                    current_code = code.checked_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    codes
+}
+
+fn type3_base_encoding_code(name: &[u8], encoding: Option<&Encoding<'_>>) -> Option<u8> {
+    let unicode = glyph_name_code_point(name)?;
+    let encoding = encoding?;
+    (u8::MIN..=u8::MAX).find(|code| decoded_code_point(encoding, *code) == Some(unicode))
+}
+
+fn glyph_name_code_point(name: &[u8]) -> Option<i32> {
+    let value = std::str::from_utf8(name).ok()?;
+    if value.len() == 1 {
+        return value
+            .chars()
+            .next()
+            .and_then(|character| i32::try_from(u32::from(character)).ok());
+    }
+    let scalar = match value {
+        "space" => Some(u32::from(' ')),
+        "hyphen" => Some(u32::from('-')),
+        _ => value
+            .strip_prefix("uni")
+            .filter(|hex| hex.len() == 4)
+            .or_else(|| {
+                value
+                    .strip_prefix('u')
+                    .filter(|hex| (4..=6).contains(&hex.len()))
+            })
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok()),
+    }?;
+    char::from_u32(scalar).and_then(|character| i32::try_from(u32::from(character)).ok())
+}
+
+fn decoded_code_point(encoding: &Encoding<'_>, code: u8) -> Option<i32> {
+    let text = Document::decode_text(encoding, &[code]).ok()?;
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    characters
+        .next()
+        .is_none()
+        .then(|| i32::try_from(u32::from(character)).ok())
+        .flatten()
 }
 
 fn resource_id(prefix: &str, name: &str) -> String {
@@ -2841,9 +4209,11 @@ fn standard14_font_name(document: &Document, font: &Dictionary) -> Option<String
 /// and affine transforms. `Type0` source codes are segmented through `/ToUnicode`,
 /// with horizontal descendant `/DW` and `/W` advances. Vertical Type0 fonts use
 /// `/DW2` and both `/W2` forms for glyph origins, displacement, and `TJ`
-/// adjustment. Type3 outlines, non-identity `CMap` code-to-CID mapping, and some
-/// graphics-state transitions remain conservative until the full glyph
-/// interpreter lands.
+/// adjustment. Embedded non-identity encoding `CMaps` and installed Poppler
+/// Adobe `CMap` resources apply bounded `cidchar` and `cidrange`
+/// source-code-to-CID mappings before descendant metrics. Type3 outline geometry,
+/// unavailable predefined `CMaps`, and some graphics-state transitions remain
+/// conservative until the full glyph interpreter lands.
 fn extract_text_elements(document: &Document, page_id: lopdf::ObjectId) -> Vec<PdfJsonTextElement> {
     let Ok(resources) = inherited_value(document, page_id, b"Resources") else {
         return Vec::new();
@@ -3146,6 +4516,7 @@ struct TextFont<'a> {
 /// metrics plus their fixed-width fallback code size.
 struct TextFontMetrics {
     widths: BTreeMap<u32, f32>,
+    code_to_cid: CodeToCidMap,
     fallback_width: f32,
     composite: bool,
     code_bytes: usize,
@@ -3159,6 +4530,7 @@ impl Default for TextFontMetrics {
     fn default() -> Self {
         Self {
             widths: BTreeMap::new(),
+            code_to_cid: Arc::new(BTreeMap::new()),
             fallback_width: 500.0,
             composite: false,
             code_bytes: 1,
@@ -3225,6 +4597,7 @@ impl TextFontMetrics {
     }
 
     fn width_for_code(&self, code: u32) -> f32 {
+        let code = self.metric_code(code);
         self.widths
             .get(&code)
             .copied()
@@ -3246,14 +4619,46 @@ impl TextFontMetrics {
     }
 
     fn vertical_metric_for_code(&self, code: u32) -> VerticalMetric {
+        let code = self.metric_code(code);
         self.vertical_metrics
             .get(&code)
             .copied()
             .unwrap_or_else(|| VerticalMetric {
                 displacement_y: self.default_vertical_displacement_y,
-                position_x: self.width_for_code(code) / 2.0,
+                position_x: self
+                    .widths
+                    .get(&code)
+                    .copied()
+                    .unwrap_or(self.fallback_width)
+                    / 2.0,
                 position_y: self.default_vertical_position_y,
             })
+    }
+
+    fn metric_code(&self, source_code: u32) -> u32 {
+        self.code_to_cid
+            .get(&source_code)
+            .copied()
+            .unwrap_or(source_code)
+    }
+}
+
+fn type0_to_unicode_encoding(document: &Document, font: &Dictionary) -> Option<Encoding<'static>> {
+    if dictionary_name(document, font, b"Subtype").as_deref() != Some("Type0") {
+        return None;
+    }
+    font_to_unicode_encoding(document, font)
+}
+
+fn font_to_unicode_encoding(document: &Document, font: &Dictionary) -> Option<Encoding<'static>> {
+    let mut to_unicode_only = font.clone();
+    to_unicode_only.remove(b"Encoding");
+    match to_unicode_only
+        .get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
+        .ok()?
+    {
+        Encoding::UnicodeMapEncoding(cmap) => Some(Encoding::UnicodeMapEncoding(cmap)),
+        _ => None,
     }
 }
 
@@ -3267,19 +4672,19 @@ fn page_font_encodings(
     fonts
         .into_iter()
         .filter_map(|(name, font)| {
-            font.get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
-                .ok()
-                .map(|encoding| {
-                    let font_name = String::from_utf8_lossy(&name).into_owned();
-                    (
-                        name,
-                        TextFont {
-                            source: TextFontSource::Encoding(encoding),
-                            resource_id: font_name,
-                            metrics: text_font_metrics(document, font),
-                        },
-                    )
-                })
+            let encoding = type0_to_unicode_encoding(document, font).or_else(|| {
+                font.get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
+                    .ok()
+            })?;
+            let font_name = String::from_utf8_lossy(&name).into_owned();
+            Some((
+                name,
+                TextFont {
+                    source: TextFontSource::Encoding(encoding),
+                    resource_id: font_name,
+                    metrics: text_font_metrics(document, font),
+                },
+            ))
         })
         .collect()
 }
@@ -3466,9 +4871,11 @@ fn append_text_element(
             .get_dictionary(*object_id)
             .ok()
             .and_then(|font_dictionary| {
-                font_dictionary
-                    .get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
-                    .ok()
+                type0_to_unicode_encoding(document, font_dictionary).or_else(|| {
+                    font_dictionary
+                        .get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
+                        .ok()
+                })
             })
             .and_then(|encoding| text_run(operands, &encoding, &font.metrics, state, operator)),
     };
@@ -3689,6 +5096,7 @@ fn cid_text_font_metrics(document: &Document, font: &Dictionary) -> TextFontMetr
         cid_vertical_defaults(document, descendant);
     TextFontMetrics {
         widths: cid_widths(document, descendant),
+        code_to_cid: type0_code_to_cid(document, font),
         fallback_width,
         composite: true,
         code_bytes: 2,
@@ -3696,6 +5104,591 @@ fn cid_text_font_metrics(document: &Document, font: &Dictionary) -> TextFontMetr
         vertical_metrics: cid_vertical_metrics(document, descendant),
         default_vertical_position_y,
         default_vertical_displacement_y,
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CidCMapSection {
+    Character,
+    Range,
+}
+
+#[derive(Clone, Copy)]
+enum CidCMapToken {
+    Hex(u32),
+    Integer(u32),
+    BeginCharacter,
+    EndCharacter,
+    BeginRange,
+    EndRange,
+    Other,
+}
+
+struct CidCMapLexer<'a> {
+    content: &'a [u8],
+    index: usize,
+}
+
+impl<'a> CidCMapLexer<'a> {
+    fn new(content: &'a [u8]) -> Self {
+        Self { content, index: 0 }
+    }
+
+    fn next_token(&mut self) -> Option<CidCMapToken> {
+        self.skip_ignored();
+        let byte = *self.content.get(self.index)?;
+        if byte == b'<' && self.content.get(self.index + 1) != Some(&b'<') {
+            return Some(self.hex_token());
+        }
+        if byte.is_ascii_digit() {
+            return Some(self.integer_token());
+        }
+        if is_pdf_delimiter(byte) {
+            self.index += 1;
+            return Some(CidCMapToken::Other);
+        }
+        let start = self.index;
+        while self
+            .content
+            .get(self.index)
+            .is_some_and(|value| !value.is_ascii_whitespace() && !is_pdf_delimiter(*value))
+        {
+            self.index += 1;
+        }
+        let word = &self.content[start..self.index];
+        Some(match word {
+            b"begincidchar" => CidCMapToken::BeginCharacter,
+            b"endcidchar" => CidCMapToken::EndCharacter,
+            b"begincidrange" => CidCMapToken::BeginRange,
+            b"endcidrange" => CidCMapToken::EndRange,
+            _ => CidCMapToken::Other,
+        })
+    }
+
+    fn skip_ignored(&mut self) {
+        loop {
+            while self
+                .content
+                .get(self.index)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                self.index += 1;
+            }
+            if self.content.get(self.index) != Some(&b'%') {
+                break;
+            }
+            while self
+                .content
+                .get(self.index)
+                .is_some_and(|value| !matches!(value, b'\r' | b'\n'))
+            {
+                self.index += 1;
+            }
+        }
+    }
+
+    fn hex_token(&mut self) -> CidCMapToken {
+        self.index += 1;
+        let mut value = 0_u32;
+        let mut digits = 0_usize;
+        let mut valid = true;
+        while let Some(byte) = self.content.get(self.index).copied() {
+            self.index += 1;
+            if byte == b'>' {
+                return if valid && (1..=8).contains(&digits) {
+                    CidCMapToken::Hex(value)
+                } else {
+                    CidCMapToken::Other
+                };
+            }
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            let Some(nibble) = hex_nibble(byte) else {
+                valid = false;
+                continue;
+            };
+            digits += 1;
+            if digits > 8 {
+                valid = false;
+                continue;
+            }
+            value = value.saturating_mul(16).saturating_add(u32::from(nibble));
+        }
+        CidCMapToken::Other
+    }
+
+    fn integer_token(&mut self) -> CidCMapToken {
+        let mut value = 0_u32;
+        let mut valid = true;
+        while let Some(byte) = self.content.get(self.index).copied()
+            && byte.is_ascii_digit()
+        {
+            self.index += 1;
+            if let Some(next) = value
+                .checked_mul(10)
+                .and_then(|current| current.checked_add(u32::from(byte - b'0')))
+            {
+                value = next;
+            } else {
+                valid = false;
+            }
+        }
+        if valid {
+            CidCMapToken::Integer(value)
+        } else {
+            CidCMapToken::Other
+        }
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn type0_code_to_cid(document: &Document, font: &Dictionary) -> CodeToCidMap {
+    let roots = predefined_cmap_roots();
+    type0_code_to_cid_with_roots(document, font, &roots)
+}
+
+fn type0_code_to_cid_with_roots(
+    document: &Document,
+    font: &Dictionary,
+    roots: &[PathBuf],
+) -> CodeToCidMap {
+    let Some(encoding) = font.get(b"Encoding").ok() else {
+        return Arc::new(BTreeMap::new());
+    };
+    let collection = type0_cmap_collection(document, font);
+    if let Object::Name(name) = encoding {
+        return named_code_to_cid_mappings(roots, collection.as_deref(), name)
+            .unwrap_or_else(|| Arc::new(BTreeMap::new()));
+    }
+    let mut mappings = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    collect_code_to_cid_mappings(
+        document,
+        encoding,
+        roots,
+        collection.as_deref(),
+        &mut mappings,
+        &mut visited,
+        0,
+    );
+    Arc::new(mappings)
+}
+
+fn collect_code_to_cid_mappings(
+    document: &Document,
+    encoding: &Object,
+    roots: &[PathBuf],
+    collection: Option<&str>,
+    mappings: &mut BTreeMap<u32, u32>,
+    visited: &mut BTreeSet<lopdf::ObjectId>,
+    depth: usize,
+) {
+    if depth >= MAX_PREDEFINED_CMAP_DEPTH {
+        return;
+    }
+    match encoding {
+        Object::Reference(object_id) => {
+            if !visited.insert(*object_id) {
+                return;
+            }
+            if let Ok(object) = document.get_object(*object_id) {
+                collect_code_to_cid_mappings(
+                    document,
+                    object,
+                    roots,
+                    collection,
+                    mappings,
+                    visited,
+                    depth + 1,
+                );
+            }
+            visited.remove(object_id);
+        }
+        Object::Stream(stream) => {
+            collect_usecmap_mappings(
+                document,
+                &stream.dict,
+                roots,
+                collection,
+                mappings,
+                visited,
+                depth,
+            );
+            if let Ok(content) = stream.get_plain_content_with_limit(MAX_EMBEDDED_FONT_BYTES) {
+                collect_content_usecmap_mappings(roots, collection, &content, mappings);
+                parse_code_to_cid_mappings(&content, mappings);
+            }
+        }
+        Object::Dictionary(dictionary) => {
+            collect_usecmap_mappings(
+                document, dictionary, roots, collection, mappings, visited, depth,
+            );
+        }
+        Object::Name(name) => {
+            if let Some(named) = named_code_to_cid_mappings(roots, collection, name) {
+                merge_code_to_cid_mappings(mappings, &named);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_usecmap_mappings(
+    document: &Document,
+    dictionary: &Dictionary,
+    roots: &[PathBuf],
+    collection: Option<&str>,
+    mappings: &mut BTreeMap<u32, u32>,
+    visited: &mut BTreeSet<lopdf::ObjectId>,
+    depth: usize,
+) {
+    if let Ok(use_cmap) = dictionary.get(b"UseCMap") {
+        collect_code_to_cid_mappings(
+            document,
+            use_cmap,
+            roots,
+            collection,
+            mappings,
+            visited,
+            depth + 1,
+        );
+    }
+}
+
+fn collect_content_usecmap_mappings(
+    roots: &[PathBuf],
+    collection: Option<&str>,
+    content: &[u8],
+    mappings: &mut BTreeMap<u32, u32>,
+) {
+    for name in cmap_usecmap_names(content) {
+        if let Some(named) = named_code_to_cid_mappings(roots, collection, name.as_bytes()) {
+            merge_code_to_cid_mappings(mappings, &named);
+        }
+    }
+}
+
+fn named_code_to_cid_mappings(
+    roots: &[PathBuf],
+    collection: Option<&str>,
+    name: &[u8],
+) -> Option<CodeToCidMap> {
+    if matches!(name, b"Identity-H" | b"Identity-V") {
+        return None;
+    }
+    let collection = collection?;
+    let name = std::str::from_utf8(name).ok()?;
+    predefined_cmap_mappings(roots, collection, name)
+}
+
+fn type0_cmap_collection(document: &Document, font: &Dictionary) -> Option<String> {
+    let info = font_cid_system_info(document, font)?;
+    let registry = info.registry?;
+    let ordering = info.ordering?;
+    if !safe_cmap_path_component(&registry) || !safe_cmap_path_component(&ordering) {
+        return None;
+    }
+    Some(format!("{registry}-{ordering}"))
+}
+
+fn predefined_cmap_roots() -> Vec<PathBuf> {
+    let mut roots = env::var_os(PREDEFINED_CMAP_PATH_ENV)
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for root in DEFAULT_PREDEFINED_CMAP_ROOTS {
+        let root = PathBuf::from(root);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn predefined_cmap_mappings(
+    roots: &[PathBuf],
+    collection: &str,
+    name: &str,
+) -> Option<CodeToCidMap> {
+    if !safe_cmap_path_component(collection) || !safe_cmap_path_component(name) {
+        return None;
+    }
+    roots
+        .iter()
+        .find_map(|root| load_predefined_cmap_from_root(root, collection, name))
+}
+
+fn safe_cmap_path_component(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= 128
+        && !matches!(component, "." | "..")
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn load_predefined_cmap_from_root(
+    root: &Path,
+    collection: &str,
+    name: &str,
+) -> Option<CodeToCidMap> {
+    let root = fs::canonicalize(root).ok()?;
+    let mut visited = BTreeSet::new();
+    let mut files_loaded = 0;
+    load_predefined_cmap_file(&root, collection, name, &mut visited, &mut files_loaded, 0)
+}
+
+fn load_predefined_cmap_file(
+    root: &Path,
+    collection: &str,
+    name: &str,
+    visited: &mut BTreeSet<PathBuf>,
+    files_loaded: &mut usize,
+    depth: usize,
+) -> Option<CodeToCidMap> {
+    if depth >= MAX_PREDEFINED_CMAP_DEPTH
+        || *files_loaded >= MAX_PREDEFINED_CMAP_FILES
+        || !safe_cmap_path_component(collection)
+        || !safe_cmap_path_component(name)
+    {
+        return None;
+    }
+    let collection_path = fs::canonicalize(root.join(collection)).ok()?;
+    if !collection_path.starts_with(root) {
+        return None;
+    }
+    let path = fs::canonicalize(collection_path.join(name)).ok()?;
+    if !path.starts_with(&collection_path) {
+        return None;
+    }
+    if let Some(cached) = cached_predefined_cmap(&path) {
+        return Some(cached);
+    }
+    if !visited.insert(path.clone()) {
+        return None;
+    }
+    *files_loaded += 1;
+    let loaded = (|| {
+        let metadata = fs::metadata(&path).ok()?;
+        if !metadata.is_file()
+            || metadata.len() > u64::try_from(MAX_EMBEDDED_FONT_BYTES).unwrap_or(u64::MAX)
+        {
+            return None;
+        }
+        let content = fs::read(&path).ok()?;
+        if content.len() > MAX_EMBEDDED_FONT_BYTES {
+            return None;
+        }
+        let mut mappings = BTreeMap::new();
+        for base_name in cmap_usecmap_names(&content) {
+            if let Some(base) = load_predefined_cmap_file(
+                root,
+                collection,
+                &base_name,
+                visited,
+                files_loaded,
+                depth + 1,
+            ) {
+                merge_code_to_cid_mappings(&mut mappings, &base);
+            }
+        }
+        parse_code_to_cid_mappings(&content, &mut mappings);
+        Some(Arc::new(mappings))
+    })();
+    visited.remove(&path);
+    if let Some(mappings) = loaded.as_ref() {
+        cache_predefined_cmap(path, mappings);
+    }
+    loaded
+}
+
+fn cached_predefined_cmap(path: &Path) -> Option<CodeToCidMap> {
+    PREDEFINED_CMAP_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()?
+        .get(path)
+        .cloned()
+}
+
+fn cache_predefined_cmap(path: PathBuf, mappings: &CodeToCidMap) {
+    let Ok(mut cache) = PREDEFINED_CMAP_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    else {
+        return;
+    };
+    if cache.len() >= MAX_PREDEFINED_CMAP_CACHE_ENTRIES
+        && !cache.contains_key(&path)
+        && let Some(evicted) = cache.keys().next().cloned()
+    {
+        cache.remove(&evicted);
+    }
+    cache.insert(path, Arc::clone(mappings));
+}
+
+fn cmap_usecmap_names(content: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending_name = None;
+    let mut index = 0;
+    while index < content.len() && names.len() < MAX_PREDEFINED_CMAP_USECMAP_NAMES {
+        while content.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index >= content.len() {
+            break;
+        }
+        if content.get(index) == Some(&b'%') {
+            while content
+                .get(index)
+                .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if content.get(index) == Some(&b'/') {
+            index += 1;
+            let start = index;
+            while content
+                .get(index)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && !is_pdf_delimiter(*byte))
+            {
+                index += 1;
+            }
+            pending_name = std::str::from_utf8(&content[start..index])
+                .ok()
+                .filter(|name| safe_cmap_path_component(name))
+                .map(ToOwned::to_owned);
+            continue;
+        }
+        if content
+            .get(index)
+            .is_some_and(|byte| is_pdf_delimiter(*byte))
+        {
+            pending_name = None;
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while content
+            .get(index)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !is_pdf_delimiter(*byte))
+        {
+            index += 1;
+        }
+        if &content[start..index] == b"usecmap" {
+            if let Some(name) = pending_name.take() {
+                names.push(name);
+            }
+        } else {
+            pending_name = None;
+        }
+    }
+    names
+}
+
+fn merge_code_to_cid_mappings(mappings: &mut BTreeMap<u32, u32>, inherited: &BTreeMap<u32, u32>) {
+    for (&code, &cid) in inherited {
+        insert_code_to_cid_mapping(mappings, code, cid);
+    }
+}
+
+fn parse_code_to_cid_mappings(content: &[u8], mappings: &mut BTreeMap<u32, u32>) {
+    let mut lexer = CidCMapLexer::new(content);
+    let mut section = None;
+    let mut values = Vec::with_capacity(3);
+    while let Some(token) = lexer.next_token() {
+        match token {
+            CidCMapToken::BeginCharacter => {
+                section = Some(CidCMapSection::Character);
+                values.clear();
+            }
+            CidCMapToken::BeginRange => {
+                section = Some(CidCMapSection::Range);
+                values.clear();
+            }
+            CidCMapToken::EndCharacter if section == Some(CidCMapSection::Character) => {
+                section = None;
+                values.clear();
+            }
+            CidCMapToken::EndRange if section == Some(CidCMapSection::Range) => {
+                section = None;
+                values.clear();
+            }
+            CidCMapToken::Hex(value) | CidCMapToken::Integer(value) if section.is_some() => {
+                values.push(value);
+                let group_size = if section == Some(CidCMapSection::Character) {
+                    2
+                } else {
+                    3
+                };
+                if values.len() == group_size {
+                    match section {
+                        Some(CidCMapSection::Character) => {
+                            insert_code_to_cid_mapping(mappings, values[0], values[1]);
+                        }
+                        Some(CidCMapSection::Range) => {
+                            insert_code_to_cid_range(mappings, values[0], values[1], values[2]);
+                        }
+                        None => {}
+                    }
+                    values.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn insert_code_to_cid_mapping(mappings: &mut BTreeMap<u32, u32>, code: u32, cid: u32) {
+    if mappings.contains_key(&code) || mappings.len() < MAX_CID_WIDTH_ENTRIES {
+        mappings.insert(code, cid);
+    }
+}
+
+fn insert_code_to_cid_range(
+    mappings: &mut BTreeMap<u32, u32>,
+    start: u32,
+    end: u32,
+    first_cid: u32,
+) {
+    let Some(range_len) = end.checked_sub(start).and_then(|span| span.checked_add(1)) else {
+        return;
+    };
+    let Ok(range_len) = usize::try_from(range_len) else {
+        return;
+    };
+    if range_len > MAX_CID_WIDTH_ENTRIES {
+        return;
+    }
+    let new_entries = (0..range_len)
+        .filter_map(|offset| u32::try_from(offset).ok())
+        .filter_map(|offset| start.checked_add(offset))
+        .filter(|code| !mappings.contains_key(code))
+        .count();
+    if new_entries > MAX_CID_WIDTH_ENTRIES.saturating_sub(mappings.len()) {
+        return;
+    }
+    for offset in 0..range_len {
+        let Ok(offset) = u32::try_from(offset) else {
+            return;
+        };
+        let Some(code) = start.checked_add(offset) else {
+            return;
+        };
+        let Some(cid) = first_cid.checked_add(offset) else {
+            return;
+        };
+        insert_code_to_cid_mapping(mappings, code, cid);
     }
 }
 
@@ -6245,6 +8238,58 @@ mod tests {
     }
 
     #[test]
+    fn type3_glyph_metadata_prefers_to_unicode_for_custom_difference_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PdfJsonFontType3Glyph, build_font_model};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let glyph_id =
+            document.add_object(Stream::new(dictionary! {}, b"0 0 500 700 re f".to_vec()));
+        let to_unicode_id = document.add_object(Stream::new(
+            dictionary! {},
+            br"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapName /RustType3Unicode def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+<C8> <03A9>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"
+            .to_vec(),
+        ));
+        let font = Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "CharProcs" => dictionary! { "customGlyph" => glyph_id },
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![200.into(), Object::Name(b"customGlyph".to_vec())],
+            },
+            "ToUnicode" => to_unicode_id,
+        });
+
+        let model = build_font_model(&document, &font, "F3", 1).ok_or("missing font model")?;
+        assert_eq!(
+            model.type3_glyphs,
+            Some(vec![PdfJsonFontType3Glyph {
+                char_code: Some(200),
+                glyph_name: Some("customGlyph".to_owned()),
+                unicode: Some(0x03A9),
+                char_code_raw: Some(200),
+            }])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn json_to_pdf_restores_type3_charprocs_for_generated_text()
     -> Result<(), Box<dyn std::error::Error>> {
         use super::{convert_json_to_pdf, pdf_to_json, resolved_dictionary};
@@ -6299,6 +8344,18 @@ mod tests {
         let mut model = pdf_to_json(&source_path, "type3-source.pdf", false)?;
         assert_eq!(model.fonts[0].subtype.as_deref(), Some("Type3"));
         assert_eq!(model.fonts[0].embedded, Some(false));
+        assert_eq!(
+            model.fonts[0].type3_glyphs.as_deref(),
+            Some(
+                [super::PdfJsonFontType3Glyph {
+                    char_code: Some(65),
+                    glyph_name: Some("A".to_owned()),
+                    unicode: Some(65),
+                    char_code_raw: Some(65),
+                }]
+                .as_slice()
+            )
+        );
         assert_eq!(model.pages[0].text_elements[0].text.as_deref(), Some("A"));
         model.pages[0].content_streams.clear();
         model.pages[0].resources = None;
@@ -6583,6 +8640,588 @@ mod tests {
         assert_eq!(
             image::load_from_memory(&png)?.to_luma8().as_raw(),
             &[0, 255]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_icc_based_images_and_uses_the_declared_alternate_on_invalid_profiles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+        use moxcms::{ColorProfile, Layout, TransformOptions};
+
+        let source_profile = ColorProfile::new_bt2020();
+        let encoded_profile = source_profile.encode()?;
+        let source_samples = vec![128, 64, 32, 48, 192, 96];
+        let destination_profile = ColorProfile::new_srgb();
+        let transform = source_profile.create_transform_8bit(
+            Layout::Rgb,
+            &destination_profile,
+            Layout::Rgb,
+            TransformOptions::default(),
+        )?;
+        let mut expected = vec![0; source_samples.len()];
+        transform.transform(&source_samples, &mut expected)?;
+        assert_ne!(source_samples, expected);
+
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => "DeviceRGB" },
+            encoded_profile,
+        ));
+        let icc_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            source_samples,
+        );
+        let (png, format) = encode_image_xobject(&document, &icc_image, 2, 1)
+            .ok_or("ICCBased image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &expected);
+
+        let invalid_profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => "DeviceRGB" },
+            b"not-an-icc-profile".to_vec(),
+        ));
+        let alternate_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(invalid_profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![10, 20, 30],
+        );
+        let (png, _) = encode_image_xobject(&document, &alternate_image, 1, 1)
+            .ok_or("ICCBased alternate image was not encoded")?;
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[10, 20, 30]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_icc_based_indexed_palettes_and_falls_back_to_the_alternate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, StringFormat, dictionary};
+        use moxcms::{ColorProfile, Layout, TransformOptions};
+
+        let source_profile = ColorProfile::new_bt2020();
+        let palette = vec![128, 64, 32, 48, 192, 96];
+        let transform = source_profile.create_transform_8bit(
+            Layout::Rgb,
+            &ColorProfile::new_srgb(),
+            Layout::Rgb,
+            TransformOptions::default(),
+        )?;
+        let mut expected = vec![0; palette.len()];
+        transform.transform(&palette, &mut expected)?;
+
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => "DeviceRGB" },
+            source_profile.encode()?,
+        ));
+        let indexed_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"ICCBased".to_vec()),
+                        Object::Reference(profile_id),
+                    ]),
+                    Object::Integer(1),
+                    Object::String(palette.clone(), StringFormat::Literal),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 1],
+        );
+        let (png, format) = encode_image_xobject(&document, &indexed_image, 2, 1)
+            .ok_or("ICCBased Indexed image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &expected);
+
+        let invalid_profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => "DeviceRGB" },
+            b"not-an-icc-profile".to_vec(),
+        ));
+        let alternate_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"ICCBased".to_vec()),
+                        Object::Reference(invalid_profile_id),
+                    ]),
+                    Object::Integer(1),
+                    Object::String(palette.clone(), StringFormat::Literal),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 1],
+        );
+        let (png, _) = encode_image_xobject(&document, &alternate_image, 2, 1)
+            .ok_or("ICCBased Indexed alternate image was not encoded")?;
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &palette);
+        Ok(())
+    }
+
+    #[test]
+    fn converts_separation_images_with_a_type_two_tint_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let document = Document::with_version("1.7");
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 3,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotRed".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Dictionary(dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "Range" => vec![
+                            0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()
+                        ],
+                        "C0" => vec![1.into(), 1.into(), 1.into()],
+                        "C1" => vec![1.into(), 0.into(), 0.into()],
+                        "N" => 1,
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 255],
+        );
+        let (png, format) = encode_image_xobject(&document, &separation_image, 3, 1)
+            .ok_or("Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 255, 255, 255, 127, 127, 255, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_separation_images_with_a_sampled_tint_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let tint_transform = document.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 0,
+                "Domain" => vec![0.into(), 1.into()],
+                "Range" => vec![
+                    0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()
+                ],
+                "Size" => vec![2.into()],
+                "BitsPerSample" => 4,
+                "Encode" => vec![1.into(), 0.into()],
+                "Decode" => vec![
+                    1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()
+                ],
+            },
+            vec![0x0f, 0xf0, 0x00],
+        ));
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 3,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotRed".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 255],
+        );
+        let (png, format) = encode_image_xobject(&document, &separation_image, 3, 1)
+            .ok_or("sampled Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 255, 255, 255, 127, 127, 255, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_device_n_images_with_a_multivariate_sampled_tint_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let tint_transform = document.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 0,
+                "Domain" => vec![0.into(), 1.into(), 0.into(), 1.into()],
+                "Range" => vec![
+                    0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()
+                ],
+                "Size" => vec![2.into(), 2.into()],
+                "BitsPerSample" => 8,
+            },
+            vec![255, 255, 255, 0, 255, 255, 255, 0, 255, 0, 0, 255],
+        ));
+        let device_n_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 5,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"DeviceN".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"CyanSpot".to_vec()),
+                        Object::Name(b"MagentaSpot".to_vec()),
+                    ]),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 0, 255, 0, 0, 255, 255, 255, 128, 128],
+        );
+        let (png, format) = encode_image_xobject(&document, &device_n_image, 5, 1)
+            .ok_or("DeviceN image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[
+                255, 255, 255, 0, 255, 255, 255, 0, 255, 0, 0, 255, 127, 127, 255,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_grayscale_dct_separation_images_with_decode_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use image::{DynamicImage, GrayImage, ImageFormat};
+        use lopdf::{Document, Object, Stream, dictionary};
+        use std::io::Cursor;
+
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageLuma8(
+            GrayImage::from_raw(1, 1, vec![255]).ok_or("invalid grayscale fixture")?,
+        )
+        .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotRed".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Dictionary(dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "C0" => vec![1.into(), 1.into(), 1.into()],
+                        "C1" => vec![1.into(), 0.into(), 0.into()],
+                        "N" => 1,
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => vec![1.into(), 0.into()],
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+        let (png, format) =
+            encode_image_xobject(&Document::with_version("1.7"), &separation_image, 1, 1)
+                .ok_or("DCT Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 255, 255]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_separation_images_with_stitching_tint_transforms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let stitching_function = Object::Dictionary(dictionary! {
+            "FunctionType" => 3,
+            "Domain" => vec![0.into(), 1.into()],
+            "Functions" => Object::Array(vec![
+                Object::Dictionary(dictionary! {
+                    "FunctionType" => 2,
+                    "Domain" => vec![0.into(), 1.into()],
+                    "C0" => vec![2.into(), 0.into(), 0.into()],
+                    "C1" => vec![2.into(), 0.into(), 0.into()],
+                    "N" => 1,
+                }),
+                Object::Dictionary(dictionary! {
+                    "FunctionType" => 2,
+                    "Domain" => vec![0.into(), 1.into()],
+                    "C0" => vec![0.into(), 0.into(), 2.into()],
+                    "C1" => vec![0.into(), 0.into(), 2.into()],
+                    "N" => 1,
+                }),
+            ]),
+            "Bounds" => vec![Object::Real(0.5)],
+            "Encode" => vec![0.into(), 1.into(), 0.into(), 1.into()],
+            "Range" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+        });
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 4,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotRedBlue".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    stitching_function,
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 127, 128, 255],
+        );
+        let (png, format) =
+            encode_image_xobject(&Document::with_version("1.7"), &separation_image, 4, 1)
+                .ok_or("stitched Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_calibrated_separation_and_device_n_alternates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let cal_gray = Object::Array(vec![
+            Object::Name(b"CalGray".to_vec()),
+            Object::Dictionary(dictionary! {
+                "WhitePoint" => vec![
+                    Object::Real(0.95047),
+                    Object::Real(1.0),
+                    Object::Real(1.08883),
+                ],
+                "Gamma" => Object::Real(2.0),
+            }),
+        ]);
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 3,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"CalibratedGraySpot".to_vec()),
+                    cal_gray,
+                    Object::Dictionary(dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "C0" => vec![0.into()],
+                        "C1" => vec![1.into()],
+                        "N" => 1,
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 255],
+        );
+        let (png, format) =
+            encode_image_xobject(&Document::with_version("1.7"), &separation_image, 3, 1)
+                .ok_or("CalGray Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[0, 0, 0, 146, 146, 146, 255, 255, 255]
+        );
+
+        let cal_rgb = Object::Array(vec![
+            Object::Name(b"CalRGB".to_vec()),
+            Object::Dictionary(dictionary! {
+                "WhitePoint" => vec![
+                    Object::Real(0.95047),
+                    Object::Real(1.0),
+                    Object::Real(1.08883),
+                ],
+                "Gamma" => vec![Object::Real(1.0), Object::Real(1.0), Object::Real(1.0)],
+                "Matrix" => vec![
+                    Object::Real(0.412_456_4), Object::Real(0.212_672_9), Object::Real(0.019_333_9),
+                    Object::Real(0.357_576_1), Object::Real(0.715_152_2), Object::Real(0.119_192),
+                    Object::Real(0.180_437_5), Object::Real(0.072_175_0), Object::Real(0.950_304_1),
+                ],
+            }),
+        ]);
+        let device_n_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"DeviceN".to_vec()),
+                    Object::Array(vec![Object::Name(b"CalibratedRed".to_vec())]),
+                    cal_rgb,
+                    Object::Dictionary(dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "C0" => vec![0.into(), 0.into(), 0.into()],
+                        "C1" => vec![1.into(), 0.into(), 0.into()],
+                        "N" => 1,
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 255],
+        );
+        let (png, format) =
+            encode_image_xobject(&Document::with_version("1.7"), &device_n_image, 2, 1)
+                .ok_or("CalRGB DeviceN image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[0, 0, 0, 255, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_direct_calibrated_raw_and_dct_images() -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use image::{DynamicImage, ImageFormat, RgbImage};
+        use lopdf::{Document, Object, Stream, dictionary};
+        use std::io::Cursor;
+
+        let cal_gray_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 3,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"CalGray".to_vec()),
+                    Object::Dictionary(dictionary! {
+                        "WhitePoint" => vec![
+                            Object::Real(0.95047),
+                            Object::Real(1.0),
+                            Object::Real(1.08883),
+                        ],
+                        "Gamma" => Object::Real(2.0),
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![0, 128, 255],
+        );
+        let document = Document::with_version("1.7");
+        let (png, format) = encode_image_xobject(&document, &cal_gray_image, 3, 1)
+            .ok_or("direct CalGray image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[0, 0, 0, 146, 146, 146, 255, 255, 255]
+        );
+
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(
+            RgbImage::from_raw(1, 1, vec![255, 255, 255]).ok_or("invalid RGB fixture")?,
+        )
+        .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+        let cal_rgb_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"CalRGB".to_vec()),
+                    Object::Dictionary(dictionary! {
+                        "WhitePoint" => vec![
+                            Object::Real(0.95047),
+                            Object::Real(1.0),
+                            Object::Real(1.08883),
+                        ],
+                        "Gamma" => vec![
+                            Object::Real(1.0),
+                            Object::Real(1.0),
+                            Object::Real(1.0),
+                        ],
+                        "Matrix" => vec![
+                            Object::Real(0.412_456_4),
+                            Object::Real(0.212_672_9),
+                            Object::Real(0.019_333_9),
+                            Object::Real(0.357_576_1),
+                            Object::Real(0.715_152_2),
+                            Object::Real(0.119_192),
+                            Object::Real(0.180_437_5),
+                            Object::Real(0.072_175_0),
+                            Object::Real(0.950_304_1),
+                        ],
+                    }),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => vec![
+                    1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into(),
+                ],
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+        let (png, format) = encode_image_xobject(&document, &cal_rgb_image, 1, 1)
+            .ok_or("direct DCT CalRGB image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            &[0, 0, 0]
         );
         Ok(())
     }
@@ -7108,6 +9747,101 @@ end";
         source
     }
 
+    fn non_identity_type0_cid_document() -> lopdf::Document {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let to_unicode = br"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+/CMapName /RustUnicode def
+/CMapType 2 def
+1 begincodespacerange
+<00> <ff>
+endcodespacerange
+3 beginbfchar
+<21> <4e2d>
+<30> <6587>
+<31> <8a9e>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+        let code_to_cid = br"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+/CMapName /RustNonIdentity def
+/CMapType 1 def
+1 begincodespacerange
+<00> <ff>
+endcodespacerange
+1 begincidchar
+<21> 1
+endcidchar
+1 begincidrange
+<30> <31> 2
+endcidrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+        let mut source = Document::with_version("1.7");
+        let page_tree_id = source.new_object_id();
+        let to_unicode_id = source.add_object(Stream::new(dictionary! {}, to_unicode.to_vec()));
+        let encoding_id = source.add_object(Stream::new(
+            dictionary! { "Type" => "CMap", "CMapName" => "RustNonIdentity", "WMode" => 0 },
+            code_to_cid.to_vec(),
+        ));
+        let descendant_id = source.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "RustCID",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "DW" => 1000,
+            "W" => vec![
+                1.into(),
+                Object::Array(vec![600.into(), 700.into(), 800.into()]),
+            ],
+        });
+        let font_id = source.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "RustCID",
+            "Encoding" => encoding_id,
+            "DescendantFonts" => vec![Object::Reference(descendant_id)],
+            "ToUnicode" => to_unicode_id,
+        });
+        let content_id = source.add_object(Stream::new(
+            dictionary! {},
+            b"BT /F0 10 Tf 1 0 0 1 10 20 Tm <213031> Tj ET".to_vec(),
+        ));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => page_tree_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F0" => font_id } },
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            page_tree_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_object_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => page_tree_id });
+        source.trailer.set("Root", catalog_id);
+        source
+    }
+
     fn add_vertical_type0_metrics(descendant: &mut lopdf::Dictionary) {
         use lopdf::Object;
 
@@ -7165,6 +9899,72 @@ end";
             .and_then(|operand| operand.as_str().ok())
             .ok_or("missing rebuilt CID text")?;
         assert_eq!(encoded, &[0, 1, 0, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_non_identity_type0_codes_to_cid_widths() -> Result<(), Box<dyn std::error::Error>> {
+        use super::pdf_to_json;
+
+        let mut source = non_identity_type0_cid_document();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("type0-non-identity.pdf");
+        source.save(&path)?;
+
+        let model = pdf_to_json(&path, "type0-non-identity.pdf", false)?;
+        let text = model.pages[0]
+            .text_elements
+            .first()
+            .ok_or("non-identity Type0 text missing")?;
+        assert_eq!(text.text.as_deref(), Some("中文語"));
+        assert_eq!(text.char_codes, Some(vec![0x21, 0x30, 0x31]));
+        assert_eq!(text.width, Some(21.0));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_predefined_type0_cmaps_with_usecmap_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::type0_code_to_cid_with_roots;
+        use lopdf::{Document, Object, dictionary};
+        use std::{fs, sync::Arc};
+
+        let directory = tempfile::tempdir()?;
+        let collection_directory = directory.path().join("Adobe-Rust1");
+        fs::create_dir(&collection_directory)?;
+        fs::write(
+            collection_directory.join("RustBase-H"),
+            b"1 begincidrange\n<21> <22> 10\nendcidrange\n",
+        )?;
+        fs::write(
+            collection_directory.join("RustDerived-V"),
+            b"/RustBase-H usecmap\n2 begincidchar\n<22> 99\n<23> 12\nendcidchar\n",
+        )?;
+
+        let mut document = Document::with_version("1.7");
+        let descendant_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Rust1"),
+                "Supplement" => 0,
+            },
+        });
+        let font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "Encoding" => "RustDerived-V",
+            "DescendantFonts" => vec![Object::Reference(descendant_id)],
+        };
+        let roots = [directory.path().to_path_buf()];
+        let mappings = type0_code_to_cid_with_roots(&document, &font, &roots);
+        assert_eq!(mappings.get(&0x21), Some(&10));
+        assert_eq!(mappings.get(&0x22), Some(&99));
+        assert_eq!(mappings.get(&0x23), Some(&12));
+
+        let cached = type0_code_to_cid_with_roots(&document, &font, &roots);
+        assert!(Arc::ptr_eq(&mappings, &cached));
         Ok(())
     }
 

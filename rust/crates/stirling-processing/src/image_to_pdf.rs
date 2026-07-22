@@ -14,6 +14,8 @@ use tiff::{
     decoder::{Decoder as TiffDecoder, DecodingResult},
 };
 
+use crate::pdf_metadata::apply_default_new_document_metadata;
+
 const A4_WIDTH: f32 = 595.275_63;
 const A4_HEIGHT: f32 = 841.889_8;
 
@@ -168,6 +170,7 @@ fn images_to_pdf_file_with_policy(
     );
     let catalog_id = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     document.trailer.set("Root", catalog_id);
+    apply_default_new_document_metadata(&mut document);
     document.compress();
     document.save(output_path)?;
     Ok(())

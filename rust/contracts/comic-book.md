@@ -78,9 +78,9 @@ uses `comic_converted.cbr`.
 - CBZ-to-PDF accepts deflated and stored ZIP inputs. Generated CBZ entries use
   stored compression rather than Java's default deflate; decoded image content
   and entry structure are compatible.
-- CBZ images are embedded through the Rust image-to-PDF path, so PDF stream
-  encoding and metadata differ from PDFBox while page sizes and rendered image
-  content remain compatible.
+- CBZ/CBR images are embedded through the Rust image-to-PDF path, so PDF stream
+  encoding differs from PDFBox while page sizes, rendered image content, and
+  default non-Pro Stirling creator/producer/date metadata remain compatible.
 - Rust compares arbitrarily long numeric filename chunks safely. Java parses
   each numeric chunk as a signed 32-bit integer and can fail on an unusually
   long comic page number.
@@ -93,9 +93,8 @@ uses `comic_converted.cbr`.
 - PDF-to-CBR requires a licensed or otherwise provisioned `rar` command at
   deployment time. No CBR is synthesized as ZIP, because that would violate the
   CBR media contract.
-- The configured Ghostscript ebook optimization branch, application default
-  PDF metadata, and server-side asynchronous `fileId` resolution remain later
-  migration slices.
+- The configured Ghostscript ebook optimization branch and server-side
+  asynchronous `fileId` resolution remain later migration slices.
 
 Unit and HTTP tests cover Java natural sorting, corrupt-image skipping,
 deflated archives, filename fallbacks, invalid/empty/imageless CBZ input,

@@ -24,7 +24,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::task;
 
-use crate::security::{AuthContext, SecurityAuditEvent, SecurityAuditFilter, SecurityError, SecurityStore};
+use crate::security::{
+    AuthContext, SecurityAuditEvent, SecurityAuditFilter, SecurityError, SecurityStore,
+};
 
 /// Portal Documents review queue.
 pub(crate) const DOCUMENTS_PATH: &str = "/api/v1/documents";
@@ -444,7 +446,9 @@ fn product_label(source: &str) -> String {
 }
 
 fn doc_type(content_type: Option<&str>, name: &str) -> &'static str {
-    let content_type = content_type.map(str::to_ascii_lowercase).unwrap_or_default();
+    let content_type = content_type
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     let extension = std::path::Path::new(name)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -534,7 +538,10 @@ fn relative_time(timestamp: i64, now: i64) -> String {
 // Infrastructure audit shaping (ports PortalInfraAuditService)
 // ---------------------------------------------------------------------------
 
-fn build_infra_audit_log(events: &[SecurityAuditEvent], full_server: bool) -> InfraAuditLogResponse {
+fn build_infra_audit_log(
+    events: &[SecurityAuditEvent],
+    full_server: bool,
+) -> InfraAuditLogResponse {
     let events = events
         .iter()
         .filter(|event| is_infra_relevant(&event.event_type))
@@ -600,10 +607,9 @@ fn infra_event(event: &SecurityAuditEvent) -> InfraAuditEvent {
 }
 
 fn infra_timestamp(timestamp: i64) -> String {
-    DateTime::<Utc>::from_timestamp(timestamp, 0)
-        .map_or_else(String::new, |value| {
-            value.format("%Y-%m-%d %H:%M:%S").to_string()
-        })
+    DateTime::<Utc>::from_timestamp(timestamp, 0).map_or_else(String::new, |value| {
+        value.format("%Y-%m-%d %H:%M:%S").to_string()
+    })
 }
 
 fn category_for(event_type: &str, path: Option<&str>) -> &'static str {
@@ -746,7 +752,10 @@ fn target_for(
     if let Some(file) = first_file_name(data) {
         return file;
     }
-    non_blank(path).map_or_else(|| "Document".to_owned(), |path| infra_pretty_tool(Some(path)))
+    non_blank(path).map_or_else(
+        || "Document".to_owned(),
+        |path| infra_pretty_tool(Some(path)),
+    )
 }
 
 fn status_for(event_type: &str, category: &str, data: &Map<String, Value>) -> &'static str {
@@ -850,12 +859,18 @@ fn java_split_slash(value: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SecurityAuditEvent, build_documents, build_infra_audit_log, category_for,
-        documents_pretty_tool, doc_type, infra_pretty_tool, status_for,
+        SecurityAuditEvent, build_documents, build_infra_audit_log, category_for, doc_type,
+        documents_pretty_tool, infra_pretty_tool, status_for,
     };
     use serde_json::{Map, Value};
 
-    fn event(id: i64, event_type: &str, source: &str, data: &str, timestamp: i64) -> SecurityAuditEvent {
+    fn event(
+        id: i64,
+        event_type: &str,
+        source: &str,
+        data: &str,
+        timestamp: i64,
+    ) -> SecurityAuditEvent {
         SecurityAuditEvent {
             id,
             principal: "alice@example.test".to_owned(),
@@ -883,17 +898,20 @@ mod tests {
             documents_pretty_tool(Some("/api/v1/convert/pdf/word")),
             "Convert PDF to Word"
         );
-        assert_eq!(documents_pretty_tool(Some("/api/v1/security/auto-redact")), "Auto Redact");
+        assert_eq!(
+            documents_pretty_tool(Some("/api/v1/security/auto-redact")),
+            "Auto Redact"
+        );
         assert_eq!(documents_pretty_tool(None), "Processed");
     }
 
     #[test]
     fn infra_tool_label_does_not_expand_convert_and_defaults_to_pdf_operation() {
+        assert_eq!(infra_pretty_tool(Some("/api/v1/convert/pdf/word")), "Word");
         assert_eq!(
-            infra_pretty_tool(Some("/api/v1/convert/pdf/word")),
-            "Word"
+            infra_pretty_tool(Some("/api/v1/misc/merge-pdfs")),
+            "Merge PDFs"
         );
-        assert_eq!(infra_pretty_tool(Some("/api/v1/misc/merge-pdfs")), "Merge PDFs");
         assert_eq!(infra_pretty_tool(Some("   ")), "PDF operation");
     }
 
@@ -913,14 +931,25 @@ mod tests {
             "danger"
         );
         assert_eq!(
-            status_for("PDF_PROCESS", "processing", &data_of("{\"statusCode\":500}")),
+            status_for(
+                "PDF_PROCESS",
+                "processing",
+                &data_of("{\"statusCode\":500}")
+            ),
             "danger"
         );
         assert_eq!(
-            status_for("PDF_PROCESS", "processing", &data_of("{\"statusCode\":422}")),
+            status_for(
+                "PDF_PROCESS",
+                "processing",
+                &data_of("{\"statusCode\":422}")
+            ),
             "warning"
         );
-        assert_eq!(status_for("SETTINGS_CHANGED", "config", &Map::new()), "info");
+        assert_eq!(
+            status_for("SETTINGS_CHANGED", "config", &Map::new()),
+            "info"
+        );
     }
 
     #[test]
@@ -950,7 +979,13 @@ mod tests {
                 "{\"path\":\"/api/v1/misc/compress-pdf\",\"files\":[{\"name\":\"a.pdf\"}],\"statusCode\":200}",
                 now - 20,
             ),
-            event(6, "SETTINGS_CHANGED", "WEB", "{\"path\":\"/api/v1/admin/settings\"}", now - 30),
+            event(
+                6,
+                "SETTINGS_CHANGED",
+                "WEB",
+                "{\"path\":\"/api/v1/admin/settings\"}",
+                now - 30,
+            ),
             event(5, "USER_LOGIN", "WEB", "{}", now - 40),
         ];
         let response = build_infra_audit_log(&events, true);

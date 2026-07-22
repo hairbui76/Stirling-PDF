@@ -33,6 +33,11 @@ pub(crate) fn reviewed_security_app_at_tier(
         backend_url: runtime_config.security_backend_url(),
         audit_enabled: runtime_config.security_audit_enabled(),
         audit_level: runtime_config.security_audit_level(),
+        audit_file_capture: stirling_processing::security_http::SecurityAuditFileCaptureConfig {
+            file_hash: runtime_config.security_audit_capture_file_hash(),
+            pdf_author: runtime_config.security_audit_capture_pdf_author(),
+        },
+        audit_capture_operation_results: runtime_config.security_audit_capture_operation_results(),
         license_tier,
         external_jwt,
     };

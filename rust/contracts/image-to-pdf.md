@@ -35,6 +35,9 @@ emitted as a separate page before processing the next upload.
   a deterministic 128-level threshold.
 - Image streams and masks are Flate-compressed, and the output uses a fresh page
   tree and catalog.
+- The fresh Info dictionary carries Java's default non-Pro `Creator` and
+  `Producer` label (`Stirling-PDF v<version>`) plus parseable creation and
+  modification timestamps.
 
 ## Known boundaries
 
@@ -54,8 +57,8 @@ emitted as a separate page before processing the next upload.
   alpha, as does the legacy conversion into opaque Java buffered-image types.
 - Out-of-schema fit modes return HTTP 400. Java currently creates blank A4 pages
   for an unknown fit string.
-- Application default producer/creator metadata is not yet added to this fresh
-  Rust PDF; metadata normalization remains a cross-route cutover item.
+- Pro custom-metadata substitution, including authenticated `username`
+  expansion in the configured author, remains part of the secured-mode cutover.
 - Server-side asynchronous `fileId` resolution belongs to the later job and
   storage migration slice; this additive route currently accepts `fileInput`
   only.

@@ -465,7 +465,7 @@ fn rotate_image(image: &RgbImage, rotation_deg: f64, gradient: Gradient) -> RgbI
             if sx < 0.0 || sy < 0.0 || sx > f64::from(w - 1) || sy > f64::from(h - 1) {
                 continue;
             }
-            let color = bilinear_sample(src, src_width, w, h, sx, sy);
+            let color = bicubic_sample(src, src_width, w, h, sx, sy);
             let index = (dy * dst_width + dx) * 3;
             buffer[index] = color[0];
             buffer[index + 1] = color[1];
@@ -475,24 +475,34 @@ fn rotate_image(image: &RgbImage, rotation_deg: f64, gradient: Gradient) -> RgbI
     image_from(rot_w, rot_h, buffer)
 }
 
-fn bilinear_sample(src: &[u8], src_width: usize, w: u32, h: u32, sx: f64, sy: f64) -> [u8; 3] {
-    let x0 = sx.floor() as u32;
-    let y0 = sy.floor() as u32;
-    let x1 = (x0 + 1).min(w - 1);
-    let y1 = (y0 + 1).min(h - 1);
-    let fx = sx - f64::from(x0);
-    let fy = sy - f64::from(y0);
+fn bicubic_sample(src: &[u8], src_width: usize, w: u32, h: u32, sx: f64, sy: f64) -> [u8; 3] {
+    let base_x = sx.floor() as i64;
+    let base_y = sy.floor() as i64;
+    let x_weight = sx - base_x as f64;
+    let y_weight = sy - base_y as f64;
     let mut result = [0u8; 3];
-    for c in 0..3 {
-        let p00 = f64::from(src[(y0 as usize * src_width + x0 as usize) * 3 + c]);
-        let p10 = f64::from(src[(y0 as usize * src_width + x1 as usize) * 3 + c]);
-        let p01 = f64::from(src[(y1 as usize * src_width + x0 as usize) * 3 + c]);
-        let p11 = f64::from(src[(y1 as usize * src_width + x1 as usize) * 3 + c]);
-        let top = p00 + (p10 - p00) * fx;
-        let bottom = p01 + (p11 - p01) * fx;
-        result[c] = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
+    for (channel, output) in result.iter_mut().enumerate() {
+        let mut rows = [0.0; 4];
+        for (row_offset, row) in rows.iter_mut().enumerate() {
+            let y = (base_y + row_offset as i64 - 1).clamp(0, i64::from(h) - 1) as usize;
+            let mut samples = [0.0; 4];
+            for (column_offset, sample) in samples.iter_mut().enumerate() {
+                let x = (base_x + column_offset as i64 - 1).clamp(0, i64::from(w) - 1) as usize;
+                *sample = f64::from(src[(y * src_width + x) * 3 + channel]);
+            }
+            *row = cubic_blend(samples, x_weight);
+        }
+        *output = cubic_blend(rows, y_weight).round().clamp(0.0, 255.0) as u8;
     }
     result
+}
+
+fn cubic_blend(samples: [f64; 4], weight: f64) -> f64 {
+    let [p0, p1, p2, p3] = samples;
+    p1 + 0.5
+        * weight
+        * (p2 - p0
+            + weight * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + weight * (3.0 * (p1 - p2) + p3 - p0)))
 }
 
 fn soften_edges(image: &RgbImage, feather: u32, gradient: Gradient) -> RgbImage {
@@ -645,7 +655,7 @@ fn next_gaussian(rng: &mut impl RngExt) -> f64 {
 mod tests {
     use super::{
         Colorspace, Quality, Rotation, ScannerEffectParams, ScannerEffectRequestValues,
-        calculate_safe_resolution,
+        bicubic_sample, calculate_safe_resolution,
     };
 
     #[test]
@@ -694,5 +704,16 @@ mod tests {
         let clamped = calculate_safe_resolution(2000.0, 2000.0, 1200);
         assert!(clamped < 1200);
         assert!(clamped >= 72);
+    }
+
+    #[test]
+    fn bicubic_rotation_sampling_uses_the_four_by_four_neighbourhood() {
+        let mut source = vec![10_u8; 5 * 5 * 3];
+        for channel in 0..3 {
+            source[(2 * 5 + 4) * 3 + channel] = 255;
+        }
+
+        assert_eq!(bicubic_sample(&source, 5, 5, 5, 2.0, 2.0), [10; 3]);
+        assert_eq!(bicubic_sample(&source, 5, 5, 5, 2.5, 2.0), [0; 3]);
     }
 }

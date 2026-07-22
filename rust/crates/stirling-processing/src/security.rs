@@ -9,8 +9,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, RwLock},
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +29,7 @@ use rusqlite::{
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::{io::AsyncReadExt as _, sync::Notify, task};
 use zeroize::Zeroizing;
 
 use crate::integration_config::{IntegrationConfig, IntegrationType, NewIntegrationConfig};
@@ -74,6 +79,16 @@ const MAX_USER_SETTING_KEY_BYTES: usize = 256;
 const MAX_USER_SETTING_VALUE_BYTES: usize = 4 * 1024;
 const MAX_AUDIT_FILTER_VALUES: usize = 32;
 const MAX_AUDIT_EXPORT_EVENTS: usize = 50_000;
+const MAX_AUDIT_FILES: usize = 100;
+const MAX_AUDIT_FILENAME_CHARS: usize = 255;
+const MAX_AUDIT_CONTENT_TYPE_CHARS: usize = 128;
+const MAX_AUDIT_PDF_AUTHOR_CHARS: usize = 512;
+const MAX_AUDIT_FORM_VALUES: usize = 128;
+const MAX_AUDIT_FORM_NAME_CHARS: usize = 128;
+const MAX_AUDIT_FORM_VALUE_CHARS: usize = 2_048;
+const REDACTED_AUDIT_FORM_VALUE: &str = "[REDACTED]";
+const MAX_AUDIT_POLICY_LABEL_CHARS: usize = 200;
+const MAX_AUDIT_POLICY_STEPS: usize = 50;
 
 pub const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -206,6 +221,463 @@ pub struct SecurityAuditEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SecurityAuditFile {
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) content_type: Option<String>,
+    pub(crate) file_hash: Option<String>,
+    pub(crate) pdf_author: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SecurityAuditFileCapture {
+    pub(crate) hash: bool,
+    pub(crate) pdf_author: bool,
+}
+
+impl SecurityAuditFile {
+    fn metadata(name: &str, size: u64, content_type: Option<&str>) -> Option<Self> {
+        Some(Self {
+            name: bounded_audit_filename(name)?,
+            size,
+            content_type: content_type
+                .and_then(|value| bounded_audit_value(value, MAX_AUDIT_CONTENT_TYPE_CHARS)),
+            file_hash: None,
+            pdf_author: None,
+        })
+    }
+
+    pub(crate) async fn from_path(
+        name: &str,
+        size: u64,
+        content_type: Option<&str>,
+        path: &Path,
+        capture: SecurityAuditFileCapture,
+    ) -> Option<Self> {
+        let mut file = Self::metadata(name, size, content_type)?;
+        if capture.hash {
+            file.file_hash = sha256_file(path).await;
+        }
+        if capture.pdf_author && is_pdf_content_type(content_type) {
+            let path = path.to_owned();
+            file.pdf_author = task::spawn_blocking(move || pdf_author_from_path(&path))
+                .await
+                .ok()
+                .flatten();
+        }
+        Some(file)
+    }
+
+    fn from_bytes(
+        name: &str,
+        size: u64,
+        content_type: Option<&str>,
+        bytes: &[u8],
+        capture: SecurityAuditFileCapture,
+    ) -> Option<Self> {
+        let mut file = Self::metadata(name, size, content_type)?;
+        if capture.hash {
+            file.file_hash = Some(lowercase_hex(&Sha256::digest(bytes)));
+        }
+        if capture.pdf_author && is_pdf_content_type(content_type) {
+            file.pdf_author = pdf_author_from_bytes(bytes);
+        }
+        Some(file)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SecurityAuditEnrichment {
+    pub(crate) files: Vec<SecurityAuditFile>,
+    pub(crate) form_params: BTreeMap<String, Vec<String>>,
+    pub(crate) automation: bool,
+    pub(crate) policy_name: Option<String>,
+    pub(crate) policy_steps: Vec<String>,
+}
+
+impl SecurityAuditEnrichment {
+    pub(crate) fn policy_step(
+        policy_name: &str,
+        files: Vec<SecurityAuditFile>,
+        include_files: bool,
+    ) -> Self {
+        Self {
+            files: if include_files { files } else { Vec::new() },
+            form_params: BTreeMap::new(),
+            automation: true,
+            policy_name: bounded_audit_label(policy_name),
+            policy_steps: Vec::new(),
+        }
+    }
+
+    fn merge_into(&self, data: &mut serde_json::Value) {
+        if !self.files.is_empty() {
+            data["files"] = serde_json::Value::Array(
+                self.files
+                    .iter()
+                    .map(|file| {
+                        let mut data = serde_json::json!({
+                            "name": file.name,
+                            "size": file.size,
+                            "type": file.content_type,
+                        });
+                        if let Some(file_hash) = &file.file_hash {
+                            data["fileHash"] = serde_json::Value::String(file_hash.clone());
+                        }
+                        if let Some(pdf_author) = &file.pdf_author {
+                            data["pdfAuthor"] = serde_json::Value::String(pdf_author.clone());
+                        }
+                        data
+                    })
+                    .collect(),
+            );
+        }
+        if !self.form_params.is_empty() {
+            data["formParams"] = serde_json::json!(self.form_params);
+        }
+        if self.automation {
+            data["automation"] = serde_json::Value::Bool(true);
+        }
+        if let Some(policy_name) = &self.policy_name {
+            data["policyName"] = serde_json::Value::String(policy_name.clone());
+        }
+        if !self.policy_steps.is_empty() {
+            data["policySteps"] = serde_json::Value::Array(
+                self.policy_steps
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+    }
+
+    pub(crate) fn record_form_param(&mut self, name: &str, value: &str) {
+        if name == "_csrf" {
+            return;
+        }
+        let sensitive = is_sensitive_audit_form_name(name);
+        let Some(name) = bounded_audit_form_name(name) else {
+            return;
+        };
+        let value_count = self.form_params.values().map(Vec::len).sum::<usize>();
+        if value_count >= MAX_AUDIT_FORM_VALUES {
+            return;
+        }
+        let value = if sensitive {
+            REDACTED_AUDIT_FORM_VALUE.to_owned()
+        } else {
+            bounded_audit_form_value(value)
+        };
+        self.form_params.entry(name).or_default().push(value);
+    }
+}
+
+/// Request-scoped enrichment populated by handlers after multipart parsing.
+///
+/// The security middleware owns the outer request and snapshots this context
+/// after the handler returns. Generic asynchronous jobs defer that snapshot
+/// until their background handler has replayed the persisted body. This mirrors
+/// Java's request attributes without buffering or replaying streamed request
+/// bodies in middleware.
+#[derive(Clone, Debug)]
+pub(crate) struct SecurityAuditContext {
+    enrichment: Arc<Mutex<SecurityAuditEnrichment>>,
+    completion: Arc<SecurityAuditCompletion>,
+    file_capture: SecurityAuditFileCapture,
+    include_standard_data: bool,
+}
+
+#[derive(Debug, Default)]
+struct SecurityAuditCompletion {
+    deferred: AtomicBool,
+    complete: AtomicBool,
+    notify: Notify,
+}
+
+/// Marks a deferred request audit complete even when its worker exits early.
+#[derive(Debug)]
+pub(crate) struct SecurityAuditCompletionGuard {
+    context: SecurityAuditContext,
+}
+
+impl Drop for SecurityAuditCompletionGuard {
+    fn drop(&mut self) {
+        self.context.complete_deferred();
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_SECURITY_AUDIT_CONTEXT: SecurityAuditContext;
+}
+
+impl Default for SecurityAuditContext {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl SecurityAuditContext {
+    pub(crate) fn new(include_files: bool) -> Self {
+        Self::with_file_capture(include_files, SecurityAuditFileCapture::default())
+    }
+
+    pub(crate) fn with_file_capture(
+        include_files: bool,
+        file_capture: SecurityAuditFileCapture,
+    ) -> Self {
+        Self {
+            enrichment: Arc::new(Mutex::new(SecurityAuditEnrichment::default())),
+            completion: Arc::new(SecurityAuditCompletion::default()),
+            file_capture,
+            include_standard_data: include_files,
+        }
+    }
+
+    pub(crate) async fn scope<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        CURRENT_SECURITY_AUDIT_CONTEXT
+            .scope(self.clone(), future)
+            .await
+    }
+
+    pub(crate) async fn record_current_file_path(
+        name: &str,
+        size: u64,
+        content_type: Option<&str>,
+        path: &Path,
+    ) {
+        let Ok(context) = CURRENT_SECURITY_AUDIT_CONTEXT.try_with(Clone::clone) else {
+            return;
+        };
+        if !context.can_record_file() {
+            return;
+        }
+        if let Some(file) =
+            SecurityAuditFile::from_path(name, size, content_type, path, context.file_capture).await
+        {
+            context.push_file(file);
+        }
+    }
+
+    pub(crate) fn record_current_file_bytes(
+        name: &str,
+        size: u64,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) {
+        let _ = CURRENT_SECURITY_AUDIT_CONTEXT.try_with(|context| {
+            if !context.can_record_file() {
+                return;
+            }
+            if let Some(file) =
+                SecurityAuditFile::from_bytes(name, size, content_type, bytes, context.file_capture)
+            {
+                context.push_file(file);
+            }
+        });
+    }
+
+    pub(crate) fn record_current_form_param(name: &str, value: &str) {
+        let _ = CURRENT_SECURITY_AUDIT_CONTEXT
+            .try_with(|context| context.record_form_param(name, value));
+    }
+
+    /// Defers the middleware snapshot until the returned worker guard drops.
+    ///
+    /// Generic asynchronous requests return a job identifier before their
+    /// replayed multipart body reaches the handler. Sharing this context with
+    /// that worker preserves streamed file enrichment without another body
+    /// pass in the submission request.
+    pub(crate) fn defer(&self) -> SecurityAuditCompletionGuard {
+        self.completion.deferred.store(true, Ordering::Release);
+        SecurityAuditCompletionGuard {
+            context: self.clone(),
+        }
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.completion.deferred.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_deferred_completion(&self) {
+        while !self.completion.complete.load(Ordering::Acquire) {
+            let notified = self.completion.notify.notified();
+            if self.completion.complete.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    fn complete_deferred(&self) {
+        self.completion.complete.store(true, Ordering::Release);
+        self.completion.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn record_file(&self, name: &str, size: u64, content_type: Option<&str>) {
+        let Some(file) = SecurityAuditFile::metadata(name, size, content_type) else {
+            return;
+        };
+        self.push_file(file);
+    }
+
+    fn can_record_file(&self) -> bool {
+        self.include_standard_data
+            && self
+                .enrichment
+                .lock()
+                .is_ok_and(|enrichment| enrichment.files.len() < MAX_AUDIT_FILES)
+    }
+
+    fn push_file(&self, file: SecurityAuditFile) {
+        if !self.include_standard_data {
+            return;
+        }
+        let Ok(mut enrichment) = self.enrichment.lock() else {
+            return;
+        };
+        if enrichment.files.len() >= MAX_AUDIT_FILES {
+            return;
+        }
+        enrichment.files.push(file);
+    }
+
+    fn record_form_param(&self, name: &str, value: &str) {
+        if !self.include_standard_data {
+            return;
+        }
+        let Ok(mut enrichment) = self.enrichment.lock() else {
+            return;
+        };
+        enrichment.record_form_param(name, value);
+    }
+
+    pub(crate) fn set_policy(&self, name: &str, steps: impl IntoIterator<Item = String>) {
+        let Ok(mut enrichment) = self.enrichment.lock() else {
+            return;
+        };
+        enrichment.policy_name = bounded_audit_label(name);
+        enrichment.policy_steps = steps
+            .into_iter()
+            .take(MAX_AUDIT_POLICY_STEPS)
+            .filter_map(|step| bounded_audit_label(&step))
+            .collect();
+    }
+
+    pub(crate) fn snapshot(&self) -> SecurityAuditEnrichment {
+        self.enrichment
+            .lock()
+            .map(|enrichment| enrichment.clone())
+            .unwrap_or_default()
+    }
+}
+
+async fn sha256_file(path: &Path) -> Option<String> {
+    let mut input = tokio::fs::File::open(path).await.ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = input.read(&mut buffer).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(lowercase_hex(&digest.finalize()))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn is_pdf_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/pdf"))
+}
+
+fn pdf_author_from_path(path: &Path) -> Option<String> {
+    let document = lopdf::Document::load(path).ok()?;
+    pdf_author(&document)
+}
+
+fn pdf_author_from_bytes(bytes: &[u8]) -> Option<String> {
+    let document = lopdf::Document::load_mem(bytes).ok()?;
+    pdf_author(&document)
+}
+
+fn pdf_author(document: &lopdf::Document) -> Option<String> {
+    let info = document.trailer.get(b"Info").ok()?;
+    let (_, info) = document.dereference(info).ok()?;
+    let author = info.as_dict().ok()?.get(b"Author").ok()?;
+    let (_, author) = document.dereference(author).ok()?;
+    let author = lopdf::decode_text_string(author).ok()?;
+    bounded_audit_value(&author, MAX_AUDIT_PDF_AUTHOR_CHARS)
+}
+
+fn bounded_audit_filename(value: &str) -> Option<String> {
+    let filename = value.rsplit(['/', '\\']).next().unwrap_or(value);
+    bounded_audit_value(filename, MAX_AUDIT_FILENAME_CHARS)
+}
+
+fn bounded_audit_form_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(MAX_AUDIT_FORM_NAME_CHARS).collect())
+}
+
+fn bounded_audit_form_value(value: &str) -> String {
+    value.chars().take(MAX_AUDIT_FORM_VALUE_CHARS).collect()
+}
+
+fn is_sensitive_audit_form_name(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "password",
+        "passwd",
+        "passphrase",
+        "secret",
+        "token",
+        "apikey",
+        "privatekey",
+        "credential",
+        "authorization",
+        "cookie",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+        || normalized == "pin"
+        || normalized.ends_with("pincode")
+        || normalized.ends_with("pin")
+}
+
+fn bounded_audit_value(value: &str, limit: usize) -> Option<String> {
+    let value = value.replace(['\r', '\n'], " ");
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(limit).collect())
+}
+
+fn bounded_audit_label(value: &str) -> Option<String> {
+    bounded_audit_value(value, MAX_AUDIT_POLICY_LABEL_CHARS)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecurityAuditPage {
     pub events: Vec<SecurityAuditEvent>,
     pub total_events: usize,
@@ -214,6 +686,7 @@ pub struct SecurityAuditPage {
 #[derive(Clone, Debug)]
 pub(crate) struct SecurityHttpAuditRecord {
     pub context: Option<AuthContext>,
+    pub client_ip: Option<String>,
     pub correlation_id: String,
     pub source: String,
     pub event_type: String,
@@ -223,6 +696,8 @@ pub(crate) struct SecurityHttpAuditRecord {
     pub latency_ms: u64,
     pub include_standard_data: bool,
     pub annotated: bool,
+    pub result: Option<String>,
+    pub enrichment: SecurityAuditEnrichment,
     pub created_at: i64,
     pub timestamp: String,
 }
@@ -2296,13 +2771,12 @@ impl SecurityStore {
 
     /// Inserts a fully specified audit event, returning its new id.
     ///
-    /// The standard recorders (`record_audit`, `record_http_audit`) synthesize a
-    /// fixed request-shaped payload. Audit-derived portal surfaces additionally
-    /// read `files`, `automation`, `policyName`, and `policySteps` keys that the
-    /// recorders never write; this seam persists events carrying those keys so
-    /// those surfaces (and their tests) can be exercised against representative
-    /// data. The `path` and `outcome` columns are derived from the supplied
-    /// `data` document when present, so a later read reconstructs the payload.
+    /// The standard recorders synthesize request-shaped payloads and the policy
+    /// boundary additionally supplies live `files`, `automation`, `policyName`,
+    /// and `policySteps` enrichment. This seam remains useful for importing or
+    /// testing other representative event shapes. The `path` and `outcome`
+    /// columns are derived from the supplied `data` document when present, so a
+    /// later read reconstructs the payload.
     ///
     /// # Errors
     ///
@@ -2321,8 +2795,8 @@ impl SecurityStore {
                 return Err(SecurityError::InvalidInput);
             }
         }
-        let parsed =
-            serde_json::from_str::<serde_json::Value>(data).map_err(|_| SecurityError::InvalidInput)?;
+        let parsed = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(|_| SecurityError::InvalidInput)?;
         let (path, outcome) = parsed.as_object().map_or_else(
             || (String::new(), String::new()),
             |object| {
@@ -2349,7 +2823,9 @@ impl SecurityStore {
              (user_id, principal, source, data, session_id, correlation_id,
               event_type, path, outcome, created_at)
              VALUES (NULL, ?1, ?2, ?3, '', '', ?4, ?5, ?6, ?7)",
-            params![principal, source, data, event_type, path, outcome, created_at],
+            params![
+                principal, source, data, event_type, path, outcome, created_at
+            ],
         )?;
         Ok(connection.last_insert_rowid())
     }
@@ -2405,6 +2881,12 @@ impl SecurityStore {
             "path": record.path.as_str(),
         });
         data[outcome_key] = serde_json::Value::String("success".to_owned());
+        if let Some(client_ip) = &record.client_ip {
+            if client_ip.len() > MAX_AUDIT_VALUE_BYTES {
+                return Err(SecurityError::InvalidInput);
+            }
+            data["__ipAddress"] = serde_json::Value::String(client_ip.clone());
+        }
         if record.include_standard_data {
             data["sessionId"] = if session_id.is_empty() {
                 serde_json::Value::Null
@@ -2414,7 +2896,14 @@ impl SecurityStore {
             data["requestId"] = serde_json::Value::String(record.correlation_id.clone());
             data["latencyMs"] = serde_json::Value::from(record.latency_ms);
             data["statusCode"] = serde_json::Value::from(record.status_code);
+            if let Some(client_ip) = &record.client_ip {
+                data["clientIp"] = serde_json::Value::String(client_ip.clone());
+            }
         }
+        if let Some(result) = &record.result {
+            data["result"] = serde_json::Value::String(result.clone());
+        }
+        record.enrichment.merge_into(&mut data);
         let data = serde_json::to_string(&data).map_err(|_| SecurityError::InvalidInput)?;
         let connection = self.lock()?;
         connection.execute(
@@ -5437,8 +5926,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityAuditFilter, SecurityError, SecurityStore,
-        initialize_connection,
+        DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, MAX_AUDIT_FILES, MAX_AUDIT_FORM_VALUE_CHARS,
+        REDACTED_AUDIT_FORM_VALUE, SecurityAuditContext, SecurityAuditFilter, SecurityError,
+        SecurityStore, initialize_connection,
     };
     use crate::integration_config::{IntegrationType, NewIntegrationConfig};
     use crate::resource_access::{
@@ -5447,6 +5937,53 @@ mod tests {
     use crate::security_crypto::totp_code_at;
     use crate::security_jwt::VerifiedSupabaseIdentity;
     use rusqlite::Connection;
+
+    #[test]
+    fn audit_file_enrichment_is_opt_in_sanitized_and_bounded() {
+        let basic = SecurityAuditContext::new(false);
+        basic.record_file("ignored.pdf", 1, Some("application/pdf"));
+        basic.record_form_param("angle", "90");
+        assert!(basic.snapshot().files.is_empty());
+        assert!(basic.snapshot().form_params.is_empty());
+
+        let standard = SecurityAuditContext::new(true);
+        standard.record_file(
+            "../folder\\invoice\r\n.pdf",
+            42,
+            Some(" application/pdf\r\nignored "),
+        );
+        for index in 0..MAX_AUDIT_FILES {
+            standard.record_file(&format!("document-{index}.pdf"), 1, None);
+        }
+        standard.record_form_param("angle", "90");
+        standard.record_form_param("angle", "180");
+        standard.record_form_param("_csrf", "must-not-appear");
+        standard.record_form_param("private-key-password", "must-not-appear");
+        standard.record_form_param("spineLocation", "RIGHT");
+        standard.record_form_param("empty", "");
+        standard.record_form_param("bounded", &"x".repeat(MAX_AUDIT_FORM_VALUE_CHARS + 1));
+
+        let enrichment = standard.snapshot();
+        assert_eq!(enrichment.files.len(), MAX_AUDIT_FILES);
+        assert_eq!(enrichment.files[0].name, "invoice  .pdf");
+        assert_eq!(enrichment.files[0].size, 42);
+        assert_eq!(
+            enrichment.files[0].content_type.as_deref(),
+            Some("application/pdf  ignored")
+        );
+        assert_eq!(enrichment.form_params["angle"], ["90", "180"]);
+        assert!(!enrichment.form_params.contains_key("_csrf"));
+        assert_eq!(
+            enrichment.form_params["private-key-password"],
+            [REDACTED_AUDIT_FORM_VALUE]
+        );
+        assert_eq!(enrichment.form_params["spineLocation"], ["RIGHT"]);
+        assert_eq!(enrichment.form_params["empty"], [""]);
+        assert_eq!(
+            enrichment.form_params["bounded"][0].len(),
+            MAX_AUDIT_FORM_VALUE_CHARS
+        );
+    }
 
     #[test]
     fn bootstraps_bcrypt_admin_and_persists_lockout() -> Result<(), Box<dyn std::error::Error>> {

@@ -66,6 +66,7 @@ pub mod pdf_poster;
 pub mod pdf_rearrange;
 pub mod pdf_redaction;
 pub mod pdf_remove;
+mod pdf_repair;
 pub mod pdf_replace_invert_color;
 pub mod pdf_rotate;
 pub mod pdf_sanitize;
@@ -102,6 +103,7 @@ mod policy_s3;
 mod policy_sources;
 mod policy_triggers;
 mod portal_audit;
+mod process_executor;
 mod resource_access;
 pub mod runtime_config;
 mod runtime_dependencies;
@@ -119,6 +121,7 @@ mod smtp_mail;
 mod storage;
 mod storage_http;
 pub mod svg_to_pdf;
+mod tessdata;
 mod tessdata_admin;
 pub mod ui_data;
 pub mod url_to_pdf;
@@ -190,7 +193,7 @@ use crate::{
     mobile_scanner::{
         FileMetadata as MobileScannerFileMetadata, MobileScannerError, MobileScannerService,
     },
-    ocr_pdf::{OcrError, OcrOptions, OcrOutput, run_ocr},
+    ocr_pdf::{OcrError, OcrOptions, OcrOutput, OcrProcessControls, OcrRuntime, run_ocr},
     office_to_pdf::{
         OfficeToPdfError, PdfToOfficeOutput, convert_office_to_pdf, convert_pdf_to_office,
     },
@@ -210,7 +213,7 @@ use crate::{
     pdf_crop::{CropError, CropOptions, crop_pdf_to_file},
     pdf_document_ops::{
         DocumentOperationError, decompress_pdf_to_file, remove_cert_sign_to_file,
-        remove_images_to_file, repair_pdf_to_file, unlock_pdf_forms_to_file,
+        remove_images_to_file, unlock_pdf_forms_to_file,
     },
     pdf_edit_text::{PdfTextEditError, TextEdit, TextEditOptions, edit_pdf_text_to_file},
     pdf_extract_images::{ExtractImagesError, extract_images_to_zip},
@@ -256,6 +259,7 @@ use crate::{
         redact_pdf_to_raster_file,
     },
     pdf_remove::{RemovePagesError, remove_pdf_pages_to_file},
+    pdf_repair::{RepairError, RepairRuntime},
     pdf_replace_invert_color::{
         HighContrastColorCombination, ReplaceAndInvert, ReplaceInvertError, ReplaceInvertOptions,
         replace_invert_color_to_file,
@@ -295,11 +299,11 @@ use crate::{
         PdfiumAutoCropError, PdfiumAutoSplitError, PdfiumMergeError, PdfiumRemoveError,
         PdfiumRotateError, PdfiumToImageError,
     },
-    pipeline::{PIPELINE_PATH, PipelineDispatcher},
+    pipeline::{PIPELINE_PATH, PipelineDispatcher, PolicyAuditRecorder},
     pipeline_directory::PipelineDirectoryWatcher,
     runtime_config::RuntimeConfig,
     runtime_metrics::{RuntimeMetrics, application_version},
-    security::{AuthContext, SecurityStore},
+    security::{AuthContext, SecurityAuditContext, SecurityStore},
     security_http::{
         SecurityHttpConfig, SecurityStartupError, initialize_security_store,
         secure_router_with_mail,
@@ -1374,6 +1378,10 @@ impl ProcessingRuntime {
             .enabled
             .then(|| Arc::new(smtp_mail::SmtpMailService::new(smtp_mail_config)));
         let policies_enabled = runtime_config.policies_enabled();
+        let ocr_process_controls = Arc::new(OcrProcessControls::new(
+            runtime_config.ocr_process_settings(),
+        ));
+        let repair_runtime = Arc::new(RepairRuntime::from_runtime_config(&runtime_config));
         let classification_service = Arc::new(classification::ClassificationService::new(
             runtime_config.classification_database_path(),
             policies_enabled,
@@ -1408,6 +1416,8 @@ impl ProcessingRuntime {
             ))
             .layer(middleware::from_fn(enforce_endpoint_availability))
             .layer(Extension(Arc::clone(&runtime_config)))
+            .layer(Extension(Arc::clone(&ocr_process_controls)))
+            .layer(Extension(Arc::clone(&repair_runtime)))
             .layer(Extension(Arc::clone(&ai_comment_engine_settings)))
             .layer(Extension(Arc::clone(&runtime_metrics)))
             .layer(Extension(Arc::clone(&job_manager)))
@@ -1435,6 +1445,8 @@ impl ProcessingRuntime {
         ))
         .layer(middleware::from_fn(enforce_endpoint_availability))
         .layer(Extension(runtime_config))
+        .layer(Extension(ocr_process_controls))
+        .layer(Extension(repair_runtime))
         .layer(Extension(ai_comment_engine_settings))
         .layer(Extension(Arc::clone(&runtime_metrics)))
         .layer(Extension(Arc::clone(&job_manager)))
@@ -1551,14 +1563,15 @@ impl ProcessingRuntime {
             storage::StorageService::open(storage_configuration)
                 .map_err(|error| SecurityStartupError::Storage(Box::new(error)))?,
         );
-        let workflow_secret_cipher = crate::security_crypto::ProtectedSecretCipher::from_config_or_file(
-            storage_bootstrap
-                .credential_encryption_key
-                .as_ref()
-                .map(|key| key.as_str()),
-            &storage_bootstrap.credential_encryption_key_path,
-        )
-        .map_err(|error| SecurityStartupError::WorkflowSigning(Box::new(error)))?;
+        let workflow_secret_cipher =
+            crate::security_crypto::ProtectedSecretCipher::from_config_or_file(
+                storage_bootstrap
+                    .credential_encryption_key
+                    .as_ref()
+                    .map(|key| key.as_str()),
+                &storage_bootstrap.credential_encryption_key_path,
+            )
+            .map_err(|error| SecurityStartupError::WorkflowSigning(Box::new(error)))?;
         let workflow_signing_service = Arc::new(
             workflow_signing::WorkflowSigningService::open(
                 &workflow_signing_configuration,
@@ -1591,14 +1604,31 @@ impl ProcessingRuntime {
             .layer(Extension(Arc::clone(&storage_service)))
             .layer(Extension(Arc::clone(&workflow_signing_service)))
             .layer(Extension(initialized_license.state));
+        let policy_audit = (security_http_config.audit_enabled
+            && security_http_config.license_tier
+                == crate::security_policy::LicenseTier::Enterprise
+            && security_http_config.audit_level >= 1)
+            .then(|| {
+                PolicyAuditRecorder::new(
+                    Arc::clone(&security_store),
+                    security_http_config.audit_level >= 2,
+                )
+                .with_file_capture(crate::security::SecurityAuditFileCapture {
+                    hash: security_http_config.audit_file_capture.file_hash,
+                    pdf_author: security_http_config.audit_file_capture.pdf_author,
+                })
+            });
         attach_policy_routes(
             &mut runtime,
             policy_service,
             processed_ledger,
-            policy_source_readiness,
-            policy_trigger_settings,
-            policy_stream_timeout,
-            max_upload_bytes,
+            PolicyRouteSettings {
+                audit: policy_audit,
+                readiness: policy_source_readiness,
+                trigger: policy_trigger_settings,
+                stream_timeout: policy_stream_timeout,
+                max_upload_bytes,
+            },
         );
         runtime.router = secure_router_with_mail(
             runtime.router,
@@ -1707,19 +1737,29 @@ fn reviewed_security_http_config(
         backend_url: runtime_config.security_backend_url(),
         audit_enabled: runtime_config.security_audit_enabled(),
         audit_level: runtime_config.security_audit_level(),
+        audit_file_capture: crate::security_http::SecurityAuditFileCaptureConfig {
+            file_hash: runtime_config.security_audit_capture_file_hash(),
+            pdf_author: runtime_config.security_audit_capture_pdf_author(),
+        },
+        audit_capture_operation_results: runtime_config.security_audit_capture_operation_results(),
         license_tier: verified_license.tier,
         external_jwt,
     })
+}
+
+struct PolicyRouteSettings {
+    audit: Option<PolicyAuditRecorder>,
+    readiness: runtime_config::FileReadinessConfig,
+    trigger: runtime_config::PolicyTriggerSettings,
+    stream_timeout: Duration,
+    max_upload_bytes: usize,
 }
 
 fn attach_policy_routes(
     runtime: &mut ProcessingRuntime,
     policy_service: Option<Arc<policy_config::PolicyConfigService>>,
     processed_ledger: Option<Arc<policy_ledger::ProcessedLedger>>,
-    readiness: runtime_config::FileReadinessConfig,
-    trigger_settings: runtime_config::PolicyTriggerSettings,
-    stream_timeout: Duration,
-    max_upload_bytes: usize,
+    settings: PolicyRouteSettings,
 ) {
     let (Some(policy_service), Some(processed_ledger)) = (policy_service, processed_ledger) else {
         return;
@@ -1736,19 +1776,20 @@ fn attach_policy_routes(
         Arc::clone(&runtime.job_manager),
         Arc::clone(&runtime.job_queue),
         output_service,
+        settings.audit,
     ));
     let source_runner = Arc::new(policy_sources::PolicySourceRunner::new(
         Arc::clone(&policy_service),
         Arc::clone(&execution_service),
         Arc::clone(&processed_ledger),
-        readiness,
+        settings.readiness,
         s3,
     ));
     let trigger_notifier = policy_triggers::PolicyChangeNotifier::default();
     runtime.policy_trigger_runtime = Some(policy_triggers::PolicyTriggerRuntime::new(
         Arc::clone(&policy_service),
         Arc::clone(&source_runner),
-        trigger_settings,
+        settings.trigger,
         trigger_notifier.clone(),
     ));
     runtime.router = runtime.router.clone().merge(
@@ -1758,9 +1799,9 @@ fn attach_policy_routes(
             source_runner,
             processed_ledger,
             trigger_notifier,
-            stream_timeout,
+            settings.stream_timeout,
         )
-        .layer(DefaultBodyLimit::max(max_upload_bytes)),
+        .layer(DefaultBodyLimit::max(settings.max_upload_bytes)),
     );
 }
 
@@ -2308,35 +2349,45 @@ fn spawn_async_job(
     request: Request,
     next: Next,
 ) {
+    let audit_context = request.extensions().get::<SecurityAuditContext>().cloned();
+    let audit_completion = audit_context.as_ref().map(SecurityAuditContext::defer);
     tokio::spawn(async move {
-        let lease = match admission.wait().await {
-            Ok(lease) => lease,
-            Err(JobQueueError::Cancelled) => return,
-            Err(error) => {
-                let _ = job_manager.fail(&worker_job_id, error.to_string());
-                return;
+        let worker = async move {
+            let lease = match admission.wait().await {
+                Ok(lease) => lease,
+                Err(JobQueueError::Cancelled) => return,
+                Err(error) => {
+                    let _ = job_manager.fail(&worker_job_id, error.to_string());
+                    return;
+                }
+            };
+            if lease.waited_over_limit() {
+                let _ = job_manager.update_progress(
+                    &worker_job_id,
+                    1,
+                    "queued-timeout",
+                    "Job exceeded the configured queue wait target and is starting now",
+                );
             }
-        };
-        if lease.waited_over_limit() {
+            let _lease = lease;
             let _ = job_manager.update_progress(
                 &worker_job_id,
-                1,
-                "queued-timeout",
-                "Job exceeded the configured queue wait target and is starting now",
+                5,
+                "processing",
+                "Processing asynchronous request",
             );
-        }
-        let _lease = lease;
-        let _ = job_manager.update_progress(
-            &worker_job_id,
-            5,
-            "processing",
-            "Processing asynchronous request",
-        );
-        let response = next.run(request).await;
-        if let Err(error) =
-            persist_async_job_response(&job_manager, &worker_job_id, &directory, response).await
-        {
-            let _ = job_manager.fail(&worker_job_id, error);
+            let response = next.run(request).await;
+            if let Err(error) =
+                persist_async_job_response(&job_manager, &worker_job_id, &directory, response).await
+            {
+                let _ = job_manager.fail(&worker_job_id, error);
+            }
+        };
+        let _audit_completion = audit_completion;
+        if let Some(audit_context) = audit_context {
+            audit_context.scope(worker).await;
+        } else {
+            worker.await;
         }
     });
 }
@@ -2872,6 +2923,13 @@ async fn mobile_scanner_upload(
             return ApiError::internal_at(MOBILE_SCANNER_UPLOAD_PATH, error.to_string())
                 .into_response();
         }
+        SecurityAuditContext::record_current_file_path(
+            &filename,
+            size,
+            content_type.as_deref(),
+            &path,
+        )
+        .await;
         if size == 0 {
             let _ = tokio::fs::remove_file(&path).await;
             continue;
@@ -3323,6 +3381,7 @@ async fn read_analytics_enabled(request: Request) -> Result<bool, ApiError> {
                     format!("could not read settings form: {error}"),
                 )
             })?;
+        record_urlencoded_form_params(&bytes);
         read_urlencoded_field(&bytes, "enabled").ok_or_else(|| {
             ApiError::bad_request_at(
                 SETTINGS_UPDATE_ANALYTICS_PATH,
@@ -3368,12 +3427,29 @@ async fn read_analytics_enabled_multipart(request: Request) -> Result<String, Ap
         if field.name() != Some("enabled") {
             continue;
         }
-        return field.text().await.map_err(|error| {
+        let value = field.text().await.map_err(|error| {
             ApiError::bad_request_at(
                 SETTINGS_UPDATE_ANALYTICS_PATH,
                 format!("could not read enabled parameter: {error}"),
             )
-        });
+        })?;
+        SecurityAuditContext::record_current_form_param("enabled", &value);
+        return Ok(value);
+    }
+}
+
+fn record_urlencoded_form_params(bytes: &[u8]) {
+    let Ok(form) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    for pair in form.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let (Ok(key), Ok(value)) = (urlencoding::decode(key), urlencoding::decode(value)) else {
+            continue;
+        };
+        SecurityAuditContext::record_current_form_param(&key, &value);
     }
 }
 
@@ -5022,21 +5098,33 @@ async fn markdown_to_pdf(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
-async fn ocr_pdf(multipart: Multipart) -> Result<Response, ApiError> {
+async fn ocr_pdf(
+    Extension(runtime_config): Extension<Arc<RuntimeConfig>>,
+    Extension(process_controls): Extension<Arc<OcrProcessControls>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
     let request = read_ocr_request(multipart).await?;
     let input_path = request.file.path;
     let filename = request.file.filename;
     let options = request.options;
+    let ocr_runtime = OcrRuntime {
+        ocrmypdf_enabled: runtime_config.is_group_enabled("OCRmyPDF"),
+        tesseract_enabled: runtime_config.is_group_enabled("tesseract"),
+        tessdata_dir: runtime_config.tessdata_dir(),
+        render_dpi: runtime_config.max_render_dpi(),
+        ocrmypdf_commands: None,
+        tesseract_commands: None,
+        process_controls,
+    };
     let temp_dir = request.temp_dir;
     let output_path = temp_dir.path().join("ocr-output");
     let blocking_output_path = output_path.clone();
-    let output =
-        task::spawn_blocking(move || run_ocr(&input_path, &blocking_output_path, &options))
-            .await
-            .map_err(|error| {
-                ApiError::internal_at(OCR_PDF_PATH, format!("OCR task failed: {error}"))
-            })?
-            .map_err(|error| map_ocr_error(&error))?;
+    let output = task::spawn_blocking(move || {
+        run_ocr(&input_path, &blocking_output_path, &options, &ocr_runtime)
+    })
+    .await
+    .map_err(|error| ApiError::internal_at(OCR_PDF_PATH, format!("OCR task failed: {error}")))?
+    .map_err(|error| map_ocr_error(&error))?;
     let (output_filename, content_type) = match output {
         OcrOutput::Pdf => (suffixed_filename(&filename, "_OCR.pdf"), "application/pdf"),
         OcrOutput::Zip => (
@@ -7033,13 +7121,29 @@ async fn decompress_pdf(multipart: Multipart) -> Result<Response, ApiError> {
     .await
 }
 
-async fn repair_pdf(multipart: Multipart) -> Result<Response, ApiError> {
-    run_document_operation(
-        multipart,
+async fn repair_pdf(
+    Extension(runtime): Extension<Arc<RepairRuntime>>,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let request = read_single_pdf_request(multipart, REPAIR_PDF_PATH).await?;
+    let output_filename = suffixed_filename(&request.file.filename, "_repaired.pdf");
+    let input_path = request.file.path;
+    let filename = request.file.filename;
+    let temp_dir = request.temp_dir;
+    let output_path = temp_dir.path().join("repaired.pdf");
+    let blocking_output_path = output_path.clone();
+    task::spawn_blocking(move || runtime.repair(&input_path, &filename, &blocking_output_path))
+        .await
+        .map_err(|error| {
+            ApiError::internal_at(REPAIR_PDF_PATH, format!("PDF repair task failed: {error}"))
+        })?
+        .map_err(map_repair_error)?;
+    file_response(
+        output_path,
+        temp_dir,
+        &output_filename,
         REPAIR_PDF_PATH,
-        "_repaired.pdf",
-        "repaired.pdf",
-        repair_pdf_to_file,
+        "application/pdf",
     )
     .await
 }
@@ -10633,9 +10737,7 @@ async fn read_ocr_request(mut multipart: Multipart) -> Result<UploadedOcrRequest
             }
             "languages" => {
                 let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
-                if !value.trim().is_empty() {
-                    languages.push(value.trim().to_owned());
-                }
+                languages.push(value);
             }
             "sidecar" => {
                 sidecar = parse_bool_at(
@@ -10663,15 +10765,11 @@ async fn read_ocr_request(mut multipart: Multipart) -> Result<UploadedOcrRequest
             }
             "ocrType" => {
                 let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
-                if !value.trim().is_empty() {
-                    ocr_type = Some(value.trim().to_owned());
-                }
+                ocr_type = Some(value);
             }
             "ocrRenderType" => {
                 let value = read_form_value(&mut field, OCR_PDF_PATH).await?;
-                if !value.trim().is_empty() {
-                    value.trim().clone_into(&mut ocr_render_type);
-                }
+                value.clone_into(&mut ocr_render_type);
             }
             "removeImagesAfter" => {
                 remove_images_after = parse_bool_at(
@@ -12034,6 +12132,8 @@ async fn write_field_to_file_bounded(
     api_path: &'static str,
     limit: usize,
 ) -> Result<(), ApiError> {
+    let audit_filename = safe_filename(field.file_name());
+    let audit_content_type = field.content_type().map(ToOwned::to_owned);
     let mut output = File::create(path)
         .await
         .map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
@@ -12058,7 +12158,15 @@ async fn write_field_to_file_bounded(
     output
         .flush()
         .await
-        .map_err(|error| ApiError::internal_at(api_path, error.to_string()))
+        .map_err(|error| ApiError::internal_at(api_path, error.to_string()))?;
+    SecurityAuditContext::record_current_file_path(
+        &audit_filename,
+        u64::try_from(written).unwrap_or(u64::MAX),
+        audit_content_type.as_deref(),
+        path,
+    )
+    .await;
+    Ok(())
 }
 
 async fn read_form_value(
@@ -12073,6 +12181,7 @@ async fn read_form_value_bounded(
     api_path: &'static str,
     limit: usize,
 ) -> Result<String, ApiError> {
+    let audit_name = field.name().map(ToOwned::to_owned);
     let mut value = Vec::new();
     while let Some(chunk) = field
         .chunk()
@@ -12087,8 +12196,12 @@ async fn read_form_value_bounded(
         }
         value.extend_from_slice(&chunk);
     }
-    String::from_utf8(value)
-        .map_err(|_| ApiError::bad_request_at(api_path, "multipart form value is not UTF-8"))
+    let value = String::from_utf8(value)
+        .map_err(|_| ApiError::bad_request_at(api_path, "multipart form value is not UTF-8"))?;
+    if let Some(name) = audit_name {
+        SecurityAuditContext::record_current_form_param(&name, &value);
+    }
+    Ok(value)
 }
 
 async fn read_field_bytes(
@@ -12103,6 +12216,9 @@ async fn read_field_bytes_bounded(
     api_path: &'static str,
     limit: usize,
 ) -> Result<Vec<u8>, ApiError> {
+    let audit_filename = field.file_name().map(|name| safe_filename(Some(name)));
+    let audit_name = field.name().map(ToOwned::to_owned);
+    let audit_content_type = field.content_type().map(ToOwned::to_owned);
     let mut value = Vec::new();
     while let Some(chunk) = field
         .chunk()
@@ -12117,6 +12233,16 @@ async fn read_field_bytes_bounded(
         }
         value.extend_from_slice(&chunk);
     }
+    if let Some(filename) = audit_filename {
+        SecurityAuditContext::record_current_file_bytes(
+            &filename,
+            u64::try_from(value.len()).unwrap_or(u64::MAX),
+            audit_content_type.as_deref(),
+            &value,
+        );
+    } else if let (Some(name), Ok(value)) = (audit_name, std::str::from_utf8(&value)) {
+        SecurityAuditContext::record_current_form_param(&name, value);
+    }
     Ok(value)
 }
 
@@ -12124,12 +12250,25 @@ async fn drain_field(
     field: &mut axum::extract::multipart::Field<'_>,
     api_path: &'static str,
 ) -> Result<(), ApiError> {
-    while field
+    let audit_name = if field.file_name().is_none() {
+        field.name().map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    let mut audit_value = Vec::new();
+    while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|error| ApiError::bad_request_at(api_path, error.body_text()))?
-        .is_some()
-    {}
+    {
+        if audit_value.len() < FORM_VALUE_LIMIT_BYTES {
+            let remaining = FORM_VALUE_LIMIT_BYTES - audit_value.len();
+            audit_value.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+    }
+    if let (Some(name), Ok(value)) = (audit_name, std::str::from_utf8(&audit_value)) {
+        SecurityAuditContext::record_current_form_param(&name, value);
+    }
     Ok(())
 }
 
@@ -12501,6 +12640,15 @@ fn map_document_operation_error(
         DocumentOperationError::Pdf(_)
         | DocumentOperationError::Regex(_)
         | DocumentOperationError::Write(_) => ApiError::internal_at(api_path, error.to_string()),
+    }
+}
+
+fn map_repair_error(error: RepairError) -> ApiError {
+    match error {
+        RepairError::InProcess(error) => map_document_operation_error(&error, REPAIR_PDF_PATH),
+        RepairError::ExternalTools { .. } => {
+            ApiError::internal_at(REPAIR_PDF_PATH, error.to_string())
+        }
     }
 }
 
@@ -13297,7 +13445,9 @@ fn map_flatten_error(error: &FlattenError, api_path: &'static str) -> ApiError {
             explicitly_configured: true,
             ..
         }
-        | FlattenError::Pdfium(_) => ApiError::internal_at(api_path, error.to_string()),
+        | FlattenError::Pdfium(_)
+        | FlattenError::Metadata(_)
+        | FlattenError::Write(_) => ApiError::internal_at(api_path, error.to_string()),
     }
 }
 
@@ -13330,14 +13480,23 @@ fn map_replace_invert_error(error: &ReplaceInvertError) -> ApiError {
 
 fn map_ocr_error(error: &OcrError) -> ApiError {
     match error {
-        OcrError::NoLanguages | OcrError::InvalidRenderType => {
+        OcrError::NoLanguages | OcrError::InvalidLanguages | OcrError::InvalidRenderType => {
             ApiError::bad_request_at(OCR_PDF_PATH, error.to_string())
         }
-        OcrError::OcrMyPdfUnavailable | OcrError::GhostscriptUnavailable => {
+        OcrError::OcrMyPdfUnavailable
+        | OcrError::OcrToolsUnavailable
+        | OcrError::PdfiumUnavailable { .. }
+        | OcrError::GhostscriptUnavailable => {
             ApiError::unsupported_at(OCR_PDF_PATH, error.to_string())
         }
         OcrError::OcrMyPdfFailed { .. }
         | OcrError::OcrMyPdfStart { .. }
+        | OcrError::OcrMyPdfTimeout { .. }
+        | OcrError::TesseractFailed { .. }
+        | OcrError::TesseractStart { .. }
+        | OcrError::TesseractTimeout { .. }
+        | OcrError::Pdfium(_)
+        | OcrError::Merge(_)
         | OcrError::GhostscriptFailed { .. }
         | OcrError::Io(_)
         | OcrError::Zip(_) => ApiError::internal_at(OCR_PDF_PATH, error.to_string()),
@@ -13420,7 +13579,9 @@ fn map_ai_document_error(error: &AiDocumentError) -> ApiError {
         AiDocumentError::Html(HtmlToPdfError::WeasyPrintUnavailable) => {
             ApiError::unsupported_at(CREATE_PDF_AGENT_PATH, error.to_string())
         }
-        AiDocumentError::Html(_) => ApiError::internal_at(CREATE_PDF_AGENT_PATH, error.to_string()),
+        AiDocumentError::Html(_) | AiDocumentError::Metadata(_) | AiDocumentError::Write(_) => {
+            ApiError::internal_at(CREATE_PDF_AGENT_PATH, error.to_string())
+        }
     }
 }
 

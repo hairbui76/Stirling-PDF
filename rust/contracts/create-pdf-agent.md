@@ -32,6 +32,10 @@ colour parser. Only this fixed template takes the internal trusted-HTML path to
 `convert/html/pdf` endpoint.
 
 On success it returns `application/pdf`. If `WeasyPrint` is missing the route
-returns `501`; renderer failures return `500`. The current PDF is produced
-directly by `WeasyPrint`; Java's subsequent PDFBox metadata re-save is not
-byte-identical and is a documented output-metadata parity gap.
+returns `501`; renderer failures return `500`. After rendering, Rust applies
+the same default non-Pro loaded-document metadata policy as Java's PDFBox
+re-save: valid WeasyPrint creation metadata and custom Info keys remain,
+producer becomes `Stirling-PDF v<version>`, and a missing modification date is
+created. PDF bytes remain renderer- and serializer-dependent rather than
+byte-identical. Pro user-aware custom metadata substitution remains tied to the
+secured-mode cutover.

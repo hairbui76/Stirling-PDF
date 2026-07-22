@@ -29,7 +29,10 @@ use x509_certificate::{InMemorySigningKeyPair, X509CertificateBuilder, certifica
 use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
-use crate::signing_key::{Pkcs12SigningKey, SigningSecret};
+use crate::{
+    security::SecurityAuditContext,
+    signing_key::{Pkcs12SigningKey, SigningSecret},
+};
 
 const KEYSTORE_FILENAME: &str = "server-certificate.p12";
 const PASSWORD_FILENAME: &str = "server-certificate.password";
@@ -389,9 +392,10 @@ async fn read_upload(
     {
         match field.name().unwrap_or_default() {
             "file" if archive.is_none() => {
-                let supported_extension = Path::new(field.file_name().unwrap_or_default())
-                    .extension()
-                    .is_some_and(|extension| {
+                let filename = field.file_name().unwrap_or_default().to_owned();
+                let content_type = field.content_type().map(ToOwned::to_owned);
+                let supported_extension =
+                    Path::new(&filename).extension().is_some_and(|extension| {
                         extension.eq_ignore_ascii_case("p12")
                             || extension.eq_ignore_ascii_case("pfx")
                     });
@@ -402,6 +406,12 @@ async fn read_upload(
                     .bytes()
                     .await
                     .map_err(|_| ServerCertificateError::Invalid)?;
+                SecurityAuditContext::record_current_file_bytes(
+                    &filename,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    content_type.as_deref(),
+                    &bytes,
+                );
                 if bytes.is_empty() || bytes.len() > MAX_KEYSTORE_BYTES {
                     return Err(ServerCertificateError::Invalid);
                 }

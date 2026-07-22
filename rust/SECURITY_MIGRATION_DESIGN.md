@@ -13,7 +13,8 @@ identity is also implemented behind an optional strict JWKS verifier:
 public-key algorithms only, bounded cache/refresh, issuer/expiry/audience and
 required-claim checks, and durable `(issuer, subject)` mapping without email
 auto-linking. Integration tests exercise the router, but the production binary
-still fails closed when `DOCKER_ENABLE_SECURITY=true` is requested. Generic
+still fails closed when `DOCKER_ENABLE_SECURITY=true`, `SECURITY_ENABLELOGIN=true`,
+or its underscored alias is requested. Generic
 OIDC login, SAML, device identity, broader resource-owner policies, recovery
 flows, Java-database migration compatibility, and the final independent review
 remain required before that guard can be removed.

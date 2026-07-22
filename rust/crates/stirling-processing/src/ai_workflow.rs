@@ -39,7 +39,7 @@ use crate::{
         PipelineProgress, PipelineProgressPhase,
     },
     runtime_config::RuntimeConfig,
-    security::AuthContext,
+    security::{AuthContext, SecurityAuditContext},
 };
 
 pub(crate) const AI_ORCHESTRATE_PATH: &str = "/api/v1/ai/orchestrate";
@@ -1383,6 +1383,13 @@ async fn read_workflow_upload(
                     public_path,
                 ));
             }
+            SecurityAuditContext::record_current_file_path(
+                &filename,
+                size,
+                content_type.as_deref(),
+                &path,
+            )
+            .await;
             let digest = short_hex_id(&hasher.finalize());
             files.insert(
                 index,
@@ -1474,13 +1481,15 @@ async fn read_text_field(
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes).map_err(|_| {
+    let value = String::from_utf8(bytes).map_err(|_| {
         ProxyError::new(
             StatusCode::BAD_REQUEST,
             format!("{name} is not UTF-8"),
             public_path,
         )
-    })
+    })?;
+    SecurityAuditContext::record_current_form_param(name, &value);
+    Ok(value)
 }
 
 fn indexed_field(name: &str, collection: &str, field: &str) -> Option<usize> {

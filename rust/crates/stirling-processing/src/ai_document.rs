@@ -7,10 +7,14 @@
 
 use std::path::Path;
 
+use lopdf::Document;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::html_to_pdf::{HtmlToPdfError, render_trusted_html_to_pdf};
+use crate::{
+    html_to_pdf::{HtmlToPdfError, render_trusted_html_to_pdf},
+    pdf_metadata::apply_default_loaded_document_metadata,
+};
 
 const TEMPLATE_PREFIX: &str = r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><style>
@@ -48,6 +52,10 @@ pub enum AiDocumentError {
     InvalidDocument(#[from] serde_json::Error),
     #[error(transparent)]
     Html(#[from] HtmlToPdfError),
+    #[error("could not read generated PDF metadata: {0}")]
+    Metadata(#[from] lopdf::Error),
+    #[error("could not write generated PDF metadata: {0}")]
+    Write(#[from] std::io::Error),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -98,6 +106,15 @@ pub fn convert_ai_document_to_pdf(
 ) -> Result<(), AiDocumentError> {
     let html = render_ai_document_html(document_json)?;
     render_trusted_html_to_pdf(&html, output_path)?;
+    normalize_generated_pdf_metadata(output_path)?;
+    Ok(())
+}
+
+fn normalize_generated_pdf_metadata(output_path: &Path) -> Result<(), AiDocumentError> {
+    let mut document = Document::load(output_path)?;
+    apply_default_loaded_document_metadata(&mut document);
+    document.prune_objects();
+    document.save(output_path)?;
     Ok(())
 }
 
@@ -309,7 +326,11 @@ fn append_escaped(html: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::render_ai_document_html;
+    use lopdf::{Document, Object, dictionary};
+    use tempfile::tempdir;
+
+    use super::{normalize_generated_pdf_metadata, render_ai_document_html};
+    use crate::runtime_metrics::application_version;
 
     #[test]
     fn renders_all_section_types_with_escaped_user_content()
@@ -348,6 +369,46 @@ mod tests {
         assert!(html.contains("--color-primary:#ff00ff;"));
         assert!(!html.contains("rgb("));
         assert!(!html.contains("--color-bg:#fff;"));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_pdf_receives_the_java_loaded_document_metadata_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("generated.pdf");
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.add_object(dictionary! {
+            "Type" => "Pages",
+            "Kids" => Vec::<Object>::new(),
+            "Count" => 0,
+        });
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        let info_id = document.add_object(dictionary! {
+            "Creator" => Object::string_literal("WeasyPrint"),
+            "Producer" => Object::string_literal("WeasyPrint"),
+            "CreationDate" => Object::string_literal("D:20240102030405+00'00'"),
+            "Custom" => Object::string_literal("keep me"),
+        });
+        document.trailer.set("Root", catalog_id);
+        document.trailer.set("Info", info_id);
+        document.save(&path)?;
+
+        normalize_generated_pdf_metadata(&path)?;
+
+        let output = Document::load(&path)?;
+        let (_, info) = output.dereference(output.trailer.get(b"Info")?)?;
+        let info = info.as_dict()?;
+        let label = format!("Stirling-PDF v{}", application_version());
+        assert_eq!(info.get(b"Creator")?.as_str()?, b"WeasyPrint");
+        assert_eq!(info.get(b"Producer")?.as_str()?, label.as_bytes());
+        assert_eq!(
+            info.get(b"CreationDate")?.as_str()?,
+            b"D:20240102030405+00'00'"
+        );
+        assert!(info.get(b"ModDate")?.as_datetime().is_some());
+        assert_eq!(info.get(b"Custom")?.as_str()?, b"keep me");
         Ok(())
     }
 }

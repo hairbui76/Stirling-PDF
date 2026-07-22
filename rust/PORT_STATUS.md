@@ -4,17 +4,12 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-22):** `cargo build` and strict
-`cargo clippy --workspace --all-targets --locked -- -D warnings` pass with the pinned
-PDFium runtime (the whole workspace, including every endpoint test target, compiles and
-lints clean). The processing library unit suite runs 360/361 green; the lone failure,
-`policy_config::lexical_path_normalization_removes_dot_segments`, is a POSIX-absolute-path
-assumption that only fails on Windows dev machines (`/srv/...` is not absolute there) and
-passes on the Linux runtime target. The durable-storage and collaborative-signing endpoint
-suites pass. External-runtime happy paths remain conditional on their respective tools and
-services. Note: a full single-invocation `cargo test --workspace` is memory-sensitive on
-Windows dev boxes (the parallel link of ~100 test binaries can corrupt artifacts); run the
-lib suite plus endpoint suites in smaller batches locally, or rely on Linux/CI.
+**Latest validation (2026-07-22):** `task rust:check` passes formatting, strict
+locked all-target workspace Clippy, all 98 AI-engine library tests, all 414
+processing library tests, helper-binary and process-smoke tests, the complete
+endpoint/integration matrix, and doc tests with the pinned PDFium runtime.
+External-runtime happy paths remain conditional on their respective tools and
+services.
 
 ## Ported compatibility endpoints
 
@@ -56,8 +51,21 @@ auto-rename/auto-split, plus:
 - `convert/pdf/word`, `convert/pdf/presentation`, `convert/pdf/xml` — PDF → office
   via LibreOffice shell-out (`--infilter=writer_pdf_import`/`impress_pdf_import`),
   single-file or ZIP output.
-- `misc/ocr-pdf` — OCR via OCRmyPDF shell-out (sidecar → ZIP, `removeImagesAfter`
-  via Ghostscript). Tesseract page-by-page fallback NOT ported (→ 501).
+- `misc/ocr-pdf` — OCR via preferred OCRmyPDF shell-out or Java-compatible
+  PDFium-rendered, text-aware per-page Tesseract fallback, with tessdata language
+  discovery/filtering, ordered page reassembly, and configurable per-tool process
+  pools with timeout/tree cleanup (sidecar → ZIP, OCRmyPDF-only
+  `removeImagesAfter` via Ghostscript).
+- `misc/repair` — Java-compatible Ghostscript-first and qpdf-second recovery,
+  retaining startup-discovered executable paths and using the shared bounded
+  process runner with qpdf warning-exit handling; the normalized in-process
+  rewrite remains the fallback when neither external tool is available.
+- Fresh-PDF metadata parity — image-to-PDF now writes the versioned Stirling
+  creator/producer label and creation/modification dates; booklet and poster
+  outputs retain Java's selected standard source fields and valid dates while
+  dropping custom Info keys. Form-only and full-raster flattening now apply the
+  corresponding loaded/rebuilt Java policies after PDFium writes the result.
+  Pro user-aware metadata substitution remains tied to the secured-mode cutover.
 - `convert/pdf/html` — PDF → HTML via `pdftohtml -c` shell-out, all output files
   bundled into a ZIP.
 - `convert/pdf/markdown` — native text-first Markdown in page order with literal
@@ -104,7 +112,9 @@ auto-rename/auto-split, plus:
   result download. `convert/pdf/text-editor?async=true` retains its specialized worker; the
   other ported processing POST endpoints now support generic `?async=true` by streaming their
   original multipart request and result through the job directory instead of RAM. Secured-mode
-  jobs and files are isolated by durable local user ID and return 404 across owners. A bounded
+  jobs carry their request audit context through queued background replay, deferring the event
+  write until streamed file metadata is available. Jobs and files are isolated by durable local
+  user ID and return 404 across owners. A bounded
   resource-weighted queue gates light/medium/heavy/extra-heavy work, supports queued cancellation
   and queue positions, and exposes Java-compatible admin job/queue stats and cleanup.
 - `edit-text` — ordered literal find/replace in selected-page PDF text-showing content streams,
@@ -167,7 +177,17 @@ auto-rename/auto-split, plus:
   the old mutation pair, including Java's GET/type, WEB/API/AI/AUTOMATION, polling, and fail-open
   semantics. Principal/source/JSON attribution survives user deletion and legacy Rust-schema
   migration; queries and exports have explicit resource bounds. Every route and audit capture
-  itself require a verified Enterprise tier. See `contracts/audit.md`.
+  itself require a verified Enterprise tier. Client IP capture follows Java's forwarded-for,
+  real-IP, then peer-address precedence. STANDARD/VERBOSE direct processing, pipeline,
+  AI-workflow, and policy uploads now contribute bounded streamed name/size/type context without
+  request replay, feeding live portal document rows. Generic async jobs preserve that context
+  across their worker boundary without rescanning uploads. Custom storage, collaborative-signing,
+  certificate, license, mail, and mobile-scanner upload readers use the same typed hook, and
+  storage file mutations retain Java's `FILE_OPERATION` category. Java's default-off operation
+  result setting is supported through bounded finite text/JSON/XML capture while streaming,
+  binary, UI-data, and explicit auth responses stay excluded. VERBOSE request arguments use the
+  typed redacted form map rather than AspectJ-style raw object stringification. See
+  `contracts/audit.md`.
 - Secured self-hosted `usage/fleet-stats` — administrator-only deployed-editor, active-WEB-editor,
   and cumulative processed-PDF aggregates with Java's STANDARD-audit nullability, internal-user
   exclusion, active/deployed clamp, indexed durable queries, and live typed processing-event
@@ -212,11 +232,21 @@ auto-rename/auto-split, plus:
   shaping, policy-dispatch detection, and read-noise (`UI_DATA`/`HTTP_REQUEST`) exclusion.
   Enforced through the same central Enterprise entitlement + `enforce_security` gate as
   `/api/v1/audit/*`; scope resolves admin → whole-server, team owner → team-principal-scoped,
-  else 403. Closes Java `PortalDocumentsController`, `PortalInfraAuditController`. Parity gap:
-  the reviewed HTTP audit recorder does not yet enrich events with `files`/`policyName`/
-  `automation`/`policySteps`, so live-traffic events currently yield no documents / no policy
-  shaping until that enrichment is ported (the projections are correct given enriched data).
-  See `contracts/portal-audit.md`.
+  else 403. Closes Java `PortalDocumentsController`, `PortalInfraAuditController`. Live policy
+  traffic now stamps bounded `policyName`/`policySteps` on parent runs and records each internal
+  tool call as `AUTOMATION` with streamed input/supporting `files`, so both projections receive
+  real policy events. Shared direct processing uploads and direct pipelines now record bounded
+  streamed `files`; Java's opt-in audit flags add streaming lowercase SHA-256 and bounded PDF Info
+  Author metadata, while their default-off state adds no file scan. Generic async workers defer
+  their event until replay supplies the same context and capture settings. STANDARD/VERBOSE also
+  records bounded Java-shaped multipart/URL-encoded `formParams`, preserving repeats and omitting
+  `_csrf`; credential-shaped names are intentionally persisted as `[REDACTED]` instead of copying
+  Java's secret-disclosure behavior. Default-off operation-result capture adds bounded finite
+  textual responses without consuming binary or streaming document bodies.
+  An authenticated real repair request proves the durable event creates the corresponding
+  documents row, and an async rotate proves queued preservation. Custom administrative multipart
+  readers now report through the same explicit typed enrichment boundary. See
+  `contracts/portal-audit.md`.
 
 ## Remaining (not yet ported)
 
@@ -227,16 +257,31 @@ auto-rename/auto-split, plus:
   XObject text-showing content streams are ported. Text runs preserve device fill/stroke colours,
   rendering mode, and simple-font `/Widths` geometry. Type0 `/ToUnicode` source codes and
   horizontal descendant `/DW`/`/W` advances are now applied. Vertical Type0 writing applies
-  `/DW2` defaults and both `/W2` forms to glyph origins, displacement, and `TJ` movement; Type3
-  outlines, non-identity CMap code-to-CID mapping and embedded-font reconstruction remain. Direct and Form-nested image
+  `/DW2` defaults and both `/W2` forms to glyph origins, displacement, and `TJ` movement. Embedded
+  encoding CMaps now apply bounded `cidchar`/`cidrange` source-code-to-CID mappings before those
+  metrics. Named non-identity CMaps additionally resolve bounded recursive `usecmap` inheritance
+  from the production image's Poppler Adobe mapping data, with safe collection-scoped paths and a
+  shared bounded cache; missing data retains the conservative source-code fallback. Type3 fonts
+  now export the Java-shaped bounded CharProc code/name/Unicode metadata and preserve their source
+  CharProcs for generated-text rebuilds; outline-derived normalization and broader font synthesis
+  remain. Direct and Form-nested image
   XObjects now export page-space transforms
   and bounded JPEG or 1/2/4/8/16-bit RGB/gray/CMYK image data, apply `/Decode` ranges and grayscale
   `/SMask` alpha, and expand packed 1/2/4/8-bit Indexed images with Gray/RGB/CMYK palettes;
   JSON-only pages rebuild ordered raster images, including alpha through PDF soft masks.
   Unfiltered and bounded single-filter Flate/LZW/ASCII85/DCT 8-bit device-colour inline
   images are extracted. Color-key `/Mask` arrays and explicit 1-bit stencil masks are applied
-  for bounded supported rasters. Complex inline filter parameters and ICC/Separation/DeviceN
-  colour spaces remain; DCT CMYK color-key masks are also not projected.
+  for bounded supported rasters. ICCBased Gray/RGB/CMYK XObjects and ICCBased Indexed palette bases
+  now use their bounded embedded profiles for pure-Rust conversion to sRGB, including Gray/RGB DCT
+  images, with compatible declared device-`/Alternate` fallback for invalid profiles. Complex inline
+  filter parameters, external ICC conversion after DCT CMYK decoder projection, and DCT CMYK
+  color-key masks remain. Device-alternate Separation and one-to-eight-component DeviceN XObjects
+  with bounded order-1 sampled Type 0, single-input exponential Type 2, or recursively bounded
+  single-input stitching Type 3 tint transforms are evaluated into Gray/RGB/CMYK, including
+  one-component DCT Separation images after applying `/Decode`. CalGray/CalRGB direct images,
+  Indexed bases, ICC fallbacks, and spot-color alternates use bounded calibrated conversion,
+  including Gray/RGB DCT; DCT DeviceN tint conversion, PostScript Type 4 functions, and
+  Lab/ICCBased DeviceN alternates remain.
   Full editor responses also inspect root AcroForm fields plus their
   inherited metadata and first widget location, and export structured page annotations (with
   full-mode COS data). JSON→PDF rebuilds root fields/one fresh widget and non-widget page
@@ -270,9 +315,11 @@ opt-in Tauri native-launch path now receives an unconditional ephemeral-port
 handshake, desktop/base-path/login-agreement environment, legacy-workspace
 migration, a bounded startup wait, early-exit reporting, stale-port cleanup,
 PID/start-time parent-death enforcement, and atomic fresh-install settings/template
-initialization. Java remains the packaged/default backend; Java-compatible
-short-file backup and upgrade-template merging, PDFium/sidecar packaging,
-cross-platform upgrade proof, and the production default switch remain. See
+initialization. Open-mode local `backend:dev`, `dev`, and default `dev:all` now
+launch `stirling-processing`; the explicit Java oracle plus portal and SaaS Task
+paths remain available. Java remains the packaged production and desktop backend;
+Java-compatible short-file backup and upgrade-template merging, PDFium/sidecar
+packaging, cross-platform upgrade proof, and the production default switch remain. See
 `contracts/desktop-native-startup.md`. The
 hardware-signing capability route reports desktop mode
 and safely discovers on-disk PKCS#11 libraries without loading them. Windows desktop builds can
@@ -345,9 +392,9 @@ remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
 full signing or PAdES parity.
 
-When `DOCKER_ENABLE_SECURITY=true` is requested, the Rust binary still refuses
-to start instead of silently serving either an unsecured approximation or the
-not-yet-approved opt-in security router. See
+When `DOCKER_ENABLE_SECURITY=true`, `SECURITY_ENABLELOGIN=true`, or its underscored
+alias is requested, the Rust binary still refuses to start instead of silently
+serving either an unsecured approximation or the not-yet-approved opt-in security router. See
 `SECURITY_MIGRATION_DESIGN.md` and `SIGNING_MIGRATION_DESIGN.md` for the review
 gates before either secure mode or signing is implemented.
 
@@ -357,7 +404,9 @@ durable SQLite documents with ACL/TTL and provider embeddings, PDF questions,
 bounded long-document map/reduce, contradiction detection, schema-grounded PDF
 edit planning, PDF review, structured PDF creation, saved-agent draft/revision,
 the current terminal next-action contract, and the NDJSON orchestrator with
-math-audit resume. Its MCP manifest publishes all eight completed Python
+math-audit resume. The smart and fast model tiers share the Python-compatible
+process-wide `STIRLING_MODEL_MAX_CONCURRENCY` ceiling, in addition to narrower
+per-agent worker limits. Its MCP manifest publishes all eight completed Python
 capabilities. Model-selected evidence and comment anchors are mapped back to
 trusted local indices, while edit parameters are validated against a generated
 snapshot of the Java operation schemas. PostgreSQL/pgvector now uses the
