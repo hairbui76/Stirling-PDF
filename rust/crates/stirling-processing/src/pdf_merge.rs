@@ -25,6 +25,14 @@ pub struct PdfSortMetadata {
     pub date_millis: i64,
 }
 
+/// A single merged-outline entry with its 1-based nesting level, used to rebuild the
+/// combined bookmark hierarchy in document order.
+struct MergeBookmark {
+    title: String,
+    page_id: ObjectId,
+    level: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum MergeError {
     #[error("could not read '{filename}' as a PDF: {source}")]
@@ -138,16 +146,14 @@ fn build_merged_document(
     let mut total_page_count = document.get_pages().len();
     let mut next_object_id = document.max_id.saturating_add(1);
     let mut imported_page_roots = Vec::new();
-    let mut generated_toc_entries = Vec::new();
-    let mut source_bookmark_entries = Vec::new();
+    let mut bookmark_entries = Vec::new();
 
     collect_bookmark_entries(
         &document,
         first_input,
         1,
         options.generate_toc,
-        &mut generated_toc_entries,
-        &mut source_bookmark_entries,
+        &mut bookmark_entries,
     )?;
 
     for (input_index, input) in remaining_inputs.iter().enumerate() {
@@ -159,8 +165,7 @@ fn build_merged_document(
             input,
             input_index + 2,
             options.generate_toc,
-            &mut generated_toc_entries,
-            &mut source_bookmark_entries,
+            &mut bookmark_entries,
         )?;
 
         total_page_count = total_page_count.saturating_add(source.get_pages().len());
@@ -181,12 +186,7 @@ fn build_merged_document(
         total_page_count,
     )?;
 
-    attach_bookmarks(
-        &mut document,
-        catalog_id,
-        generated_toc_entries,
-        source_bookmark_entries,
-    )?;
+    attach_bookmarks(&mut document, catalog_id, bookmark_entries)?;
 
     if options.remove_cert_sign {
         flatten_signature_fields(&mut document)?;
@@ -217,18 +217,33 @@ fn collect_bookmark_entries(
     input: &MergeInput,
     document_number: usize,
     generate_toc: bool,
-    generated_toc_entries: &mut Vec<(String, ObjectId)>,
-    source_bookmark_entries: &mut Vec<(String, ObjectId)>,
+    bookmark_entries: &mut Vec<MergeBookmark>,
 ) -> Result<(), MergeError> {
     let pages = document.get_pages();
-    if generate_toc && let Some(first_page_id) = pages.values().next().copied() {
-        generated_toc_entries.push((toc_title(&input.filename, document_number), first_page_id));
-    }
+    // With a generated table of contents, each document contributes a level-1 root
+    // entry and its own bookmarks nest one level deeper beneath it. Without it, the
+    // source outline levels are preserved as-is (lopdf reports 1-based levels).
+    let level_offset = if generate_toc {
+        if let Some(first_page_id) = pages.values().next().copied() {
+            bookmark_entries.push(MergeBookmark {
+                title: toc_title(&input.filename, document_number),
+                page_id: first_page_id,
+                level: 1,
+            });
+        }
+        1
+    } else {
+        0
+    };
     for bookmark in source_toc_entries(document, &input.filename)? {
         if let Ok(page_number) = u32::try_from(bookmark.page)
             && let Some(page_id) = pages.get(&page_number).copied()
         {
-            source_bookmark_entries.push((bookmark.title, page_id));
+            bookmark_entries.push(MergeBookmark {
+                title: bookmark.title,
+                page_id,
+                level: bookmark.level.saturating_add(level_offset),
+            });
         }
     }
     Ok(())
@@ -256,14 +271,24 @@ fn append_page_tree_roots(
 fn attach_bookmarks(
     document: &mut Document,
     catalog_id: ObjectId,
-    generated_toc_entries: Vec<(String, ObjectId)>,
-    source_bookmark_entries: Vec<(String, ObjectId)>,
+    bookmark_entries: Vec<MergeBookmark>,
 ) -> Result<(), MergeError> {
-    for (title, page_id) in generated_toc_entries
-        .into_iter()
-        .chain(source_bookmark_entries)
-    {
-        document.add_bookmark(Bookmark::new(title, [0.0, 0.0, 0.0], 0, page_id), None);
+    // Rebuild the nested outline in document order using a level-keyed parent stack:
+    // an entry's parent is the most recent entry at a strictly shallower level.
+    let mut parents: Vec<(usize, u32)> = Vec::new();
+    for entry in bookmark_entries {
+        while parents
+            .last()
+            .is_some_and(|(level, _)| *level >= entry.level)
+        {
+            parents.pop();
+        }
+        let parent = parents.last().map(|(_, id)| *id);
+        let bookmark_id = document.add_bookmark(
+            Bookmark::new(entry.title, [0.0, 0.0, 0.0], 0, entry.page_id),
+            parent,
+        );
+        parents.push((entry.level, bookmark_id));
     }
     if let Some(outline_id) = document.build_outline() {
         document
@@ -411,6 +436,28 @@ mod tests {
     }
 
     #[test]
+    fn preserves_nested_source_bookmark_hierarchy() -> Result<(), Box<dyn std::error::Error>> {
+        let first = write_pdf(1)?;
+        let second = write_pdf_with_nested_bookmarks()?;
+        let inputs = vec![input("first.pdf", &first), input("second.pdf", &second)];
+
+        let merged = merge_pdf_paths(&inputs, MergeOptions::default())?;
+
+        let merged = Document::load_mem(&merged)?;
+        let toc = merged.get_toc()?;
+        // Both outline levels survive the merge with page offsets and nesting intact:
+        // the child stays a level deeper than its parent.
+        assert_eq!(toc.toc.len(), 2);
+        assert_eq!(toc.toc[0].title, "Chapter 1");
+        assert_eq!(toc.toc[0].level, 1);
+        assert_eq!(toc.toc[0].page, 2);
+        assert_eq!(toc.toc[1].title, "Section 1.1");
+        assert_eq!(toc.toc[1].level, 2);
+        assert_eq!(toc.toc[1].page, 3);
+        Ok(())
+    }
+
+    #[test]
     fn preserves_the_seed_document_acroform() -> Result<(), Box<dyn std::error::Error>> {
         let form = write_pdf_with_form(TestForm::Text)?;
         let ordinary = write_pdf(1)?;
@@ -479,6 +526,70 @@ mod tests {
 
     fn write_pdf_with_form(form: TestForm) -> Result<NamedTempFile, Box<dyn std::error::Error>> {
         write_pdf_with_features(1, None, Some(form))
+    }
+
+    fn write_pdf_with_nested_bookmarks() -> Result<NamedTempFile, Box<dyn std::error::Error>> {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let mut page_object_ids = Vec::new();
+        for _ in 0..3 {
+            let content_id = document.add_object(Stream::new(dictionary! {}, Vec::new()));
+            let page_object_id = document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Contents" => content_id,
+            });
+            page_object_ids.push(page_object_id);
+        }
+        let page_references = page_object_ids
+            .iter()
+            .copied()
+            .map(Object::Reference)
+            .collect::<Vec<_>>();
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_references,
+                "Count" => 3,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let chapter = document.add_bookmark(
+            Bookmark::new(
+                "Chapter 1".to_owned(),
+                [0.0, 0.0, 0.0],
+                0,
+                page_object_ids[0],
+            ),
+            None,
+        );
+        document.add_bookmark(
+            Bookmark::new(
+                "Section 1.1".to_owned(),
+                [0.0, 0.0, 0.0],
+                0,
+                page_object_ids[1],
+            ),
+            Some(chapter),
+        );
+        if let Some(outline_id) = document.build_outline() {
+            document
+                .get_object_mut(catalog_id)?
+                .as_dict_mut()?
+                .set("Outlines", outline_id);
+        }
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes)?;
+        let mut file = NamedTempFile::new()?;
+        file.write_all(&bytes)?;
+        Ok(file)
     }
 
     fn write_pdf_with_features(
