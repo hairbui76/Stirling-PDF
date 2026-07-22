@@ -151,8 +151,9 @@ does not claim glyph-accurate extraction or font reconstruction yet.
   one-component DCT Separation images
   after applying `/Decode`. CalGray/CalRGB/Lab direct images, Indexed bases, ICC fallbacks, and
   spot-color alternates convert through bounded calibrated color math, including Gray/RGB/Lab DCT.
-  DCT DeviceN tint conversion, complex inline filter parameters, and
-  ICCBased DeviceN alternates remain.
+  Separation/DeviceN images with an `ICCBased` alternate convert the tint output through the
+  embedded profile, with device-`/Alternate` fallback on invalid profiles.
+  DCT DeviceN tint conversion (above four components) and complex inline filter parameters remain.
   Full-document exports inspect root
   AcroForm fields and their first widget locations, plus structured page annotations. JSON→PDF
   reconstructs fresh root fields and one attached widget from the structured field model, and

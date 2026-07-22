@@ -288,8 +288,9 @@ auto-rename/auto-split, plus:
   Indexed bases, ICC fallbacks, and spot-color alternates use bounded calibrated conversion,
   including Gray/RGB/Lab DCT. One-to-four-component DCT DeviceN images retain native JPEG planes,
   perform Adobe/`ColorTransform` conversion, apply `/Decode` in PDF.js order, and evaluate their
-  tint functions; DeviceN DCT above four components and ICCBased
-  DeviceN alternates remain.
+  tint functions. Separation and DeviceN images whose alternate is an `ICCBased` space now
+  convert the tint output through the embedded profile (falling back to the declared device
+  `/Alternate` when the profile is invalid); DeviceN DCT above four components remains.
   Full editor responses also inspect root AcroForm fields plus their
   inherited metadata and first widget location, and export structured page annotations (with
   full-mode COS data). JSON→PDF rebuilds root fields/one fresh widget and non-widget page

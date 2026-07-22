@@ -185,7 +185,7 @@ Glyph-accurate `textElements` extraction (including Type3 outline geometry and C
 not available through the configured Poppler data paths), token-level rewriting and mixed-stream
 editing in the full-document rebuild path, font-program round-trip, complex inline filter
 parameters, DCT DeviceN images with more than four JPEG source components,
-ICCBased DeviceN alternates, and external ICC conversion for DCT CMYK images, rich
+and external ICC conversion for DCT CMYK images, rich
 annotation appearance/reply graphs,
 nested/multi-widget form hierarchies and appearance
 streams remain outstanding. Direct and Form-nested image XObjects already export page-space
@@ -207,7 +207,10 @@ stack ceilings, `%` comment handling, and Domain/Range clamping; any unsupported
 program unparseable rather than silently mis-evaluating.
 Device-alternate DeviceN images use the same bounded evaluator for one to eight input colorants,
 including multilinear sample-table interpolation. A single-input DeviceN can also use Type 2 or
-Type 3, and any DeviceN colorant count can use Type 4.
+Type 3, and any DeviceN colorant count can use Type 4. When a Separation or DeviceN alternate is
+itself an `ICCBased` space, the tint output is converted through the embedded profile (using the
+profile's declared device fallback for channel count and sample range), falling back to that device
+`/Alternate` when the profile cannot be parsed — the same behaviour as a standalone `ICCBased` image.
 One-component DCT Separation images preserve their grayscale samples, apply `/Decode`, and evaluate
 their tint transforms. DCT DeviceN images with one to four JPEG components likewise retain the
 source planes, perform Adobe/`ColorTransform` JPEG colour conversion, apply per-component `/Decode`
@@ -258,7 +261,9 @@ Type 2 interpolation, packed 4-bit sampled Type 0 interpolation, a Type 3 segmen
 Range clipping, plus one-component DCT `/Decode` handling into a DeviceRGB alternate. A Type 4
 fixture proves a PostScript calculator tint transform reproduces the Type 2 Separation output, and a
 direct interpreter test covers arithmetic, `ifelse` branch selection, `roll` rotation, Domain/Range
-clamping, `%` comment handling, and unsupported-operator rejection. Calibrated
+clamping, `%` comment handling, and unsupported-operator rejection. A Separation fixture with an
+`ICCBased` RGB alternate proves the tint output is transformed through a BT.2020 profile to sRGB.
+Calibrated
 fixtures cover CalGray gamma, a CalRGB D65 matrix, direct raw/DCT conversion, and reversed DCT
 `/Decode`. A two-colorant fixture proves DeviceN sample ordering and bilinear interpolation across a
 2×2 table. A four-component Adobe CMYK DCT fixture proves native-plane preservation, reversed

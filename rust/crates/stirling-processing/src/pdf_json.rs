@@ -1502,6 +1502,7 @@ fn decode_pdf_raster(
                 .or(Some(image)),
             Some(PdfImageColorSpace::Separation {
                 alternate,
+                alternate_profile,
                 tint_transform,
             }) => {
                 let DynamicImage::ImageLuma8(image) = image else {
@@ -1509,7 +1510,13 @@ fn decode_pdf_raster(
                 };
                 let samples = apply_image_decode_to_u8(document, stream, 1, image.into_raw())?;
                 let samples = tint_transform.apply(&samples, alternate)?;
-                device_samples_to_image(alternate, width, height, samples)
+                tint_output_to_image(
+                    alternate,
+                    alternate_profile.as_deref(),
+                    width,
+                    height,
+                    samples,
+                )
             }
             Some(PdfImageColorSpace::DeviceN { .. }) => unreachable!(),
             Some(PdfImageColorSpace::Calibrated(color_space)) => {
@@ -1770,15 +1777,23 @@ fn decoded_samples_to_image(
         }
         PdfImageColorSpace::Separation {
             alternate,
+            alternate_profile,
             tint_transform,
         }
         | PdfImageColorSpace::DeviceN {
             alternate,
+            alternate_profile,
             tint_transform,
             ..
         } => {
             let samples = tint_transform.apply(&samples, alternate)?;
-            device_samples_to_image(alternate, width, height, samples)
+            tint_output_to_image(
+                alternate,
+                alternate_profile.as_deref(),
+                width,
+                height,
+                samples,
+            )
         }
         PdfImageColorSpace::Indexed { .. } => None,
     }
@@ -1850,11 +1865,13 @@ enum PdfImageColorSpace {
     },
     Separation {
         alternate: IndexedBaseColorSpace,
+        alternate_profile: Option<Vec<u8>>,
         tint_transform: TintTransform,
     },
     DeviceN {
         channels: usize,
         alternate: IndexedBaseColorSpace,
+        alternate_profile: Option<Vec<u8>>,
         tint_transform: TintTransform,
     },
     Indexed {
@@ -2695,6 +2712,26 @@ fn icc_samples_to_rgb(samples: &[u8], channels: usize, profile: &[u8]) -> Option
     let mut rgb = vec![0; pixel_count.checked_mul(3)?];
     transform.transform(samples, &mut rgb).ok()?;
     Some(rgb)
+}
+
+/// Turns tint-transform output samples into an image. When the Separation/DeviceN
+/// alternate is an `ICCBased` space, the device samples are converted through the
+/// embedded profile; an invalid profile falls back to the declared device alternate.
+fn tint_output_to_image(
+    alternate: IndexedBaseColorSpace,
+    alternate_profile: Option<&[u8]>,
+    width: u32,
+    height: u32,
+    samples: Vec<u8>,
+) -> Option<DynamicImage> {
+    if let Some(rgb) = alternate_profile
+        .and_then(|profile| icc_samples_to_rgb(&samples, alternate.channels(), profile))
+    {
+        return Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+            width, height, rgb,
+        )?));
+    }
+    device_samples_to_image(alternate, width, height, samples)
 }
 
 fn device_samples_to_image(
@@ -3938,12 +3975,34 @@ fn separation_image_color_space(
         .and_then(|value| resolved_object(document, value))?
         .as_name()
         .ok()?;
-    let alternate = base_image_color_space(document, values.get(2)?)?;
+    let (alternate, alternate_profile) =
+        separation_alternate_color_space(document, values.get(2)?)?;
     let tint_transform = tint_transform(document, values.get(3)?, 1, alternate.channels())?;
     Some(PdfImageColorSpace::Separation {
         alternate,
+        alternate_profile,
         tint_transform,
     })
+}
+
+/// Resolves a Separation/DeviceN alternate color space. Device and calibrated
+/// alternates carry no ICC profile; an `ICCBased` alternate contributes its declared
+/// device fallback plus the embedded profile, mirroring the standalone `ICCBased`
+/// image path.
+fn separation_alternate_color_space(
+    document: &Document,
+    color_space: &Object,
+) -> Option<(IndexedBaseColorSpace, Option<Vec<u8>>)> {
+    if let Some(base) = base_image_color_space(document, color_space) {
+        return Some((base, None));
+    }
+    let values = resolved_object(document, color_space)?.as_array().ok()?;
+    match icc_image_color_space(document, values)? {
+        PdfImageColorSpace::Icc {
+            alternate, profile, ..
+        } => Some((alternate, profile)),
+        _ => None,
+    }
 }
 
 fn device_n_image_color_space(
@@ -3972,12 +4031,14 @@ fn device_n_image_color_space(
     {
         return None;
     }
-    let alternate = base_image_color_space(document, values.get(2)?)?;
+    let (alternate, alternate_profile) =
+        separation_alternate_color_space(document, values.get(2)?)?;
     let channels = colorants.len();
     let tint_transform = tint_transform(document, values.get(3)?, channels, alternate.channels())?;
     Some(PdfImageColorSpace::DeviceN {
         channels,
         alternate,
+        alternate_profile,
         tint_transform,
     })
 }
@@ -10071,6 +10132,72 @@ end"
             image::load_from_memory(&png)?.to_rgb8().as_raw(),
             &[10, 20, 30]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_separation_images_with_an_icc_based_alternate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+        use moxcms::{ColorProfile, Layout, TransformOptions};
+
+        // The Type 2 tint maps tint 1.0 to the device RGB triple [128, 64, 32];
+        // the ICCBased alternate then converts that BT.2020 triple to sRGB.
+        let source_profile = ColorProfile::new_bt2020();
+        let encoded_profile = source_profile.encode()?;
+        let device_samples = vec![128, 64, 32];
+        let destination_profile = ColorProfile::new_srgb();
+        let transform = source_profile.create_transform_8bit(
+            Layout::Rgb,
+            &destination_profile,
+            Layout::Rgb,
+            TransformOptions::default(),
+        )?;
+        let mut expected = vec![0; device_samples.len()];
+        transform.transform(&device_samples, &mut expected)?;
+        assert_ne!(device_samples, expected);
+
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 3, "Alternate" => "DeviceRGB" },
+            encoded_profile,
+        ));
+        let tint_transform = document.add_object(dictionary! {
+            "FunctionType" => 2,
+            "Domain" => vec![0.into(), 1.into()],
+            "Range" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+            "C0" => vec![0.into(), 0.into(), 0.into()],
+            "C1" => vec![
+                Object::Real(128.0 / 255.0),
+                Object::Real(64.0 / 255.0),
+                Object::Real(32.0 / 255.0),
+            ],
+            "N" => 1,
+        });
+        let separation_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Separation".to_vec()),
+                    Object::Name(b"SpotColor".to_vec()),
+                    Object::Array(vec![
+                        Object::Name(b"ICCBased".to_vec()),
+                        Object::Reference(profile_id),
+                    ]),
+                    Object::Reference(tint_transform),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            vec![255],
+        );
+        let (png, format) = encode_image_xobject(&document, &separation_image, 1, 1)
+            .ok_or("ICC-alternate Separation image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &expected);
         Ok(())
     }
 
