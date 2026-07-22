@@ -9,7 +9,7 @@ use std::{
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops};
 use pdfium_render::prelude::{
     PdfDocument, PdfPage, PdfPageObjectCommon, PdfPageObjectsCommon, PdfPagePaperSize,
-    PdfPageRenderRotation, PdfPoints, PdfRenderConfig, Pdfium, PdfiumError,
+    PdfPageRenderRotation, PdfPageText, PdfPoints, PdfRenderConfig, Pdfium, PdfiumError,
 };
 use rxing::{
     BarcodeFormat, BinaryBitmap, DecodeHintValue, DecodeHints, Luma8LuminanceSource,
@@ -170,6 +170,13 @@ pub struct MarkdownTextLine {
     pub dominant_font_size: f32,
     /// Line bounding-box height, the fallback heading signal when font sizes are degenerate.
     pub height: f32,
+    /// Left edge of the line bounding box, used for two-column gutter detection.
+    pub x: f32,
+    /// Width of the line bounding box, used for two-column gutter detection.
+    pub width: f32,
+    /// Top edge of the line bounding box; the top-to-bottom reading-order key
+    /// (PDF user space grows upward, so larger `y` is higher on the page).
+    pub y: f32,
     /// True when a vertical gap before this line suggests a paragraph break.
     pub paragraph_break_before: bool,
 }
@@ -2651,6 +2658,8 @@ struct LineAccumulator {
     top: f32,
     bottom: f32,
     height: f32,
+    left: f32,
+    right: f32,
 }
 
 /// Extracts reconstructed visual lines with the glyph/line geometry the Markdown
@@ -2707,36 +2716,7 @@ pub fn try_extract_markdown_lines(
             page_number,
             source,
         })?;
-        let mut accumulators: Vec<LineAccumulator> = Vec::new();
-        for segment in text.segments().iter() {
-            let value = segment.text();
-            if value.trim().is_empty() {
-                continue;
-            }
-            let bounds = segment.bounds();
-            let top = bounds.top().value;
-            let bottom = bounds.bottom().value;
-            let height = bounds.height().value;
-            if !top.is_finite() || !bottom.is_finite() || !height.is_finite() {
-                continue;
-            }
-            let mut sizes = Vec::new();
-            for character in segment
-                .chars()
-                .map_err(|source| PdfiumTextError::ReadText {
-                    page_number,
-                    source,
-                })?
-                .iter()
-            {
-                let whitespace = character.unicode_char().is_none_or(char::is_whitespace);
-                let size = character.unscaled_font_size().value;
-                if !whitespace && size.is_finite() && size > 0.0 {
-                    sizes.push(size);
-                }
-            }
-            merge_segment_into_line(&mut accumulators, &value, &sizes, top, bottom, height);
-        }
+        let accumulators = accumulate_page_lines(&text, page_number)?;
         append_page_lines(
             usize::try_from(page_index).unwrap_or_default(),
             accumulators,
@@ -2754,8 +2734,65 @@ pub fn try_extract_markdown_lines(
     })
 }
 
+/// Groups a page's non-empty text segments into visual-line accumulators, carrying the
+/// glyph sizes and bounding-box geometry the Markdown converter needs.
+fn accumulate_page_lines(
+    text: &PdfPageText,
+    page_number: usize,
+) -> Result<Vec<LineAccumulator>, PdfiumTextError> {
+    let mut accumulators: Vec<LineAccumulator> = Vec::new();
+    for segment in text.segments().iter() {
+        let value = segment.text();
+        if value.trim().is_empty() {
+            continue;
+        }
+        let bounds = segment.bounds();
+        let top = bounds.top().value;
+        let bottom = bounds.bottom().value;
+        let height = bounds.height().value;
+        let left = bounds.left().value;
+        let width = bounds.width().value;
+        if !top.is_finite()
+            || !bottom.is_finite()
+            || !height.is_finite()
+            || !left.is_finite()
+            || !width.is_finite()
+        {
+            continue;
+        }
+        let right = left + width;
+        let mut sizes = Vec::new();
+        for character in segment
+            .chars()
+            .map_err(|source| PdfiumTextError::ReadText {
+                page_number,
+                source,
+            })?
+            .iter()
+        {
+            let whitespace = character.unicode_char().is_none_or(char::is_whitespace);
+            let size = character.unscaled_font_size().value;
+            if !whitespace && size.is_finite() && size > 0.0 {
+                sizes.push(size);
+            }
+        }
+        merge_segment_into_line(
+            &mut accumulators,
+            &value,
+            &sizes,
+            top,
+            bottom,
+            height,
+            left,
+            right,
+        );
+    }
+    Ok(accumulators)
+}
+
 /// Appends a segment to the current line when it shares the line's vertical centre,
 /// otherwise starts a new line.
+#[allow(clippy::too_many_arguments)]
 fn merge_segment_into_line(
     accumulators: &mut Vec<LineAccumulator>,
     text: &str,
@@ -2763,6 +2800,8 @@ fn merge_segment_into_line(
     top: f32,
     bottom: f32,
     height: f32,
+    left: f32,
+    right: f32,
 ) {
     let center = f32::midpoint(top, bottom);
     if let Some(current) = accumulators.last_mut() {
@@ -2780,6 +2819,8 @@ fn merge_segment_into_line(
             current.top = current.top.max(top);
             current.bottom = current.bottom.min(bottom);
             current.height = current.height.max(height);
+            current.left = current.left.min(left);
+            current.right = current.right.max(right);
             return;
         }
     }
@@ -2789,6 +2830,8 @@ fn merge_segment_into_line(
         top,
         bottom,
         height,
+        left,
+        right,
     });
 }
 
@@ -2826,6 +2869,9 @@ fn append_page_lines(
             text: accumulator.text,
             dominant_font_size,
             height: accumulator.height,
+            x: accumulator.left,
+            width: (accumulator.right - accumulator.left).max(0.0),
+            y: accumulator.top,
             paragraph_break_before,
         });
     }
