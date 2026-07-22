@@ -2,8 +2,7 @@ changelog:
   exclude:
     labels:
       - ignore-for-release
-      # engine: Python AI engine - not currently live / not yet shipped to users.
-      # Remove this entry once the engine is released.
+      # Engine changes remain excluded until the Rust AI engine is product-released.
       - engine
 
   categories:

@@ -101,16 +101,38 @@ tauri: &tauri
   - Taskfile.yml
   - .taskfiles/desktop.yml
 
-# Files that affect the AI engine (Python tool models, fixers, tests). Gate
-# the engine validation job on changes to engine sources or to the Java
-# tool surfaces it generates models from.
+# Files that affect the Rust AI engine or its explicit Python legacy oracle.
+# Gate validation on either implementation and on the Java tool surfaces used
+# to generate the Rust operation catalog.
 engine: &engine
   - *ci
   - engine/**
+  - rust/Cargo.toml
+  - rust/Cargo.lock
+  - rust/crates/stirling-ai-engine/**
+  - rust/crates/stirling-operation-catalog/**
   - app/(common|core|proprietary|saas)/src/main/java/**
   - .github/workflows/ai-engine.yml
   - Taskfile.yml
   - .taskfiles/engine.yml
+
+# Files that affect the Rust processing backend or the shared Rust workspace.
+# This gate is independent of the AI-engine oracle gate: production processing
+# changes must run the complete locked Rust workspace check, including PDFium
+# endpoint coverage.
+rust-processing: &rust-processing
+  - rust/Cargo.toml
+  - rust/Cargo.lock
+  - rust/crates/stirling-operation-catalog/**
+  - rust/crates/stirling-processing/**
+  - rust/contracts/**
+  - rust/scripts/**
+  - rust/README.md
+  - rust/PORT_STATUS.md
+  - rust/BACKEND_REPLACEMENT_PLAN.md
+  - .github/workflows/rust-processing.yml
+  - Taskfile.yml
+  - .taskfiles/rust.yml
 
 # Files that can make the committed generated API models (frontend tool API
 # types + engine tool models) go stale: the Java tool surfaces they derive from,
@@ -124,6 +146,10 @@ generated-models: &generated-models
   - frontend/editor/src/core/types/toolApiTypes.ts
   - engine/scripts/generate_tool_models.py
   - engine/src/stirling/models/tool_models.py
+  - rust/Cargo.toml
+  - rust/Cargo.lock
+  - rust/crates/stirling-operation-catalog/**
+  - rust/crates/stirling-ai-engine/src/operation_catalog.json
   - .taskfiles/frontend.yml
   - .taskfiles/engine.yml
   - .github/workflows/check-generated-models.yml

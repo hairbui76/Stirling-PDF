@@ -268,6 +268,11 @@ frontend/editor/public/locales/*/translation.backup*.json
 
 # Development/build artifacts
 .gradle-cache/
+rust/target/
+rust/.pdfium/
+# Local Rust AI-engine document stores (default `data/rag.db` from the repo root).
+/data/
+rust/data/
 scripts/pdf-collection/
 **/tmp/
 *.backup
@@ -284,9 +289,19 @@ docs/type3/signatures/
 # Claude
 .claude/
 
+# Local Codex agent settings
+.codex/config.toml
+
 # Playwright MCP screenshots / traces
 .playwright-mcp/
 *.playwright-mcp.png
 
 # Local screenshot artifacts from *-screenshots.spec.ts
 frontend/editor/screenshots/
+
+# Harness durable layer
+harness.db
+harness.db-wal
+harness.db-shm
+scripts/bin/harness-cli
+scripts/bin/harness-cli.exe

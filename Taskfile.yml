@@ -15,7 +15,10 @@ includes:
     dir: frontend
   engine:
     taskfile: .taskfiles/engine.yml
-    dir: engine
+    dir: .
+  rust:
+    taskfile: .taskfiles/rust.yml
+    dir: rust
   docker:
     taskfile: .taskfiles/docker.yml
     dir: .
@@ -55,7 +58,7 @@ tasks:
     desc: "Install all project dependencies"
     cmds:
       - task: frontend:install
-      - task: engine:install
+      - task: rust:install
 
   # ============================================================
   # Development
@@ -86,7 +89,7 @@ tasks:
       BACKEND_PORT: '{{index (splitList "\n" .PORTS) 0}}'
       EDITOR_PORT: '{{index (splitList "\n" .PORTS) 1}}'
     deps:
-      - task: backend:dev
+      - task: backend:dev:proprietary
         vars:
           PORT: '{{.BACKEND_PORT}}'
           SECURITY_ENABLELOGIN: "true"
@@ -111,7 +114,7 @@ tasks:
     internal: true
     vars:
       FRONTEND: '{{.FRONTEND | default "proprietary"}}'
-      BACKEND: '{{.BACKEND | default "proprietary"}}'
+      BACKEND: '{{.BACKEND | default "rust"}}'
       PORTS:
         sh: '{{if eq OS "windows"}}{{.FIND_FREE_PORT_PS}} 8080 5173 5001{{else}}{{.FIND_FREE_PORT_SH}} 8080 5173 5001{{end}}'
       BACKEND_PORT: '{{index (splitList "\n" .PORTS) 0}}'
@@ -141,17 +144,18 @@ tasks:
     cmds:
       - task: backend:build
       - task: frontend:build
+      - task: rust:build
 
   # ============================================================
   # Test
   # ============================================================
 
   test:
-    desc: "Run ALL tests (backend + frontend + engine)"
+    desc: "Run all tests"
     cmds:
       - task: backend:test
       - task: frontend:test
-      - task: engine:test
+      - task: rust:test
 
   # ============================================================
   # Lint & Format
@@ -161,28 +165,28 @@ tasks:
     desc: "Run all linters"
     cmds:
       - task: frontend:lint
-      - task: engine:lint
+      - task: rust:lint
 
   fix:
     desc: "Auto-fix all components"
     cmds:
       - task: backend:fix
       - task: frontend:fix
-      - task: engine:fix
+      - task: rust:format
 
   format:
     desc: "Auto-fix formatting across all components"
     cmds:
       - task: backend:format
       - task: frontend:format
-      - task: engine:format
+      - task: rust:format
 
   format:check:
     desc: "Check formatting across all components"
     cmds:
       - task: backend:format:check
       - task: frontend:format:check
-      - task: engine:format:check
+      - task: rust:format:check
 
   # ============================================================
   # Code generation
@@ -193,6 +197,7 @@ tasks:
     cmds:
       - task: frontend:tool-models
       - task: engine:tool-models
+      - task: engine:legacy:tool-models
 
   # ============================================================
   # Quality Gate
@@ -203,14 +208,14 @@ tasks:
     cmds:
       - task: backend:check
       - task: frontend:check
-      - task: engine:check
+      - task: rust:check
 
   check:all:
     desc: "Full CI quality gate"
     cmds:
       - task: backend:check
       - task: frontend:check:all
-      - task: engine:check
+      - task: rust:check
 
   # ============================================================
   # Clean
@@ -221,5 +226,5 @@ tasks:
     cmds:
       - task: backend:clean
       - task: frontend:clean
-      - task: engine:clean
+      - task: rust:clean
       - task: pre-commit:clean

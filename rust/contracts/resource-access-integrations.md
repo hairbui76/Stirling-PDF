@@ -1,0 +1,70 @@
+# Resource grants and integration configs
+
+## Reviewed-security scope
+
+The opt-in reviewed Rust security router owns the Java-compatible resource-grant surface:
+
+- `GET|POST /api/v1/admin/access/grants`
+- `GET /api/v1/admin/access/grants/by-principal`
+- `DELETE /api/v1/admin/access/grants/{id}`
+
+It also owns `GET|POST /api/v1/integrations` and
+`GET|PUT|DELETE /api/v1/integrations/{id}`. These routes are not exposed by the open router, and
+production secure-mode startup remains fail-closed pending the independent security review.
+
+Grant administration requires `ROLE_ADMIN`. `PORTAL` is the singleton empty resource ID;
+`INTEGRATION_CONFIG` requires an ID. User/team principals must exist. A repeated grant atomically
+updates the one current `USE` or `MANAGE` permission for that principal/resource pair.
+
+## Ownership and access
+
+Administrators and exact USER owners always use/manage a resource. A TEAM owner is a user whose
+durable team membership has `is_owner=1`. `MANAGE` grants imply use. Disabled configs ignore grants
+and default access, leaving only administrators/owners. `ORG_ALL` is deployment-wide in this
+reviewed self-hosted router; it must be replaced with a tenant-aware resolver before a Rust SaaS
+security router is enabled. `ADMINS_AND_TEAM_LEADS` follows the Java owner-sensitive rules.
+
+The list endpoint intentionally retains Java's observable projection: own USER configs, accessible
+SERVER configs, accessible configs for the caller's current team, then explicitly granted IDs. An
+administrator may therefore directly fetch a config that is absent from the list.
+
+Creation preserves the current Java restrictions for USER/TEAM/SERVER ownership, team-leader
+checks, S3 personal ownership, and locked SERVER overrides. Update ignores type/scope/team changes.
+Locked configs block non-admin updates but, matching Java, do not block an otherwise authorized
+delete.
+
+## Secrets and persistence
+
+Configs and grants live in the security SQLite transaction domain. Integration JSON is encrypted
+with Java's AES-256-GCM row format: standard Base64 of `12-byte IV || ciphertext || 16-byte tag`,
+without AAD or a version prefix. This is deliberately separate from Rust's purpose-bound
+`enc:v1:` security-secret format.
+
+Sensitive key names are masked recursively as exactly `********`. A masked/blank sensitive update
+preserves the stored value; absent keys are removed under PUT replacement semantics; nested
+non-sensitive maps merge. Payload size and depth are bounded. S3 save validation is enabled only
+when `policies.enabled=true`; it requires explicit bucket/credentials, validates mode and HTTP(S)
+endpoint syntax, and rejects private/reserved resolution unless the operator enables
+`policies.allowPrivateS3Endpoints`.
+
+Deleting a config and its grants is atomic. User deletion removes user-owned configs and all
+associated/principal grants; team deletion is rejected while a TEAM-owned config exists.
+
+## Policy references
+
+The reviewed policy/source configuration store resolves S3 `connectionId` references at save time.
+The stored connection owns bucket, region, endpoint, and credentials; only `prefix` and `mode` are
+copied from the per-source/output options. Unknown, inaccessible, disabled, non-S3, or malformed
+references fail without revealing whether another team's connection exists. Legacy embedded S3
+options remain readable and structurally validated.
+
+Integration deletion scans every encrypted `policy_sources.source_json` and
+`policies.policy_json` row. A live source or output reference returns `409` with the Java-shaped
+usage labels; grants/config are removed only after references are gone. See `policy-config.md`.
+
+## Explicit remaining boundary
+
+MCP/API remain storage placeholders, matching their current Java integration-config behavior. S3
+references are durable and deletion-safe, and the policy runner now owns paginated conditional S3
+input, consume cleanup, and collision-safe conditional output delivery. Cross-node ownership and
+recovery remain part of the distributed-runtime boundary.
