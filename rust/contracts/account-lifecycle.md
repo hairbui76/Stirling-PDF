@@ -40,6 +40,27 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
+## Generic OIDC login (first slice only — discovery, not login)
+
+Java's proprietary backend registers a generic OIDC provider via
+`OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
+`ClientRegistrations.fromIssuerLocation(issuer)` to fetch and validate the
+provider's `.well-known/openid-configuration` discovery document. Rust has
+ported only that discovery step so far: `oidc_discovery::discover_oidc_provider`
+fetches `{issuer}/.well-known/openid-configuration`, checks that the document's
+own `issuer` matches the requested issuer (OIDC Discovery 1.0 section 4.3),
+and that `authorization_endpoint`, `token_endpoint`, and `jwks_uri` are present
+and well-formed under the same HTTPS-first scheme policy as Supabase JWKS
+issuer validation in `security_jwt.rs` (HTTPS always allowed, plain HTTP only
+against a loopback host) — returning a typed `OidcProviderMetadata` rather than
+a raw JSON value.
+
+This is fetch-and-validate only. Redirect-URL construction, state/nonce/PKCE
+handling, the OAuth2 callback route, the authorization-code-for-token exchange,
+and session creation are all separate, not-yet-started work — there is no
+generic OIDC login flow in Rust yet, just the ability to determine whether an
+issuer is a well-formed provider and what its three key endpoints are.
+
 ## Persistence and migration
 
 `security_users.initial_setup_completed` defaults to false. Existing Rust

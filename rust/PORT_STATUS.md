@@ -426,8 +426,18 @@ required-claim validation. Verified subjects are persisted by `(issuer, subject)
 email, receive isolated personal teams, support one-way anonymous upgrade, and retain live local
 role/disable policy on every request. Deleted external subjects receive tombstones so a still-live
 upstream token cannot silently recreate them. Async jobs, status, cancellation, metadata, and
-downloads are now owner-scoped by trusted `AuthContext`. Recovery codes, generic OIDC login,
-SAML2, desktop callbacks, device identities, ownership for additional
+downloads are now owner-scoped by trusted `AuthContext`. Generic OIDC login has its first slice:
+`oidc_discovery` fetches and validates a provider's `.well-known/openid-configuration` (issuer
+match, required-endpoint presence, the same HTTPS/loopback-only scheme policy Supabase JWKS
+fetching already uses, a hard response-size cap enforced independent of a server's own
+`Content-Length`, and no-redirect fetching), mirroring Java's
+`OAuth2Configuration.oidcClientRegistration()`. This is discovery only — no route calls it yet, and
+none of authorization redirect construction, state/nonce/PKCE, the callback route, code-for-token
+exchange, or session creation exist. Reviewers should also tighten the shared HTTPS scheme check
+before a later ticket wires a lower-trust caller to it: it currently allows any HTTPS host with no
+private-network restriction, which is fine for an admin-configured issuer but would need hardening
+before it also gates a discovery document's own returned endpoint URLs against SSRF. Recovery
+codes, SAML2, desktop callbacks, device identities, ownership for additional
 durable proprietary resources, and independent security review remain.
 
 The standalone Rust runtime now performs bounded startup discovery for its optional

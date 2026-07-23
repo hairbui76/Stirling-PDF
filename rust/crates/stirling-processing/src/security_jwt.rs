@@ -398,7 +398,12 @@ impl SupabaseClaims {
     }
 }
 
-fn issuer_url_scheme_is_allowed(url: &Url) -> bool {
+/// Shared HTTPS-first URL-scheme policy for remote-issuer style configuration:
+/// HTTPS is always allowed, and plain HTTP only against a loopback host (local
+/// dev / self-hosted testing). Reused by [`crate::oidc_discovery`] so issuer and
+/// discovered-endpoint validation follow the same security posture as Supabase
+/// JWKS issuer validation rather than inventing a second policy.
+pub(crate) fn issuer_url_scheme_is_allowed(url: &Url) -> bool {
     if url.scheme() == "https" {
         return url.host_str().is_some();
     }
