@@ -8491,7 +8491,7 @@ fn build_generated_page_content(
     for (_, _, drawable) in drawables {
         match drawable {
             GeneratedDrawable::Text(element) => {
-                let (resource_name, encoded_text) = resolve_generated_font(
+                let segments = resolve_generated_font(
                     document,
                     document_json,
                     page_number,
@@ -8499,12 +8499,7 @@ fn build_generated_page_content(
                     &mut font_bindings,
                     &mut used_resource_names,
                 )?;
-                append_generated_text_operations(
-                    &mut operations,
-                    element,
-                    &resource_name,
-                    encoded_text,
-                )?;
+                append_generated_text_operations(&mut operations, element, &segments)?;
             }
             GeneratedDrawable::Image(element) => {
                 let resource_name =
@@ -8590,6 +8585,16 @@ fn resolve_standard14_font(
     Ok(standard14_name)
 }
 
+/// Resolves the font resource(s) needed to draw `element`'s text, returning one
+/// or more `(resourceName, encodedBytes)` segments in show order.
+///
+/// A non-restorable font draws the whole element via a single Standard-14
+/// segment, as before. A restorable (embedded/Type3) font also tries to draw
+/// the whole element as a single segment against its restored encoding — but if
+/// that fails because *some* characters aren't representable by it, this no
+/// longer refuses the entire element: [`encode_text_segments_with_font_resource`]
+/// falls back to Standard-14 per run of otherwise-unrepresentable characters,
+/// splitting the element into multiple `Tf`/`Tj` segments instead.
 fn resolve_generated_font(
     document: &mut Document,
     document_json: &PdfJsonDocument,
@@ -8597,7 +8602,7 @@ fn resolve_generated_font(
     element: &PdfJsonTextElement,
     bindings: &mut BTreeMap<String, GeneratedFontBinding>,
     used_resource_names: &mut BTreeSet<Vec<u8>>,
-) -> Result<(String, Vec<u8>), PdfJsonError> {
+) -> Result<Vec<(String, Vec<u8>)>, PdfJsonError> {
     let text = element.text.as_deref().unwrap_or_default();
     let document_font = document_font_for_element(document_json, page_number, element);
     let restorable = document_font.is_some_and(|font| {
@@ -8608,53 +8613,73 @@ fn resolve_generated_font(
                     .as_deref()
                     .is_some_and(|subtype| subtype.eq_ignore_ascii_case("Type3")))
     });
-    let binding_key = if restorable {
-        let font = document_font.ok_or_else(|| {
-            PdfJsonError::UnsupportedText("embedded font model is unavailable".to_owned())
-        })?;
-        let key = font
-            .uid
-            .clone()
-            .or_else(|| font.id.clone())
-            .unwrap_or_else(|| format!("embedded:{page_number}"));
-        let binding_key = format!("embedded:{key}");
-        if !bindings.contains_key(&binding_key) {
-            let resource = restore_embedded_font_resource(document, font)?;
-            insert_generated_font_binding(
-                bindings,
-                used_resource_names,
-                binding_key.clone(),
-                resource,
-            );
-        }
-        binding_key
-    } else {
-        let standard14_name = resolve_standard14_font(document_font, element)?;
-        let binding_key = format!("standard14:{standard14_name}");
-        if !bindings.contains_key(&binding_key) {
-            let resource = Object::Dictionary(dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => Object::Name(standard14_name.as_bytes().to_vec()),
-            });
-            insert_generated_font_binding(
-                bindings,
-                used_resource_names,
-                binding_key.clone(),
-                resource,
-            );
-        }
-        binding_key
-    };
+    if !restorable {
+        let resource_name = resolve_generated_standard14_binding(
+            document_font,
+            element,
+            bindings,
+            used_resource_names,
+        )?;
+        return Ok(vec![(resource_name, win_ansi_text_bytes(text)?)]);
+    }
+
+    let font = document_font.ok_or_else(|| {
+        PdfJsonError::UnsupportedText("embedded font model is unavailable".to_owned())
+    })?;
+    let key = font
+        .uid
+        .clone()
+        .or_else(|| font.id.clone())
+        .unwrap_or_else(|| format!("embedded:{page_number}"));
+    let binding_key = format!("embedded:{key}");
+    if !bindings.contains_key(&binding_key) {
+        let resource = restore_embedded_font_resource(document, font)?;
+        insert_generated_font_binding(bindings, used_resource_names, binding_key.clone(), resource);
+    }
+    // Cloned to release the borrow on `bindings` before the segment fallback
+    // below needs to insert a new Standard-14 binding into the same map.
+    let binding = bindings
+        .get(&binding_key)
+        .ok_or_else(|| {
+            PdfJsonError::UnsupportedText("generated font binding is unavailable".to_owned())
+        })?
+        .clone();
+    encode_text_segments_with_font_resource(
+        document,
+        &binding.resource,
+        &binding.resource_name,
+        text,
+        document_font,
+        element,
+        bindings,
+        used_resource_names,
+    )
+}
+
+/// Resolves (creating on first use) the Standard-14 font binding for `element`,
+/// returning its resource name. Shared by the non-restorable whole-element
+/// fallback and the per-character fallback in
+/// [`encode_text_segments_with_font_resource`].
+fn resolve_generated_standard14_binding(
+    document_font: Option<&PdfJsonFont>,
+    element: &PdfJsonTextElement,
+    bindings: &mut BTreeMap<String, GeneratedFontBinding>,
+    used_resource_names: &mut BTreeSet<Vec<u8>>,
+) -> Result<String, PdfJsonError> {
+    let standard14_name = resolve_standard14_font(document_font, element)?;
+    let binding_key = format!("standard14:{standard14_name}");
+    if !bindings.contains_key(&binding_key) {
+        let resource = Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => Object::Name(standard14_name.as_bytes().to_vec()),
+        });
+        insert_generated_font_binding(bindings, used_resource_names, binding_key.clone(), resource);
+    }
     let binding = bindings.get(&binding_key).ok_or_else(|| {
         PdfJsonError::UnsupportedText("generated font binding is unavailable".to_owned())
     })?;
-    let encoded = if restorable {
-        encode_text_with_font_resource(document, &binding.resource, text)?
-    } else {
-        win_ansi_text_bytes(text)?
-    };
-    Ok((binding.resource_name.clone(), encoded))
+    Ok(binding.resource_name.clone())
 }
 
 fn insert_generated_font_binding(
@@ -8781,11 +8806,31 @@ fn materialize_font_dictionary(
     Ok(materialized)
 }
 
-fn encode_text_with_font_resource(
+/// Encodes `text` against the restored font `resource`'s encoding, splitting it
+/// into `(resourceName, encodedBytes)` segments in show order whenever a run of
+/// characters can't be represented by that encoding.
+///
+/// The whole string is tried first, matching the prior all-or-nothing behavior
+/// when every character round-trips. When it doesn't, each character is instead
+/// checked individually: characters the restored font can represent are
+/// accumulated into a segment against `resource_name`; a character it can't
+/// represent falls back to Standard-14 (the same mechanism already used when a
+/// font can't be restored at all — see [`resolve_generated_standard14_binding`]
+/// — just applied per run of characters instead of per element) and is
+/// accumulated into a separate segment. Consecutive characters that resolve to
+/// the same resource share one segment. Returns [`PdfJsonError::UnsupportedText`]
+/// only when a character can be represented by neither encoding.
+#[allow(clippy::too_many_arguments)]
+fn encode_text_segments_with_font_resource(
     document: &Document,
     resource: &Object,
+    resource_name: &str,
     text: &str,
-) -> Result<Vec<u8>, PdfJsonError> {
+    document_font: Option<&PdfJsonFont>,
+    element: &PdfJsonTextElement,
+    bindings: &mut BTreeMap<String, GeneratedFontBinding>,
+    used_resource_names: &mut BTreeSet<Vec<u8>>,
+) -> Result<Vec<(String, Vec<u8>)>, PdfJsonError> {
     if text.is_empty() {
         return Ok(Vec::new());
     }
@@ -8797,15 +8842,58 @@ fn encode_text_with_font_resource(
         .map_err(|_| {
             PdfJsonError::UnsupportedText("restored font encoding is invalid".to_owned())
         })?;
-    let encoded = Document::encode_text(&encoding, text);
-    if encoded.is_empty()
-        || Document::decode_text(&encoding, &encoded).map_err(PdfJsonError::Pdf)? != text
+
+    // Fast path: the pre-existing all-or-nothing behavior when the whole string
+    // round-trips through the restored font.
+    let whole_string = Document::encode_text(&encoding, text);
+    if !whole_string.is_empty()
+        && Document::decode_text(&encoding, &whole_string)
+            .ok()
+            .as_deref()
+            == Some(text)
     {
-        return Err(PdfJsonError::UnsupportedText(
-            "text cannot be represented by the restored font encoding".to_owned(),
-        ));
+        return Ok(vec![(resource_name.to_owned(), whole_string)]);
     }
-    Ok(encoded)
+
+    let mut segments: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut character_buffer = [0u8; 4];
+    for character in text.chars() {
+        let character_str = &*character.encode_utf8(&mut character_buffer);
+        let (segment_resource, encoded) =
+            if let Some(encoded) = encode_single_character(&encoding, character_str) {
+                (resource_name.to_owned(), encoded)
+            } else {
+                let fallback_name = resolve_generated_standard14_binding(
+                    document_font,
+                    element,
+                    bindings,
+                    used_resource_names,
+                )?;
+                let encoded = win_ansi_text_bytes(character_str).map_err(|_| {
+                    PdfJsonError::UnsupportedText(format!(
+                        "character {character:?} cannot be represented by the restored font \
+                         or the Standard-14 fallback"
+                    ))
+                })?;
+                (fallback_name, encoded)
+            };
+        match segments.last_mut() {
+            Some((last_resource, last_bytes)) if *last_resource == segment_resource => {
+                last_bytes.extend_from_slice(&encoded);
+            }
+            _ => segments.push((segment_resource, encoded)),
+        }
+    }
+    Ok(segments)
+}
+
+/// Single-character round-trip check behind
+/// [`encode_text_segments_with_font_resource`]'s per-character fallback.
+fn encode_single_character(encoding: &Encoding<'_>, character: &str) -> Option<Vec<u8>> {
+    let encoded = Document::encode_text(encoding, character);
+    (!encoded.is_empty()
+        && Document::decode_text(encoding, &encoded).ok().as_deref() == Some(character))
+    .then_some(encoded)
 }
 
 fn generated_image_resource_name(
@@ -8968,13 +9056,23 @@ fn finite_image_value(value: Option<f32>, default: f32, field: &str) -> Result<f
         .ok_or_else(|| PdfJsonError::UnsupportedImage(format!("{field} must be a finite number")))
 }
 
+/// Appends `BT ... ET` operators drawing `element`'s text.
+///
+/// `segments` is one or more `(resourceName, encodedBytes)` pairs in show
+/// order (see [`resolve_generated_font`]): each gets its own `Tf`/`Tj` pair, so
+/// a mid-element font switch (the restored-font-plus-Standard-14-fallback case)
+/// draws as consecutive `Tf`/`Tj` operators rather than one. `Tf` alone never
+/// repositions text — the text-state operators (`Tc`/`Tw`/`Tz`/`TL`/`Ts`/`Tr`)
+/// and the initial `Tm` are set once up front and apply across every segment,
+/// and each `Tj` naturally continues from wherever the previous one (or `Tm`)
+/// left the text position, using its own segment's font metrics for its own
+/// advance — the same positioning the single-font path already relied on.
 fn append_generated_text_operations(
     operations: &mut Vec<Operation>,
     element: &PdfJsonTextElement,
-    resource_name: &str,
-    encoded_text: Vec<u8>,
+    segments: &[(String, Vec<u8>)],
 ) -> Result<(), PdfJsonError> {
-    if element.text.as_ref().is_none_or(String::is_empty) {
+    if element.text.as_ref().is_none_or(String::is_empty) || segments.is_empty() {
         return Ok(());
     }
     let font_size = finite_text_value(
@@ -8991,13 +9089,6 @@ fn append_generated_text_operations(
     operations.push(Operation::new("BT", Vec::new()));
     append_text_color(operations, element.fill_color.as_ref(), false)?;
     append_text_color(operations, element.stroke_color.as_ref(), true)?;
-    operations.push(Operation::new(
-        "Tf",
-        vec![
-            Object::Name(resource_name.as_bytes().to_vec()),
-            Object::Real(font_size),
-        ],
-    ));
     append_optional_text_scalar(
         operations,
         element.character_spacing,
@@ -9028,10 +9119,19 @@ fn append_generated_text_operations(
         "Tm",
         text_matrix.into_iter().map(Object::Real).collect(),
     ));
-    operations.push(Operation::new(
-        "Tj",
-        vec![Object::String(encoded_text, StringFormat::Literal)],
-    ));
+    for (resource_name, encoded_text) in segments {
+        operations.push(Operation::new(
+            "Tf",
+            vec![
+                Object::Name(resource_name.as_bytes().to_vec()),
+                Object::Real(font_size),
+            ],
+        ));
+        operations.push(Operation::new(
+            "Tj",
+            vec![Object::String(encoded_text.clone(), StringFormat::Literal)],
+        ));
+    }
     operations.push(Operation::new("ET", Vec::new()));
     Ok(())
 }
@@ -10713,6 +10813,141 @@ end"
             .and_then(|operand| operand.as_str().ok())
             .ok_or("missing Type3 text")?;
         assert_eq!(bytes, b"A");
+        Ok(())
+    }
+
+    /// Regression test for the "one font per element" limitation: a text
+    /// element mixing a character the restored Type3 font can represent ("A",
+    /// via its `/Differences` encoding) with one it can't (the Euro sign "€" —
+    /// absent from `/Differences` *and* from Adobe `StandardEncoding`, the
+    /// implicit base encoding a `/Differences` table with no `/BaseEncoding`
+    /// falls back to for undefined codes) used to fail the *entire* element
+    /// with `UnsupportedText`, even though Stirling already has a working
+    /// Standard-14 fallback for fonts that cannot be restored at all (Euro is a
+    /// `WinAnsiEncoding` character, so it *is* representable there). The fix
+    /// applies that same fallback per run of unrepresentable characters instead:
+    /// the element now succeeds, drawing "A" with the restored Type3 font and
+    /// "€" with a Standard-14 fallback, as two `Tf`/`Tj` segments.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn json_to_pdf_falls_back_to_standard14_for_characters_the_restored_font_cannot_represent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{convert_json_to_pdf, pdf_to_json, resolved_dictionary};
+        use lopdf::{Document, Object, Stream, content::Content, dictionary};
+
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let glyph_id = source.add_object(Stream::new(
+            dictionary! {},
+            b"0 0 600 700 d1 0 0 500 700 re f".to_vec(),
+        ));
+        let font_id = source.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "Name" => "RustType3",
+            // Type3 fonts don't need a `BaseFont` to render, but this one
+            // carries one anyway (real-world Type3 fonts sometimes do, purely
+            // informationally) so the per-character Standard-14 fallback below
+            // has a real Standard-14 name to resolve to.
+            "BaseFont" => "Helvetica",
+            "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+            "FontMatrix" => vec![0.001.into(), 0.into(), 0.into(), 0.001.into(), 0.into(), 0.into()],
+            "CharProcs" => dictionary! { "A" => glyph_id },
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![65.into(), Object::Name(b"A".to_vec())],
+            },
+            "FirstChar" => 65,
+            "LastChar" => 65,
+            "Widths" => vec![600.into()],
+            "Resources" => dictionary! {},
+        });
+        let content_id = source.add_object(Stream::new(
+            dictionary! {},
+            b"BT /F3 24 Tf 1 0 0 1 10 30 Tm (A) Tj ET".to_vec(),
+        ));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 120.into(), 100.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F3" => font_id } },
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page_object_id)], "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("type3-mixed-source.pdf");
+        source.save(&source_path)?;
+        let mut model = pdf_to_json(&source_path, "type3-mixed-source.pdf", false)?;
+        assert_eq!(model.pages[0].text_elements[0].text.as_deref(), Some("A"));
+
+        // Mix in a character absent from the restored font's encoding. Before
+        // the fix, this made the whole element's rebuild fail.
+        model.pages[0].text_elements[0].text = Some("A€".to_owned());
+        model.pages[0].content_streams.clear();
+        model.pages[0].resources = None;
+
+        let output_path = directory.path().join("type3-mixed-rebuilt.pdf");
+        convert_json_to_pdf(&model, &output_path)?;
+
+        let rebuilt = Document::load(&output_path)?;
+        let rebuilt_page_id = *rebuilt.get_pages().values().next().ok_or("missing page")?;
+        let content = Content::decode(&rebuilt.get_page_content(rebuilt_page_id))?;
+        let tf_tj_pairs: Vec<(&[u8], &[u8])> = content
+            .operations
+            .windows(2)
+            .filter_map(|pair| {
+                let [tf, tj] = pair else { return None };
+                if tf.operator != "Tf" || tj.operator != "Tj" {
+                    return None;
+                }
+                let font_name = tf.operands.first()?.as_name().ok()?;
+                let text = tj.operands.first()?.as_str().ok()?;
+                Some((font_name, text))
+            })
+            .collect();
+        assert_eq!(
+            tf_tj_pairs.len(),
+            2,
+            "expected two Tf/Tj segments: {tf_tj_pairs:?}"
+        );
+        let (first_font, first_text) = tf_tj_pairs[0];
+        let (second_font, second_text) = tf_tj_pairs[1];
+        assert_eq!(first_text, b"A");
+        assert_eq!(
+            lopdf::Encoding::SimpleEncoding(b"WinAnsiEncoding")
+                .bytes_to_string(second_text)?
+                .as_str(),
+            "€"
+        );
+        assert_ne!(first_font, second_font);
+
+        let fonts = rebuilt.get_page_fonts(rebuilt_page_id)?;
+        let type3_font = fonts
+            .get(first_font)
+            .ok_or("missing restored Type3 font resource")?;
+        assert_eq!(type3_font.get(b"Subtype")?.as_name()?, b"Type3");
+        let char_procs = resolved_dictionary(&rebuilt, type3_font.get(b"CharProcs")?)
+            .ok_or("missing CharProcs")?;
+        let glyph = rebuilt.dereference(char_procs.get(b"A")?)?.1.as_stream()?;
+        assert_eq!(
+            glyph.decompressed_content()?,
+            b"0 0 600 700 d1 0 0 500 700 re f"
+        );
+
+        let fallback_font = fonts
+            .get(second_font)
+            .ok_or("missing Standard-14 fallback font resource")?;
+        assert_eq!(fallback_font.get(b"Subtype")?.as_name()?, b"Type1");
+        assert_eq!(fallback_font.get(b"BaseFont")?.as_name()?, b"Helvetica");
         Ok(())
     }
 

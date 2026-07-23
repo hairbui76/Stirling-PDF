@@ -339,9 +339,14 @@ auto-rename/auto-split, plus:
   resubmitted," not "delete everything of this type," so a client cannot yet clear just one content
   type on a mixed page through this endpoint (the lazy/partial endpoint already supports that). This
   is strip-and-regenerate, not Java's token-level in-place `Tj`/`TJ` rewriting, so it is not yet
-  byte-level parity with `PdfJsonConversionService`. Synthesizing new Type3
-  glyphs is still missing (existing source CharProcs are preserved, but a glyph absent from the
-  source font cannot yet be fabricated). One widget per
+  byte-level parity with `PdfJsonConversionService`. Generated text that mixes a character the
+  restored font (Type3 or otherwise) can represent with one it cannot now degrades gracefully —
+  the unrepresentable run falls back to Standard-14 instead of refusing the whole element's edit —
+  rather than fabricating a genuinely new glyph. A character representable by neither the restored
+  font nor Standard-14 still fails the edit. True Type3 glyph synthesis (drawing a novel outline for
+  a character absent from every available source) remains missing and would need a new font-outline
+  extraction/Bezier-to-PDF-path subsystem this crate does not have; it is not a bounded follow-on to
+  the graceful-fallback work above. One widget per
   field matches Java's own `PdfJsonFormField` wire model (`rect`/`pageNumber` are singular there too,
   and `PdfJsonConversionService` likewise reconstructs only one widget per field) — a radio-button-
   style multi-widget field is not a Rust port gap versus Java; it would need a new shared schema

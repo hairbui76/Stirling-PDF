@@ -103,12 +103,25 @@ is not honored as "clear this type," only as "I have nothing new to say about th
 type." Clearing text/images from a page independently is still possible today via
 the lazy/partial endpoint below, whose presence-aware model has no such ambiguity.
 
+A restored (embedded or Type3) font's encoding no longer has to represent an
+element's *entire* text to draw it: when some characters round-trip through it and
+others don't, the unrepresentable ones fall back to Standard-14 individually — the
+element is split into multiple `Tf`/`Tj` segments, one per run of characters
+resolved to the same resource, rather than refusing the whole element the way a
+single mismatched character used to. This is graceful degradation, not glyph
+synthesis: a character representable by neither the restored font nor Standard-14
+still fails the element, and the fallback segments use Standard-14's built-in
+metrics rather than the restored font's, so a font switch mid-line can shift
+positioning slightly. Both this endpoint and the cached partial-export path go
+through the same font-resolution code, so this applies equally to both.
+
 **Deferred (font subsystem, later phases):** token-level rewriting of `textElements`
 in place over an existing preserved source stream (Java's `rewriteTextOperators`
 fast path) — Rust's mixed-edit path always strips-and-regenerates rather than
 patching matched text tokens in place — plus Symbol/ZapfDingbats encodings,
-synthesizing new embedded/CID/Type3 fonts, and glyph-level edits that cannot use a
-restored source encoding. The cached partial endpoint has the bounded regeneration
+synthesizing new embedded/CID/Type3 fonts, and true glyph synthesis for characters
+representable by neither the restored font nor the Standard-14 fallback. The
+cached partial endpoint has the bounded regeneration
 path described below.
 
 The `PdfJsonCosValue` ↔ lopdf `Object` bridge (`cos_value_to_object`,
@@ -284,8 +297,11 @@ Gray/RGB images (DCT CMYK color-key masks remain unsupported);
 separate 1-bit ImageMask streams are resized in image space and applied with their `/Decode`
 polarity. An `SMask`, when present, overrides that explicit mask as required by the PDF model.
 Bounded source font dictionaries/programs and existing Type3 CharProcs can be restored for
-JSON-only generated text. Normalizing them, synthesizing missing glyphs, or applying new text over
-preserved source streams outside the bounded cached-page regeneration path is not yet implemented.
+generated text, including applying new text over a preserved source stream in both the
+full-rebuild and cached partial-export paths (see `/api/v1/convert/text-editor/pdf` above).
+A restored font's encoding falls back to Standard-14 per run of characters it can't represent
+rather than refusing the whole element; normalizing a restored font's outlines or synthesizing
+glyphs that exist in neither the restored font nor Standard-14 is not yet implemented.
 
 Font-program strategy chosen: **pure Rust** (ttf-parser/allsorts/freetype). Phases:
 2 = JSON→PDF for the Standard-14 / no-embedded-program case; 3 = PDF→JSON glyph
