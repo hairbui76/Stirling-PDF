@@ -951,6 +951,11 @@ impl WorkflowSigningService {
                     location: submission.location.as_deref(),
                     reason: Some(reason),
                 },
+                // `submission_signing_material` only ever produces `ManagedServer`
+                // or `Software` material for a workflow participant - hardware
+                // signing is a desktop-app-only, loopback-gated feature and is
+                // never reachable through this remote, token-based signing path.
+                false,
             )?;
             current_path = output;
         }

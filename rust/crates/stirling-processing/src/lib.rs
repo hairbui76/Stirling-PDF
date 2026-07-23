@@ -134,6 +134,7 @@ use std::{
     collections::BTreeMap,
     env,
     io::ErrorKind,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -143,8 +144,8 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{
-        DefaultBodyLimit, Extension, FromRequest, Multipart, Path as AxumPath, Query, Request,
-        State,
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Multipart, Path as AxumPath, Query,
+        Request, State, connect_info::MockConnectInfo,
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
@@ -1824,7 +1825,17 @@ fn initialize_policy_ledger(
 }
 
 pub fn app(max_upload_bytes: usize) -> Router {
-    ProcessingRuntime::from_environment(max_upload_bytes).into_router()
+    with_test_connect_info(ProcessingRuntime::from_environment(max_upload_bytes).into_router())
+}
+
+/// Test-only routers built via [`app`] and its siblings never go through
+/// [`Router::into_make_service_with_connect_info`], so `ConnectInfo<SocketAddr>`
+/// extraction (used by the hardware-signing loopback gate) would otherwise
+/// fail on every request. This mock is only a fallback: axum tries the real
+/// `ConnectInfo` extension first, so it is never consulted for a real
+/// production listener built via `into_make_service_with_connect_info`.
+fn with_test_connect_info(router: Router) -> Router {
+    router.layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
 }
 
 pub fn app_with_timestamp_settings(
@@ -1843,8 +1854,14 @@ pub fn app_with_runtime_config(
     timestamp_settings: TimestampSettings,
     runtime_config: RuntimeConfig,
 ) -> Router {
-    ProcessingRuntime::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config)
-        .into_router()
+    with_test_connect_info(
+        ProcessingRuntime::with_runtime_config(
+            max_upload_bytes,
+            timestamp_settings,
+            runtime_config,
+        )
+        .into_router(),
+    )
 }
 
 /// Constructs an opt-in secured router for integration tests and security
@@ -1860,6 +1877,7 @@ pub fn app_with_reviewed_security(
 ) -> Result<Router, SecurityStartupError> {
     ProcessingRuntime::with_reviewed_security(max_upload_bytes, timestamp_settings, runtime_config)
         .map(ProcessingRuntime::into_router)
+        .map(with_test_connect_info)
 }
 
 fn processing_routes() -> Router {
@@ -3143,39 +3161,48 @@ async fn hardware_signing_capabilities_route() -> Json<hardware_signing::Hardwar
     Json(hardware_signing_capabilities())
 }
 
-async fn hardware_signing_windows_certificates_route()
--> Result<Json<Vec<hardware_signing::HardwareCertificateInfo>>, ApiError> {
-    let certificates = task::spawn_blocking(list_hardware_windows_certificates)
-        .await
-        .map_err(|error| {
-            ApiError::internal_at(
-                HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
-                format!("Windows certificate enumeration task failed: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            ApiError::bad_request_at(
-                HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
-                error.to_string(),
-            )
-        })?;
+async fn hardware_signing_windows_certificates_route(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<Vec<hardware_signing::HardwareCertificateInfo>>, ApiError> {
+    let peer_is_loopback = peer.ip().is_loopback();
+    let certificates =
+        task::spawn_blocking(move || list_hardware_windows_certificates(peer_is_loopback))
+            .await
+            .map_err(|error| {
+                ApiError::internal_at(
+                    HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
+                    format!("Windows certificate enumeration task failed: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                ApiError::bad_request_at(
+                    HARDWARE_SIGNING_WINDOWS_CERTIFICATES_PATH,
+                    error.to_string(),
+                )
+            })?;
     Ok(Json(certificates))
 }
 
 async fn hardware_signing_pkcs11_certificates_route(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<hardware_signing::Pkcs11CertificatesRequest>,
 ) -> Result<Json<Vec<hardware_signing::HardwareCertificateInfo>>, ApiError> {
-    let certificates = task::spawn_blocking(move || list_hardware_pkcs11_certificates(request))
-        .await
-        .map_err(|error| {
-            ApiError::internal_at(
-                HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH,
-                format!("PKCS#11 certificate enumeration task failed: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            ApiError::bad_request_at(HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH, error.to_string())
-        })?;
+    let peer_is_loopback = peer.ip().is_loopback();
+    let certificates =
+        task::spawn_blocking(move || list_hardware_pkcs11_certificates(peer_is_loopback, request))
+            .await
+            .map_err(|error| {
+                ApiError::internal_at(
+                    HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH,
+                    format!("PKCS#11 certificate enumeration task failed: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                ApiError::bad_request_at(
+                    HARDWARE_SIGNING_PKCS11_CERTIFICATES_PATH,
+                    error.to_string(),
+                )
+            })?;
     Ok(Json(certificates))
 }
 
@@ -6644,8 +6671,10 @@ fn map_signature_validation_error(error: SignatureValidationError) -> ApiError {
 
 async fn cert_sign_pdf(
     server_certificate: Option<Extension<Arc<ServerCertificateService>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
+    let peer_is_loopback = peer.ip().is_loopback();
     let UploadedCertSignRequest {
         file,
         signing_material,
@@ -6672,6 +6701,7 @@ async fn cert_sign_pdf(
                 location: location.as_deref(),
                 reason: reason.as_deref(),
             },
+            peer_is_loopback,
         )
     })
     .await
@@ -6764,6 +6794,7 @@ fn sign_pdf_with_uploaded_material(
     server_certificate: Option<&ServerCertificateService>,
     appearance: Option<UploadedSignatureAppearance>,
     metadata: PdfSignatureMetadata<'_>,
+    peer_is_loopback: bool,
 ) -> Result<(), CertSignError> {
     let input = std::fs::read(input_path).map_err(CertSignError::Read)?;
     match signing_material {
@@ -6779,7 +6810,7 @@ fn sign_pdf_with_uploaded_material(
             )
         }
         UploadedSigningMaterial::Pkcs11(request) => {
-            with_pkcs11_signing_key(request, |signing_key| {
+            with_pkcs11_signing_key(peer_is_loopback, request, |signing_key| {
                 let certificate_der = signing_key.certificate_der();
                 complete_pdf_signature(
                     &input,
@@ -6793,7 +6824,7 @@ fn sign_pdf_with_uploaded_material(
             .map_err(CertSignError::Hardware)?
         }
         UploadedSigningMaterial::WindowsStore { alias } => {
-            with_windows_signing_key(&alias, |signing_key| {
+            with_windows_signing_key(peer_is_loopback, &alias, |signing_key| {
                 let certificate_der = signing_key.certificate_der();
                 complete_pdf_signature(
                     &input,
@@ -6842,10 +6873,22 @@ fn complete_pdf_signature(
         signer_name: &signer_name,
         show_logo: appearance.show_logo,
     });
+    // The `/Sig/Name` dictionary entry must reflect the actual signing
+    // certificate's identity, not an unverified client-supplied string: this
+    // module's own signature-validation endpoint reports this same field
+    // back out as `signerName`, so an uncross-checked client value here would
+    // let a signer falsely claim to be someone else. Reuse the same
+    // certificate-preferred value already computed for the visible
+    // appearance above; only a certificate-less signing path (which
+    // shouldn't normally happen) falls back to the client's own `name`.
+    let signature_metadata = PdfSignatureMetadata {
+        name: Some(signer_name.as_str()),
+        ..metadata
+    };
     let placeholder = PdfSignaturePlaceholder::prepare_with_metadata_and_appearance(
         input,
         DEFAULT_CERT_SIGN_RESERVATION_BYTES,
-        metadata,
+        signature_metadata,
         pdf_appearance,
     )?;
     let signed_bytes = placeholder.signed_bytes();
@@ -8608,8 +8651,13 @@ fn pkcs11_signing_material(
         .ok_or_else(|| {
             ApiError::bad_request_at(CERT_SIGN_PATH, "alias is required for certType=PKCS11")
         })?;
+    // Validate via a borrow (`str::from_utf8`), not `String::from_utf8`: the
+    // latter's error path carries the copied bytes back out unzeroized, which
+    // would leave an unzeroized copy of the PIN behind on invalid input.
     let pin = password
-        .map(|password| String::from_utf8(password.as_bytes().to_vec()).map(Zeroizing::new))
+        .map(|password| {
+            std::str::from_utf8(password.as_bytes()).map(|pin| Zeroizing::new(pin.to_owned()))
+        })
         .transpose()
         .map_err(|_| ApiError::bad_request_at(CERT_SIGN_PATH, "password must be valid UTF-8"))?;
     Ok(UploadedSigningMaterial::Pkcs11(Pkcs11SigningRequest::new(

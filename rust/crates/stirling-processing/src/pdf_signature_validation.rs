@@ -128,18 +128,12 @@ pub fn validate_pdf_signatures(
         .map(parse_custom_certificate)
         .transpose()?;
     let signatures = collect_signatures(&document);
-    let maximum_covered_byte = signatures
-        .iter()
-        .filter_map(|signature| signature.byte_range)
-        .filter_map(|range| range[2].checked_add(range[3]))
-        .max()
-        .unwrap_or(0);
-    let document_covered = maximum_covered_byte == 0 || maximum_covered_byte >= bytes.len();
 
     Ok(signatures
         .iter()
         .map(|signature| {
-            let mut result = SignatureValidationResult::new(document_covered);
+            let mut result =
+                SignatureValidationResult::new(covers_entire_document(signature, bytes.len()));
             if let Err(error) =
                 validate_signature(signature, &bytes, custom_certificate.as_ref(), &mut result)
             {
@@ -171,6 +165,26 @@ fn collect_signatures(document: &Document) -> Vec<PdfSignature> {
         .collect::<Vec<_>>();
     signatures.sort_by_key(|signature| signature.object_id);
     signatures
+}
+
+/// Whether this signature's own `/ByteRange` extends to the literal end of
+/// the file - i.e. whether nothing was appended to the document after this
+/// specific signature was applied.
+///
+/// This must be computed strictly per-signature from that signature's own
+/// declared range. An earlier implementation computed one shared "does any
+/// object's `/ByteRange` reach the end of file" flag and applied it to every
+/// signature's result; that let an attacker-supplied decoy object anywhere in
+/// the file (with a fabricated `/ByteRange`/`/Contents` pair and no valid CMS
+/// at all) mark an unrelated, genuinely-signed-then-tampered document as
+/// fully covered, hiding real modifications appended after the real
+/// signature. A missing or unparseable byte range is conservatively "not
+/// covered" rather than assumed valid.
+fn covers_entire_document(signature: &PdfSignature, document_len: usize) -> bool {
+    signature
+        .byte_range
+        .and_then(|range| range[2].checked_add(range[3]))
+        .is_some_and(|covered| covered >= document_len)
 }
 
 fn parse_byte_range(dictionary: &Dictionary) -> Option<[usize; 4]> {
@@ -592,7 +606,8 @@ fn format_java_date(date: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pdf_date, serial_number_hex};
+    use super::{parse_pdf_date, serial_number_hex, validate_pdf_signatures};
+    use lopdf::{Document, dictionary};
 
     #[test]
     fn parses_pdf_dates_with_offsets() {
@@ -605,5 +620,46 @@ mod tests {
     fn formats_serial_numbers_like_java_big_integer() {
         assert_eq!(serial_number_hex(&[0, 0, 0x0a, 0xbc]), "0abc");
         assert_eq!(serial_number_hex(&[0]), "00");
+    }
+
+    #[test]
+    fn a_decoy_byte_range_cannot_spoof_a_different_signatures_document_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A real signature whose own `/ByteRange` does not reach the file's
+        // true length (as if content had been appended after it) must report
+        // `coversEntireDocument: false`, even in the presence of an unrelated
+        // "signature-like" object elsewhere in the file (no valid CMS
+        // required, no relationship to the real signature or AcroForm tree)
+        // whose own fabricated `/ByteRange` claims to cover far more than the
+        // real file length. Neither object's flag may leak into the other's.
+        let mut document = Document::with_version("1.7");
+        let real_id = document.add_object(dictionary! {
+            "Type" => "Sig",
+            "ByteRange" => vec![0.into(), 10.into(), 20.into(), 5.into()],
+            "Contents" => lopdf::Object::string_literal("x"),
+        });
+        let decoy_id = document.add_object(dictionary! {
+            "ByteRange" => vec![0.into(), 1.into(), 999_999.into(), 1.into()],
+            "Contents" => lopdf::Object::string_literal("y"),
+        });
+        assert!(real_id.0 < decoy_id.0);
+        let catalog_id = document.add_object(dictionary! { "Type" => "Catalog" });
+        document.trailer.set("Root", catalog_id);
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("decoy.pdf");
+        document.save(&path)?;
+
+        let results = validate_pdf_signatures(&path, None)?;
+        assert_eq!(results.len(), 2);
+        assert!(
+            !results[0].covers_entire_document,
+            "the real signature's own (short) byte range must not be inflated by the decoy"
+        );
+        assert!(
+            results[1].covers_entire_document,
+            "the decoy's own fabricated range still resolves to its own result only"
+        );
+        Ok(())
     }
 }

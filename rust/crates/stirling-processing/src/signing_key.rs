@@ -74,6 +74,13 @@ impl SigningSecret {
         Self(Zeroizing::new(value))
     }
 
+    /// Wraps bytes that are already held in a zeroizing buffer, without an
+    /// intermediate unzeroized copy.
+    #[must_use]
+    pub(crate) fn from_zeroizing(value: Zeroizing<Vec<u8>>) -> Self {
+        Self(value)
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0

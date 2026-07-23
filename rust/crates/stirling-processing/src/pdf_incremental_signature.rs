@@ -186,9 +186,20 @@ impl PdfSignaturePlaceholder {
 
         let mut document = Vec::new();
         incremental.save_to(&mut document)?;
-        let contents = locate_contents(&document, pdf.len(), reserved_signature_bytes)?;
-        write_byte_range(&mut document, pdf.len(), contents.clone())?;
+        Self::finish(document, signature_id, reserved_signature_bytes)
+    }
 
+    /// Locates the real signature object's own `/Contents` placeholder and
+    /// fills in its `/ByteRange`, once the incremental revision has been
+    /// fully assembled and written.
+    fn finish(
+        mut document: Vec<u8>,
+        signature_id: lopdf::ObjectId,
+        reserved_signature_bytes: usize,
+    ) -> Result<Self, PdfSigningError> {
+        let signature_offset = signature_object_offset(&document, signature_id)?;
+        let contents = locate_contents(&document, signature_offset, reserved_signature_bytes)?;
+        write_byte_range(&mut document, signature_offset, contents.clone())?;
         Ok(Self { document, contents })
     }
 
@@ -405,6 +416,37 @@ fn acro_form_fields(
     }
 }
 
+/// Returns the exact byte offset where the freshly-created signature object's
+/// own serialization begins, from the just-written document's real,
+/// PDF-parsed cross-reference table.
+///
+/// [`locate_contents`] and [`write_byte_range`] must search starting only
+/// from this offset, never from `pdf.len()` (the start of the whole appended
+/// incremental section). Every other object re-serialized alongside the
+/// signature - most importantly the input PDF's own (attacker-controlled)
+/// Catalog/Root dictionary, cloned and rewritten at `root_id` - keeps its
+/// original, strictly-lower object id and is therefore always written earlier
+/// in the appended section (`lopdf` serializes its `BTreeMap<ObjectId, _>` in
+/// ascending id order, and `signature_id` is always freshly allocated higher
+/// than every id that existed in the input document). A raw byte search that
+/// starts at `pdf.len()` would find the *first* occurrence of a marker
+/// anywhere in that whole section, so an attacker could plant a decoy
+/// `/Contents<...>` (or `/ByteRange[...]`) value as an extra key on their own
+/// Root dictionary and hijack which bytes get treated as the placeholder.
+/// Re-parsing with `lopdf` (rather than trusting a raw byte scan) means only
+/// a real object boundary counts, exactly like any other PDF consumer would
+/// see it - a decoy string value can never be misread as a new object.
+fn signature_object_offset(
+    document: &[u8],
+    signature_id: lopdf::ObjectId,
+) -> Result<usize, PdfSigningError> {
+    let reparsed = Document::load_mem(document)?;
+    match reparsed.reference_table.entries.get(&signature_id.0) {
+        Some(lopdf::xref::XrefEntry::Normal { offset, .. }) => Ok(*offset as usize),
+        _ => Err(PdfSigningError::PlaceholderMissing),
+    }
+}
+
 fn locate_contents(
     document: &[u8],
     appended_start: usize,
@@ -466,7 +508,7 @@ mod tests {
     use std::{fs, process::Command};
 
     use cryptographic_message_syntax::SignedData;
-    use lopdf::{Dictionary, Document, Object, Stream, dictionary};
+    use lopdf::{Dictionary, Document, Object, Stream, StringFormat, dictionary};
     use x509_certificate::{Sign, testutil::self_signed_ecdsa_key_pair};
 
     use crate::signing_key::{PemSigningKey, SigningSecret};
@@ -547,6 +589,67 @@ mod tests {
             placeholder.complete(&[1, 2, 3]),
             Err(PdfSigningError::CmsTooLarge)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_decoy_contents_key_on_the_input_catalog_cannot_hijack_the_real_placeholder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reserved = 64usize;
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(Dictionary::new(), Vec::new()));
+        let page_object_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => content_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_object_id)],
+                "Count" => 1,
+            }),
+        );
+        // A decoy `/Contents<0...0>` hex string, sized to exactly match the
+        // real CMS reservation, planted directly on the Catalog - the one
+        // dictionary this module always clones and re-serializes verbatim
+        // (plus an added AcroForm key) ahead of the real signature object in
+        // the appended incremental bytes, since it keeps its original,
+        // strictly-lower object id.
+        let decoy = Object::String(vec![0; reserved], StringFormat::Hexadecimal);
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+            "Contents" => decoy,
+        });
+        document.trailer.set("Root", Object::Reference(catalog_id));
+        let mut source = Vec::new();
+        document.save_to(&mut source)?;
+
+        let placeholder = PdfSignaturePlaceholder::prepare(&source, reserved)?;
+        let cms = vec![0xAB; reserved];
+        let signed_pdf = placeholder.complete(&cms)?;
+
+        let reloaded = Document::load_mem(&signed_pdf)?;
+        let acro_form_id = reloaded.catalog()?.get(b"AcroForm")?.as_reference()?;
+        let acro_form = reloaded.get_object(acro_form_id)?.as_dict()?;
+        let field_id = acro_form.get(b"Fields")?.as_array()?[0].as_reference()?;
+        let field = reloaded.get_object(field_id)?.as_dict()?;
+        let signature_id = field.get(b"V")?.as_reference()?;
+        let signature = reloaded.get_object(signature_id)?.as_dict()?;
+        // The real signature object must hold the actual CMS bytes we supplied...
+        assert_eq!(signature.get(b"Contents")?.as_str()?, cms.as_slice());
+
+        // ...and the decoy on the Catalog must remain exactly as planted
+        // (still all-zero), proving the placeholder search never touched it.
+        let catalog = reloaded.catalog()?;
+        assert_eq!(
+            catalog.get(b"Contents")?.as_str()?,
+            vec![0u8; reserved].as_slice()
+        );
         Ok(())
     }
 

@@ -24,6 +24,57 @@ opaque and zeroized where supported. The route lacks policy validation, a
 public compatibility suite, and security review, so it must not be represented
 as production-ready PAdES support.
 
+**2026-07-23 AI-assisted review pass (not a substitute for an independent
+review):** an adversarially-verified pass against this document's own
+non-negotiable constraints found and fixed 6 concrete issues, each with a
+regression test. **Critical:** `covers_entire_document` in
+`pdf_signature_validation.rs` was computed once as a document-wide flag from
+the largest `/ByteRange` among *any* signature-like object, then applied to
+every signature's result; an attacker-supplied decoy object with a fabricated
+`/ByteRange`/`/Contents` pair (no valid CMS needed) could spoof a genuinely
+tampered, appended-to document as fully covered. It is now computed strictly
+per-signature from that signature's own byte range. **High:**
+`pdf_incremental_signature.rs` located the real signature's `/Contents`
+placeholder and `/ByteRange` insertion point by raw byte-scanning from the
+start of the whole appended revision, so a decoy `/Contents` key added to the
+input PDF's own Catalog (which always serializes at a lower object ID than the
+freshly-allocated signature object) could be matched first and hijack the
+placeholder; it now locates the offset via the just-written revision's own
+PDF-parsed cross-reference table instead of string matching. **High:** the
+`/Sig/Name` dictionary entry (later read back out as `signerName` by this
+module's own validation endpoint) was populated from the raw client-supplied
+`name` form field with no cross-check against the actual signing certificate;
+it now reuses the same certificate-CN-preferred value already used for the
+visible appearance, so a signer cannot claim a false identity in a
+technically-valid signature. **High:** `hardware_signing.rs`'s desktop gate
+(`ensure_desktop`/`is_desktop`) checked only process-wide environment
+variables, never the calling peer, so any caller reaching a desktop-mode
+runtime over the network could enumerate/use hardware certificates as the
+bundled desktop UI; it now additionally requires the request's peer address to
+be loopback (`ConnectInfo<SocketAddr>` threaded through the two discovery
+routes and `cert_sign_pdf`). **Medium:** traditional (non-PKCS#8) PEM parsing
+held decoded key bytes and their base64 text in plain `Vec<u8>`/`String`
+buffers before wrapping them as the zeroizing `SigningSecret`; both are now
+zeroizing from the moment they are decoded. **Medium:** an invalid-UTF-8
+PKCS#11 PIN was copied into a plain, unzeroized `Vec<u8>` via
+`String::from_utf8` before validation failed; it is now validated by borrowing
+(`str::from_utf8`) with no unzeroized copy on the failure path. **Low
+(previously missing, now implemented):** PKCS#11 login had no attempt limit,
+letting an unbounded number of PIN guesses reach a token through this endpoint
+regardless of what the token/driver itself enforces; it now locks out further
+attempts against a given `(library, slot)` for 5 minutes after 5 consecutive
+failures. One further low-severity finding was reviewed and intentionally left
+unchanged by product decision: `workflow_signing.rs`'s participant-token routes
+return distinguishable errors (`Expired` vs `Conflict` vs `AccessDenied`) for a
+resolved participant, but only *after* the caller already holds a valid
+122-bit UUID share token — invalid/nonexistent tokens are already collapsed to
+a uniform `AccessDenied` before any state check runs, so this is not a
+pre-authentication existence oracle, and collapsing the post-token state
+errors would degrade legitimate participants' ability to tell "this link
+expired" from "you already signed this" for negligible security benefit. None
+of this changes the status above: an independent review is still required
+before this route can be represented as production-ready PAdES support.
+
 ## Java baseline
 
 `POST /api/v1/security/cert-sign` accepts a PDF with PEM + certificate,

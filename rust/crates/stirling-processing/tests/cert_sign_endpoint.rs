@@ -54,7 +54,12 @@ async fn signs_a_pdf_with_an_uploaded_pem_key_and_der_certificate() -> TestResul
     let signed_pdf = to_bytes(response.into_body(), usize::MAX).await?.to_vec();
     let document = Document::load_mem(&signed_pdf)?;
     let signature = signature_dictionary(&document)?;
-    assert_eq!(signature.get(b"Name")?.as_str()?, b"Stirling Test");
+    // /Sig/Name must reflect the signing certificate's own CN ("test", set by
+    // self_signed_ecdsa_key_pair), not the client-supplied "name" field above
+    // - a raw client string here would let a signer claim an unverified
+    // identity that Stirling's own signature-validation endpoint later
+    // reports back out as `signerName`.
+    assert_eq!(signature.get(b"Name")?.as_str()?, b"test");
     let byte_range = signature
         .get(b"ByteRange")?
         .as_array()?

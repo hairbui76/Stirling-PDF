@@ -13,6 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -139,6 +140,8 @@ pub enum HardwareSigningError {
     Pkcs11SlotRequired,
     #[error("PKCS#11 token could not be opened, authenticated, or queried")]
     Pkcs11Operation,
+    #[error("Too many PIN attempts for this PKCS#11 token; try again later")]
+    Pkcs11Locked,
     #[error("A PKCS#11 certificate alias is required")]
     Pkcs11AliasRequired,
     #[error("The PKCS#11 certificate alias is invalid")]
@@ -194,10 +197,13 @@ pub fn capabilities() -> HardwareSigningCapabilities {
 ///
 /// # Errors
 ///
-/// Returns an error outside desktop mode, on a non-Windows runtime, or if the
-/// current user's `MY` certificate store cannot be opened.
-pub fn list_windows_certificates() -> Result<Vec<HardwareCertificateInfo>, HardwareSigningError> {
-    ensure_desktop()?;
+/// Returns an error outside desktop mode, when the request did not come from
+/// the loopback interface, on a non-Windows runtime, or if the current user's
+/// `MY` certificate store cannot be opened.
+pub fn list_windows_certificates(
+    peer_is_loopback: bool,
+) -> Result<Vec<HardwareCertificateInfo>, HardwareSigningError> {
+    ensure_desktop(peer_is_loopback)?;
     #[cfg(windows)]
     {
         windows_store::list_signing_certificates()
@@ -215,13 +221,15 @@ pub fn list_windows_certificates() -> Result<Vec<HardwareCertificateInfo>, Hardw
 ///
 /// # Errors
 ///
-/// Returns an outer error outside desktop/Windows mode, for an invalid or
-/// ambiguous alias, or when the certificate store cannot be opened.
+/// Returns an outer error outside desktop/Windows mode, when the request did
+/// not come from the loopback interface, for an invalid or ambiguous alias, or
+/// when the certificate store cannot be opened.
 pub fn with_windows_signing_key<T, E>(
+    peer_is_loopback: bool,
     alias: &str,
     operation: impl FnOnce(&WindowsSigningKey) -> Result<T, E>,
 ) -> Result<Result<T, E>, HardwareSigningError> {
-    ensure_desktop()?;
+    ensure_desktop(peer_is_loopback)?;
     let thumbprint = parse_windows_alias(alias)?;
     #[cfg(windows)]
     {
@@ -292,14 +300,16 @@ impl WindowsSigningKey {
 ///
 /// # Errors
 ///
-/// Returns an error outside desktop mode, for a non-allowlisted driver, when
-/// token selection or authentication fails, or when token objects cannot be
-/// read. Provider errors are intentionally not exposed because they can contain
-/// sensitive token state.
+/// Returns an error outside desktop mode, when the request did not come from
+/// the loopback interface, for a non-allowlisted driver, when token selection
+/// or authentication fails, or when token objects cannot be read. Provider
+/// errors are intentionally not exposed because they can contain sensitive
+/// token state.
 pub fn list_pkcs11_certificates(
+    peer_is_loopback: bool,
     request: Pkcs11CertificatesRequest,
 ) -> Result<Vec<HardwareCertificateInfo>, HardwareSigningError> {
-    ensure_desktop()?;
+    ensure_desktop(peer_is_loopback)?;
     let Pkcs11CertificatesRequest {
         library_path,
         slot,
@@ -316,9 +326,7 @@ pub fn list_pkcs11_certificates(
         .open_ro_session(slot)
         .map_err(|_| HardwareSigningError::Pkcs11Operation)?;
     let pin = pin.map(|pin| AuthPin::new(pin.to_string().into()));
-    session
-        .login(UserType::User, pin.as_ref())
-        .map_err(|_| HardwareSigningError::Pkcs11Operation)?;
+    pkcs11_login(&session, pin.as_ref(), (library_path, slot.id()))?;
 
     let certificates = read_pkcs11_certificates(&session);
     let logout = session.logout();
@@ -338,13 +346,15 @@ pub fn list_pkcs11_certificates(
 ///
 /// # Errors
 ///
-/// Returns an outer error when desktop policy, driver selection, token login,
-/// key selection, mechanism validation, or logout fails.
+/// Returns an outer error when desktop policy (including the loopback-peer
+/// requirement), driver selection, token login, key selection, mechanism
+/// validation, or logout fails.
 pub fn with_pkcs11_signing_key<T, E>(
+    peer_is_loopback: bool,
     request: Pkcs11SigningRequest,
     operation: impl FnOnce(&Pkcs11SigningKey<'_>) -> Result<T, E>,
 ) -> Result<Result<T, E>, HardwareSigningError> {
-    ensure_desktop()?;
+    ensure_desktop(peer_is_loopback)?;
     let Pkcs11SigningRequest {
         library_path,
         slot,
@@ -363,7 +373,7 @@ pub fn with_pkcs11_signing_key<T, E>(
         .open_ro_session(slot)
         .map_err(|_| HardwareSigningError::Pkcs11Operation)?;
     let pin = pin.map(|pin| AuthPin::new(pin.to_string().into()));
-    let login = Pkcs11Login::new(&session, pin.as_ref())?;
+    let login = Pkcs11Login::new(&session, pin.as_ref(), (library_path, slot.id()))?;
     let signing_key = Pkcs11SigningKey::select(&context, slot, &session, &identifier)?;
     let result = operation(&signing_key);
     drop(signing_key);
@@ -381,10 +391,12 @@ struct Pkcs11Login<'a> {
 }
 
 impl<'a> Pkcs11Login<'a> {
-    fn new(session: &'a Session, pin: Option<&AuthPin>) -> Result<Self, HardwareSigningError> {
-        session
-            .login(UserType::User, pin)
-            .map_err(|_| HardwareSigningError::Pkcs11Operation)?;
+    fn new(
+        session: &'a Session,
+        pin: Option<&AuthPin>,
+        lockout_key: (PathBuf, u64),
+    ) -> Result<Self, HardwareSigningError> {
+        pkcs11_login(session, pin, lockout_key)?;
         Ok(Self {
             session,
             logged_in: true,
@@ -804,12 +816,80 @@ fn select_pkcs11_slot(
     }
 }
 
-fn ensure_desktop() -> Result<(), HardwareSigningError> {
-    if is_desktop() {
+const PKCS11_MAX_PIN_ATTEMPTS: u32 = 5;
+const PKCS11_LOCKOUT_DURATION: Duration = Duration::from_secs(5 * 60);
+
+static PKCS11_PIN_LOCKOUT: OnceLock<Mutex<HashMap<(PathBuf, u64), Pkcs11LockoutState>>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct Pkcs11LockoutState {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl Pkcs11LockoutState {
+    fn is_locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| now < until)
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.failures += 1;
+        if self.failures >= PKCS11_MAX_PIN_ATTEMPTS {
+            self.locked_until = Some(now + PKCS11_LOCKOUT_DURATION);
+        }
+    }
+}
+
+/// Authenticates a PKCS#11 session, tracking failed PIN attempts per
+/// `(library, slot)`.
+///
+/// The token or its driver may enforce its own lockout, but this endpoint must
+/// not rely on that alone: without a server-side limit too, an unbounded
+/// number of PIN guesses could be sent through it regardless of what the
+/// underlying hardware does.
+fn pkcs11_login(
+    session: &Session,
+    pin: Option<&AuthPin>,
+    lockout_key: (PathBuf, u64),
+) -> Result<(), HardwareSigningError> {
+    let lockout = PKCS11_PIN_LOCKOUT.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let currently_locked = lockout.lock().is_ok_and(|lockout| {
+        lockout
+            .get(&lockout_key)
+            .is_some_and(|state| state.is_locked(now))
+    });
+    if currently_locked {
+        return Err(HardwareSigningError::Pkcs11Locked);
+    }
+    if session.login(UserType::User, pin).is_ok() {
+        if let Ok(mut lockout) = lockout.lock() {
+            lockout.remove(&lockout_key);
+        }
+        return Ok(());
+    }
+    if let Ok(mut lockout) = lockout.lock() {
+        lockout.entry(lockout_key).or_default().record_failure(now);
+    }
+    Err(HardwareSigningError::Pkcs11Operation)
+}
+
+/// `is_desktop()` reflects the whole process's environment, not the caller of
+/// this particular request: once a desktop-mode Rust runtime is up, any
+/// network peer that can reach it would otherwise pass this gate too. Hardware
+/// signing must additionally be requested from the loopback interface, which
+/// is how the bundled desktop UI actually talks to its local sidecar.
+fn ensure_desktop(peer_is_loopback: bool) -> Result<(), HardwareSigningError> {
+    if desktop_gate_satisfied(is_desktop(), peer_is_loopback) {
         Ok(())
     } else {
         Err(HardwareSigningError::DesktopOnly)
     }
+}
+
+fn desktop_gate_satisfied(is_desktop: bool, peer_is_loopback: bool) -> bool {
+    is_desktop && peer_is_loopback
 }
 
 fn is_desktop() -> bool {
@@ -1252,13 +1332,47 @@ try {
 #[cfg(test)]
 mod tests {
     use super::{
-        HardwareSigningError, Pkcs11LibraryInfo, allowed_pkcs11_library, certificate_info_from_der,
-        detect_libraries, normalize_ecdsa_signature, parse_pkcs11_alias, parse_windows_alias,
-        pkcs11_alias, select_signing_mechanism, serial_number_hex, valid_der_ecdsa_signature,
+        HardwareSigningError, PKCS11_LOCKOUT_DURATION, PKCS11_MAX_PIN_ATTEMPTS, Pkcs11LibraryInfo,
+        Pkcs11LockoutState, allowed_pkcs11_library, certificate_info_from_der,
+        desktop_gate_satisfied, detect_libraries, normalize_ecdsa_signature, parse_pkcs11_alias,
+        parse_windows_alias, pkcs11_alias, select_signing_mechanism, serial_number_hex,
+        valid_der_ecdsa_signature,
     };
     use cryptoki::mechanism::MechanismType;
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     use x509_certificate::{EcdsaCurve, KeyAlgorithm, SignatureAlgorithm};
+
+    #[test]
+    fn hardware_signing_requires_both_desktop_mode_and_a_loopback_peer() {
+        // The env-based desktop check alone is process-wide, not
+        // request-specific: any network peer reaching a desktop-mode Rust
+        // runtime would otherwise be treated the same as the bundled desktop
+        // UI talking to its own local sidecar. Both conditions must hold.
+        assert!(desktop_gate_satisfied(true, true));
+        assert!(!desktop_gate_satisfied(true, false));
+        assert!(!desktop_gate_satisfied(false, true));
+        assert!(!desktop_gate_satisfied(false, false));
+    }
+
+    #[test]
+    fn locks_a_pkcs11_token_after_repeated_pin_failures_and_unlocks_after_the_window() {
+        let mut state = Pkcs11LockoutState::default();
+        let now = Instant::now();
+        assert!(!state.is_locked(now));
+
+        for _ in 0..PKCS11_MAX_PIN_ATTEMPTS - 1 {
+            state.record_failure(now);
+            assert!(!state.is_locked(now));
+        }
+        state.record_failure(now);
+        assert!(state.is_locked(now));
+        assert!(state.is_locked(now + Duration::from_secs(1)));
+        assert!(!state.is_locked(now + PKCS11_LOCKOUT_DURATION + Duration::from_secs(1)));
+    }
 
     #[test]
     fn detects_configured_existing_libraries_without_duplicates()

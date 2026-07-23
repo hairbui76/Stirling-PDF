@@ -6,15 +6,23 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-23):** `cargo fmt --check`, strict locked all-target
 workspace Clippy, and `cargo test --workspace --no-fail-fast` all pass with the
-pinned PDFium runtime: all 111 AI-engine library tests, all 439 processing
-library tests, helper-binary tests, and the complete endpoint/integration
-matrix (every `stirling-processing` integration-test binary, including the new
-`mcp_endpoint` suite, passes in full). Two `stirling-ai-engine` `process_smoke`
-tests (`binary_serves_ephemeral_port_with_auth_and_post_contracts`,
+pinned PDFium runtime, with four exceptions, each confirmed via a clean-tree
+(`git stash`) rerun to be pre-existing and unrelated to any change made in this
+pass: two `stirling-ai-engine` `process_smoke` tests
+(`binary_serves_ephemeral_port_with_auth_and_post_contracts`,
 `binary_infers_keyless_ollama_and_completes_an_http_agent_request`) time out in
-this sandbox specifically — confirmed via a clean-tree rerun to be a
-pre-existing, sandbox-network/process-timing limitation, not a regression from
-any change here. External-runtime happy paths remain conditional on their
+this sandbox's network/process-timing environment; `stirling-processing`'s
+`pdf_markdown::tests::infers_heading_from_font_size_end_to_end` fails
+independent of the signing work in this pass; and two `stirling-processing`
+integration tests that depend on state outside this sandbox —
+`ai_workflow_endpoint`'s AI-engine-backed tests (503 instead of 200, the AI
+engine dependency is not reachable here) and
+`policy_config_endpoint::disconnecting_a_policy_stream_does_not_cancel_the_run`
+(a wall-clock timing assertion) — also fail here on a clean tree. All 111
+AI-engine library tests and all 443 processing library tests otherwise pass
+(442 of 443, excluding the one pre-existing `pdf_markdown` failure above), as
+does the complete endpoint/integration matrix aside from the two exceptions
+just noted. External-runtime happy paths remain conditional on their
 respective tools and services.
 
 **Route-count scoping note:** the Rust service registers 313 HTTP routes total.

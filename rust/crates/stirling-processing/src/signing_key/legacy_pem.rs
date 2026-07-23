@@ -34,7 +34,7 @@ pub(super) fn decode_traditional_pem(
             let password = password.ok_or(SigningKeyError::PrivateKeyPasswordRequired)?;
             decrypt_legacy_pem(&parsed.payload, password.as_bytes(), &encryption)?
         }
-        None => SigningSecret::new(parsed.payload),
+        None => SigningSecret::from_zeroizing(parsed.payload),
     };
     traditional_der_to_pkcs8(parsed.label, private_key_der).map_err(|error| {
         if was_encrypted {
@@ -48,7 +48,7 @@ pub(super) fn decode_traditional_pem(
 struct ParsedLegacyPem {
     label: &'static str,
     encryption: Option<LegacyEncryption>,
-    payload: Vec<u8>,
+    payload: Zeroizing<Vec<u8>>,
 }
 
 impl ParsedLegacyPem {
@@ -65,7 +65,7 @@ impl ParsedLegacyPem {
         let expected_end = format!("-----END {label}-----");
         let mut encrypted = false;
         let mut dek_info = None;
-        let mut encoded = String::new();
+        let mut encoded = Zeroizing::new(String::new());
         let mut reached_end = false;
         for line in lines {
             if line == expected_end {
@@ -96,9 +96,11 @@ impl ParsedLegacyPem {
         if !reached_end || encoded.is_empty() {
             return Err(SigningKeyError::InvalidPrivateKey);
         }
-        let payload = STANDARD
-            .decode(encoded)
-            .map_err(|_| SigningKeyError::InvalidPrivateKey)?;
+        let payload = Zeroizing::new(
+            STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|_| SigningKeyError::InvalidPrivateKey)?,
+        );
         let encryption = if encrypted {
             Some(LegacyEncryption::parse(
                 dek_info
