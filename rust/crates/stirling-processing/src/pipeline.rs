@@ -93,6 +93,12 @@ impl PipelineDispatcher {
     pub(crate) fn new(router: Router) -> Self {
         Self { router }
     }
+
+    /// Returns a cheap clone of the in-process router for internal dispatch
+    /// (e.g. `Service::oneshot`), the same mechanism used to run pipeline steps.
+    pub(crate) fn router(&self) -> Router {
+        self.router.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -725,7 +731,7 @@ async fn record_policy_step_audit(
     let _ = task::spawn_blocking(move || store.record_http_audit(&record)).await;
 }
 
-async fn build_operation_request(
+pub(crate) async fn build_operation_request(
     operation: &PipelineOperation,
     files: &[PipelineFile],
     supporting_files: &SupportingFiles,
@@ -826,7 +832,7 @@ fn parameter_values(value: &Value) -> Vec<String> {
     }
 }
 
-async fn write_response_to_file(
+pub(crate) async fn write_response_to_file(
     response: axum::response::Response,
     path: &Path,
 ) -> Result<(), PipelineFailure> {
@@ -847,7 +853,7 @@ async fn write_response_to_file(
     })
 }
 
-async fn response_error_message(response: axum::response::Response) -> String {
+pub(crate) async fn response_error_message(response: axum::response::Response) -> String {
     match to_bytes(response.into_body(), ERROR_BODY_LIMIT_BYTES).await {
         Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
         Ok(_) => "empty response".to_owned(),
@@ -865,7 +871,7 @@ fn pipeline_filename(operation: &str, headers: &HeaderMap) -> String {
     }
 }
 
-fn response_filename(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn response_filename(headers: &HeaderMap) -> Option<String> {
     let content_disposition = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
     content_disposition.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
@@ -1116,7 +1122,7 @@ async fn drain_field(
     Ok(())
 }
 
-fn validate_operation_path(operation: &str) -> Result<(), PipelineFailure> {
+pub(crate) fn validate_operation_path(operation: &str) -> Result<(), PipelineFailure> {
     let Some(path) = operation.strip_prefix("/api/v1/") else {
         return Err(disallowed_operation(operation));
     };
@@ -1212,7 +1218,7 @@ fn is_valid_form_field_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn safe_filename(value: Option<&str>) -> String {
+pub(crate) fn safe_filename(value: Option<&str>) -> String {
     value
         .and_then(|name| Path::new(name).file_name())
         .and_then(|name| name.to_str())

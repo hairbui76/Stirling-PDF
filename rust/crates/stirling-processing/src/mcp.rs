@@ -1,12 +1,20 @@
 //! API-key-authenticated MCP JSON-RPC boundary.
 //!
-//! This first vertical slice intentionally exposes only the Rust AI-engine
-//! catalog. PDF category tools and reusable file artifacts stay hidden until
-//! their storage and internal-dispatch contracts are ported together.
+//! Alongside the Rust AI-engine catalog (`stirling_describe_operation`,
+//! `stirling_ai`), this now owns reusable file artifacts (`stirling_upload`,
+//! `stirling_download`) and direct dispatch of a real Stirling processing
+//! operation (`stirling_operation`), reusing the existing owner-scoped
+//! [`crate::job_manager::JobManager`] for storage and the same in-process
+//! router dispatch [`crate::pipeline`] uses to run a pipeline step. Per-caller
+//! granular scopes (Java's `mcp.tools.read`/`mcp.tools.write`) are not ported:
+//! there is no Rust API-key scope store yet, so these tools share the same
+//! authorization boundary as the existing two (a valid API key plus the
+//! operation allowlist), not a regression versus what was already shipped.
 
 use std::{
     collections::BTreeMap,
     io::Read as _,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,14 +27,19 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
+use tempfile::TempDir;
 use tokio::task;
+use tower::ServiceExt as _;
 use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::{
+    job_manager::{JobManager, JobOwner},
     pdf_ai_comments::AiCommentEngineSettings,
+    pipeline::{PipelineFile, PipelineOperation, SupportingFiles},
     runtime_config::McpConfig,
     runtime_metrics::application_version,
     security::{AuthContext, SecurityError, SecurityStore},
@@ -52,6 +65,8 @@ struct McpState {
     config: McpConfig,
     store: Arc<SecurityStore>,
     catalog: Arc<AiCapabilityCatalog>,
+    job_manager: Arc<JobManager>,
+    dispatch_router: Router,
 }
 
 #[derive(Clone)]
@@ -175,6 +190,8 @@ pub(crate) fn routes(
     config: McpConfig,
     store: Arc<SecurityStore>,
     engine_settings: &AiCommentEngineSettings,
+    job_manager: Arc<JobManager>,
+    dispatch_router: Router,
 ) -> Router {
     if !config.enabled || !config.auth.mode.trim().eq_ignore_ascii_case("apikey") {
         return Router::new();
@@ -187,6 +204,8 @@ pub(crate) fn routes(
         config,
         store,
         catalog,
+        job_manager,
+        dispatch_router,
     });
     Router::new()
         .route(MCP_PATH, post(handle))
@@ -308,6 +327,9 @@ async fn handle_tools_call(state: &McpState, context: &AuthContext, request: &Rp
     let result = match name {
         "stirling_describe_operation" => describe_operation(&arguments, &operations),
         "stirling_ai" => call_ai(state, context, &arguments, &operations).await,
+        "stirling_upload" => upload_file(state, context, &arguments).await,
+        "stirling_download" => download_file(state, context, &arguments).await,
+        "stirling_operation" => run_operation(state, context, &arguments).await,
         _ => {
             return rpc_failure(request.id.clone(), -32602, &format!("Unknown tool: {name}"));
         }
@@ -352,8 +374,70 @@ fn tools_list_result(operations: &BTreeMap<String, AiCapability>) -> Value {
                 "name": "stirling_ai",
                 "description": "Invoke a Stirling AI agent capability. Call stirling_describe_operation with the chosen capability id before invoking this tool.",
                 "inputSchema": ai_tool_schema(operations),
+            },
+            {
+                "name": "stirling_upload",
+                "description": "Store a file server-side and get back a fileId to reuse across operations. Recommended only for large files or multi-step workflows; for a single operation on a typical file, pass the file inline via stirling_operation's `file` argument instead.",
+                "inputSchema": upload_tool_schema(),
+            },
+            {
+                "name": "stirling_download",
+                "description": "Fetch a stored file's content by fileId (e.g. an operation result), returned inline as base64. Recommended only when a result was too large to be returned inline.",
+                "inputSchema": download_tool_schema(),
+            },
+            {
+                "name": "stirling_operation",
+                "description": "Run a real Stirling PDF processing operation (e.g. split, merge, compress, convert) by its API path, not an AI capability. Pass the input file inline as base64 via `file`, or a `fileId` from stirling_upload or a prior operation's result.",
+                "inputSchema": operation_tool_schema(),
             }
         ]
+    })
+}
+
+fn upload_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "file": {"type": "string", "description": "Base64-encoded file content."},
+            "fileName": {"type": "string", "description": "Optional original filename (with extension)."},
+        },
+        "required": ["file"],
+    })
+}
+
+fn download_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "fileId": {"type": "string", "description": "Id of a stored file (e.g. an operation result's fileId)."},
+        },
+        "required": ["fileId"],
+    })
+}
+
+fn operation_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "operation": {
+                "type": "string",
+                "description": "The Stirling API path to call, e.g. /api/v1/general/split-pages.",
+            },
+            "file": {"type": "string", "description": "Base64-encoded input file content."},
+            "fileId": {
+                "type": "string",
+                "description": "Id of a previously stored file (from stirling_upload or a prior operation's result), used instead of 'file'.",
+            },
+            "fileName": {"type": "string", "description": "Optional filename for the input file."},
+            "parameters": {
+                "type": "object",
+                "description": "Operation-specific form parameters, matching the operation's own API request fields.",
+            },
+        },
+        "required": ["operation"],
     })
 }
 
@@ -469,6 +553,334 @@ async fn call_ai(
                 "Engine request failed for capability '{operation_id}'."
             ))
         }
+    }
+}
+
+const UPLOAD_FILE_NAME: &str = "upload.bin";
+
+/// Stores an inline base64 file server-side under a fresh owner-scoped job so
+/// it can be reused by `fileId` across later `stirling_operation`/
+/// `stirling_download` calls. Reuses [`JobManager`] verbatim: no new storage
+/// mechanism, no new ownership semantics.
+async fn upload_file(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+    let Some(base64) = text_argument(arguments, "file") else {
+        return tool_error("Missing required argument: file (base64-encoded content).");
+    };
+    let Ok(bytes) = STANDARD.decode(base64) else {
+        return tool_error("The 'file' argument is not valid base64.");
+    };
+    let name = text_argument(arguments, "fileName").unwrap_or("upload.bin");
+    let owner = JobOwner::from_auth_context(Some(context));
+    let Ok(submission) = state.job_manager.create_job(owner) else {
+        return tool_error("Failed to store the uploaded file.");
+    };
+    let path = submission.directory.join(UPLOAD_FILE_NAME);
+    if tokio::fs::write(&path, &bytes).await.is_err() {
+        return tool_error("Failed to store the uploaded file.");
+    }
+    if state
+        .job_manager
+        .complete_file(&submission.job_id, &path, name, "application/octet-stream")
+        .is_err()
+    {
+        return tool_error("Failed to store the uploaded file.");
+    }
+    match state.job_manager.result_file(owner, &submission.job_id) {
+        Ok(Some(file)) => tool_text(&format!(
+            "Stored '{name}' ({len} bytes) as fileId={file_id}. Pass this fileId to stirling_operation's 'fileId' argument.",
+            len = bytes.len(),
+            file_id = file.file_id,
+        )),
+        _ => tool_error("Failed to store the uploaded file."),
+    }
+}
+
+/// Fetches a stored file's content by `fileId`, inline as base64. Owner
+/// isolation comes entirely from [`JobManager::job_file`], which already
+/// returns the same "not found" result for a foreign fileId as for a missing
+/// one - this function must not distinguish those cases either.
+async fn download_file(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+    let Some(file_id) = text_argument(arguments, "fileId") else {
+        return tool_error("Missing required argument: fileId.");
+    };
+    let owner = JobOwner::from_auth_context(Some(context));
+    let file = match state.job_manager.job_file(owner, file_id) {
+        Ok(Some((_, file))) => file,
+        Ok(None) => {
+            return tool_error(&format!("Unknown or inaccessible fileId '{file_id}'."));
+        }
+        Err(_) => return tool_error(&format!("Failed to read fileId '{file_id}'.")),
+    };
+    if file.file_size > state.config.max_inline_response_bytes {
+        return tool_error(&format!(
+            "File is {size} bytes, over the inline limit of {limit} bytes. Retrieve it via the Stirling UI/API instead.",
+            size = file.file_size,
+            limit = state.config.max_inline_response_bytes,
+        ));
+    }
+    let Ok(bytes) = tokio::fs::read(&file.path).await else {
+        return tool_error(&format!("Failed to read fileId '{file_id}'."));
+    };
+    file_result(
+        &format!(
+            "File {file_id} ({len} bytes) included inline below.",
+            len = bytes.len()
+        ),
+        file_id,
+        &file.content_type,
+        &bytes,
+    )
+}
+
+/// Dispatches a real Stirling processing operation (identified by its own API
+/// path, e.g. `/api/v1/general/split-pages`) in-process through the same
+/// router `pipeline` uses to run a step, with an input resolved from an
+/// uploaded `fileId` or inline base64.
+async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+    let Some(operation) = text_argument(arguments, "operation") else {
+        return tool_error(
+            "Missing required argument: operation (the Stirling API path, e.g. /api/v1/general/split-pages).",
+        );
+    };
+    if crate::pipeline::validate_operation_path(operation).is_err()
+        || !operation_allowed(&state.config, operation)
+    {
+        return tool_error(&format!(
+            "Operation '{operation}' is not permitted for MCP dispatch."
+        ));
+    }
+    let owner = JobOwner::from_auth_context(Some(context));
+    let Some((input_path, input_filename, _scratch)) =
+        resolve_operation_input(state, owner, arguments).await
+    else {
+        return tool_error(
+            "This operation needs an input file. Pass 'file' as base64, or 'fileId' from stirling_upload for large files.",
+        );
+    };
+    let input_path = match input_path {
+        Ok(path) => path,
+        Err(message) => return tool_error(&message),
+    };
+
+    let parameters = arguments
+        .get("parameters")
+        .and_then(Value::as_object)
+        .cloned()
+        .map(|map| map.into_iter().collect::<BTreeMap<_, _>>())
+        .unwrap_or_default();
+    let pipeline_operation = PipelineOperation {
+        operation: operation.to_owned(),
+        parameters,
+        file_parameters: BTreeMap::new(),
+    };
+    let files = [PipelineFile {
+        filename: input_filename,
+        path: input_path,
+        content_type: None,
+        origin: None,
+    }];
+    let Ok(mut request) = crate::pipeline::build_operation_request(
+        &pipeline_operation,
+        &files,
+        &SupportingFiles::new(),
+    )
+    .await
+    else {
+        return tool_error(&format!(
+            "{operation} failed: could not build the internal request."
+        ));
+    };
+    request.extensions_mut().insert(context.clone());
+
+    let response = state
+        .dispatch_router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    let status = response.status();
+    let headers = response.headers().clone();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+
+    if !status.is_success() {
+        let message = crate::pipeline::response_error_message(response).await;
+        warn!(operation, %status, "MCP operation dispatch failed");
+        return tool_error(&format!(
+            "{operation} failed: HTTP {status}. {}",
+            truncate_message(&message, 300)
+        ));
+    }
+
+    if content_type.starts_with("application/json") {
+        let limit = usize::try_from(MAX_ENGINE_RESULT_BYTES).unwrap_or(usize::MAX);
+        let Ok(body) = to_bytes(response.into_body(), limit).await else {
+            return tool_error(&format!(
+                "{operation} returned a response that was too large or unreadable."
+            ));
+        };
+        return tool_text(&String::from_utf8_lossy(&body));
+    }
+
+    store_operation_result(state, owner, operation, &content_type, headers, response).await
+}
+
+/// Resolves `stirling_operation`'s input file, either from an owner-scoped
+/// `fileId` (already on disk, path reused directly) or a freshly-staged
+/// inline base64 payload (written under a request-scoped [`TempDir`] that
+/// callers must keep alive until dispatch completes). Returns `None` when
+/// neither `fileId` nor `file` was supplied.
+async fn resolve_operation_input(
+    state: &McpState,
+    owner: JobOwner,
+    arguments: &Value,
+) -> Option<(Result<PathBuf, String>, String, Option<TempDir>)> {
+    let file_name = text_argument(arguments, "fileName");
+    if let Some(file_id) = text_argument(arguments, "fileId") {
+        return Some(match state.job_manager.job_file(owner, file_id) {
+            Ok(Some((_, file))) => {
+                let name = file_name.map(str::to_owned).unwrap_or(file.file_name);
+                (Ok(file.path), name, None)
+            }
+            Ok(None) => (
+                Err(format!(
+                    "Unknown or inaccessible fileId '{file_id}'. Re-upload with stirling_upload."
+                )),
+                String::new(),
+                None,
+            ),
+            Err(_) => (
+                Err(format!("Could not read fileId '{file_id}'.")),
+                String::new(),
+                None,
+            ),
+        });
+    }
+    let base64 = text_argument(arguments, "file")?;
+    let Ok(bytes) = STANDARD.decode(base64) else {
+        return Some((
+            Err("The 'file' argument is not valid base64.".to_owned()),
+            String::new(),
+            None,
+        ));
+    };
+    let Ok(scratch) = TempDir::new() else {
+        return Some((
+            Err("Could not allocate scratch space for the input file.".to_owned()),
+            String::new(),
+            None,
+        ));
+    };
+    let path = scratch.path().join("input.bin");
+    if tokio::fs::write(&path, &bytes).await.is_err() {
+        return Some((
+            Err("Could not stage the input file.".to_owned()),
+            String::new(),
+            None,
+        ));
+    }
+    let name = file_name.unwrap_or("input.pdf").to_owned();
+    Some((Ok(path), name, Some(scratch)))
+}
+
+/// Streams a `stirling_operation` file result into a fresh owned job (reusing
+/// [`crate::pipeline::write_response_to_file`]'s bounded streaming writer, so
+/// a large result is never fully buffered in memory), then inlines it when
+/// small enough or reports its `fileId` for `stirling_download` otherwise.
+async fn store_operation_result(
+    state: &McpState,
+    owner: JobOwner,
+    operation: &str,
+    content_type: &str,
+    headers: HeaderMap,
+    response: Response,
+) -> Value {
+    let Ok(submission) = state.job_manager.create_job(owner) else {
+        return tool_error(&format!(
+            "{operation} succeeded but the result could not be stored."
+        ));
+    };
+    let filename = crate::pipeline::response_filename(&headers)
+        .as_deref()
+        .map_or_else(
+            || crate::pipeline::safe_filename(None),
+            |name| crate::pipeline::safe_filename(Some(name)),
+        );
+    let output_path = submission.directory.join(&filename);
+    if crate::pipeline::write_response_to_file(response, &output_path)
+        .await
+        .is_err()
+    {
+        return tool_error(&format!(
+            "{operation} succeeded but the result could not be stored."
+        ));
+    }
+    let content_type = if content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        content_type
+    };
+    if state
+        .job_manager
+        .complete_file(&submission.job_id, &output_path, &filename, content_type)
+        .is_err()
+    {
+        return tool_error(&format!(
+            "{operation} succeeded but the result could not be finalized."
+        ));
+    }
+    let Ok(Some(result)) = state.job_manager.result_file(owner, &submission.job_id) else {
+        return tool_error(&format!(
+            "{operation} succeeded but the result could not be retrieved."
+        ));
+    };
+    let summary = format!(
+        "{operation} succeeded. Result: {name} ({size} bytes), fileId={file_id}.",
+        name = result.file_name,
+        size = result.file_size,
+        file_id = result.file_id,
+    );
+    if result.file_size <= state.config.max_inline_response_bytes
+        && let Ok(bytes) = tokio::fs::read(&result.path).await
+    {
+        return file_result(
+            &format!("{summary} The file is included inline below."),
+            &result.file_id,
+            content_type,
+            &bytes,
+        );
+    }
+    tool_text(&format!(
+        "{summary} Large result - fetch it with stirling_download {{\"fileId\":\"{}\"}}, or pass this fileId to another operation.",
+        result.file_id
+    ))
+}
+
+fn file_result(summary: &str, file_id: &str, content_type: &str, bytes: &[u8]) -> Value {
+    json!({
+        "content": [
+            {"type": "text", "text": summary},
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": format!("stirling://file/{file_id}"),
+                    "mimeType": content_type,
+                    "blob": STANDARD.encode(bytes),
+                },
+            },
+        ],
+    })
+}
+
+fn truncate_message(message: &str, max_chars: usize) -> String {
+    let truncated: String = message.chars().take(max_chars).collect();
+    if truncated.chars().count() < message.chars().count() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 

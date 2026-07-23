@@ -7891,10 +7891,26 @@ fn restore_form_fields(
                     "AS",
                     Object::Name(
                         button_state
+                            .clone()
                             .unwrap_or_else(|| "Off".to_owned())
                             .into_bytes(),
                     ),
                 );
+            }
+            match field_type.as_str() {
+                "Tx" | "Ch" => {
+                    if let Some(appearance_id) = text_field_appearance_stream_id(document, field)? {
+                        widget.set("AP", dictionary! { "N" => appearance_id });
+                    }
+                }
+                "Btn" => {
+                    if let Some(appearance) =
+                        button_field_appearance(document, field, button_state.as_deref())?
+                    {
+                        widget.set("AP", dictionary! { "N" => appearance });
+                    }
+                }
+                _ => {}
             }
             document
                 .objects
@@ -8048,6 +8064,147 @@ fn form_widget_placement(
         page_id,
         rectangle.iter().copied().map(Object::Real).collect(),
     ))
+}
+
+/// Builds a normal (`/N`) appearance stream for a text-field widget so
+/// headless consumers (flatteners, rasterizers, printers) that ignore
+/// `NeedAppearances` still render the field's current value. Only `Tx`
+/// fields with a non-empty `V` and a valid `rect` get one; empty fields keep
+/// relying on the interactive-viewer `NeedAppearances` fallback.
+/// Widget width/height derived from the field's editor `rect`, in default user
+/// space. Returns `None` for a missing rect or a degenerate (zero/negative)
+/// box, which callers treat as "no appearance stream is worth generating".
+fn field_widget_dimensions(field: &PdfJsonFormField) -> Option<(f32, f32)> {
+    let rectangle = field.rect.as_deref()?;
+    if rectangle.len() != 4 {
+        return None;
+    }
+    let width = (rectangle[2] - rectangle[0]).abs();
+    let height = (rectangle[3] - rectangle[1]).abs();
+    (width > 0.0 && height > 0.0).then_some((width, height))
+}
+
+/// Builds a Form-XObject appearance stream that draws `encoded_text` (already
+/// WinAnsi-encoded) with the shared `Helv` resource, left-aligned and roughly
+/// vertically centered in a `width`x`height` box.
+fn build_form_field_appearance_stream(
+    document: &mut Document,
+    width: f32,
+    height: f32,
+    font_size: f32,
+    encoded_text: Vec<u8>,
+) -> Result<lopdf::ObjectId, PdfJsonError> {
+    let baseline = ((height - font_size) / 2.0).max(0.0) + font_size * 0.2;
+    let operations = vec![
+        Operation::new("BT", Vec::new()),
+        Operation::new("g", vec![Object::Real(0.0)]),
+        Operation::new(
+            "Tf",
+            vec![Object::Name(b"Helv".to_vec()), Object::Real(font_size)],
+        ),
+        Operation::new("Td", vec![Object::Real(2.0), Object::Real(baseline)]),
+        Operation::new(
+            "Tj",
+            vec![Object::String(encoded_text, StringFormat::Literal)],
+        ),
+        Operation::new("ET", Vec::new()),
+    ];
+    build_form_field_xobject(document, width, height, Content { operations }.encode()?)
+}
+
+/// Builds a Form-XObject appearance stream with no marks, used for a
+/// checkbox's unchecked (`Off`) state.
+fn build_empty_form_field_appearance_stream(
+    document: &mut Document,
+    width: f32,
+    height: f32,
+) -> Result<lopdf::ObjectId, PdfJsonError> {
+    let encoded = Content {
+        operations: Vec::new(),
+    }
+    .encode()?;
+    build_form_field_xobject(document, width, height, encoded)
+}
+
+fn build_form_field_xobject(
+    document: &mut Document,
+    width: f32,
+    height: f32,
+    content: Vec<u8>,
+) -> Result<lopdf::ObjectId, PdfJsonError> {
+    let mut stream = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(width),
+                Object::Real(height),
+            ],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "Helv" => dictionary! {
+                        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                    }
+                }
+            },
+        },
+        content,
+    );
+    stream.compress()?;
+    Ok(document.add_object(stream))
+}
+
+/// Normal (`/N`) appearance stream for a `Tx` or `Ch` widget: draws the
+/// field's current value. Empty values, an unrepresentable (non-WinAnsi)
+/// value, or a missing/degenerate `rect` skip appearance generation and fall
+/// back to `NeedAppearances`.
+fn text_field_appearance_stream_id(
+    document: &mut Document,
+    field: &PdfJsonFormField,
+) -> Result<Option<lopdf::ObjectId>, PdfJsonError> {
+    let Some(text) = field.value.as_deref().filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((width, height)) = field_widget_dimensions(field) else {
+        return Ok(None);
+    };
+    let Ok(encoded_text) = win_ansi_text_bytes(text) else {
+        return Ok(None);
+    };
+    let font_size = field
+        .font_size
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(12.0);
+    let appearance_id =
+        build_form_field_appearance_stream(document, width, height, font_size, encoded_text)?;
+    Ok(Some(appearance_id))
+}
+
+/// Normal (`/N`) appearance dictionary for a `Btn` (checkbox) widget: a
+/// two-state `{on_state: stream, "Off": stream}` map matching `/AS`. The "on"
+/// mark is a plain `X` glyph — Java's own checkbox rendering isn't
+/// byte-matched, but headless consumers now see a mark instead of nothing.
+/// Returns `None` when the field has no on-state (e.g. an unchecked box with
+/// no explicit state name) or a missing/degenerate `rect`.
+fn button_field_appearance(
+    document: &mut Document,
+    field: &PdfJsonFormField,
+    button_state: Option<&str>,
+) -> Result<Option<Object>, PdfJsonError> {
+    let Some((width, height)) = field_widget_dimensions(field) else {
+        return Ok(None);
+    };
+    let Some(on_state) = button_state.filter(|state| !state.is_empty() && *state != "Off") else {
+        return Ok(None);
+    };
+    let on_id = build_form_field_appearance_stream(document, width, height, 12.0, b"X".to_vec())?;
+    let off_id = build_empty_form_field_appearance_stream(document, width, height)?;
+    let mut states = Dictionary::new();
+    states.set(on_state.as_bytes().to_vec(), Object::Reference(on_id));
+    states.set(b"Off".to_vec(), Object::Reference(off_id));
+    Ok(Some(Object::Dictionary(states)))
 }
 
 fn append_page_annotation(
@@ -9303,6 +9460,141 @@ mod tests {
         assert_eq!(form_fields[0].value.as_deref(), Some("Ada"));
         assert_eq!(form_fields[1].value.as_deref(), Some("Yes"));
         assert_eq!(form_fields[2].value.as_deref(), Some("Pro"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_to_pdf_generates_text_field_appearance_stream() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{PdfJsonDocument, PdfJsonFormField, PdfJsonPage, convert_json_to_pdf};
+        use lopdf::{Document, Encoding, content::Content};
+
+        let document_json = PdfJsonDocument {
+            pages: vec![PdfJsonPage {
+                page_number: Some(1),
+                width: Some(200.0),
+                height: Some(160.0),
+                ..PdfJsonPage::default()
+            }],
+            form_fields: Some(vec![
+                PdfJsonFormField {
+                    name: Some("givenName".to_owned()),
+                    field_type: Some("Tx".to_owned()),
+                    value: Some("Ada".to_owned()),
+                    page_number: Some(1),
+                    rect: Some(vec![10.0, 20.0, 80.0, 40.0]),
+                    ..PdfJsonFormField::default()
+                },
+                PdfJsonFormField {
+                    name: Some("acceptsTerms".to_owned()),
+                    field_type: Some("Btn".to_owned()),
+                    checked: Some(true),
+                    page_number: Some(1),
+                    rect: Some(vec![10.0, 50.0, 30.0, 70.0]),
+                    ..PdfJsonFormField::default()
+                },
+            ]),
+            ..PdfJsonDocument::default()
+        };
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("editor-form-field-appearance.pdf");
+        convert_json_to_pdf(&document_json, &output)?;
+
+        let rebuilt = Document::load(&output)?;
+        let acroform_id = rebuilt.catalog()?.get(b"AcroForm")?.as_reference()?;
+        let fields = rebuilt
+            .get_dictionary(acroform_id)?
+            .get(b"Fields")?
+            .as_array()?
+            .clone();
+        let given_name = rebuilt.get_dictionary(fields[0].as_reference()?)?;
+        let widget_id = given_name.get(b"Kids")?.as_array()?[0].as_reference()?;
+        let widget = rebuilt.get_dictionary(widget_id)?;
+
+        let appearance_id = widget.get(b"AP")?.as_dict()?.get(b"N")?.as_reference()?;
+        let appearance = rebuilt.get_object(appearance_id)?.as_stream()?;
+        assert_eq!(appearance.dict.get(b"Subtype")?.as_name()?, b"Form");
+        let appearance_bbox = appearance
+            .dict
+            .get(b"BBox")?
+            .as_array()?
+            .iter()
+            .map(super::number_as_f32)
+            .collect::<Option<Vec<_>>>()
+            .ok_or("invalid appearance BBox")?;
+        assert_eq!(appearance_bbox, vec![0.0, 0.0, 70.0, 20.0]);
+        let appearance_content = Content::decode(&appearance.decompressed_content()?)?;
+        let text_operation = appearance_content
+            .operations
+            .iter()
+            .find(|operation| operation.operator == "Tj")
+            .ok_or("appearance stream missing Tj")?;
+        let encoded_text = text_operation
+            .operands
+            .first()
+            .and_then(|operand| operand.as_str().ok())
+            .ok_or("missing Tj string")?;
+        let encoding = Encoding::SimpleEncoding(b"WinAnsiEncoding");
+        assert_eq!(
+            encoding.bytes_to_string(encoded_text).ok(),
+            Some("Ada".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_to_pdf_generates_checkbox_appearance_stream() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{PdfJsonDocument, PdfJsonFormField, PdfJsonPage, convert_json_to_pdf};
+        use lopdf::{Document, content::Content};
+
+        let document_json = PdfJsonDocument {
+            pages: vec![PdfJsonPage {
+                page_number: Some(1),
+                width: Some(200.0),
+                height: Some(160.0),
+                ..PdfJsonPage::default()
+            }],
+            form_fields: Some(vec![PdfJsonFormField {
+                name: Some("acceptsTerms".to_owned()),
+                field_type: Some("Btn".to_owned()),
+                checked: Some(true),
+                page_number: Some(1),
+                rect: Some(vec![10.0, 50.0, 30.0, 70.0]),
+                ..PdfJsonFormField::default()
+            }]),
+            ..PdfJsonDocument::default()
+        };
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("editor-checkbox-appearance.pdf");
+        convert_json_to_pdf(&document_json, &output)?;
+
+        let rebuilt = Document::load(&output)?;
+        let acroform_id = rebuilt.catalog()?.get(b"AcroForm")?.as_reference()?;
+        let fields = rebuilt
+            .get_dictionary(acroform_id)?
+            .get(b"Fields")?
+            .as_array()?;
+        let button = rebuilt.get_dictionary(fields[0].as_reference()?)?;
+        assert_eq!(button.get(b"V")?.as_name()?, b"Yes");
+        let widget_id = button.get(b"Kids")?.as_array()?[0].as_reference()?;
+        let widget = rebuilt.get_dictionary(widget_id)?;
+        assert_eq!(widget.get(b"AS")?.as_name()?, b"Yes");
+
+        let states = widget.get(b"AP")?.as_dict()?.get(b"N")?.as_dict()?;
+        let on_id = states.get(b"Yes")?.as_reference()?;
+        let off_id = states.get(b"Off")?.as_reference()?;
+        let on_stream = rebuilt.get_object(on_id)?.as_stream()?;
+        let on_content = Content::decode(&on_stream.decompressed_content()?)?;
+        assert!(
+            on_content
+                .operations
+                .iter()
+                .any(|operation| operation.operator == "Tj")
+        );
+        let off_stream = rebuilt.get_object(off_id)?.as_stream()?;
+        let off_content = Content::decode(&off_stream.decompressed_content()?)?;
+        assert!(off_content.operations.is_empty());
         Ok(())
     }
 

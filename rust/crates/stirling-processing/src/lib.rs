@@ -1640,6 +1640,8 @@ impl ProcessingRuntime {
             mcp_config,
             security_store,
             &mcp_engine_settings,
+            Arc::clone(&runtime.job_manager),
+            runtime.pipeline_dispatcher.router(),
         ))
         .merge(
             workflow_signing_http::participant_routes(max_upload_bytes)

@@ -16,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine as _;
 use futures_util::stream;
 use serde_json::{Value, json};
 use stirling_processing::{
@@ -132,7 +133,7 @@ async fn mcp_lists_only_the_ai_slice_and_forwards_only_parameters_with_trusted_i
     let tools = listed["result"]["tools"]
         .as_array()
         .ok_or("tools result was not an array")?;
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 5);
     assert_eq!(tools[0]["name"], "stirling_describe_operation");
     assert_eq!(tools[1]["name"], "stirling_ai");
     assert_eq!(
@@ -144,9 +145,12 @@ async fn mcp_lists_only_the_ai_slice_and_forwards_only_parameters_with_trusted_i
             .get("fileId")
             .is_some()
     );
+    for present in ["stirling_upload", "stirling_download", "stirling_operation"] {
+        assert!(tools.iter().any(|tool| tool["name"] == present));
+    }
+    // The per-category tool split (stirling_pages/convert/misc/security) is a
+    // documented future increment, not yet implemented.
     for omitted in [
-        "stirling_upload",
-        "stirling_download",
         "stirling_pages",
         "stirling_convert",
         "stirling_misc",
@@ -225,6 +229,209 @@ async fn mcp_lists_only_the_ai_slice_and_forwards_only_parameters_with_trusted_i
 }
 
 #[tokio::test]
+async fn mcp_upload_download_round_trips_and_isolates_foreign_owners()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (directory, app, api_key) = configured_app(&engine.url, true, "apikey", true, 1024 * 1024)?;
+
+    let content = base64::engine::general_purpose::STANDARD.encode(b"hello from mcp upload");
+    let uploaded = tool_call(
+        &app,
+        &api_key,
+        1,
+        "stirling_upload",
+        json!({"file": content, "fileName": "note.txt"}),
+    )
+    .await?;
+    let uploaded = response_json(uploaded).await?;
+    assert_eq!(uploaded["result"]["isError"], Value::Null);
+    let summary = uploaded["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("upload result was not text")?;
+    assert!(summary.contains("note.txt"));
+    let file_id = summary
+        .split("fileId=")
+        .nth(1)
+        .and_then(|rest| rest.split(['.', ' ']).next())
+        .ok_or("upload result did not include a fileId")?
+        .to_owned();
+
+    let downloaded = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_download",
+        json!({"fileId": file_id}),
+    )
+    .await?;
+    let downloaded = response_json(downloaded).await?;
+    assert_eq!(downloaded["result"]["isError"], Value::Null);
+    let blob = downloaded["result"]["content"][1]["resource"]["blob"]
+        .as_str()
+        .ok_or("download result did not include a resource blob")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(blob)?;
+    assert_eq!(bytes, b"hello from mcp upload");
+
+    // A foreign owner must see the exact same "unknown or inaccessible" error
+    // for someone else's real fileId as for a fileId that never existed -
+    // job_file's owner check must never distinguish the two.
+    let store = SecurityStore::open(&directory.path().join("configs/security.db"))?;
+    let other_user_id =
+        store.create_local_user("Other.User@Example.Test", PASSWORD, ["ROLE_USER"], None)?;
+    let other_api_key = store
+        .create_api_key(other_user_id, 1_700_000_000)?
+        .to_string();
+
+    let foreign_attempt = tool_call(
+        &app,
+        &other_api_key,
+        3,
+        "stirling_download",
+        json!({"fileId": file_id}),
+    )
+    .await?;
+    let foreign_attempt = response_json(foreign_attempt).await?;
+    assert_eq!(foreign_attempt["result"]["isError"], true);
+    let foreign_message = foreign_attempt["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("foreign download result was not text")?;
+
+    let missing_attempt = tool_call(
+        &app,
+        &other_api_key,
+        4,
+        "stirling_download",
+        json!({"fileId": "does-not-exist"}),
+    )
+    .await?;
+    let missing_attempt = response_json(missing_attempt).await?;
+    assert_eq!(missing_attempt["result"]["isError"], true);
+    let missing_message = missing_attempt["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("missing download result was not text")?;
+    assert_eq!(
+        foreign_message.replace(&file_id, "does-not-exist"),
+        missing_message
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_operation_dispatches_a_real_stirling_endpoint_via_fileid_and_inline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with_operations(
+        &engine.url,
+        true,
+        "apikey",
+        true,
+        1024 * 1024,
+        &["/api/v1/general/rotate-pdf"],
+    )?;
+    let pdf_bytes = minimal_pdf_bytes()?;
+    let pdf_base64 = base64::engine::general_purpose::STANDARD.encode(&pdf_bytes);
+
+    // Disallowed operation path is rejected before any dispatch is attempted.
+    let disallowed = tool_call(
+        &app,
+        &api_key,
+        1,
+        "stirling_operation",
+        json!({"operation":"/api/v1/general/merge-pdfs","file":pdf_base64}),
+    )
+    .await?;
+    let disallowed = response_json(disallowed).await?;
+    assert_eq!(disallowed["result"]["isError"], true);
+    assert!(
+        disallowed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not permitted")
+    );
+
+    // Inline base64 input.
+    let inline_result = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_operation",
+        json!({"operation":"/api/v1/general/rotate-pdf","file":pdf_base64,"parameters":{"angle":90}}),
+    )
+    .await?;
+    let inline_result = response_json(inline_result).await?;
+    assert_eq!(inline_result["result"]["isError"], Value::Null);
+    assert_eq!(
+        inline_result["result"]["content"][1]["resource"]["mimeType"],
+        "application/pdf"
+    );
+
+    // fileId input, uploaded first.
+    let uploaded = tool_call(
+        &app,
+        &api_key,
+        3,
+        "stirling_upload",
+        json!({"file": pdf_base64, "fileName": "input.pdf"}),
+    )
+    .await?;
+    let uploaded = response_json(uploaded).await?;
+    let summary = uploaded["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("upload result was not text")?;
+    let file_id = summary
+        .split("fileId=")
+        .nth(1)
+        .and_then(|rest| rest.split(['.', ' ']).next())
+        .ok_or("upload result did not include a fileId")?
+        .to_owned();
+
+    let by_file_id = tool_call(
+        &app,
+        &api_key,
+        4,
+        "stirling_operation",
+        json!({"operation":"/api/v1/general/rotate-pdf","fileId":file_id,"parameters":{"angle":90}}),
+    )
+    .await?;
+    let by_file_id = response_json(by_file_id).await?;
+    assert_eq!(by_file_id["result"]["isError"], Value::Null);
+    let by_file_id_text = by_file_id["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("operation result was not text")?;
+    assert!(by_file_id_text.contains("succeeded"));
+
+    engine.stop().await?;
+    Ok(())
+}
+
+fn minimal_pdf_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use lopdf::{Object, dictionary};
+
+    let mut document = lopdf::Document::with_version("1.7");
+    let pages_id = document.new_object_id();
+    let page_object_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+    });
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_object_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[tokio::test]
 async fn mcp_is_absent_when_disabled_or_configured_for_oauth_and_rejects_disabled_users()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = MockEngine::start().await?;
@@ -261,14 +468,35 @@ fn configured_app(
     ai_enabled: bool,
     max_request_bytes: usize,
 ) -> Result<(TempDir, Router, String), Box<dyn std::error::Error>> {
+    configured_app_with_operations(
+        engine_url,
+        mcp_enabled,
+        auth_mode,
+        ai_enabled,
+        max_request_bytes,
+        &[],
+    )
+}
+
+fn configured_app_with_operations(
+    engine_url: &str,
+    mcp_enabled: bool,
+    auth_mode: &str,
+    ai_enabled: bool,
+    max_request_bytes: usize,
+    extra_allowed_operations: &[&str],
+) -> Result<(TempDir, Router, String), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let config_directory = directory.path().join("configs");
     fs::create_dir_all(&config_directory)?;
     let settings_path = config_directory.join("settings.yml");
+    let mut allowed_operations = vec!["agent-draft".to_owned(), "blocked-agent".to_owned()];
+    allowed_operations.extend(extra_allowed_operations.iter().map(|op| (*op).to_owned()));
+    let allowed_operations = allowed_operations.join(", ");
     fs::write(
         &settings_path,
         format!(
-            "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {mcp_enabled}\n  auth:\n    mode: {auth_mode}\n  maxRequestBytes: {max_request_bytes}\n  allowedOperations: [agent-draft, blocked-agent]\n  blockedOperations: [blocked-agent]\naiEngine:\n  enabled: {ai_enabled}\n  url: '{engine_url}'\n  timeoutSeconds: 5\n"
+            "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {mcp_enabled}\n  auth:\n    mode: {auth_mode}\n  maxRequestBytes: {max_request_bytes}\n  allowedOperations: [{allowed_operations}]\n  blockedOperations: [blocked-agent]\naiEngine:\n  enabled: {ai_enabled}\n  url: '{engine_url}'\n  timeoutSeconds: 5\n"
         ),
     )?;
     let database_path = config_directory.join("security.db");

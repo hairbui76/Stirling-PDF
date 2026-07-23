@@ -157,8 +157,11 @@ does not claim glyph-accurate extraction or font reconstruction yet.
   Full-document exports inspect root
   AcroForm fields and their first widget locations, plus structured page annotations. JSON→PDF
   reconstructs fresh root fields and one attached widget from the structured field model, and
-  recreates non-widget page annotations. Nested/multi-widget hierarchies, annotation reply/
-  appearance graphs, and appearance streams remain.
+  recreates non-widget page annotations. `Tx`/`Ch` widgets now get a generated `/AP` appearance
+  stream from their current value, and `Btn` widgets get a two-state on/off appearance dictionary.
+  One widget per field and no annotation reply-chain (`/IRT`) field match Java's own
+  `PdfJsonFormField`/`PdfJsonAnnotation` wire models — not a Rust port gap versus Java. Non-widget
+  annotation appearance streams remain.
 - **Phase 4:** outline-derived Type3 normalization, broader font synthesis, complex CID/layout, and
   preserved-stream editing — full fidelity.
 - **Job cache** (`partial`/`page`/`fonts`/`clear-cache`): an in-memory `jobId`→state

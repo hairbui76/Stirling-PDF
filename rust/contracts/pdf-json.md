@@ -130,7 +130,13 @@ the AcroForm resource/default-appearance dictionary, and one fresh widget attach
 to its declared page. Text, choice options/indices, button state, values/defaults,
 flags, and alternate/mapping names survive this path. Raw COS data supplies only
 field-level properties: source object IDs and widget/page references must not be
-reused in a new document.
+reused in a new document. `Tx`/`Ch` widgets with a non-empty value also get a
+generated `/AP` normal appearance stream (the value drawn with the shared Helvetica
+`DR` resource, sized to the widget's `rect`), so consumers that ignore
+`NeedAppearances` still render the field. `Btn` widgets get a two-state `/AP/N`
+appearance dictionary (`{on_state: stream, "Off": stream}` matching `/AS`) with a
+plain `X` mark for the checked state — not a byte-match for Java's own checkbox
+glyph, but a real mark instead of nothing for headless consumers.
 
 Page annotations are also exported. The JSON includes subtype, contents, rectangle,
 appearance state, color, flags, name, subject, author, and PDF date strings. Full
@@ -138,14 +144,16 @@ responses additionally carry an annotation COS projection; `lightweight=true`
 omits that raw projection but retains the structured annotation fields. JSON→PDF
 creates fresh non-widget annotation objects and attaches them to their page. Widget
 annotations are instead reconstructed through the matching root-form-field path,
-which prevents duplicate controls. Rich appearance streams, reply/destination
-relationships, and orphan widgets without a root field are not reconstructed and
-remain a parity gap.
+which prevents duplicate controls. Rich non-widget-annotation appearance streams,
+destination relationships, and orphan widgets without a root field are not
+reconstructed and remain a parity gap; `Tx`/`Ch`/`Btn` widget appearance streams
+are covered (see above). An annotation reply chain (`/IRT`) is not a parity gap:
+Java's own `PdfJsonAnnotation` model has no reply-chain field either.
 
 **Deferred (font/graphics subsystem, Phase 4):** Type3 outline-derived normalization,
-font synthesis beyond restored source dictionaries, rich annotation appearance/reply graphs,
-and re-encoded CFF payloads. Raster image elements are implemented for the bounded cases
-described below.
+font synthesis beyond restored source dictionaries, rich non-widget-annotation appearance
+streams, and re-encoded CFF payloads. Raster image elements are implemented for the bounded
+cases described below.
 The top-level `fonts` collection contains bounded source resource/program data,
 including fonts found in nested Form XObjects.
 
@@ -185,10 +193,14 @@ Glyph-accurate `textElements` extraction (including Type3 outline geometry and C
 not available through the configured Poppler data paths), token-level rewriting and mixed-stream
 editing in the full-document rebuild path, font-program round-trip, complex inline filter
 parameters, DCT DeviceN images with more than four JPEG source components,
-and external ICC conversion for DCT CMYK images, rich
-annotation appearance/reply graphs,
-nested/multi-widget form hierarchies and appearance
-streams remain outstanding. Direct and Form-nested image XObjects already export page-space
+and external ICC conversion for DCT CMYK images, and rich
+non-widget-annotation appearance streams
+remain outstanding (`Tx`/`Ch`/`Btn` widget appearance streams are ported — see above).
+Nested/multi-widget form hierarchies and annotation reply chains are not parity gaps:
+Java's own `PdfJsonFormField`/`PdfJsonAnnotation` wire models are one-widget-per-field and have
+no `/IRT` reply field either; a true multi-widget/radio-group field would need a new shared
+schema design across Java, Rust, and the frontend contract, not a Rust-only port.
+Direct and Form-nested image XObjects already export page-space
 transforms plus bounded JPEG or 1/2/4/8/16-bit DeviceRGB/DeviceGray/DeviceCMYK payloads, apply `/Decode`
 ranges and grayscale `/SMask` alpha, and expand packed 1/2/4/8-bit Indexed images with Gray/RGB/
 CMYK palettes. ICCBased Gray/RGB/CMYK XObjects and ICCBased Indexed palette bases use their bounded

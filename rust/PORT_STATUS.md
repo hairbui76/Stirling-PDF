@@ -5,11 +5,23 @@ service lives in this `rust/` workspace as the `stirling-processing` crate — a
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-22):** `task rust:check` passes formatting, strict
-locked all-target workspace Clippy, all 111 AI-engine library tests, all 419
+locked all-target workspace Clippy, all 118 AI-engine library tests, all 441
 processing library tests, helper-binary and process-smoke tests, the complete
 endpoint/integration matrix, and doc tests with the pinned PDFium runtime.
 External-runtime happy paths remain conditional on their respective tools and
 services.
+
+**Route-count scoping note:** the Rust service registers 313 HTTP routes total.
+Only a subset of those are directly comparable to Java's OSS `controller/api`
+PDF-operation surface (~140 endpoint mappings, several of which are the
+project's composed `@AutoJobPostMapping` annotation rather than the four plain
+Spring mapping annotations). The remaining Rust routes are non-PDF
+infrastructure — license/entitlement administration, MCP, durable storage,
+audit, workflow signing sessions, tessdata administration, hardware signing
+discovery — that has no Java OSS-core equivalent because that logic lives in
+`app/proprietary`/`app/saas`. "PDF processing operations are ~90% done" refers
+to the PDF-operation-comparable subset, not the raw 313-route total; citing the
+raw total as the denominator would understate actual coverage.
 
 ## Ported compatibility endpoints
 
@@ -305,9 +317,18 @@ auto-rename/auto-split, plus:
   nested font-program streams, Type0/CID encodings, and existing Type3 CharProcs, refusing edits that
   cannot round-trip through the source encoding. Document XMP packets round-trip as bounded base64
   metadata. Cached partial export can redraw edited text/images over bounded retained vector content;
-  token-level/mixed-stream editing in the full-document rebuild path, synthesizing new Type3 glyphs,
-  nested/multi-widget form hierarchies, and form/annotation appearance streams are still missing, so
-  it cannot yet match Java's `PdfJsonConversionService`.
+  token-level/mixed-stream editing in the full-document rebuild path and synthesizing new Type3
+  glyphs are still missing, so it cannot yet match Java's `PdfJsonConversionService`. One widget per
+  field matches Java's own `PdfJsonFormField` wire model (`rect`/`pageNumber` are singular there too,
+  and `PdfJsonConversionService` likewise reconstructs only one widget per field) — a radio-button-
+  style multi-widget field is not a Rust port gap versus Java; it would need a new shared schema
+  design across Java, Rust, and the frontend contract before either side could port it. Restored
+  `Tx`/`Ch` (text/choice) form-field widgets now get a real `/AP` normal appearance stream — the
+  widget's current value drawn with the shared Helvetica `DR` resource, sized to the field's `rect`
+  — so headless consumers (flatteners, rasterizers, printers) that ignore `NeedAppearances` still
+  render the value. `Btn` (checkbox) widgets get a two-state `{on_state, Off}` `/AP/N` appearance
+  dictionary matching `/AS`, with a plain `X` mark for the checked state (not a byte-match for
+  Java's own checkbox glyph). Non-widget annotation appearance streams remain `NeedAppearances`-only.
 - **Advanced text editing parity** (`edit-text`): selected-page content-stream replacements are
   ported; every edited page receives a private clone of its indirect Form graph so shared source
   Forms cannot leak changes across page filters. Every repeated visual invocation on one selected
@@ -464,9 +485,15 @@ question/review delegation. See `contracts/ai-proxy.md`.
 
 The reviewed secured router now owns API-key MCP phase one at `POST /mcp`, including
 bounded JSON-RPC transport, protocol negotiation, trusted API-key identity, capability
-manifest caching/filtering, and the two executable AI tools. OAuth/JWT metadata,
-artifact upload/download storage, PDF category tools, and production secured-mode
-cutover remain explicit later phases. See `contracts/mcp.md`.
+manifest caching/filtering, and the two executable AI tools. It also now owns reusable
+file artifacts (`stirling_upload`/`stirling_download`, reusing the existing owner-scoped
+async-job store verbatim) and direct dispatch of a real Stirling processing operation by
+its API path (`stirling_operation`, reusing the pipeline runner's own in-process router
+dispatch). Per-caller granular scopes (`mcp.tools.read`/`mcp.tools.write`) are not ported —
+there is no Rust API-key scope store yet, so these tools share phase one's existing
+authorization boundary rather than a narrower one. OAuth/JWT metadata, a per-category tool
+split (`stirling_pages`/`convert`/`misc`/`security`), and production secured-mode cutover
+remain explicit later phases. See `contracts/mcp.md`.
 
 The same reviewed router now owns resource-grant administration and encrypted
 S3/MCP/API integration-config CRUD. Ownership, team-leader/default/grant rules,
