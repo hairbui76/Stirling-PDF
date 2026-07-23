@@ -55,6 +55,82 @@ issuer validation in `security_jwt.rs` (HTTPS always allowed, plain HTTP only
 against a loopback host) — returning a typed `OidcProviderMetadata` rather than
 a raw JSON value.
 
+The three discovered endpoint URLs get one further, SSRF-motivated check the
+issuer itself does not: an HTTPS endpoint whose host is a literal IP address
+in a private/reserved range is rejected. This matters because, unlike the
+admin-typed issuer, these three URLs come *from* the issuer's own response —
+a compromised or spoofed provider could point one at internal infrastructure
+instead of itself once a later ticket actually fetches it.
+
+Covered ranges, for a plain IPv4/IPv6 literal directly: loopback, RFC 1918
+private, link-local (including the `169.254.169.254` cloud-metadata address),
+multicast, broadcast, documentation, unspecified (`0.0.0.0`/`::`), RFC 6598
+Shared Address Space / CGNAT (`100.64.0.0/10`), RFC 2544 benchmarking
+(`198.18.0.0/15`), and RFC 6890 IETF Protocol Assignments (`192.0.0.0/24`).
+The first seven use `std::net`'s stable `Ipv4Addr`/`Ipv6Addr` predicates; the
+last three have no stable-API equivalent (`is_global`/`is_reserved`/
+`is_shared`/`is_benchmarking` are still unstable on the pinned Rust 1.94,
+confirmed against the actual toolchain rather than assumed) and are checked as
+plain octet-range comparisons instead. Numeric-obfuscated IPv4 (decimal
+integer, hex, octal, e.g. `2852039166`) is not a bypass: the `url` crate's
+WHATWG-compliant host parser normalizes those to canonical dotted-decimal
+before this check ever sees them.
+
+An IPv4 address embedded inside an IPv6 literal is *also* extracted and
+checked against the same ranges. This went through two independent rounds of
+"a different embedding notation defeats the check" after it first shipped
+(IPv4-compatible, then NAT64), so the fix after the second round was a
+deliberate, one-time enumeration of IANA's IPv6 Special-Purpose Address
+Registry and the RFCs it cites for every *fixed, standardized* IPv4-in-IPv6
+embedding form, rather than patching forms in one at a time as they were
+independently found. All seven registered/documented fixed forms found by
+that pass are covered: IPv4-mapped (`::ffff:a.b.c.d`, RFC 4291), the older
+deprecated IPv4-compatible form (`::a.b.c.d`, no `ffff` marker, RFC 4291),
+the NAT64 Well-Known Prefix (`64:ff9b::/96`, RFC 6052) and Local-Use Prefix
+(`64:ff9b:1::/48`, RFC 8215 — this one splits the IPv4 bits around a reserved
+octet per RFC 6052's general embedding algorithm rather than storing them
+contiguously; the byte layout was verified against the RFC text, not
+assumed), 6to4 (`2002::/16`, RFC 3056), Teredo (`2001::/32`, RFC 4380/8190 —
+this one embeds *two* IPv4 addresses, the tunnel server's and the NAT-mapped
+client's, and both are checked), and ISATAP (RFC 5214 — identified by a fixed
+interface-identifier marker rather than a fixed leading prefix, since
+ISATAP's network prefix can be any on-link unicast prefix; the marker itself
+is only the `5E-FE` octet pair, not the two octets before it, since RFC 5214
+section 6.1 defines those as a "u" bit / scope indicator — `00-00` or
+`02-00` — that doesn't affect the embedded IPv4 address; an earlier version
+of this check required an exact `00-00-5E-FE` match and missed the `02-00`
+case as a live bypass).
+
+**Explicitly not covered**, so this list doesn't silently imply more than it
+delivers:
+
+- The check is literal-address-only (no DNS lookup), so a domain name that
+  resolves to any of the ranges above — including one that resolves
+  differently at validation time than at the real connect time (DNS
+  rebinding) — is not caught by anything in this module today. That is a
+  documented gap for whoever wires the next OIDC ticket's real network fetch
+  against `jwks_uri` to close, most likely by pinning the resolved address
+  between validation and the real request rather than re-resolving.
+- NAT64's *Network-Specific Prefixes* (RFC 6052 section 2.2 also permits an
+  operator to embed IPv4 addresses under a prefix of their own choosing,
+  instead of the fixed Well-Known/Local-Use prefixes above) and 6rd
+  (RFC 5969, a similarly operator-configured generalization of 6to4) are
+  genuinely open-ended: detecting them would require knowing a specific
+  deployment's chosen prefix out of band, not just recognizing a fixed,
+  registered value the way the seven forms above allow. These are left
+  uncovered rather than guessed at.
+- This pass audited IPv4-embedded-in-IPv6 forms specifically, not IPv6's own
+  special-purpose ranges beyond that — e.g. native IPv6 benchmarking
+  (`2001:2::/48`, RFC 5180), Discard-Only (`100::/64`), and narrow anycast
+  ranges (AMT, PCP, TURN, AS112-v6, ORCHIDv2). None of these carry an
+  embedded IPv4 address, so they were out of this pass's scope rather than
+  overlooked within it; whether they're worth blocking too is a separate,
+  lower-priority question from the embedding-form gaps above.
+
+The narrow HTTP+loopback allowance for the issuer itself is
+unaffected: it already only matches the three loopback literals, not
+arbitrary private ranges, and is not the scheme a real provider would use.
+
 This is fetch-and-validate only. Redirect-URL construction, state/nonce/PKCE
 handling, the OAuth2 callback route, the authorization-code-for-token exchange,
 and session creation are all separate, not-yet-started work — there is no

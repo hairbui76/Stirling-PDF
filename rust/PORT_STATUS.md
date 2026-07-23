@@ -451,10 +451,20 @@ fetching already uses, a hard response-size cap enforced independent of a server
 `Content-Length`, and no-redirect fetching), mirroring Java's
 `OAuth2Configuration.oidcClientRegistration()`. This is discovery only — no route calls it yet, and
 none of authorization redirect construction, state/nonce/PKCE, the callback route, code-for-token
-exchange, or session creation exist. Reviewers should also tighten the shared HTTPS scheme check
-before a later ticket wires a lower-trust caller to it: it currently allows any HTTPS host with no
-private-network restriction, which is fine for an admin-configured issuer but would need hardening
-before it also gates a discovery document's own returned endpoint URLs against SSRF. Recovery
+exchange, or session creation exist. The discovery document's own returned endpoint URLs
+(`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
+unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
+host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,
+IETF-benchmarking/protocol-assignment ranges, and every IANA-registered IPv4-embedded-in-IPv6 form
+(mapped, compatible, both NAT64 fixed prefixes, 6to4, Teredo including its XOR-obfuscated client
+slot, and ISATAP for either scope-bit value). An adversarially-verified pass against real RFC text
+found and closed three successive bypasses of this check before landing here (a missed embedding
+form each time), which is itself informative: literal-address enumeration is a whack-a-mole shape,
+not a one-and-done fix. Explicitly and deliberately still open: operator-configurable NAT64/6rd
+prefixes and DNS-name resolution (a domain that resolves to a private address) are undetectable
+without out-of-band deployment knowledge or an actual, TOCTOU-safe resolve-and-pin mechanism neither
+of which exist here yet; native IPv6 special-purpose ranges beyond the embedding forms above (e.g.
+IPv6 benchmarking, Discard-Only) were not audited. Recovery
 codes, SAML2, desktop callbacks, device identities, ownership for additional
 durable proprietary resources, and independent security review remain.
 

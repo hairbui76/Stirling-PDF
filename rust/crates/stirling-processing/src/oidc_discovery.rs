@@ -12,7 +12,11 @@
 //! Spring's `ClientRegistrations.fromIssuerLocation(issuer)` to fetch and
 //! validate the same discovery document.
 
-use std::{io::Read as _, time::Duration};
+use std::{
+    io::Read as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::Deserialize;
@@ -121,15 +125,237 @@ fn validated_issuer(issuer: &str) -> Result<String, OidcDiscoveryError> {
 }
 
 /// Validates a discovered endpoint URL under the same scheme policy as the
-/// issuer. Endpoint URLs aren't required to be credential/query/fragment-free
-/// the way an OIDC issuer identifier is — only their scheme and host matter.
+/// issuer, plus an SSRF guard that the issuer check does not need.
+///
+/// Endpoint URLs aren't required to be credential/query/fragment-free the way
+/// an OIDC issuer identifier is — only their scheme and host matter. But
+/// unlike the issuer (an admin-configured value the admin already chose to
+/// trust), `authorization_endpoint`/`token_endpoint`/`jwks_uri` come *from*
+/// that issuer's own discovery response — a compromised or spoofed provider
+/// could point one at internal infrastructure (a cloud metadata endpoint, an
+/// internal service) instead of itself. So on top of the shared
+/// [`issuer_url_scheme_is_allowed`] policy, an HTTPS endpoint whose host is a
+/// literal IP address in a private/reserved range is rejected too. This is a
+/// literal-address check only (no DNS lookup): it protects a *future* caller
+/// that fetches these endpoints over the network from the direct-IP form of
+/// this attack (`https://169.254.169.254/...`, `https://10.0.0.5/...`).
+/// DNS-based SSRF/rebinding — a domain name that resolves to a private
+/// address, possibly only at connect time — is not covered here and remains a
+/// documented gap for whoever wires that network fetch to revisit (see
+/// `rust/contracts/account-lifecycle.md`).
+///
+/// The narrow HTTP+loopback allowance in `issuer_url_scheme_is_allowed` is
+/// deliberately left alone: it already only matches the three loopback
+/// literals (not arbitrary private ranges), which is exactly what this
+/// module's own test fixtures rely on for the mock discovery server, and it
+/// is not the scheme a real, spoofable production provider would use anyway.
 fn validated_endpoint_url(value: &str) -> Result<Url, OidcDiscoveryError> {
     let url = Url::parse(value).map_err(|_| OidcDiscoveryError::InvalidDiscoveryDocument)?;
-    if issuer_url_scheme_is_allowed(&url) {
-        Ok(url)
-    } else {
-        Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+    if !issuer_url_scheme_is_allowed(&url) {
+        return Err(OidcDiscoveryError::InvalidDiscoveryDocument);
     }
+    if url.scheme() == "https" && url.host_str().is_some_and(host_is_reserved_ip_literal) {
+        return Err(OidcDiscoveryError::InvalidDiscoveryDocument);
+    }
+    Ok(url)
+}
+
+/// True when `host` — as returned by [`Url::host_str`], which brackets an
+/// IPv6 literal (e.g. `"[::1]"`) — is a literal IPv4/IPv6 address in a
+/// private, loopback, link-local (this also covers the `169.254.169.254`
+/// cloud-metadata address), multicast, broadcast, documentation, unspecified,
+/// CGNAT/shared-address-space (RFC 6598, `100.64.0.0/10`), benchmarking
+/// (RFC 2544, `198.18.0.0/15`), or IETF-protocol-assignment (RFC 6890,
+/// `192.0.0.0/24`) range.
+///
+/// A domain name (anything that doesn't parse as a literal IP once
+/// unbracketed) is not resolved and always returns `false` — see
+/// [`validated_endpoint_url`]'s doc comment for why (**not covered**: a
+/// domain name that resolves to any of the ranges above, including at
+/// connect time rather than validation time — DNS-based SSRF/rebinding).
+/// Numeric-obfuscated forms (decimal-integer/hex/octal IPv4, e.g.
+/// `2852039166`) are not a bypass here: the `url` crate's WHATWG-compliant
+/// host parser normalizes those to canonical dotted-decimal before
+/// `Url::host_str`/`Url::host` ever exposes them.
+///
+/// `Ipv4Addr`/`Ipv6Addr::is_global` would be a more direct fit but is not yet
+/// stable on this toolchain (confirmed against the pinned Rust 1.94), so this
+/// enumerates the specific stable-API reserved categories (plus the three
+/// ranges above, which are plain octet-range checks rather than a stdlib
+/// predicate) that matter for SSRF instead. Two IPv6 forms that embed an IPv4
+/// address are unwrapped and checked as that IPv4 address: the "IPv4-mapped"
+/// form (`::ffff:a.b.c.d`, via the stdlib's own
+/// [`Ipv6Addr::to_ipv4_mapped`]) and the older, deprecated "IPv4-compatible"
+/// form (`::a.b.c.d`, no `ffff` marker, via [`ipv4_compatible`] — there is no
+/// stdlib helper for this form).
+fn host_is_reserved_ip_literal(host: &str) -> bool {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match unbracketed.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => ipv4_is_reserved(address),
+        Ok(IpAddr::V6(address)) => ipv6_is_reserved(address),
+        Err(_) => false,
+    }
+}
+
+fn ipv4_is_reserved(address: Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_documentation()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || is_shared_address_space(address)
+        || is_benchmarking_range(address)
+        || is_ietf_protocol_assignment(address)
+}
+
+/// RFC 6598 Shared Address Space (`100.64.0.0/10`, i.e. the second octet in
+/// `64..=127`): CGNAT and some cloud/container-network internal ranges. Not
+/// exposed as a stable `Ipv4Addr` predicate, so checked directly.
+fn is_shared_address_space(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+/// RFC 2544 benchmarking (`198.18.0.0/15`, i.e. the second octet in `18..=19`).
+/// Not exposed as a stable `Ipv4Addr` predicate, so checked directly.
+fn is_benchmarking_range(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 198 && (18..=19).contains(&octets[1])
+}
+
+/// RFC 6890 IETF Protocol Assignments (`192.0.0.0/24`). Not exposed as a
+/// stable `Ipv4Addr` predicate, so checked directly.
+fn is_ietf_protocol_assignment(address: Ipv4Addr) -> bool {
+    address.octets()[..3] == [192, 0, 0]
+}
+
+/// Checked against every known, RFC-standardized/IANA-registered fixed-prefix
+/// IPv4-in-IPv6 embedding form (see the individual extractor functions below
+/// for citations): IPv4-mapped, IPv4-compatible, NAT64 well-known and
+/// local-use prefixes, 6to4, Teredo (both its server and its obfuscated
+/// client address), and ISATAP. This list was produced by a deliberate
+/// enumeration pass over IANA's IPv6 Special-Purpose Address Registry and the
+/// RFCs it cites — not just the two forms independently discovered as
+/// bypasses before it (IPv4-compatible, then NAT64) — precisely so a *third*
+/// standardized notation doesn't defeat this check the same way. See
+/// `rust/contracts/account-lifecycle.md` for the residual gaps this pass
+/// still can't close (operator-chosen NAT64/6rd prefixes, and DNS
+/// resolution).
+fn ipv6_is_reserved(address: Ipv6Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_unique_local()
+        || address.is_unicast_link_local()
+        || address.to_ipv4_mapped().is_some_and(ipv4_is_reserved)
+        || ipv4_compatible(address).is_some_and(ipv4_is_reserved)
+        || nat64_well_known_prefix_embedded_ipv4(address).is_some_and(ipv4_is_reserved)
+        || nat64_local_use_prefix_embedded_ipv4(address).is_some_and(ipv4_is_reserved)
+        || six_to_four_embedded_ipv4(address).is_some_and(ipv4_is_reserved)
+        || teredo_embedded_ipv4_addresses(address)
+            .into_iter()
+            .flatten()
+            .any(ipv4_is_reserved)
+        || isatap_embedded_ipv4(address).is_some_and(ipv4_is_reserved)
+}
+
+/// Extracts the embedded IPv4 address from the deprecated "IPv4-compatible"
+/// IPv6 form (`::a.b.c.d`, RFC 4291 section 2.5.5.1): the high 96 bits (12
+/// octets) all zero, with the low 32 bits carrying the IPv4 address. This is
+/// distinct from — and not caught by — [`Ipv6Addr::to_ipv4_mapped`], which
+/// only recognizes the newer "IPv4-mapped" form (`::ffff:a.b.c.d`, marked by
+/// `0xffff` in octets 10-11 rather than zero); there is no stdlib equivalent
+/// for this older form, so the octets are checked directly.
+fn ipv4_compatible(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = address.octets();
+    (octets[..12] == [0; 12]).then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+}
+
+/// Extracts the embedded IPv4 address from a NAT64 Well-Known Prefix address
+/// (`64:ff9b::/96`, RFC 6052 sections 2.1/2.2 — verified against the RFC text,
+/// not assumed). The Well-Known Prefix is only ever used at a /96 (the RFC
+/// explicitly restricts it to that length), so — like the other /96 forms
+/// above — the IPv4 address simply fills the remaining 32 bits with no
+/// reserved octet needed.
+fn nat64_well_known_prefix_embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    const PREFIX: [u8; 12] = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+    let octets = address.octets();
+    (octets[..12] == PREFIX).then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+}
+
+/// Extracts the embedded IPv4 address from a NAT64 Local-Use Prefix address
+/// (`64:ff9b:1::/48`, RFC 8215, using RFC 6052 section 2.2's general
+/// embedding algorithm for a 48-bit prefix length — verified against the RFC
+/// text, not assumed). Unlike the /96 forms, a /48 embedding leaves a
+/// reserved "u" octet at bits 64-71 (octet index 8, regardless of prefix
+/// length below 96) that is *not* part of the IPv4 address: RFC 6052 requires
+/// it to be transmitted as zero, but this extracts the IPv4 bits around it
+/// regardless of the "u" octet's actual value, since the concern here is
+/// whether the address *can* be used to reach a reserved IPv4 destination,
+/// not strict wire-format conformance. The 16 high IPv4 bits sit at octets
+/// 6-7 (right after the 48-bit/6-octet prefix) and the 16 low IPv4 bits sit
+/// at octets 9-10 (right after the reserved octet 8).
+fn nat64_local_use_prefix_embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    const PREFIX: [u8; 6] = [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01];
+    let octets = address.octets();
+    (octets[..6] == PREFIX).then(|| Ipv4Addr::new(octets[6], octets[7], octets[9], octets[10]))
+}
+
+/// Extracts the embedded IPv4 address from a 6to4 address (`2002::/16`,
+/// RFC 3056 — verified against the RFC text, not assumed): the 32 bits right
+/// after the 16-bit prefix (octets 2-5) carry the IPv4 address of the 6to4
+/// host or relay.
+fn six_to_four_embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    const PREFIX: [u8; 2] = [0x20, 0x02];
+    let octets = address.octets();
+    (octets[..2] == PREFIX).then(|| Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]))
+}
+
+/// Extracts the two IPv4 addresses embedded in a Teredo address
+/// (`2001::/32`, RFC 4380 as amended by RFC 8190 — verified against the RFC
+/// text, not assumed; RFC 8190 only corrects registry metadata, not the
+/// address layout): the Teredo server's IPv4 address in octets 4-7, stored
+/// plain, and the client's (NAT-translated) IPv4 address in octets 12-15, stored
+/// bitwise-inverted ("obfuscated" by XOR-ing every bit with 1 — equivalent to
+/// `!byte` per octet). Both are worth checking: a malicious discovery
+/// document could point either the "server" or "client" slot at a reserved
+/// address.
+fn teredo_embedded_ipv4_addresses(address: Ipv6Addr) -> [Option<Ipv4Addr>; 2] {
+    const PREFIX: [u8; 4] = [0x20, 0x01, 0x00, 0x00];
+    let octets = address.octets();
+    if octets[..4] != PREFIX {
+        return [None, None];
+    }
+    let server = Ipv4Addr::new(octets[4], octets[5], octets[6], octets[7]);
+    let client = Ipv4Addr::new(!octets[12], !octets[13], !octets[14], !octets[15]);
+    [Some(server), Some(client)]
+}
+
+/// Extracts the embedded IPv4 address from an ISATAP address (RFC 5214 —
+/// verified against the RFC text, not assumed): unlike the other forms here,
+/// ISATAP has no fixed leading prefix (its 64-bit network prefix can be any
+/// on-link unicast prefix) — instead its 64-bit interface identifier is
+/// formed by concatenating the 24-bit IANA OUI `00-00-5E`, the fixed octet
+/// `0xFE`, and the 32-bit IPv4 address. Per RFC 5214 section 6.1, octets 8-9
+/// (the two octets preceding the `5E-FE` marker) are a "u" bit / scope
+/// indicator that is `00-00` when the embedded IPv4 address is locally
+/// scoped or `02-00` when it is known to be globally unique — *not* part of
+/// a fixed prefix. Only octets 10-11 (the `5E-FE` marker itself) reliably
+/// identify ISATAP; octets 8-9 are deliberately left unconstrained here
+/// rather than enumerating the two documented values, so this doesn't
+/// silently miss a third, undocumented, or otherwise-set scope-bit value the
+/// same way requiring an exact `00-00-5E-FE` match once missed the `u=1`
+/// (`02-00-5E-FE`) case.
+fn isatap_embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    const MARKER: [u8; 2] = [0x5e, 0xfe];
+    let octets = address.octets();
+    (octets[10..12] == MARKER)
+        .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
 }
 
 fn fetch_discovery_document(issuer: &str) -> Result<RawOidcDiscoveryDocument, OidcDiscoveryError> {
@@ -280,6 +506,274 @@ mod tests {
             result,
             Err(OidcDiscoveryError::InvalidDiscoveryDocument)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_private_ip_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `10.0.0.1` and `192.168.1.1` are private-range literals, not
+        // loopback — they don't hit the existing HTTP+loopback allowlist
+        // exception at all, since these are HTTPS. This is the case the
+        // ticket asked for explicitly: a non-loopback private IP that would
+        // have passed the old (host-unrestricted) HTTPS check.
+        for jwks_uri in [
+            "https://10.0.0.1/jwks.json",
+            "https://192.168.1.1/jwks.json",
+        ] {
+            let (_, result) = discover_against_fixture(move |issuer| {
+                format!(
+                    r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"{jwks_uri}"}}"#
+                )
+            })?;
+            assert!(
+                matches!(result, Err(OidcDiscoveryError::InvalidDiscoveryDocument)),
+                "expected {jwks_uri} to be rejected, got {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_the_cloud_metadata_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 169.254.169.254 (link-local) is the canonical cloud-metadata SSRF
+        // target called out in the ticket background.
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"https://169.254.169.254/latest/meta-data","token_endpoint":"{issuer}/token","jwks_uri":"{issuer}/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_loopback_ip_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Loopback is allowed for HTTP dev/test tooling (see
+        // `issuer_url_scheme_is_allowed`) but not for an HTTPS endpoint URL
+        // sourced from the discovery document itself.
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://127.0.0.1/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_an_ipv4_mapped_ipv6_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `::ffff:169.254.169.254` is the IPv6-mapped form of the same
+        // cloud-metadata address; it must be unwrapped and checked as its
+        // underlying IPv4 address rather than slipping through as an
+        // ordinary-looking IPv6 literal.
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[::ffff:169.254.169.254]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// Regression test for a bypass: `::169.254.169.254` (the deprecated
+    /// "IPv4-compatible" IPv6 form, no `ffff` marker) reaches the same
+    /// cloud-metadata address as the mapped-form test above, but is a
+    /// distinct encoding `Ipv6Addr::to_ipv4_mapped` does not recognize —
+    /// `ipv4_compatible` must catch it separately.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_an_ipv4_compatible_ipv6_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[::169.254.169.254]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// Regression test for a second bypass, found after the IPv4-compatible
+    /// fix above: `64:ff9b::/96` (RFC 6052 NAT64 Well-Known Prefix) is a
+    /// *third* standardized notation embedding the same cloud-metadata
+    /// address, distinct from both the mapped and compatible forms.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_nat64_well_known_prefix_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[64:ff9b::169.254.169.254]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// The RFC 8215 NAT64 Local-Use Prefix (`64:ff9b:1::/48`) embeds the IPv4
+    /// address differently from every /96 form above: RFC 6052 section 2.2's
+    /// general algorithm splits the 32 IPv4 bits around a reserved "u" octet.
+    /// This is `64:ff9b:1:a9fe:a9:fe00::` — expanded, `0064 ff9b 0001 a9fe
+    /// 00a9 fe00 0000 0000`, i.e. prefix `0064:ff9b:0001`, IPv4 high octets
+    /// `a9:fe` (169.254), the reserved `u` octet `00`, IPv4 low octets
+    /// `a9:fe` (169.254) split across the next two octets, then a zero
+    /// suffix — embedding 169.254.169.254 split around the reserved octet
+    /// rather than contiguously.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_nat64_local_use_prefix_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[64:ff9b:1:a9fe:a9:fe00::]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// 6to4 (`2002::/16`, RFC 3056) embeds the IPv4 address directly in the
+    /// next 32 bits after the prefix: `2002:a9fe:a9fe::` embeds
+    /// 169.254.169.254 (`a9fe:a9fe` is the hex form of `169.254.169.254`).
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_6to4_embedded_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[2002:a9fe:a9fe::]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// Teredo (`2001::/32`, RFC 4380/8190) embeds *two* IPv4 addresses: the
+    /// server's (plain) and the client's (bitwise-inverted/"obfuscated").
+    /// `2001:0:808:808::5601:5601` carries server `8.8.8.8` (a public,
+    /// non-reserved address — deliberately, so this test isolates the
+    /// *client* slot) and an obfuscated client address that decodes
+    /// (`!0x56=0xa9=169`, `!0x01=0xfe=254`, ...) to 169.254.169.254.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_a_teredo_client_embedded_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[2001:0:808:808::5601:5601]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// ISATAP (RFC 5214) has no fixed leading prefix — only its interface
+    /// identifier is fixed (`5E-FE` then the IPv4 address, per octets 10-11)
+    /// — so this deliberately uses an *arbitrary* global-unicast-shaped
+    /// prefix (`2001:db8::`, itself independently unflagged by every other
+    /// check here: not loopback/unspecified/multicast/unique-local/
+    /// link-local, and not one of the fixed NAT64/6to4/Teredo prefixes)
+    /// rather than `fe80::/10` — reusing a link-local prefix here would make
+    /// this test pass even without the ISATAP-specific extraction, since
+    /// link-local is already independently rejected. This is the "u=0"
+    /// (locally-scoped) variant: `2001:db8::5efe:a9fe:a9fe` has `00-00`
+    /// immediately before the `5efe` marker. See the "u=1" variant test
+    /// below for the regression this was fixed to cover.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_an_isatap_embedded_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[2001:db8::5efe:a9fe:a9fe]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    /// Regression test for a bypass in the ISATAP check above: RFC 5214
+    /// section 6.1 defines octets 8-9 (immediately before the `5E-FE`
+    /// marker) as a "u" bit / scope indicator that is `00-00` when the
+    /// embedded IPv4 address is locally scoped (the variant covered by the
+    /// test above) or `02-00` when it is known to be globally unique — an
+    /// earlier version of this check required an exact `00-00-5E-FE` match,
+    /// missing this "u=1" variant entirely. `2001:db8::0200:5efe:a9fe:a9fe`
+    /// carries `02-00` before the marker but embeds the same
+    /// 169.254.169.254 target.
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_an_isatap_u_bit_set_embedded_private_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://[2001:db8::0200:5efe:a9fe:a9fe]/jwks.json"}}"#
+            )
+        })?;
+        assert!(matches!(
+            result,
+            Err(OidcDiscoveryError::InvalidDiscoveryDocument)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_https_endpoint_url_targeting_shared_address_space_benchmarking_or_ietf_protocol_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for jwks_uri in [
+            "https://100.64.0.5/jwks.json",
+            "https://198.18.0.5/jwks.json",
+            "https://192.0.0.5/jwks.json",
+        ] {
+            let (_, result) = discover_against_fixture(move |issuer| {
+                format!(
+                    r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"{jwks_uri}"}}"#
+                )
+            })?;
+            assert!(
+                matches!(result, Err(OidcDiscoveryError::InvalidDiscoveryDocument)),
+                "expected {jwks_uri} to be rejected, got {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn allows_an_https_endpoint_url_targeting_a_public_ip_literal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A public IP literal is unusual for a real provider but not itself
+        // an SSRF target, and should not be rejected by this check.
+        let (_, result) = discover_against_fixture(|issuer| {
+            format!(
+                r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"https://8.8.8.8/jwks.json"}}"#
+            )
+        })?;
+        let metadata = result?;
+        assert_eq!(metadata.jwks_uri, "https://8.8.8.8/jwks.json");
         Ok(())
     }
 
