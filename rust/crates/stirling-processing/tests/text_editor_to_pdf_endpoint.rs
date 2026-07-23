@@ -47,6 +47,89 @@ async fn rebuilds_a_pdf_from_editor_json() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
+async fn regenerates_a_mixed_edit_page_over_the_preserved_stream()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The page carries both a preserved `contentStreams` entry (an unrelated
+    // vector fill plus a represented text draw) and an edited `textElements`
+    // projection of it. The endpoint must strip the represented text draw from
+    // the preserved stream, append the newly authored text, and leave the
+    // unrelated vector fill untouched — rather than writing the preserved
+    // stream back verbatim and silently dropping the edit.
+    let original_content =
+        b"0 1 0 rg 10 10 20 20 re f BT /F1 12 Tf 10 50 Td (Original endpoint text) Tj ET";
+    let json = serde_json::json!({
+        "fonts": [{
+            "id": "body",
+            "pageNumber": 1,
+            "standard14Name": "Helvetica"
+        }],
+        "pages": [{
+            "pageNumber": 1,
+            "width": 200.0,
+            "height": 160.0,
+            "contentStreams": [{
+                "dictionary": {
+                    "Length": { "type": "INTEGER", "value": original_content.len() }
+                },
+                "rawData": STANDARD.encode(original_content)
+            }],
+            "textElements": [{
+                "text": "Edited endpoint text",
+                "fontId": "body",
+                "fontSize": 12.0,
+                "x": 10.0,
+                "y": 50.0
+            }]
+        }]
+    });
+    let response = post_json(serde_json::to_vec(&json)?.as_slice()).await?;
+    let response = require_status(response, StatusCode::OK).await?;
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+    let rebuilt = Document::load_mem(&response_bytes(response).await?)?;
+    let page_id = *rebuilt.get_pages().values().next().ok_or("no page")?;
+    let content = Content::decode(&rebuilt.get_page_content(page_id))?;
+
+    // The represented text draw from the preserved stream is gone.
+    assert!(!content.operations.iter().any(|operation| {
+        operation.operator == "Tj"
+            && operation
+                .operands
+                .first()
+                .and_then(|object| object.as_str().ok())
+                == Some(b"Original endpoint text")
+    }));
+    // The newly authored text is present.
+    let text = content
+        .operations
+        .iter()
+        .find(|operation| operation.operator == "Tj")
+        .and_then(|operation| operation.operands.first())
+        .and_then(|object| object.as_str().ok())
+        .ok_or("missing text")?;
+    assert_eq!(text, b"Edited endpoint text");
+    // The unrelated retained vector fill survives unchanged.
+    assert!(
+        content
+            .operations
+            .iter()
+            .any(|operation| operation.operator == "rg")
+    );
+    assert!(
+        content
+            .operations
+            .iter()
+            .any(|operation| operation.operator == "re")
+    );
+    assert!(
+        content
+            .operations
+            .iter()
+            .any(|operation| operation.operator == "f" && operation.operands.is_empty())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn draws_an_editor_authored_standard14_page() -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::json!({
         "fonts": [{

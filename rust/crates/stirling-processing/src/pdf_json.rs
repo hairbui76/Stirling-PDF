@@ -7566,28 +7566,128 @@ fn retained_vector_content(
     represented_images: &[PdfJsonImageElement],
 ) -> Result<Option<Vec<u8>>, PdfJsonError> {
     let bytes = document.get_page_content_with_limit(page_id, MAX_TEXT_CONTENT_BYTES)?;
-    let content = Content::decode(&bytes)?;
-    let represented_image_names = represented_images
+    // The cached partial-export path always has a merged page model with complete
+    // (not delta) `textElements`/`imageElements` lists — `merge_partial_page_model`
+    // carries the cached value forward for whichever field the update omitted — so
+    // both content types are always safe to strip and fully regenerate here.
+    strip_represented_page_content(&bytes, represented_images, true, true)
+}
+
+/// Decodes a full-rebuild page's preserved `contentStreams` model entries into
+/// concatenated plain content bytes, bounded to `max_decompressed_size` total.
+///
+/// Mirrors [`Document::get_page_content_with_limit`] for the case where the
+/// preserved streams live only in the JSON model (still filter-encoded, per
+/// [`build_stream_from_model`]) rather than in a live [`Document`]: each stream is
+/// decoded against the *remaining* budget and separated by a newline, so N
+/// streams cannot sum to N times the limit.
+fn decode_content_streams_with_limit(
+    content_streams: &[PdfJsonStream],
+    max_decompressed_size: usize,
+) -> Result<Vec<u8>, PdfJsonError> {
+    let mut content = Vec::new();
+    for stream_model in content_streams {
+        let stream = build_stream_from_model(stream_model);
+        let remaining = max_decompressed_size.saturating_sub(content.len());
+        let decoded = stream.get_plain_content_with_limit(remaining)?;
+        content.extend_from_slice(&decoded);
+        content.push(b'\n');
+    }
+    Ok(content)
+}
+
+/// Full-rebuild counterpart to [`retained_vector_content`]: strips represented
+/// text/image draws out of a page's preserved `contentStreams` model entries
+/// (rather than a live document's page content) so edited `textElements` /
+/// `imageElements` can be layered back on top instead of the stream being
+/// written back verbatim.
+///
+/// Unlike the cached partial-export path, the full-rebuild [`PdfJsonPage`] has no
+/// merged "current + edit" model — an empty `textElements`/`imageElements` list
+/// can't be told apart from "the client didn't resubmit this content type." So
+/// `strip_text`/`strip_images` are threaded through independently: the content
+/// type the client actually resubmitted (non-empty list) is stripped and
+/// regenerated, and the other is left completely untouched rather than being
+/// destroyed on the assumption that an empty list means "delete everything of
+/// this type."
+fn retained_vector_content_from_streams(
+    content_streams: &[PdfJsonStream],
+    represented_images: &[PdfJsonImageElement],
+    strip_text: bool,
+    strip_images: bool,
+) -> Result<Option<Vec<u8>>, PdfJsonError> {
+    let bytes = decode_content_streams_with_limit(content_streams, MAX_TEXT_CONTENT_BYTES)?;
+    strip_represented_page_content(&bytes, represented_images, strip_text, strip_images)
+}
+
+/// Resource names of `Image`-subtype `XObject`s directly under a reconstructed
+/// page `resources` object.
+///
+/// The full-rebuild mixed-edit path (unlike the cached partial-export path) has
+/// no separate "before the edit" `imageElements` snapshot to union with the
+/// edited list — the incoming [`PdfJsonDocument`] only carries the final state.
+/// When the editor replaces a page's `imageElements` outright (dropping the
+/// original entry's `objectName` instead of keeping it), the preserved
+/// `resources` cos value is the only remaining signal that an image used to be
+/// drawn under a given name, so its `XObject` dictionary is also treated as
+/// "represented" for stripping purposes.
+fn preserved_image_resource_names(resources: Option<&Object>) -> Vec<String> {
+    let Some(Object::Dictionary(resources)) = resources else {
+        return Vec::new();
+    };
+    let Ok(Object::Dictionary(xobjects)) = resources.get(b"XObject") else {
+        return Vec::new();
+    };
+    xobjects
         .iter()
-        .filter_map(|image| image.object_name.as_deref())
-        .map(str::as_bytes)
-        .collect::<BTreeSet<_>>();
-    let remove_inline_images = represented_images
-        .iter()
-        .any(|image| image.inline_image == Some(true));
+        .filter(|(_, value)| {
+            matches!(value, Object::Stream(stream)
+                if stream.dict.get(b"Subtype").ok().and_then(|subtype| subtype.as_name().ok()) == Some(b"Image"))
+        })
+        .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+        .collect()
+}
+
+/// Shared stripping pass behind [`retained_vector_content`] and
+/// [`retained_vector_content_from_streams`]: decodes `bytes` as a content stream
+/// and, independently, `strip_text` removes text-showing operators (everything
+/// inside `BT`/`ET`) and `strip_images` removes any `Do`/`BI` draw ops that match
+/// an already-represented image, then re-encodes what remains. Passing `false`
+/// for either leaves that content type's operators completely untouched — the
+/// caller decides per type whether the client actually resubmitted it.
+fn strip_represented_page_content(
+    bytes: &[u8],
+    represented_images: &[PdfJsonImageElement],
+    strip_text: bool,
+    strip_images: bool,
+) -> Result<Option<Vec<u8>>, PdfJsonError> {
+    let content = Content::decode(bytes)?;
+    let represented_image_names = if strip_images {
+        represented_images
+            .iter()
+            .filter_map(|image| image.object_name.as_deref())
+            .map(str::as_bytes)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let remove_inline_images = strip_images
+        && represented_images
+            .iter()
+            .any(|image| image.inline_image == Some(true));
     let mut inside_text = false;
     let mut operations = Vec::with_capacity(content.operations.len());
     for operation in content.operations {
         let retain = match operation.operator.as_str() {
-            "BT" => {
+            "BT" if strip_text => {
                 inside_text = true;
                 false
             }
-            "ET" => {
+            "ET" if strip_text => {
                 inside_text = false;
                 false
             }
-            _ if inside_text => false,
+            _ if strip_text && inside_text => false,
             "BI" if remove_inline_images => false,
             "Do" if operation
                 .operands
@@ -7641,6 +7741,121 @@ fn add_compressed_content_stream(
     Ok(Object::Reference(document.add_object(stream)))
 }
 
+/// Builds a single page's `Contents` stream references and merged `Resources`
+/// object for [`convert_json_to_pdf`].
+///
+/// A page with no preserved `contentStreams` draws its `textElements`/
+/// `imageElements` from scratch. A page with a preserved stream but no editor
+/// elements writes that stream back verbatim (the lossless path). A page with
+/// *both* is a mixed edit: the preserved stream can no longer be written back
+/// verbatim (that would silently drop the edits), so its represented text/image
+/// draws are stripped and the edited elements are regenerated on top instead —
+/// the same strategy [`regenerate_page_with_vector_overlay`] already applies to
+/// the cached partial-export path.
+///
+/// `textElements`/`imageElements` are stripped **independently**: `PdfJsonPage`
+/// carries plain (non-`Option`) lists, so there is no way to tell "the client
+/// left this content type untouched" apart from "the client wants it emptied."
+/// This resolves that ambiguity by treating an empty list as "untouched" for
+/// that content type only — an edit to one type never strips or destroys the
+/// preserved stream's draws (or resources) for the other, even though that also
+/// means a client cannot yet delete *all* text/images from a mixed-edit page
+/// independently of editing the other type via this endpoint.
+fn build_page_contents(
+    document: &mut Document,
+    document_json: &PdfJsonDocument,
+    page_model: &PdfJsonPage,
+    page_index: usize,
+) -> Result<(Vec<Object>, Option<Object>), PdfJsonError> {
+    let mut resources = page_model.resources.as_ref().and_then(cos_value_to_object);
+    let strip_text = !page_model.text_elements.is_empty();
+    let strip_images = !page_model.image_elements.is_empty();
+    let mixed_edit = !page_model.content_streams.is_empty() && (strip_text || strip_images);
+    let mut content_ids: Vec<Object> = if mixed_edit {
+        Vec::new()
+    } else {
+        page_model
+            .content_streams
+            .iter()
+            .map(|stream| {
+                Object::Reference(
+                    document.add_object(Object::Stream(build_stream_from_model(stream))),
+                )
+            })
+            .collect()
+    };
+    if mixed_edit {
+        // Represented images to strip are the edited `imageElements` plus any
+        // `Image` XObject still named in the preserved `resources` — the latter
+        // covers an edit that drops an image outright or swaps it for a new one
+        // without keeping the original `objectName` (see
+        // `preserved_image_resource_names`). Both are skipped entirely when
+        // `imageElements` is empty (images untouched by this edit).
+        let stale_image_names = if strip_images {
+            preserved_image_resource_names(resources.as_ref())
+        } else {
+            Vec::new()
+        };
+        let mut represented_images = if strip_images {
+            page_model.image_elements.clone()
+        } else {
+            Vec::new()
+        };
+        represented_images.extend(stale_image_names.iter().cloned().map(|object_name| {
+            PdfJsonImageElement {
+                object_name: Some(object_name),
+                ..PdfJsonImageElement::default()
+            }
+        }));
+        // Those stale image XObjects are being dropped from the page's draw
+        // operators below, so drop their now-unused resource entries too rather
+        // than carrying forward a nested (non-indirect) `Stream` COS value that
+        // only round-trips correctly at the top-level `contentStreams` position.
+        // Skipped when images are untouched, so an untouched image's resource
+        // entry is never disturbed.
+        if strip_images
+            && let Some(Object::Dictionary(resources_dict)) = resources.as_mut()
+            && let Ok(Object::Dictionary(xobjects)) = resources_dict.get_mut(b"XObject")
+        {
+            for object_name in &stale_image_names {
+                xobjects.remove(object_name.as_bytes());
+            }
+        }
+        let retained = retained_vector_content_from_streams(
+            &page_model.content_streams,
+            &represented_images,
+            strip_text,
+            strip_images,
+        )?;
+        if let Some(retained) = retained {
+            content_ids.push(add_compressed_content_stream(document, retained)?);
+        }
+    }
+    if content_ids.is_empty() || mixed_edit {
+        let fallback_page_number = i32::try_from(page_index.saturating_add(1)).map_err(|_| {
+            PdfJsonError::UnsupportedText("page number exceeds the Rust JSON model".to_owned())
+        })?;
+        let page_number = page_model.page_number.unwrap_or(fallback_page_number);
+        if let Some(generated) = build_generated_page_content(
+            document,
+            document_json,
+            page_model,
+            page_number,
+            resources.as_ref(),
+        )? {
+            resources = Some(merge_generated_page_resources(
+                resources,
+                &generated.fonts,
+                &generated.images,
+            )?);
+            content_ids.push(Object::Reference(document.add_object(Object::Stream(
+                Stream::new(dictionary! {}, generated.content),
+            ))));
+        }
+    }
+    Ok((content_ids, resources))
+}
+
 /// Rebuilds a PDF from the editable JSON structure and writes it to `output_path`.
 ///
 /// Phase 2 reconstructs pages from the preserved COS data — document metadata,
@@ -7651,8 +7866,17 @@ fn add_compressed_content_stream(
 /// draws `textElements` with restored embedded font dictionaries or Standard-14
 /// fonts and raster `imageElements`, including alpha via a soft mask. Restored
 /// font streams are materialized as indirect objects, and text must round-trip
-/// through the font's actual encoding. Type3 synthesis and mixed preserved-stream
-/// editing remain deferred.
+/// through the font's actual encoding.
+///
+/// When a page carries *both* a preserved `contentStreams` entry and editor-authored
+/// `textElements`/`imageElements`, the preserved stream is no longer written back
+/// verbatim (which would silently drop those edits). Instead this follows the same
+/// regeneration strategy as the cached partial-export path
+/// ([`regenerate_page_with_vector_overlay`]): the preserved stream's decoded content
+/// is stripped of text-showing operators and any `Do`/`BI` draws that match a
+/// tracked image, the remaining vector operators are retained, and the edited
+/// `textElements`/`imageElements` are appended in z-order. Type3 synthesis remains
+/// deferred.
 ///
 /// # Errors
 ///
@@ -7680,41 +7904,8 @@ pub fn convert_json_to_pdf(
         if let Some(rotation) = page_model.rotation {
             page_dict.set("Rotate", i64::from(rotation));
         }
-        let mut resources = page_model.resources.as_ref().and_then(cos_value_to_object);
-        let mut content_ids: Vec<Object> = page_model
-            .content_streams
-            .iter()
-            .map(|stream| {
-                Object::Reference(
-                    document.add_object(Object::Stream(build_stream_from_model(stream))),
-                )
-            })
-            .collect();
-        if content_ids.is_empty() {
-            let fallback_page_number =
-                i32::try_from(page_index.saturating_add(1)).map_err(|_| {
-                    PdfJsonError::UnsupportedText(
-                        "page number exceeds the Rust JSON model".to_owned(),
-                    )
-                })?;
-            let page_number = page_model.page_number.unwrap_or(fallback_page_number);
-            if let Some(generated) = build_generated_page_content(
-                &mut document,
-                document_json,
-                page_model,
-                page_number,
-                resources.as_ref(),
-            )? {
-                resources = Some(merge_generated_page_resources(
-                    resources,
-                    &generated.fonts,
-                    &generated.images,
-                )?);
-                content_ids.push(Object::Reference(document.add_object(Object::Stream(
-                    Stream::new(dictionary! {}, generated.content),
-                ))));
-            }
-        }
+        let (content_ids, resources) =
+            build_page_contents(&mut document, document_json, page_model, page_index)?;
         if let Some(resources) = resources {
             page_dict.set("Resources", resources);
         }
@@ -9702,11 +9893,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::similar_names)]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
     fn pdf_json_pdf_round_trip_preserves_content_streams() -> Result<(), Box<dyn std::error::Error>>
     {
-        use super::{convert_json_to_pdf, pdf_to_json};
-        use lopdf::{Document, Object, Stream, dictionary};
+        use super::{convert_json_to_pdf, number_as_f32, pdf_to_json};
+        use lopdf::{Document, Object, Stream, content::Content, dictionary};
 
         let content = b"BT /F1 10 Tf 2 Tc 3 Tw 80 Tz 14 TL 5 Ts 2 Tr 1 0 0 1 10 50 Tm 5 0 Td [(Round) 50 ( trip)] TJ ET";
         let mut source = Document::with_version("1.7");
@@ -9762,17 +9953,442 @@ mod tests {
         let json = serde_json::to_vec(&model)?;
         let reparsed: super::PdfJsonDocument = serde_json::from_slice(&json)?;
 
-        // JSON → PDF (Phase 2)
+        // JSON → PDF (Phase 2): the page carries both the preserved content stream
+        // and its `textElements` projection, which is now a mixed edit (see
+        // `convert_json_to_pdf`'s doc comment) — the represented text is stripped
+        // from the preserved stream and the (unedited-but-present) text element is
+        // regenerated on top, rather than the stream being written back verbatim.
         let rebuilt_path = directory.path().join("rebuilt.pdf");
         convert_json_to_pdf(&reparsed, &rebuilt_path)?;
         let rebuilt = Document::load(&rebuilt_path)?;
         let page_id = *rebuilt.get_pages().values().next().ok_or("no page")?;
         let page = rebuilt.get_dictionary(page_id)?;
-        let contents = page.get(b"Contents")?.as_array()?;
-        let (_, stream) = rebuilt.dereference(&contents[0])?;
-        assert_eq!(stream.as_stream()?.content, content);
-        // Resources survive the round trip (the /Font subtree is present).
-        assert!(page.get(b"Resources").is_ok());
+        let rebuilt_content = Content::decode(&rebuilt.get_page_content(page_id))?;
+        // The regenerated `Tm` carries the pre-rise text-line matrix (matching the
+        // original stream's own `1 0 0 1 10 50 Tm 5 0 Td`, i.e. (15, 50)); the `Ts 5`
+        // rise operator below shifts the effective glyph baseline to y=55 at render
+        // time, matching the extracted element's `y: Some(55.0)`.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tm"
+                && operation.operands.get(4).and_then(number_as_f32) == Some(15.0)
+                && operation.operands.get(5).and_then(number_as_f32) == Some(50.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Ts"
+                && operation.operands.first().and_then(number_as_f32) == Some(5.0)
+        }));
+        // The rest of the text state the original stream set (`2 Tc 3 Tw 80 Tz
+        // 14 TL ... 2 Tr`) and the font size (`10 Tf`) also survive regeneration —
+        // this is the semantic-equivalence check standing in for the byte-identical
+        // assertion the mixed-edit fix (see `convert_json_to_pdf`'s doc comment)
+        // made impossible for a text-bearing preserved stream.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tf"
+                && operation.operands.get(1).and_then(number_as_f32) == Some(10.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tc"
+                && operation.operands.first().and_then(number_as_f32) == Some(2.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tw"
+                && operation.operands.first().and_then(number_as_f32) == Some(3.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tz"
+                && operation.operands.first().and_then(number_as_f32) == Some(80.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "TL"
+                && operation.operands.first().and_then(number_as_f32) == Some(14.0)
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tr"
+                && operation.operands.first().and_then(number_as_f32) == Some(2.0)
+        }));
+        let rebuilt_text = rebuilt_content
+            .operations
+            .iter()
+            .find(|operation| operation.operator == "Tj")
+            .and_then(|operation| operation.operands.first())
+            .and_then(|object| object.as_str().ok())
+            .ok_or("missing Tj string")?;
+        assert_eq!(rebuilt_text, b"Round trip");
+        // Resources survive the round trip: the original /Font subtree (F1) is still
+        // present alongside the freshly generated resource used to redraw the text.
+        let resources = page.get(b"Resources")?.as_dict()?;
+        let fonts = resources.get(b"Font")?.as_dict()?;
+        assert!(fonts.has(b"F1"));
+        Ok(())
+    }
+
+    /// Full-rebuild counterpart to the lazy-editor coverage in
+    /// `pdf_text_editor_lazy_endpoint.rs`: a page with a preserved `contentStreams`
+    /// entry whose `textElements`/`imageElements` are edited (while the stream
+    /// itself is left untouched) must have the old represented text/image draws
+    /// stripped and the newly authored ones appended, with unrelated vector
+    /// operators surviving unchanged — the same regeneration strategy
+    /// [`regenerate_page_with_vector_overlay`] already applies to the cached
+    /// partial-export path.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn convert_json_to_pdf_regenerates_mixed_edited_page() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{PdfJsonImageElement, PdfJsonTextElement, convert_json_to_pdf, pdf_to_json};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        use lopdf::{Document, Object, Stream, content::Content, dictionary};
+        use std::io::Cursor;
+
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let font_id = source.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let old_image_id = source.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 1, "Height" => 1,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            vec![255, 0, 0],
+        ));
+        // Unrelated vector fill + represented text + represented image draw, mirroring
+        // `editable_source_pdf` in the lazy-editor integration test.
+        let content = b"0 1 0 rg 10 10 20 20 re f BT /F1 12 Tf 15 55 Td (Original text) Tj ET q 6 0 0 6 80 20 cm /ImOld Do Q";
+        let content_id = source.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "ImOld" => old_image_id },
+            },
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page_object_id)], "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("mixed-source.pdf");
+        source.save(&source_path)?;
+
+        // PDF → JSON: both `contentStreams` and the `textElements`/`imageElements`
+        // projections of it are populated, as they always are for a full-document
+        // export.
+        let mut model = pdf_to_json(&source_path, "mixed-source.pdf", false)?;
+        assert_eq!(model.pages.len(), 1);
+        assert_eq!(model.pages[0].content_streams.len(), 1);
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        assert_eq!(
+            model.pages[0].text_elements[0].text.as_deref(),
+            Some("Original text")
+        );
+        assert_eq!(model.pages[0].image_elements.len(), 1);
+        assert_eq!(
+            model.pages[0].image_elements[0].object_name.as_deref(),
+            Some("ImOld")
+        );
+
+        // Edit page 1's `textElements` and `imageElements` while leaving its
+        // `contentStreams` entry untouched (the mixed-edit case).
+        model.pages[0].text_elements = vec![PdfJsonTextElement {
+            text: Some("Edited text".to_owned()),
+            font_id: Some("F1".to_owned()),
+            font_size: Some(12.0),
+            x: Some(15.0),
+            y: Some(55.0),
+            ..PdfJsonTextElement::default()
+        }];
+        let new_image_data = {
+            let rgba = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 255, 255]));
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+            STANDARD.encode(bytes)
+        };
+        model.pages[0].image_elements = vec![PdfJsonImageElement {
+            x: Some(80.0),
+            y: Some(20.0),
+            width: Some(6.0),
+            height: Some(6.0),
+            image_data: Some(new_image_data),
+            image_format: Some("png".to_owned()),
+            ..PdfJsonImageElement::default()
+        }];
+        // `resources` (with the original `ImOld` entry) is deliberately left as
+        // extracted: `convert_json_to_pdf` must notice the stale `ImOld` XObject
+        // there and strip its `Do` even though the replacement `imageElements`
+        // entry below no longer carries that `objectName`.
+
+        let output_path = directory.path().join("mixed-rebuilt.pdf");
+        convert_json_to_pdf(&model, &output_path)?;
+
+        let rebuilt = Document::load(&output_path)?;
+        let rebuilt_page_id = *rebuilt.get_pages().values().next().ok_or("missing page")?;
+        let rebuilt_content = Content::decode(&rebuilt.get_page_content(rebuilt_page_id))?;
+
+        // (a) the original represented text/image no longer appear.
+        assert!(!rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tj"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_str().ok())
+                    == Some(b"Original text")
+        }));
+        assert!(!rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Do"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    == Some(b"ImOld")
+        }));
+
+        // (b) the newly authored text/image are present.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tj"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_str().ok())
+                    == Some(b"Edited text")
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Do"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .is_some_and(|name| name.starts_with(b"RustImg"))
+        }));
+
+        // (c) the unrelated retained vector op (the green fill rectangle) survives
+        // unchanged.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "rg" && operation.operands == vec![0.into(), 1.into(), 0.into()]
+        }));
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "re"
+                && operation.operands == vec![10.into(), 10.into(), 20.into(), 20.into()]
+        }));
+        assert!(
+            rebuilt_content
+                .operations
+                .iter()
+                .any(|operation| operation.operator == "f" && operation.operands.is_empty())
+        );
+        Ok(())
+    }
+
+    /// Builds the same rect+text+image fixture as
+    /// [`convert_json_to_pdf_regenerates_mixed_edited_page`], for the two
+    /// independent-stripping regression tests below.
+    fn mixed_edit_source_pdf() -> lopdf::Document {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let font_id = source.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let old_image_id = source.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 1, "Height" => 1,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            vec![255, 0, 0],
+        ));
+        let content = b"0 1 0 rg 10 10 20 20 re f BT /F1 12 Tf 15 55 Td (Original text) Tj ET q 6 0 0 6 80 20 cm /ImOld Do Q";
+        let content_id = source.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "ImOld" => old_image_id },
+            },
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page_object_id)], "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+        source
+    }
+
+    /// Decodes the concatenated content of every `content_ids` stream reference
+    /// returned by [`build_page_contents`], for the two independent-stripping
+    /// regression tests below. Inspecting `build_page_contents`'s output directly
+    /// (rather than round-tripping through `convert_json_to_pdf` + a disk
+    /// save/load) keeps these tests scoped to the stripping logic under test,
+    /// independent of the unrelated, pre-existing `cos_value_to_object` gap where
+    /// a `resources` cos value's nested (non-indirect) `Stream` — the untouched
+    /// image's own `XObject` entry, deliberately left alone here — does not
+    /// survive a full save/reload round trip once attached to a freshly built
+    /// page (a separate, pre-existing limitation, not something this ticket
+    /// introduces or is scoped to fix).
+    fn decode_content_ids(
+        document: &lopdf::Document,
+        content_ids: &[lopdf::Object],
+    ) -> Result<lopdf::content::Content, Box<dyn std::error::Error>> {
+        use lopdf::content::Content;
+
+        let mut operations = Vec::new();
+        for content_id in content_ids {
+            let stream = document
+                .get_object(content_id.as_reference()?)?
+                .as_stream()?;
+            let decoded = stream.get_plain_content_with_limit(super::MAX_TEXT_CONTENT_BYTES)?;
+            operations.extend(Content::decode(&decoded)?.operations);
+        }
+        Ok(Content { operations })
+    }
+
+    /// Regression test for a bug where a text-only edit on a mixed-edit page
+    /// (`imageElements` left `[]` because the client never resubmitted it, not
+    /// because it asked to delete the image) destroyed the page's untouched
+    /// image and its `XObject` resource entry. Stripping must be scoped to the
+    /// content type actually resubmitted (`textElements` here).
+    #[test]
+    fn convert_json_to_pdf_text_only_edit_preserves_untouched_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PdfJsonTextElement, build_page_contents, pdf_to_json};
+        use lopdf::Document;
+
+        let mut source = mixed_edit_source_pdf();
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("text-only-source.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "text-only-source.pdf", false)?;
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        assert_eq!(model.pages[0].image_elements.len(), 1);
+
+        // Only `textElements` is resubmitted; `imageElements` is left empty, as a
+        // client that never touched images would send.
+        model.pages[0].text_elements = vec![PdfJsonTextElement {
+            text: Some("Edited text only".to_owned()),
+            font_id: Some("F1".to_owned()),
+            font_size: Some(12.0),
+            x: Some(15.0),
+            y: Some(55.0),
+            ..PdfJsonTextElement::default()
+        }];
+        model.pages[0].image_elements = Vec::new();
+
+        let mut document = Document::with_version("1.7");
+        let (content_ids, resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+        let rebuilt_content = decode_content_ids(&document, &content_ids)?;
+
+        // The edited text took effect.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tj"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_str().ok())
+                    == Some(b"Edited text only")
+        }));
+        // The untouched image draw survives.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Do"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    == Some(b"ImOld")
+        }));
+        // The untouched image's XObject resource entry survives.
+        let resources = resources.ok_or("missing resources")?;
+        let xobjects = resources.as_dict()?.get(b"XObject")?.as_dict()?;
+        assert!(xobjects.has(b"ImOld"));
+        Ok(())
+    }
+
+    /// Regression test for a bug where an image-only edit on a mixed-edit page
+    /// (`textElements` left `[]` because the client never resubmitted it, not
+    /// because it asked to delete the text) destroyed all of the page's
+    /// untouched text. Stripping must be scoped to the content type actually
+    /// resubmitted (`imageElements` here).
+    #[test]
+    fn convert_json_to_pdf_image_only_edit_preserves_untouched_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PdfJsonImageElement, build_page_contents, pdf_to_json};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        use lopdf::Document;
+        use std::io::Cursor;
+
+        let mut source = mixed_edit_source_pdf();
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("image-only-source.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "image-only-source.pdf", false)?;
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        assert_eq!(model.pages[0].image_elements.len(), 1);
+
+        // Only `imageElements` is resubmitted; `textElements` is left empty, as a
+        // client that never touched text would send.
+        let new_image_data = {
+            let rgba = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 255, 255]));
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+            STANDARD.encode(bytes)
+        };
+        model.pages[0].image_elements = vec![PdfJsonImageElement {
+            x: Some(80.0),
+            y: Some(20.0),
+            width: Some(6.0),
+            height: Some(6.0),
+            image_data: Some(new_image_data),
+            image_format: Some("png".to_owned()),
+            ..PdfJsonImageElement::default()
+        }];
+        model.pages[0].text_elements = Vec::new();
+
+        let mut document = Document::with_version("1.7");
+        let (content_ids, _resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+        let rebuilt_content = decode_content_ids(&document, &content_ids)?;
+
+        // The untouched text survives.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Tj"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_str().ok())
+                    == Some(b"Original text")
+        }));
+        // The edited image took effect.
+        assert!(rebuilt_content.operations.iter().any(|operation| {
+            operation.operator == "Do"
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .is_some_and(|name| name.starts_with(b"RustImg"))
+        }));
         Ok(())
     }
 

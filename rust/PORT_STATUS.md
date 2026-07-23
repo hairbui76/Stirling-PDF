@@ -330,9 +330,18 @@ auto-rename/auto-split, plus:
   with matrix/state/color data. Generated text can also restore bounded embedded font dictionaries,
   nested font-program streams, Type0/CID encodings, and existing Type3 CharProcs, refusing edits that
   cannot round-trip through the source encoding. Document XMP packets round-trip as bounded base64
-  metadata. Cached partial export can redraw edited text/images over bounded retained vector content;
-  token-level/mixed-stream editing in the full-document rebuild path and synthesizing new Type3
-  glyphs are still missing, so it cannot yet match Java's `PdfJsonConversionService`. One widget per
+  metadata. Cached partial export can redraw edited text/images over bounded retained vector content.
+  The full-document rebuild path now ports that same strip-and-regenerate strategy for a page that
+  mixes a preserved `content_streams` entry with edited `textElements`/`imageElements`: it strips only
+  the represented text or represented-image draws whose element list was actually resubmitted, and
+  leaves the other content type's preserved draws/resources untouched — since the page model's
+  `textElements`/`imageElements` are plain lists rather than optional, an empty list is read as "not
+  resubmitted," not "delete everything of this type," so a client cannot yet clear just one content
+  type on a mixed page through this endpoint (the lazy/partial endpoint already supports that). This
+  is strip-and-regenerate, not Java's token-level in-place `Tj`/`TJ` rewriting, so it is not yet
+  byte-level parity with `PdfJsonConversionService`. Synthesizing new Type3
+  glyphs is still missing (existing source CharProcs are preserved, but a glyph absent from the
+  source font cannot yet be fabricated). One widget per
   field matches Java's own `PdfJsonFormField` wire model (`rect`/`pageNumber` are singular there too,
   and `PdfJsonConversionService` likewise reconstructs only one widget per field) — a radio-button-
   style multi-widget field is not a Rust port gap versus Java; it would need a new shared schema

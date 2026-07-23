@@ -70,11 +70,46 @@ text matrix/position, spacing, scale/rise/render mode, and DeviceGray/DeviceRGB/
 DeviceCMYK colors. Generated font resources use fresh `RustFont*` names, so they do
 not collide with existing resource names.
 
-**Deferred (font subsystem, later phases):** applying `textElements` as edits over
-an existing preserved source stream in the full-document rebuild path, Symbol/ZapfDingbats
-encodings, synthesizing new
-embedded/CID/Type3 fonts, and glyph-level edits that cannot use a restored source encoding.
-The cached partial endpoint has the bounded regeneration path described below.
+A page that carries *both* a preserved `contentStreams` entry and a non-empty
+`textElements`/`imageElements` is a mixed edit, and is no longer written back
+verbatim (which would silently drop those edits). Instead Rust applies the same
+regeneration strategy the cached partial-export path already uses (see
+`regenerate_page_with_vector_overlay` below): the preserved stream's still-encoded
+bytes are decoded per its own `/Filter` (reusing lopdf's stream-decompression
+directly, since there is no live `Document`/page here to decode through), text-showing
+operators and any `Do`/`BI` draws matching a tracked image are stripped, the
+remaining vector operators are retained, and the edited `textElements`/
+`imageElements` are appended in z-order on top. An edited `imageElements` list that
+drops or replaces an image without keeping its original `objectName` is still
+detected and stripped, because the original `resources`' `XObject` dictionary is
+also consulted for `Image`-subtype entries; those stale entries are then dropped
+from the rebuilt page's `Resources` too. A page with a preserved stream and *no*
+editor-authored elements is unaffected and still round-trips verbatim.
+
+Text and image stripping are decided **independently**, per content type: a page's
+represented text draws are only stripped when `textElements` is non-empty, and its
+tracked image draws (and stale `Resources` entries) are only stripped when
+`imageElements` is non-empty. This matters because `PdfJsonPage.textElements`/
+`imageElements` are plain (non-`Option`) lists on the wire, so an empty list is
+indistinguishable from "the client never resubmitted this content type" — unlike
+the partial/lazy endpoint's presence-aware model (see below), which can tell
+"omitted" apart from "explicitly emptied." Rust resolves that ambiguity by treating
+an empty list as "untouched" for that content type, so editing only one of
+`textElements`/`imageElements` on a mixed page can never destroy the other's
+preserved content. The current, known limitation this creates: a client cannot yet
+ask this endpoint to delete *all* text (or all images) from a mixed-edit page while
+leaving the other content type's preserved draws alone — an explicitly empty list
+is not honored as "clear this type," only as "I have nothing new to say about this
+type." Clearing text/images from a page independently is still possible today via
+the lazy/partial endpoint below, whose presence-aware model has no such ambiguity.
+
+**Deferred (font subsystem, later phases):** token-level rewriting of `textElements`
+in place over an existing preserved source stream (Java's `rewriteTextOperators`
+fast path) — Rust's mixed-edit path always strips-and-regenerates rather than
+patching matched text tokens in place — plus Symbol/ZapfDingbats encodings,
+synthesizing new embedded/CID/Type3 fonts, and glyph-level edits that cannot use a
+restored source encoding. The cached partial endpoint has the bounded regeneration
+path described below.
 
 The `PdfJsonCosValue` ↔ lopdf `Object` bridge (`cos_value_to_object`,
 `build_stream_from_model`) is reusable by Phases 3–4.
@@ -190,9 +225,11 @@ in place; untouched pages and document-level graph objects survive.
 ## Remaining editor capability
 
 Glyph-accurate `textElements` extraction (including Type3 outline geometry and CMap collections
-not available through the configured Poppler data paths), token-level rewriting and mixed-stream
-editing in the full-document rebuild path, font-program round-trip, complex inline filter
-parameters, DCT DeviceN images with more than four JPEG source components,
+not available through the configured Poppler data paths), token-level rewriting in the
+full-document rebuild path (mixed-stream editing itself is ported — see
+`/api/v1/convert/text-editor/pdf` above — but always strips-and-regenerates rather than
+patching matched text tokens in place like Java's `rewriteTextOperators`), font-program
+round-trip, complex inline filter parameters, DCT DeviceN images with more than four JPEG source components,
 and external ICC conversion for DCT CMYK images, and rich
 non-widget-annotation appearance streams
 remain outstanding (`Tx`/`Ch`/`Btn` widget appearance streams are ported — see above).
