@@ -374,8 +374,18 @@ auto-rename/auto-split, plus:
 
 ### App infrastructure
 
-Distributed job storage/backplane, cross-node queue/retry semantics, generic async execution for
-the Java-only/control routes, and generic OIDC/SAML/desktop identity remain. The
+Distributed job storage/backplane and cross-node queue/retry semantics are not an OSS parity gap:
+Java's own default (`InProcessJobStore`) is single-node, identical in spirit to what Rust already
+has; the Redis-backed `ValkeyJobStore` clustering path is an opt-in proprietary/enterprise add-on
+Rust hasn't built, and whether the Rust port should ever target multi-node deployment is a product
+decision, not a coding task. Generic async-job wiring for the routes the existing `?async=true`
+wrapper doesn't yet cover is narrower than it sounds: PKCS#11 hardware-certificate enumeration is
+now wired (the wrapper is content-type-agnostic, so a plain-JSON POST route needed only an allowlist
+entry, no new mechanism); Windows certificate enumeration cannot use it because it's a bodyless GET
+and the wrapper's shared detection is POST-only for the whole allowlist — matching Java's own
+`AutoJobPostMapping` annotation, itself hardcoded POST-only, so this is genuine upstream parity, not
+a Rust-specific limitation. Job/control routes, mobile scanner, and settings mutation remain
+unwired. Generic OIDC/SAML/desktop identity remain (OIDC has its first slice — see below). The
 opt-in Tauri native-launch path now receives an unconditional ephemeral-port
 handshake, desktop/base-path/login-agreement environment, legacy-workspace
 migration, a bounded startup wait, early-exit reporting, stale-port cleanup,
