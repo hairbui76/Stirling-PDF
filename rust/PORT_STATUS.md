@@ -4,12 +4,18 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-22):** `task rust:check` passes formatting, strict
-locked all-target workspace Clippy, all 118 AI-engine library tests, all 441
-processing library tests, helper-binary and process-smoke tests, the complete
-endpoint/integration matrix, and doc tests with the pinned PDFium runtime.
-External-runtime happy paths remain conditional on their respective tools and
-services.
+**Latest validation (2026-07-23):** `cargo fmt --check`, strict locked all-target
+workspace Clippy, and `cargo test --workspace --no-fail-fast` all pass with the
+pinned PDFium runtime: all 111 AI-engine library tests, all 439 processing
+library tests, helper-binary tests, and the complete endpoint/integration
+matrix (every `stirling-processing` integration-test binary, including the new
+`mcp_endpoint` suite, passes in full). Two `stirling-ai-engine` `process_smoke`
+tests (`binary_serves_ephemeral_port_with_auth_and_post_contracts`,
+`binary_infers_keyless_ollama_and_completes_an_http_agent_request`) time out in
+this sandbox specifically — confirmed via a clean-tree rerun to be a
+pre-existing, sandbox-network/process-timing limitation, not a regression from
+any change here. External-runtime happy paths remain conditional on their
+respective tools and services.
 
 **Route-count scoping note:** the Rust service registers 313 HTTP routes total.
 Only a subset of those are directly comparable to Java's OSS `controller/api`

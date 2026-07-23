@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     desktop_settings::initialize_from_environment()?;
-    if RuntimeConfig::security_mode_is_requested() {
+    if RuntimeConfig::from_environment().security_mode_is_requested()? {
         return Err(std::io::Error::other(
             "secured login mode is not supported by the Rust runtime yet; refusing to start without authentication and authorization middleware",
         )

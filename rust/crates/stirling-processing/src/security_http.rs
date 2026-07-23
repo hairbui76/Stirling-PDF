@@ -543,7 +543,7 @@ async fn finish_http_audit(pending: PendingHttpAudit, response: Response) -> Res
         source: pending.plan.source.to_owned(),
         event_type: pending.plan.event_type.to_owned(),
         method: pending.method,
-        path: pending.path,
+        path: redacted_audit_path(&pending.path),
         status_code,
         latency_ms,
         include_standard_data: pending.plan.include_standard_data,
@@ -729,10 +729,12 @@ fn explicit_audit_event(method: &axum::http::Method, path: &str) -> Option<&'sta
         return None;
     }
     match path {
-        "/api/v1/auth/login" => Some("USER_LOGIN"),
+        "/api/v1/auth/login" | "/api/v1/auth/refresh" => Some("USER_LOGIN"),
         "/api/v1/user/change-username"
         | "/api/v1/user/change-password"
-        | "/api/v1/user/change-password-on-login" => Some("USER_PROFILE_UPDATE"),
+        | "/api/v1/user/change-password-on-login"
+        | "/api/v1/user/update-api-key" => Some("USER_PROFILE_UPDATE"),
+        "/api/v1/invite/generate" => Some("SETTINGS_CHANGED"),
         _ if path.starts_with("/api/v1/user/admin/unlockUser/") => Some("SETTINGS_CHANGED"),
         _ if path.starts_with("/api/v1/user/admin/deleteUser/") => Some("USER_PROFILE_UPDATE"),
         _ => None,
@@ -818,6 +820,24 @@ fn is_static_resource_path(path: &str) -> bool {
     matches!(path, "/favicon.ico" | "/manifest.json")
         || path.starts_with("/assets/")
         || path.starts_with("/locales/")
+}
+
+/// Path prefixes whose trailing segment is a bearer-equivalent secret (an
+/// invite token used as the sole credential for an unauthenticated route),
+/// not a resource id. The audit trail must never persist these tokens
+/// verbatim, so [`redacted_audit_path`] replaces that segment before the
+/// path reaches [`SecurityHttpAuditRecord`].
+const AUDIT_TOKEN_PATH_PREFIXES: &[&str] = &["/api/v1/invite/validate/", "/api/v1/invite/accept/"];
+
+fn redacted_audit_path(path: &str) -> String {
+    for prefix in AUDIT_TOKEN_PATH_PREFIXES {
+        if let Some(token) = path.strip_prefix(prefix)
+            && !token.is_empty()
+        {
+            return format!("{prefix}[REDACTED]");
+        }
+    }
+    path.to_owned()
 }
 
 async fn authenticate_request(
@@ -2878,11 +2898,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(mutation_events.len(), 1);
         assert_eq!(mutation_events[0].event_type, "USER_PROFILE_UPDATE");
-        assert_eq!(mutation_events[0].source, "WEB");
+        // update-api-key is now an explicit (`explicit_audit_event`) event so its
+        // freshly-rotated key is never captured as a raw result; Java leaves
+        // `source` null for explicit @Audited events, matched here by "".
+        assert_eq!(mutation_events[0].source, "");
         let details: Value = serde_json::from_str(&mutation_events[0].data)?;
-        assert_eq!(details["outcome"], "success");
+        // Explicit/@Audited-equivalent events use "status" (not "outcome") and
+        // never carry the verbose HTTP metadata (statusCode/sessionId/latencyMs)
+        // reserved for `include_standard_data`, which is always false when
+        // annotated - this is also what keeps the rotated key out of `data`.
+        assert_eq!(details["status"], "success");
         assert_eq!(details["httpMethod"], "POST");
-        assert_eq!(details["statusCode"], 200);
+        assert!(details.get("statusCode").is_none());
+        assert!(details.get("result").is_none());
         Ok(())
     }
 
@@ -3088,6 +3116,100 @@ mod tests {
             .ok_or("missing login audit event")?;
         let login_data: Value = serde_json::from_str(&login.data)?;
         assert!(login_data.get("result").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invite_tokens_are_redacted_from_the_audit_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, store) = test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE, false)?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+
+        let invite = response_json(
+            authorized_multipart_post(&app, "/api/v1/invite/generate", token, &[]).await?,
+        )
+        .await?;
+        let invite_token = invite["token"].as_str().ok_or("missing invite token")?;
+
+        let validate = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/invite/validate/{invite_token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(validate.status(), StatusCode::OK);
+
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        let redacted_path = "/api/v1/invite/validate/[REDACTED]";
+        assert!(
+            events
+                .iter()
+                .any(|event| audit_event_has_path(event, redacted_path)),
+            "expected a redacted invite-validate audit event"
+        );
+        assert!(
+            !events.iter().any(|event| audit_event_has_path(
+                event,
+                &format!("/api/v1/invite/validate/{invite_token}")
+            )),
+            "the raw invite token must never reach the audit trail"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_operation_results_never_persists_fresh_secrets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, store) = test_router_with_audit_config(true, AUDIT_LEVEL_VERBOSE, true)?;
+        let login = response_json(login_request(&app, None).await?).await?;
+        let token = login["session"]["access_token"]
+            .as_str()
+            .ok_or("missing access token")?;
+
+        let rotated =
+            response_json(authorized_post(&app, "/api/v1/user/update-api-key", token, None).await?)
+                .await?;
+        let api_key = rotated["apiKey"]
+            .as_str()
+            .ok_or("missing rotated api key")?
+            .to_owned();
+
+        let invite = response_json(
+            authorized_multipart_post(&app, "/api/v1/invite/generate", token, &[]).await?,
+        )
+        .await?;
+        let invite_token = invite["token"]
+            .as_str()
+            .ok_or("missing invite token")?
+            .to_owned();
+
+        let refreshed =
+            response_json(authorized_post(&app, "/api/v1/auth/refresh", token, None).await?)
+                .await?;
+        let refreshed_access = refreshed["session"]["access_token"]
+            .as_str()
+            .ok_or("missing refreshed access token")?
+            .to_owned();
+
+        let events = store.export_audit_events(&SecurityAuditFilter::default())?;
+        for (path, secret) in [
+            ("/api/v1/user/update-api-key", api_key.as_str()),
+            ("/api/v1/invite/generate", invite_token.as_str()),
+            ("/api/v1/auth/refresh", refreshed_access.as_str()),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| audit_event_has_path(event, path))
+                .ok_or_else(|| format!("missing audit event for {path}"))?;
+            assert!(
+                !event.data.contains(secret),
+                "audit event for {path} must not contain the freshly-issued secret"
+            );
+        }
         Ok(())
     }
 

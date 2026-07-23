@@ -19,6 +19,24 @@ OIDC login, SAML, device identity, broader resource-owner policies, recovery
 flows, Java-database migration compatibility, and the final independent review
 remain required before that guard can be removed.
 
+**2026-07-23 AI-assisted review pass (not a substitute for the independent
+review above):** an adversarially-verified pass against this document's own
+threat checklist found and fixed 5 concrete issues, each with a regression
+test: invite tokens were captured verbatim into the durable audit log via the
+raw request path (now redacted); enabling
+`premium.enterpriseFeatures.audit.captureOperationResults` persisted
+freshly-rotated API keys, invite tokens, and session-refresh tokens in
+plaintext (the three routes are now explicit/`@Audited`-equivalent events, so
+their results are never captured); the startup cutover guard only checked
+environment variables, never the equivalent persisted `security.enableLogin`
+YAML setting (now checked, with a hard failure on a non-Unicode environment
+value instead of silently treating it as unset); and
+`leave_user_share`/`DELETE .../shares/self` was the one storage-ownership path
+that leaked cross-user file-ID existence via distinguishable 404/403
+responses (now collapsed to a uniform not-found, matching every sibling
+ownership check in `storage.rs`). None of this changes the status above: an
+independent review is still required before the production guard is lifted.
+
 The reviewed boundary now also scopes asynchronous job records, status,
 cancellation, result metadata, and downloads to the durable authenticated user
 ID. Cross-owner lookups deliberately return 404. Administrator settings routes

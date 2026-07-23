@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -737,20 +737,43 @@ impl RuntimeConfig {
         )
     }
 
-    /// Returns whether the deployment requested the Java security-enabled mode.
+    /// Returns whether the deployment requested the Java security-enabled mode,
+    /// from either the compatible environment variables or the persisted
+    /// `security.enableLogin` YAML setting (the same key
+    /// [`Self::login_disclaimer_requires_authentication`] already falls back to).
     ///
     /// The Rust service currently implements only the Java-compatible open OSS
     /// mode. The binary must reject this request rather than accidentally
-    /// serving protected routes without their authentication middleware.
-    #[must_use]
-    pub fn security_mode_is_requested() -> bool {
-        [
+    /// serving protected routes without their authentication middleware. A
+    /// non-Unicode value for one of the environment variables is a hard error:
+    /// this guard's only purpose is refusing to start unauthenticated, so an
+    /// unreadable value must never be silently treated the same as "unset".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the variable when `DOCKER_ENABLE_SECURITY`,
+    /// `SECURITY_ENABLELOGIN`, or `SECURITY_ENABLE_LOGIN` is set to a
+    /// non-Unicode value.
+    pub fn security_mode_is_requested(&self) -> Result<bool, io::Error> {
+        let env_values = [
             "DOCKER_ENABLE_SECURITY",
             "SECURITY_ENABLELOGIN",
             "SECURITY_ENABLE_LOGIN",
         ]
-        .into_iter()
-        .any(|variable| security_mode_requested_from_value(env::var(variable).ok().as_deref()))
+        .map(|variable| match env::var(variable) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(env::VarError::NotUnicode(_)) => Err(variable),
+        });
+        let yaml_requested = value_at(&self.settings, &["security", "enableLogin"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        resolve_security_mode_request(&env_values, yaml_requested).map_err(|variable| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} must contain valid Unicode"),
+            )
+        })
     }
 
     /// Returns whether team classification policies are enabled.
@@ -2343,6 +2366,30 @@ fn security_mode_requested_from_value(value: Option<&str>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
+/// Pure decision logic behind [`RuntimeConfig::security_mode_is_requested`],
+/// factored out so the non-Unicode fail-closed path is unit-testable without
+/// touching real process environment variables. `env_values` holds one
+/// already-read result per compatible environment variable name (`Ok(Some(v))`
+/// present, `Ok(None)` unset, `Err(name)` present but not valid Unicode).
+/// Returns the offending variable name on the first unreadable value found;
+/// otherwise `true` if any variable explicitly requested it, else the YAML
+/// fallback.
+fn resolve_security_mode_request(
+    env_values: &[Result<Option<String>, &'static str>],
+    yaml_requested: bool,
+) -> Result<bool, &'static str> {
+    for value in env_values {
+        match value {
+            Err(variable) => return Err(variable),
+            Ok(value) if security_mode_requested_from_value(value.as_deref()) => {
+                return Ok(true);
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(yaml_requested)
+}
+
 fn split_strings(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -2424,7 +2471,7 @@ mod tests {
 
     use super::{
         McpAuthConfig, McpConfig, RuntimeConfig, endpoint_key_for_uri, merge_json,
-        security_mode_requested_from_value, split_strings,
+        resolve_security_mode_request, security_mode_requested_from_value, split_strings,
     };
 
     #[test]
@@ -2773,6 +2820,26 @@ mod tests {
         assert!(!security_mode_requested_from_value(Some("1")));
         assert!(!security_mode_requested_from_value(Some("false")));
         assert!(!security_mode_requested_from_value(None));
+    }
+
+    #[test]
+    fn security_mode_request_falls_back_to_yaml_and_fails_closed_on_non_unicode() {
+        let unset = [Ok(None), Ok(None), Ok(None)];
+        assert_eq!(resolve_security_mode_request(&unset, false), Ok(false));
+        assert_eq!(resolve_security_mode_request(&unset, true), Ok(true));
+
+        let env_true = [Ok(None), Ok(Some("true".to_owned())), Ok(None)];
+        assert_eq!(resolve_security_mode_request(&env_true, false), Ok(true));
+
+        let malformed = [Ok(None), Err("SECURITY_ENABLELOGIN"), Ok(None)];
+        assert_eq!(
+            resolve_security_mode_request(&malformed, true),
+            Err("SECURITY_ENABLELOGIN")
+        );
+        assert_eq!(
+            resolve_security_mode_request(&malformed, false),
+            Err("SECURITY_ENABLELOGIN")
+        );
     }
 
     #[test]

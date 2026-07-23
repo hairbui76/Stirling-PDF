@@ -694,27 +694,23 @@ impl StorageService {
         Ok(())
     }
 
+    /// Removes the caller's own share of `file_id`, if one exists.
+    ///
+    /// A missing file, a file the caller owns instead of having been shared
+    /// with them, and a file that exists but was never shared with the caller
+    /// all collapse into the same [`StorageError::FileNotFound`] - mirroring
+    /// [`load_accessible_file`]/[`load_owned_file`] - so this endpoint cannot
+    /// be used to enumerate which numeric file IDs exist or who owns them.
     pub(crate) fn leave_user_share(&self, user_id: i64, file_id: i64) -> Result<(), StorageError> {
         self.ensure_sharing_enabled()?;
         let connection = self.lock()?;
-        let owner_id = connection
-            .query_row(
-                "SELECT owner_id FROM storage_files WHERE file_id = ?1",
-                [file_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .ok_or(StorageError::FileNotFound)?;
-        if owner_id == user_id {
-            return Err(StorageError::AccessDenied);
-        }
         let deleted = connection.execute(
             "DELETE FROM storage_shares
              WHERE file_id = ?1 AND shared_with_user_id = ?2",
             params![file_id, user_id],
         )?;
         if deleted == 0 {
-            Err(StorageError::ShareNotFound)
+            Err(StorageError::FileNotFound)
         } else {
             Ok(())
         }

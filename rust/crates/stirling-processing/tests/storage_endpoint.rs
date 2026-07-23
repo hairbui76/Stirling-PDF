@@ -257,6 +257,60 @@ async fn storage_files_shares_links_and_folders_are_owner_scoped() -> Result<(),
 }
 
 #[tokio::test]
+async fn leaving_a_share_gives_the_same_response_for_a_foreign_and_a_nonexistent_file_id()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let app = storage_router(
+        directory.path(),
+        "storage:\n  enabled: true\n  provider: local\n  sharing:\n    enabled: true\n",
+        2 * 1024 * 1024,
+    )?;
+
+    let admin_token = login(&app, "admin", "test-only-password").await?;
+    create_user(&app, &admin_token, "member", "member-password").await?;
+    let member_token = login(&app, "member", "member-password").await?;
+
+    let upload = authorized_multipart(
+        &app,
+        Method::POST,
+        "/api/v1/storage/files",
+        &admin_token,
+        file_multipart("storage-upload", "foreign.pdf", b"admin-only-data"),
+    )
+    .await?;
+    assert_eq!(upload.status(), StatusCode::OK);
+    let uploaded = response_json(upload).await?;
+    let foreign_file_id = uploaded["id"].as_i64().ok_or("missing stored file id")?;
+
+    // `member` was never shared this file - this must be indistinguishable from
+    // a file_id that never existed, not leak that a foreign-owned file exists.
+    let foreign_attempt = authorized_empty(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/storage/files/{foreign_file_id}/shares/self"),
+        &member_token,
+    )
+    .await?;
+    let foreign_status = foreign_attempt.status();
+    let foreign_body = to_bytes(foreign_attempt.into_body(), BODY_LIMIT).await?;
+
+    let missing_attempt = authorized_empty(
+        &app,
+        Method::DELETE,
+        "/api/v1/storage/files/999999999/shares/self",
+        &member_token,
+    )
+    .await?;
+    let missing_status = missing_attempt.status();
+    let missing_body = to_bytes(missing_attempt.into_body(), BODY_LIMIT).await?;
+
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_status, missing_status);
+    assert_eq!(foreign_body, missing_body);
+    Ok(())
+}
+
+#[tokio::test]
 async fn storage_disabled_and_file_quota_fail_closed() -> Result<(), Box<dyn Error>> {
     let disabled_directory = tempdir()?;
     let disabled = storage_router(disabled_directory.path(), "", 2 * 1024 * 1024)?;
