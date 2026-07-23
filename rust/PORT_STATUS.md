@@ -382,9 +382,17 @@ migration, a bounded startup wait, early-exit reporting, stale-port cleanup,
 PID/start-time parent-death enforcement, and atomic fresh-install settings/template
 initialization. Open-mode local `backend:dev`, `dev`, and default `dev:all` now
 launch `stirling-processing`; the explicit Java oracle plus portal and SaaS Task
-paths remain available. Java remains the packaged production and desktop backend;
-Java-compatible short-file backup and upgrade-template merging, PDFium/sidecar
-packaging, cross-platform upgrade proof, and the production default switch remain. See
+paths remain available. Java remains the packaged production and desktop backend.
+Java-compatible short-file recovery is now ported: a `settings.yml` with fewer than
+`MIN_SETTINGS_FILE_LINES` (31, matching `ConfigInitializer`) lines is treated as truncated by an
+interrupted write, backed up to `settings.yml.<epoch-millis>.bak`, and recreated from the template,
+exactly as Java does; `custom_settings.yml` is never subject to this check. Upgrade-template merging
+(carrying a user's existing values and comments/formatting forward when the bundled template gains
+new keys between app versions) is a separate, larger gap — Java's own merge is a comment-preserving
+line-based rewrite, not a structural YAML reparse, so it needs its own port rather than reuse of the
+`serde_yaml` dependency already in this crate. PDFium/sidecar packaging, cross-platform upgrade
+proof, and the production default switch have no Rust source-code surface at all — they are
+CI/release-pipeline and deployment-decision concerns, not outstanding coding work. See
 `contracts/desktop-native-startup.md`. The
 hardware-signing capability route reports desktop mode
 and safely discovers on-disk PKCS#11 libraries without loading them. Windows desktop builds can
