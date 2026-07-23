@@ -242,8 +242,14 @@ fn traditional_der_to_pkcs8(
                 private_key
                     .to_pkcs8_der()
                     .map_err(|_| SigningKeyError::InvalidPrivateKey)?
+            } else if let Ok(private_key) =
+                p384::SecretKey::from_sec1_der(private_key_der.as_bytes())
+            {
+                private_key
+                    .to_pkcs8_der()
+                    .map_err(|_| SigningKeyError::InvalidPrivateKey)?
             } else {
-                let private_key = p384::SecretKey::from_sec1_der(private_key_der.as_bytes())
+                let private_key = p521::SecretKey::from_sec1_der(private_key_der.as_bytes())
                     .map_err(|_| SigningKeyError::InvalidPrivateKey)?;
                 private_key
                     .to_pkcs8_der()
@@ -285,7 +291,7 @@ mod tests {
     use pkcs8::DecodePrivateKey;
     use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey};
 
-    use super::{RSA_LABEL, SigningSecret, traditional_der_to_pkcs8};
+    use super::{EC_LABEL, RSA_LABEL, SigningSecret, traditional_der_to_pkcs8};
 
     #[test]
     fn converts_traditional_rsa_pkcs1_to_pkcs8() -> Result<(), Box<dyn std::error::Error>> {
@@ -294,6 +300,22 @@ mod tests {
         let pkcs8 =
             traditional_der_to_pkcs8(RSA_LABEL, SigningSecret::new(pkcs1.as_bytes().to_vec()))?;
         let decoded = RsaPrivateKey::from_pkcs8_der(pkcs8.as_bytes())?;
+        assert_eq!(decoded, original);
+        Ok(())
+    }
+
+    /// The `EC_LABEL` branch falls back through p256 -> p384 -> p521 (in that
+    /// order, since a SEC1 DER blob carries no explicit curve label the way
+    /// PKCS#8 does), so a P-521 key must round-trip through the same
+    /// `from_sec1_der`/`to_pkcs8_der` path as the smaller curves.
+    #[test]
+    fn converts_traditional_ec_p521_sec1_to_pkcs8() -> Result<(), Box<dyn std::error::Error>> {
+        use p521::elliptic_curve::Generate;
+
+        let original = p521::SecretKey::generate_from_rng(&mut rand::rng());
+        let sec1 = original.to_sec1_der()?;
+        let pkcs8 = traditional_der_to_pkcs8(EC_LABEL, SigningSecret::new(sec1.to_vec()))?;
+        let decoded = p521::SecretKey::from_pkcs8_der(pkcs8.as_bytes())?;
         assert_eq!(decoded, original);
         Ok(())
     }

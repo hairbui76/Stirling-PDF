@@ -446,8 +446,11 @@ provider and has an opt-in live endpoint fixture. Managed server signing uses an
 PKCS#12 file re-wrapped with a separately generated password (or an explicit deployment secret),
 rejects links and malformed key/certificate pairs, and is mounted only in the opt-in secured
 router. Static proprietary route entitlement and trusted Keygen tier derivation are ported; Windows
-secret-file ACL hardening plus an external KMS/HSM option remain review gates. A live SoftHSM/token compatibility
-matrix, broader Windows smart-card coverage, and uncommon legacy PEM ciphers/curves
+secret-file ACL hardening plus an external KMS/HSM option remain review gates. Traditional (non-PKCS#8)
+EC PEM now falls back through P-256, P-384, and P-521; its DEK-Info cipher coverage (AES-128/192/256-CBC,
+DES-EDE3-CBC, DES-CBC) already matches everything realistically produced by current tooling — RC2/RC4/
+CAMELLIA are deprecated legacy PEM ciphers nobody deliberately picks for a signing workflow and are not
+planned. A live SoftHSM/token compatibility matrix and broader Windows smart-card coverage
 remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
 full signing or PAdES parity.
