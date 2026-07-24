@@ -396,10 +396,17 @@ Java-compatible short-file recovery is now ported: a `settings.yml` with fewer t
 `MIN_SETTINGS_FILE_LINES` (31, matching `ConfigInitializer`) lines is treated as truncated by an
 interrupted write, backed up to `settings.yml.<epoch-millis>.bak`, and recreated from the template,
 exactly as Java does; `custom_settings.yml` is never subject to this check. Upgrade-template merging
-(carrying a user's existing values and comments/formatting forward when the bundled template gains
-new keys between app versions) is a separate, larger gap — Java's own merge is a comment-preserving
-line-based rewrite, not a structural YAML reparse, so it needs its own port rather than reuse of the
-`serde_yaml` dependency already in this crate. PDFium/sidecar packaging, cross-platform upgrade
+is now also ported (matching Java's `ConfigInitializer`/`YamlHelper`): when an existing long-enough
+`settings.yml` is present, the bundled template is walked line-by-line and each leaf value the user
+customized is substituted into the template's own structure — preserving the template's comments,
+blank lines, key order, indentation, and inline comments — so new template keys arrive with their
+defaults, user-only keys are dropped, and the file is only rewritten if the merge changed it
+(idempotent). Values are re-emitted through `serde_yaml`'s own scalar emitter so a plain-styled
+value containing `#`/`:`/`*` (e.g. a DB password) is correctly quoted and round-trips exactly
+instead of being silently truncated or corrupting the file — a corruption bug an adversarial review
+caught and fixed before merge. A user override of a block/nested-map value (the template currently
+has no block sequences) falls back to the template default, a documented scalar/inline-scope
+limitation. PDFium/sidecar packaging, cross-platform upgrade
 proof, and the production default switch have no Rust source-code surface at all — they are
 CI/release-pipeline and deployment-decision concerns, not outstanding coding work. See
 `contracts/desktop-native-startup.md`. The
