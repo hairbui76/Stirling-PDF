@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::job_queue::JobQueueConfig;
 use crate::license::LicenseConfig;
+use crate::oidc_login::OidcLoginProviderConfig;
 use crate::runtime_dependencies::discover_dependencies;
 use crate::security_jwt::SupabaseJwtConfig;
 use crate::server_certificate::ServerCertificateConfig;
@@ -1144,6 +1145,60 @@ impl RuntimeConfig {
             expected_audience,
             clock_skew_seconds,
             jwks_cache_seconds,
+        })
+    }
+
+    /// Resolves the optional generic-OIDC login provider (public-client PKCE).
+    ///
+    /// Mirrors the `security.oauth2.*` block of the Java settings that its
+    /// discovery-driven `oidcClientRegistration()` consumes: the `issuer` is the
+    /// primary on/off switch (absent ⇒ the provider is disabled, returning
+    /// `None`, exactly like [`Self::security_supabase_jwt_config`]); a configured
+    /// issuer yields a typed [`OidcLoginProviderConfig`] whose remaining fields
+    /// are only *shaped* here, then structurally validated fail-closed at the
+    /// login boundary ([`OidcLoginProviderConfig::validate`], called by
+    /// `oidc_login::initiate_oidc_login`) rather than being second-guessed here.
+    ///
+    /// `scopes` accepts both a YAML sequence and the Java template's scalar
+    /// comma-separated string (e.g. `openid, profile, email`); the `openid`
+    /// scope is added by the authorization-request builder even if omitted.
+    #[must_use]
+    pub fn oidc_login_provider_config(&self) -> Option<OidcLoginProviderConfig> {
+        let issuer = self.string(
+            &["security", "oauth2", "issuer"],
+            "SECURITY_OAUTH2_ISSUER",
+            "",
+        );
+        if issuer.trim().is_empty() {
+            return None;
+        }
+        let client_id = self.string(
+            &["security", "oauth2", "clientId"],
+            "SECURITY_OAUTH2_CLIENTID",
+            "",
+        );
+        let redirect_uri = self.string(
+            &["security", "oauth2", "redirectUri"],
+            "SECURITY_OAUTH2_REDIRECTURI",
+            "",
+        );
+        let scopes = {
+            let listed = self.strings(&["security", "oauth2", "scopes"], "SECURITY_OAUTH2_SCOPES");
+            if listed.is_empty() {
+                split_strings(&self.string(
+                    &["security", "oauth2", "scopes"],
+                    "SECURITY_OAUTH2_SCOPES",
+                    "",
+                ))
+            } else {
+                listed
+            }
+        };
+        Some(OidcLoginProviderConfig {
+            issuer: issuer.trim().to_owned(),
+            client_id,
+            redirect_uri,
+            scopes,
         })
     }
 
@@ -2553,6 +2608,39 @@ mod tests {
         assert_eq!(configured.qpdf_timeout.as_secs(), 11 * 60);
         assert_eq!(configured.ghostscript_session_limit, 6);
         assert_eq!(configured.ghostscript_timeout.as_secs(), 13 * 60);
+        Ok(())
+    }
+
+    #[test]
+    fn oidc_login_provider_config_is_absent_without_an_issuer_and_typed_with_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+
+        // No issuer configured ⇒ the provider is simply disabled.
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert!(config.oidc_login_provider_config().is_none());
+
+        // Issuer present ⇒ a typed config, with scopes accepted as the Java
+        // template's scalar comma-separated string form.
+        fs::write(
+            &settings,
+            "security:\n  oauth2:\n    issuer: https://issuer.example.com\n    clientId: my-client-id\n    redirectUri: https://app.example.com/login/oauth2/code/oidc\n    scopes: openid, profile, email\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let provider = config
+            .oidc_login_provider_config()
+            .ok_or("expected a configured OIDC provider")?;
+        assert_eq!(provider.issuer, "https://issuer.example.com");
+        assert_eq!(provider.client_id, "my-client-id");
+        assert_eq!(
+            provider.redirect_uri,
+            "https://app.example.com/login/oauth2/code/oidc"
+        );
+        assert_eq!(provider.scopes, ["openid", "profile", "email"]);
+        // The shaped config passes the login boundary's fail-closed validation.
+        assert!(provider.validate().is_ok());
         Ok(())
     }
 

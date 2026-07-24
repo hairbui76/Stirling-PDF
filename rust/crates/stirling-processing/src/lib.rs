@@ -30,6 +30,7 @@ pub mod oidc_authorization;
 pub mod oidc_discovery;
 pub mod oidc_id_token;
 pub mod oidc_live_token;
+pub mod oidc_login;
 pub mod oidc_token;
 mod page_selection;
 pub mod pdf_ai_comments;

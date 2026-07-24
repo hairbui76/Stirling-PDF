@@ -74,6 +74,10 @@ const MAX_SUBJECT_BYTES: usize = 255;
 /// Ceiling on the `nonce` claim; the tokens this codebase issues are 43-char
 /// base64url, so 512 is generous headroom while bounding a hostile value.
 const MAX_NONCE_BYTES: usize = 512;
+/// Ceiling on the `sid` claim, matching `security.rs`'s
+/// `MAX_EXTERNAL_SESSION_ID_BYTES` so a value that verifies here also fits the
+/// external-identity session-id bound a downstream login flow enforces.
+const MAX_SID_BYTES: usize = 256;
 /// Ceiling on an email claim, mirroring [`crate::security_jwt`].
 const MAX_EMAIL_BYTES: usize = 320;
 /// Generic ceiling for the optional human-readable string claims.
@@ -101,6 +105,10 @@ pub struct VerifiedOidcIdentity {
     pub name: Option<String>,
     /// The end-user's preferred username (`preferred_username`), if present.
     pub preferred_username: Option<String>,
+    /// The provider's session identifier (`sid`, `OpenID` Connect Core 1.0 /
+    /// Session Management), if present. A login flow may adopt this as the
+    /// external session id it records rather than minting a fresh one.
+    pub sid: Option<String>,
     /// Issued-at (`iat`) as a Unix timestamp.
     pub issued_at: u64,
     /// Expiry (`exp`) as a Unix timestamp.
@@ -259,6 +267,8 @@ struct OidcIdTokenClaims {
     name: Option<String>,
     #[serde(default)]
     preferred_username: Option<String>,
+    #[serde(default)]
+    sid: Option<String>,
 }
 
 impl OidcIdTokenClaims {
@@ -294,6 +304,7 @@ impl OidcIdTokenClaims {
             email_verified: self.email_verified,
             name: bounded_optional(self.name, MAX_CLAIM_BYTES)?,
             preferred_username: bounded_optional(self.preferred_username, MAX_CLAIM_BYTES)?,
+            sid: bounded_optional(self.sid, MAX_SID_BYTES)?,
             issued_at: self.iat,
             expires_at: self.exp,
         })
@@ -463,6 +474,8 @@ mod tests {
         email_verified: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sid: Option<&'a str>,
     }
 
     fn now_secs() -> u64 {
@@ -483,6 +496,7 @@ mod tests {
             email: Some("User@Example.Test"),
             email_verified: Some(true),
             name: Some("Test User"),
+            sid: None,
         }
     }
 
@@ -561,6 +575,22 @@ mod tests {
         assert_eq!(identity.email.as_deref(), Some("user@example.test"));
         assert_eq!(identity.email_verified, Some(true));
         assert_eq!(identity.name.as_deref(), Some("Test User"));
+        // No `sid` claim in the baseline token, so it is absent.
+        assert_eq!(identity.sid, None);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_the_optional_sid_session_claim() -> Result<(), Box<dyn std::error::Error>> {
+        // A provider that participates in OIDC session management sends `sid`;
+        // it must be extracted (bounded) so a downstream login flow can adopt it
+        // as the external session id rather than minting a fresh one.
+        let fixture = Fixture::new()?;
+        let mut claims = valid_claims();
+        claims.sid = Some("provider-session-42");
+        let token = fixture.sign(&claims)?;
+        let identity = fixture.verify(&token)?;
+        assert_eq!(identity.sid.as_deref(), Some("provider-session-42"));
         Ok(())
     }
 

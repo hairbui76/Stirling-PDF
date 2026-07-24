@@ -482,9 +482,20 @@ allowlist that (double-gated with jsonwebtoken's own key-family guard, and verif
 HS256-with-public-key, `alg=none`, oct-key-in-JWKS, and cross-family tokens) prevents algorithm
 confusion, plus exact `iss`, `aud`==`client_id` (array membership), `exp` with leeway, `azp` when
 present, and — the OIDC-specific check the Supabase verifier lacks — a constant-time `nonce` match
-against the expected nonce. No route calls any of these modules yet, and neither the callback
-route nor session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to
-the caller with no persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
+against the expected nonce. `oidc_login` ties these together into the login flow as library
+functions (no HTTP route yet): `initiate_oidc_login` discovers the provider, builds the
+authorization request, and persists `{state → (nonce, code_verifier, redirect_uri, discovered
+metadata, client_id, expiry)}` in an in-memory single-use TTL store (modeled on the mobile-scanner
+session store); `complete_oidc_login` consumes the `state` entry *before any network call* (an
+unknown/expired/replayed `state` is rejected — this is the CSRF defense, since `state` is CSPRNG),
+then exchanges the code, verifies the id_token against the stored nonce, and provisions the user +
+issues a session by REUSING the exact reviewed external-identity path the Supabase JWT login uses
+(`resolve_external_user`/`context_for_user`/`issue_session`, keyed by `(issuer, subject)` so an
+OIDC identity can never collide with a Supabase one; role/permissions are server-derived, not
+token-controllable). A minimal `security.oauth2.*` provider config (issuer/client_id/redirect_uri/
+scopes, public-client PKCE) drives it, off unless an issuer is set. The two HTTP routes (authorize
++ callback) that call these two functions are the one remaining OIDC slice; confidential-client
+`client_secret` auth, a JWKS cache, and durable cross-process login-flow state remain open. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,

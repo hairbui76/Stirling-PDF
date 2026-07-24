@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange + ID-token verification — not a login flow yet)
+## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange + ID-token verification + login orchestration — library-complete; two HTTP routes remain)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -264,16 +264,77 @@ Given the discovered `OidcProviderMetadata` (for `jwks_uri` + `issuer`), the
   an otherwise fully-valid token for this client, so it is not a useful attacker
   oracle).
 
-Still explicitly not done: confidential-client (`client_secret`)
-authentication, the OAuth2 callback route, session creation, and any
-`state`/`nonce` **persistence** (the verifier is handed the `expected_nonce` the
-caller stored; nothing here stores or looks it up). There is still no generic
-OIDC login flow a browser could actually complete in Rust yet — just discovery,
-the authorization redirect + PKCE secrets, the token-request construction and
-token-response parsing, the SSRF-safe live token exchange, and now the ID-token
-verification that turns the exchange's opaque `id_token` into a typed verified
-identity — but with no callback, session, or nonce-persistence wiring them into
-an actual login.
+`oidc_login` is the slice that finally wires all of the above into a
+completable login, at the **library level** (still no axum routes — those are
+the remaining slice). It adds the three things the primitives deliberately left
+to "a later ticket": server-side single-use `state` persistence, provider
+configuration, and session issuance for a verified OIDC identity — reusing the
+existing session and external-identity machinery rather than forking parallel
+systems.
+
+- **Provider config.** `RuntimeConfig::oidc_login_provider_config()` resolves an
+  optional `OidcLoginProviderConfig { issuer, client_id, redirect_uri, scopes }`
+  from the crate's usual env/YAML config (`security.oauth2.*` /
+  `SECURITY_OAUTH2_*`, mirroring the fields of Java's discovery-driven
+  `ClientRegistration`), public-client PKCE only (no `client_secret` in this
+  slice). The `issuer` is the on/off switch — absent ⇒ `None` (provider
+  disabled), exactly like `security_supabase_jwt_config`; a present-but-invalid
+  config is not second-guessed at load but rejected fail-closed at the login
+  boundary by `OidcLoginProviderConfig::validate` (empty/over-long issuer/client
+  id, empty/unparseable redirect URI, or a whitespace-bearing scope), called at
+  the top of `initiate_oidc_login`.
+
+- **Single-use, TTL-bounded `state` store.** `OidcLoginStateStore` is an
+  in-memory `Mutex<HashMap>` over a monotonic `Instant` clock, modeled on
+  `mobile_scanner`'s session store, keyed by the CSPRNG `state` and holding one
+  pending login's `nonce`, PKCE `code_verifier`, `redirect_uri`, the discovered
+  `OidcProviderMetadata` (so the callback uses the exact endpoints discovered at
+  initiation), and `client_id`, for a bounded few minutes
+  (`DEFAULT_LOGIN_STATE_TTL`, 10 min). Lookup is **delete-on-lookup**: `consume`
+  `remove`s the entry, so it is handed out at most once. An unknown `state`
+  (never issued, or already consumed) is rejected as `UnknownState`; a
+  present-but-expired one is removed anyway and reported as `ExpiredState`. That
+  rejection **is** the CSRF defense: because `state` is CSPRNG and only a login
+  this server actually started has a matching live entry, a forged/replayed
+  callback resolves to nothing. (A store `store` also opportunistically sweeps
+  expired entries so abandoned logins can't accumulate.)
+
+- **`authenticate_oidc_identity`.** A sibling to
+  `authenticate_supabase_identity` on `SecurityStore` that maps a
+  `VerifiedOidcIdentity` onto the **same** issuer-agnostic external-identity
+  shape and runs it through the **unchanged** `validate_external_identity` /
+  `resolve_external_user` / `context_for_user` path (reused verbatim, not
+  reimplemented), tagging the context with a new `AuthenticationSource::Oidc`.
+  Field mapping: `username` = `preferred_username` else `email` else `sub`;
+  `authentication_type` = `"oauth2"`; `role` = `"ROLE_USER"`; `session_id` =
+  the id token's `sid` if present else a freshly generated random id;
+  `permissions` empty; `anonymous` false. Persistence is keyed by
+  `(issuer, subject)` in the shared `security_external_identities` table, so an
+  OIDC subject and a Supabase subject **cannot collide** unless they share both
+  an issuer and a subject (i.e. are the same account at the same provider). The
+  id-token verifier gained an optional bounded `sid` claim to feed this mapping.
+
+- **Orchestration.** `initiate_oidc_login(provider, store)` validates the config,
+  discovers the provider (SSRF-safe), builds the authorization request
+  (`state`/`nonce`/PKCE), **stores** the state entry, and returns the
+  authorization redirect URL + `state`. `complete_oidc_login(state, code, store,
+  security, now, correlation_id)` **consumes** the state entry (rejecting
+  unknown/expired before any network call — the CSRF/single-use gate), exchanges
+  the code at the stored `token_endpoint` with the stored PKCE verifier, verifies
+  the id token against the stored provider metadata and the stored `nonce`,
+  authenticates via `authenticate_oidc_identity`, and issues an opaque session
+  through the same `issue_session` every other login path uses (default
+  access/refresh TTLs) — returning the session tokens, the `AuthContext`, and the
+  verified identity.
+
+Still explicitly not done: the two HTTP routes (the authorization-redirect
+initiation endpoint and the OAuth2 callback endpoint) that would expose
+`initiate_oidc_login`/`complete_oidc_login` to a browser — that is the remaining
+slice. Also still out of scope: confidential-client (`client_secret`)
+authentication, a bounded JWKS cache in the id-token verifier, and durable
+(cross-process) `state` storage — the store is in-memory, so pending logins do
+not survive a restart, which is acceptable for the short bounded TTL of an
+in-flight login handshake.
 
 ## Persistence and migration
 

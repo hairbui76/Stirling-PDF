@@ -34,6 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::integration_config::{IntegrationConfig, IntegrationType, NewIntegrationConfig};
 use crate::license::{LicenseState, LicenseVerification};
+use crate::oidc_id_token::VerifiedOidcIdentity;
 use crate::policy_config::{PolicyDefinition, PolicySource, SourceDocStats};
 use crate::policy_ledger::{
     ClaimState, MAX_ATTEMPTS, ProcessedFileStatus, identity_hash as policy_identity_hash,
@@ -125,6 +126,7 @@ pub enum AuthenticationSource {
     AccessToken,
     ApiKey,
     SupabaseJwt,
+    Oidc,
 }
 
 /// Newly issued secrets. These values are never persisted in plaintext and are
@@ -1267,6 +1269,47 @@ impl SecurityStore {
         )?;
         context.permissions.clone_from(&identity.permissions);
         context.external_subject = Some(identity.subject.clone());
+        transaction.commit()?;
+        Ok(context)
+    }
+
+    /// Resolves or provisions a verified generic-OIDC subject, reusing the exact
+    /// same external-identity machinery as [`Self::authenticate_supabase_identity`].
+    ///
+    /// The verified OIDC identity is mapped onto the issuer-agnostic external
+    /// identity shape ([`external_identity_from_oidc`]) and then run through the
+    /// unchanged [`validate_external_identity`] / [`resolve_external_user`] /
+    /// [`context_for_user`] path. Persistence is keyed by `(issuer, subject)` in
+    /// the shared `security_external_identities` table, so an OIDC subject and a
+    /// Supabase subject can never collide unless they share an issuer *and* a
+    /// subject — i.e. are the same account at the same provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid/conflicting identity state, disabled users,
+    /// or unavailable persistence.
+    pub fn authenticate_oidc_identity(
+        &self,
+        identity: &VerifiedOidcIdentity,
+        now: i64,
+        correlation_id: &str,
+    ) -> Result<AuthContext, SecurityError> {
+        let external = external_identity_from_oidc(identity);
+        validate_external_identity(&external, now)?;
+        let username = normalize_username(&external.username)?;
+        let verification = self.current_license_verification()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let user = resolve_external_user(&transaction, &external, &username, verification, now)?;
+        let mut context = context_for_user(
+            &transaction,
+            &user,
+            AuthenticationSource::Oidc,
+            external.session_id.clone(),
+            correlation_id,
+        )?;
+        context.permissions.clone_from(&external.permissions);
+        context.external_subject = Some(external.subject.clone());
         transaction.commit()?;
         Ok(context)
     }
@@ -2727,6 +2770,7 @@ impl SecurityStore {
             AuthenticationSource::Password | AuthenticationSource::AccessToken => "WEB",
             AuthenticationSource::ApiKey => "API",
             AuthenticationSource::SupabaseJwt => "SUPABASE",
+            AuthenticationSource::Oidc => "OIDC",
         };
         let status_code = outcome
             .strip_prefix("status:")
@@ -4724,6 +4768,65 @@ fn validate_external_identity(
         return Err(SecurityError::InvalidInput);
     }
     Ok(())
+}
+
+/// Maps a verified generic-OIDC identity onto the issuer-agnostic external
+/// identity shape the external-user resolution path already consumes, so OIDC
+/// login reuses that path verbatim instead of forking a parallel one.
+///
+/// Field mapping (per ticket 37a):
+/// - `username`: `preferred_username`, else `email`, else `subject` — the first
+///   non-empty of those, so provisioning never fails for lack of a username.
+/// - `authentication_type`: fixed `"oauth2"`, one of the two non-anonymous
+///   values [`validate_external_identity`] accepts (the same value the Supabase
+///   path uses for a full `OAuth2` upgrade).
+/// - `role`: the default `"ROLE_USER"` [`validate_external_identity`] requires
+///   for a non-anonymous identity.
+/// - `session_id`: the id token's `sid` when present and non-empty, else a
+///   freshly generated random identifier (never empty — the validator rejects
+///   an empty session id).
+/// - `permissions`: empty. `anonymous`: false (OIDC login is always a full
+///   identity here).
+fn external_identity_from_oidc(identity: &VerifiedOidcIdentity) -> VerifiedSupabaseIdentity {
+    let username = [
+        identity.preferred_username.as_deref(),
+        identity.email.as_deref(),
+        Some(identity.subject.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|candidate| !candidate.is_empty())
+    .unwrap_or(identity.subject.as_str())
+    .to_owned();
+    let session_id = identity
+        .sid
+        .as_deref()
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty())
+        .map_or_else(generate_external_session_id, ToOwned::to_owned);
+    VerifiedSupabaseIdentity {
+        issuer: identity.issuer.clone(),
+        subject: identity.subject.clone(),
+        username,
+        email: identity.email.clone(),
+        authentication_type: "oauth2".to_owned(),
+        role: "ROLE_USER".to_owned(),
+        session_id,
+        permissions: BTreeSet::new(),
+        anonymous: false,
+    }
+}
+
+/// A random URL-safe session identifier for an OIDC identity whose id token
+/// carried no `sid`. Reuses the codebase's token-generation convention (32
+/// random octets, base64url-no-pad — 43 characters, well under the external
+/// session-id length bound) without a bearer-token prefix, since this is an
+/// identifier the auth context records, not a secret presented back.
+fn generate_external_session_id() -> String {
+    let mut bytes = [0_u8; TOKEN_BYTES];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn normalize_assignable_role(role: &str) -> Result<String, SecurityError> {
