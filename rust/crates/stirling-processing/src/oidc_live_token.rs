@@ -30,21 +30,38 @@
 //! connect/read timeouts, and a response-size cap enforced independently of the
 //! advertised `Content-Length`.
 //!
-//! # Scheme gate (and why it is not a weakening)
+//! # Scheme gate (per-scheme address policy, not a skip)
 //!
-//! The reserved-IP rejection fires only for `https`, mirroring
-//! [`crate::oidc_discovery`]'s own reserved-IP check exactly. The only `http`
-//! target [`crate::security_jwt::issuer_url_scheme_is_allowed`] admits at all is
-//! one of the three loopback literals (`localhost`/`127.0.0.1`/`::1`) — the
-//! dev/self-hosted seam, which *is* a loopback (reserved) address. A real,
-//! spoofable production provider is `https`, and gets the full resolve-and-pin
-//! treatment; `http` loopback stays reachable so this can be integration-tested
-//! against a loopback mock without relaxing the production `https` path.
+//! Both schemes vet the resolved addresses; they just apply the policy that
+//! fits each. `https` — the scheme a real, spoofable production provider uses —
+//! gets the full resolve-and-pin reserved-IP rejection, mirroring
+//! [`crate::oidc_discovery`]'s own reserved-IP check exactly: if *any* resolved
+//! address is private/reserved, the whole request is refused before connecting.
+//! `http` is only admitted at all for the three loopback literals
+//! (`localhost`/`127.0.0.1`/`::1`) that
+//! [`crate::security_jwt::issuer_url_scheme_is_allowed`] permits — the
+//! dev/self-hosted seam — so on that path *every* resolved address is required
+//! to **be** loopback. That keeps the loopback mock the integration tests rely
+//! on reachable while closing two holes an earlier revision left open: an
+//! attacker-influenced `localhost` (via `/etc/hosts` or a poisoned resolver)
+//! that resolves *off-box* to a non-loopback address, and the http-downgrade
+//! asymmetry where the reserved-IP check was skipped entirely for `http`.
 //!
-//! # Out of scope (later slices)
+//! # Two request shapes, one guard
 //!
-//! No `id_token` signature/issuer/audience/expiry/`nonce` verification (the
-//! response's `id_token` is still an opaque string here), no confidential-client
+//! The same resolve-and-pin primitive backs both the token POST above and a
+//! bodyless GET, exposed `pub(crate)` to the sibling [`crate::oidc_id_token`]
+//! verifier for fetching a provider-controlled `jwks_uri` under the identical
+//! SSRF protections (resolve-and-pin, per-scheme reserved rejection, no
+//! redirects, connect/read timeouts, and a caller-supplied response-size cap
+//! enforced independently of the advertised `Content-Length`).
+//!
+//! # Out of scope for *this* module
+//!
+//! This module still does not verify the `id_token` — its own response's
+//! `id_token` remains an opaque string here; signature/issuer/audience/expiry/
+//! `nonce` verification now lives in the sibling [`crate::oidc_id_token`], which
+//! reuses this module's SSRF-safe GET to fetch the JWKS. No confidential-client
 //! (`client_secret`) authentication, no callback route, no session creation.
 
 use std::{
@@ -128,11 +145,65 @@ fn exchange_oidc_token_with_resolver(
     let (status, body) = ssrf_safe_fetch(
         Method::POST,
         &request.token_endpoint,
-        request.content_type,
-        &request.form_body,
+        Some(&FetchBody {
+            content_type: request.content_type,
+            body: &request.form_body,
+        }),
+        MAX_TOKEN_RESPONSE_BYTES,
         resolve,
     )?;
     Ok(parse_oidc_token_response(status, &body)?)
+}
+
+/// SSRF-safe GET of a bounded resource (in practice a provider's JWKS document),
+/// reusing the exact same resolve-and-pin fetch primitive as the token POST.
+///
+/// Exposed `pub(crate)` so [`crate::oidc_id_token`] can fetch a
+/// provider-controlled `jwks_uri` under the identical protections rather than
+/// standing up a second, subtly-different network path. `max_response_bytes`
+/// bounds the response body independently of any advertised `Content-Length`.
+/// Production DNS resolution ([`resolve_host`]) is used; tests drive the
+/// resolve-and-pin logic through [`ssrf_safe_get_with_resolver`].
+///
+/// # Errors
+///
+/// Returns [`OidcLiveTokenError::InvalidEndpoint`] for a malformed or
+/// disallowed-scheme URL, [`OidcLiveTokenError::BlockedAddress`] when the host
+/// resolves (wholly or partly) into a reserved range on the `https` path — or to
+/// any non-loopback address on the `http` path — and
+/// [`OidcLiveTokenError::Unavailable`] when the endpoint can't be reached or its
+/// response can't be read within `max_response_bytes`.
+pub(crate) fn ssrf_safe_get(
+    endpoint: &str,
+    max_response_bytes: u64,
+) -> Result<(u16, Vec<u8>), OidcLiveTokenError> {
+    ssrf_safe_fetch(
+        Method::GET,
+        endpoint,
+        None,
+        max_response_bytes,
+        resolve_host,
+    )
+}
+
+/// A request body (media type + bytes) for the POST path; [`None`] on the GET
+/// path, where no body or `Content-Type` header is sent.
+struct FetchBody<'a> {
+    content_type: &'a str,
+    body: &'a str,
+}
+
+/// [`ssrf_safe_get`] with the host-resolution step injected, so the GET path can
+/// be driven deterministically in tests (a `jwks_uri` resolving to a chosen
+/// private/public address, or to a loopback mock) without real DNS — the GET
+/// counterpart of [`exchange_oidc_token_with_resolver`].
+#[cfg(test)]
+fn ssrf_safe_get_with_resolver(
+    endpoint: &str,
+    max_response_bytes: u64,
+    resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+) -> Result<(u16, Vec<u8>), OidcLiveTokenError> {
+    ssrf_safe_fetch(Method::GET, endpoint, None, max_response_bytes, resolve)
 }
 
 /// Production host resolution: the platform resolver (`getaddrinfo`) via
@@ -142,15 +213,20 @@ fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     (host, port).to_socket_addrs().map(Iterator::collect)
 }
 
-/// The SSRF-safe fetch primitive: validate the URL's scheme/host, resolve and
-/// vet the host, pin the vetted addresses, then send `method` with `body` and
-/// `content_type`, returning the response `(status, bytes)` with the body read
-/// under [`MAX_TOKEN_RESPONSE_BYTES`].
+/// The SSRF-safe fetch primitive shared by the token POST and the JWKS GET:
+/// validate the URL's scheme/host, resolve and vet the host, pin the vetted
+/// addresses, then send `method` — attaching `request_body`'s `Content-Type`
+/// header and bytes only when it is [`Some`] (the POST path) — and return the
+/// response `(status, bytes)` with the body read under `max_response_bytes`.
+///
+/// Keeping this one function means the resolve-and-vet SSRF logic is written
+/// exactly once; the only per-caller differences (method, whether a body is
+/// sent, and the response-size cap) are parameters.
 fn ssrf_safe_fetch(
     method: Method,
     endpoint: &str,
-    content_type: &str,
-    body: &str,
+    request_body: Option<&FetchBody<'_>>,
+    max_response_bytes: u64,
     resolve: impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 ) -> Result<(u16, Vec<u8>), OidcLiveTokenError> {
     let url = Url::parse(endpoint).map_err(|_| OidcLiveTokenError::InvalidEndpoint)?;
@@ -170,7 +246,7 @@ fn ssrf_safe_fetch(
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .redirect(Policy::none())
-        .user_agent("stirling-pdf-rust-oidc-token/1")
+        .user_agent("stirling-pdf-rust-oidc/1")
         // Pin the exact vetted addresses so the socket cannot re-resolve `host`
         // to a different address between the check above and the connect below
         // (anti DNS-rebinding / TOCTOU). reqwest keys this override on the host
@@ -180,41 +256,54 @@ fn ssrf_safe_fetch(
         .build()
         .map_err(|_| OidcLiveTokenError::Unavailable)?;
 
-    let response = client
-        .request(method, url)
-        .header(CONTENT_TYPE, content_type)
-        .body(body.to_owned())
+    let mut builder = client.request(method, url);
+    if let Some(&FetchBody { content_type, body }) = request_body {
+        builder = builder
+            .header(CONTENT_TYPE, content_type)
+            .body(body.to_owned());
+    }
+    let response = builder
         .send()
         .map_err(|_| OidcLiveTokenError::Unavailable)?;
 
     // Do NOT `error_for_status`: RFC 6749 section 5.2 token errors arrive as
-    // 4xx with a JSON error body that `parse_oidc_token_response` must see.
+    // 4xx with a JSON error body the caller must see. GET callers screen the
+    // status themselves.
     let status = response.status().as_u16();
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES)
+        .is_some_and(|length| length > max_response_bytes)
     {
         return Err(OidcLiveTokenError::Unavailable);
     }
     let mut bytes = Vec::new();
     response
-        .take(MAX_TOKEN_RESPONSE_BYTES + 1)
+        .take(max_response_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| OidcLiveTokenError::Unavailable)?;
-    if bytes.len() as u64 > MAX_TOKEN_RESPONSE_BYTES {
+    if bytes.len() as u64 > max_response_bytes {
         return Err(OidcLiveTokenError::Unavailable);
     }
     Ok((status, bytes))
 }
 
-/// Resolves `host` to concrete addresses and vets them against the SSRF policy,
-/// returning the exact addresses to pin (never empty) or an error.
+/// Resolves `host` to concrete addresses and vets them against a per-scheme
+/// SSRF policy, returning the exact addresses to pin (never empty) or an error.
 ///
-/// The reserved-IP rejection is gated to `https` (see the module docs): it is
-/// the scheme a real spoofable provider uses, whereas the only `http` target
-/// [`issuer_url_scheme_is_allowed`] permits is a loopback literal (the
-/// dev/test seam), so applying the reserved check there would block the very
-/// loopback mock the tests rely on without adding production protection.
+/// Each scheme applies the policy that fits it (see the module docs), and
+/// neither *skips* the check:
+///
+/// - **`https`** (the scheme a real, spoofable provider uses): reject if *any*
+///   resolved address is in a private/reserved range, using the single shared
+///   [`ip_addr_is_reserved`] predicate — the resolve-and-pin rejection that
+///   mirrors discovery's own reserved-IP check.
+/// - **`http`** (only ever admitted for the loopback literals
+///   [`issuer_url_scheme_is_allowed`] permits — the dev/self-hosted seam):
+///   reject unless *every* resolved address is loopback. Loopback stays
+///   reachable for the mock, but an `http` host that resolves *off-box* to a
+///   non-loopback address (an attacker-influenced `localhost`, or an
+///   http-downgrade to some other host) is refused rather than silently
+///   reached. This is the hardening that closed the earlier http-path skip.
 fn resolve_and_vet(
     host: &str,
     port: u16,
@@ -225,7 +314,14 @@ fn resolve_and_vet(
     if addrs.is_empty() {
         return Err(OidcLiveTokenError::Unavailable);
     }
-    if scheme == "https" && addrs.iter().any(|addr| ip_addr_is_reserved(addr.ip())) {
+    let blocked = if scheme == "https" {
+        addrs.iter().any(|addr| ip_addr_is_reserved(addr.ip()))
+    } else {
+        // http: the only scheme besides https the gate admits, and only for a
+        // loopback literal. Require loopback on every resolved address.
+        addrs.iter().any(|addr| !addr.ip().is_loopback())
+    };
+    if blocked {
         return Err(OidcLiveTokenError::BlockedAddress);
     }
     Ok(addrs)
@@ -240,10 +336,15 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{OidcLiveTokenError, exchange_oidc_token_with_resolver, resolve_and_vet};
+    use super::{
+        OidcLiveTokenError, exchange_oidc_token_with_resolver, resolve_and_vet,
+        ssrf_safe_get_with_resolver,
+    };
     use crate::oidc_token::{OidcTokenError, OidcTokenRequest};
 
     const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+    /// Generous cap for the GET-path tests (a real JWKS is a small JSON object).
+    const JWKS_TEST_CAP: u64 = 256 * 1024;
 
     fn http_response(status_line: &str, json: &str) -> String {
         format!(
@@ -482,6 +583,120 @@ mod tests {
             Ok(vec![loopback])
         })?;
         assert_eq!(allowed, vec![loopback]);
+        Ok(())
+    }
+
+    // ---- http-loopback hardening (#39): off-box localhost is rejected -------
+
+    #[test]
+    fn rejects_an_http_host_that_resolves_off_box_to_a_non_loopback_address() {
+        // The hardening: an earlier revision SKIPPED the reserved-IP check for
+        // http entirely, so an http://localhost whose name resolves off-box
+        // (poisoned /etc/hosts or resolver) to a non-loopback address reached
+        // it. Now the http path requires EVERY resolved address to be loopback,
+        // so both a public and a private (but non-loopback) resolution of
+        // "localhost" over http are refused. Neither address is reachable in the
+        // test environment, so the rejection is also verified to be immediate
+        // (before any connect) via resolve_and_vet directly.
+        for octets in [[93_u8, 184, 216, 34], [10, 0, 0, 1]] {
+            let result = resolve_and_vet("localhost", 80, "http", move |_: &str, port: u16| {
+                Ok(vec![v4(octets, port)])
+            });
+            assert!(
+                matches!(result, Err(OidcLiveTokenError::BlockedAddress)),
+                "expected http://localhost resolving to {octets:?} to be blocked, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_allows_an_http_host_that_resolves_to_a_non_127_0_0_1_loopback_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The seam must stay open for the whole 127.0.0.0/8 loopback block, not
+        // just 127.0.0.1 — the pinned-address test binds its mock on 127.0.0.2.
+        let loopback = v4([127, 0, 0, 2], 8080);
+        let allowed = resolve_and_vet("localhost", 8080, "http", move |_: &str, _: u16| {
+            Ok(vec![loopback])
+        })?;
+        assert_eq!(allowed, vec![loopback]);
+        Ok(())
+    }
+
+    // ---- the generalized SSRF-safe GET (JWKS fetch path) -------------------
+
+    #[test]
+    fn the_jwks_get_reads_a_bounded_body_from_a_loopback_mock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let jwks = r#"{"keys":[{"kty":"RSA","kid":"k1","n":"abc","e":"AQAB"}]}"#;
+        let server = serve_once(listener, http_response("200 OK", jwks));
+
+        // Same loopback seam the token POST uses: http://localhost pinned at the
+        // mock via the injected resolver.
+        let (status, body) = ssrf_safe_get_with_resolver(
+            &format!("http://localhost:{}/jwks.json", address.port()),
+            JWKS_TEST_CAP,
+            move |_: &str, _: u16| Ok(vec![address]),
+        )?;
+
+        let received = server.join().map_err(|_| "fixture server panicked")??;
+        assert!(
+            received.starts_with("GET /jwks.json "),
+            "expected a GET to /jwks.json, got: {received}"
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body, jwks.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn the_jwks_get_rejects_a_jwks_uri_that_resolves_to_a_private_address() {
+        // The provider-controlled jwks_uri gets the same resolve-and-pin SSRF
+        // rejection as the token endpoint: a name resolving into a private range
+        // is refused before any connection, so the verifier can never be steered
+        // to fetch "keys" from internal infrastructure.
+        let resolve = |_: &str, port: u16| Ok(vec![v4([10, 0, 0, 1], port)]);
+        let started = Instant::now();
+        let result = ssrf_safe_get_with_resolver(
+            "https://provider.example.com/jwks.json",
+            JWKS_TEST_CAP,
+            resolve,
+        );
+        assert!(
+            matches!(result, Err(OidcLiveTokenError::BlockedAddress)),
+            "expected a private-resolved jwks_uri to be blocked, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "rejection was not immediate; a connection was likely attempted"
+        );
+    }
+
+    #[test]
+    fn the_jwks_get_enforces_the_response_size_cap() -> Result<(), Box<dyn std::error::Error>> {
+        // A hostile or runaway JWKS endpoint returning a body larger than the
+        // cap is refused rather than buffered unbounded. The mock omits
+        // Content-Length (Connection: close, read-to-EOF), so this exercises the
+        // streaming .take(cap + 1) guard, not just the advertised-length check.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let oversized = "x".repeat(64);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{oversized}"
+        );
+        let server = serve_once(listener, response);
+
+        let result = ssrf_safe_get_with_resolver(
+            &format!("http://localhost:{}/jwks.json", address.port()),
+            32, // cap below the 64-byte body
+            move |_: &str, _: u16| Ok(vec![address]),
+        );
+        let _ = server.join().map_err(|_| "fixture server panicked")?;
+        assert!(
+            matches!(result, Err(OidcLiveTokenError::Unavailable)),
+            "expected an over-cap body to be rejected, got {result:?}"
+        );
         Ok(())
     }
 

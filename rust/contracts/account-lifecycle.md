@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange only — not a login flow yet)
+## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange + ID-token verification — not a login flow yet)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -207,25 +207,73 @@ addresses via `reqwest`'s `resolve_to_addrs`, so the socket cannot re-resolve
 the name to a different address between the check and the connect (anti
 DNS-rebinding / TOCTOU). It reuses discovery's other fetch conventions:
 no redirects, connect/read timeouts, and a response-size cap enforced
-independently of the advertised `Content-Length`. The reserved-IP rejection is
-gated to `https`, matching discovery's own reserved-IP check exactly — the only
-`http` target the shared scheme policy admits is a loopback literal (the
-dev/self-hosted seam), and a real spoofable provider is `https`, which gets the
-full resolve-and-pin path; the `http`-loopback allowance stays reachable so this
-is integration-testable against a loopback mock without relaxing production. Be
-precise about scope: this closes the DNS-name hole **for the token-fetch path
-only**; discovery-time endpoint validation remains a separate, literal-address
-check as described above.
+independently of the advertised `Content-Length`. The address policy is
+per-scheme, and — after a hardening pass (originally a review finding on the
+token-fetch slice) — **neither scheme skips the check**. On `https` (the scheme
+a real, spoofable provider uses) *any* resolved reserved/private address rejects
+the whole request, matching discovery's own reserved-IP check. On `http` (only
+ever admitted for the loopback literals the shared scheme policy allows — the
+dev/self-hosted seam) *every* resolved address must **be** loopback: the loopback
+mock stays reachable, but an `http` host that resolves *off-box* to a
+non-loopback address — an attacker-influenced `localhost` (poisoned
+`/etc/hosts`/resolver), or an http-downgrade to some other host — is now refused
+rather than silently reached. That closes both the off-box-`localhost` hole and
+the earlier http-downgrade asymmetry where the reserved check was skipped
+entirely for `http`. Be precise about scope: this closes the DNS-name hole **for
+the live-fetch paths** (token POST and, below, the JWKS GET); discovery-time
+endpoint validation remains a separate, literal-address check as described
+above.
 
-Still explicitly not done: `id_token`
-signature/issuer/audience/expiry/`nonce` verification (the response's `id_token`
-is still extracted as an opaque, unverified string), confidential-client
-(`client_secret`) authentication, the OAuth2 callback route, and session
-creation. There is still no generic OIDC login flow a browser could actually
-complete in Rust yet — just discovery, the authorization redirect + PKCE
-secrets, the token-request construction and token-response parsing, and now the
-SSRF-safe live token exchange that strings them together, but with no id_token
-verification, callback, or session behind it.
+That same resolve-and-pin primitive was generalized to back a bodyless GET
+(refactored so the SSRF logic — scheme/host validation, resolve-and-vet, address
+pinning, no-redirect, timeouts, and a caller-supplied response cap — is written
+once and shared by both the POST and the GET, differing only by method, body,
+and cap). The GET is exposed `pub(crate)` so the ID-token verifier can fetch a
+provider-controlled `jwks_uri` under the identical protections.
+
+`oidc_id_token` is the slice that finally verifies the `id_token` rather than
+extracting it opaquely — a **sibling** to `security_jwt`'s Supabase verifier
+(same `jsonwebtoken` rigor), not a modification of it, because the two differ:
+the JWKS URL is the provider's discovery-advertised, provider-controlled
+`jwks_uri` (not Supabase's hardcoded `{issuer}/.well-known/jwks.json`), the
+claims are OIDC ID-token claims, and there is the `nonce` check Supabase lacks.
+Given the discovered `OidcProviderMetadata` (for `jwks_uri` + `issuer`), the
+`client_id`, the `expected_nonce` from `oidc_authorization`, and the raw
+`id_token`, `verify_oidc_id_token`:
+
+- fetches the JWKS from `provider.jwks_uri` via the SSRF-safe GET above (bounded
+  to 256 KiB; fetched per verification — a bounded cache like `security_jwt`'s is
+  a noted later refinement);
+- rejects any non-public-key algorithm **before** decoding, via a public-key-only
+  allowlist (RSA PKCS#1-v1.5/PSS, ECDSA, `EdDSA`; **no HMAC**) identical to
+  `security_jwt`'s — this is the primary defense against the `alg=HS256`-against-a-
+  public-key confusion bypass (an attacker HMAC-signing with the public key
+  bytes). `jsonwebtoken`'s own `from_jwk` key-family guard, which refuses to use
+  an RSA/EC public key as an HMAC secret, is a redundant second line behind it;
+- verifies the signature against the JWK the header's `kid` selects, `iss` ==
+  `provider.issuer` (exact), `client_id` ∈ `aud` (and, when present, `azp` ==
+  `client_id`), and `exp` not past (same leeway convention as `security_jwt`);
+- requires the `nonce` claim to be present and equal (constant-time) to
+  `expected_nonce` — the OIDC-specific replay/CSRF binding `jsonwebtoken` does not
+  validate itself — and returns a typed `VerifiedOidcIdentity` (`sub`, `iss`, the
+  verified `aud`, plus optional `email`/`email_verified`/`name`/
+  `preferred_username` and `iat`/`exp`), never a raw JSON value. Signature/`iss`/
+  `aud`/`exp`/claim failures collapse to one generic `InvalidToken` (fail-closed,
+  no which-check oracle); a missing/unequal nonce surfaces as a distinct
+  `NonceMismatch` (a server-side replay signal that reaching it already requires
+  an otherwise fully-valid token for this client, so it is not a useful attacker
+  oracle).
+
+Still explicitly not done: confidential-client (`client_secret`)
+authentication, the OAuth2 callback route, session creation, and any
+`state`/`nonce` **persistence** (the verifier is handed the `expected_nonce` the
+caller stored; nothing here stores or looks it up). There is still no generic
+OIDC login flow a browser could actually complete in Rust yet — just discovery,
+the authorization redirect + PKCE secrets, the token-request construction and
+token-response parsing, the SSRF-safe live token exchange, and now the ID-token
+verification that turns the exchange's opaque `id_token` into a typed verified
+identity — but with no callback, session, or nonce-persistence wiring them into
+an actual login.
 
 ## Persistence and migration
 

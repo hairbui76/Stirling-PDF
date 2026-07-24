@@ -470,13 +470,20 @@ it resolves the `token_endpoint` host, rejects before connecting if ANY resolved
 reserved/private (reusing the same reviewed reserved-IP predicate as discovery — now shared via a
 `pub(crate) ip_addr_is_reserved`, a pure extraction verified to leave all 19 discovery SSRF tests
 green), then pins the vetted address via `resolve_to_addrs` so the live TCP connection cannot be
-re-resolved (anti DNS-rebinding). This closes the DNS-name→private-IP hole for the token-fetch path
-(discovery-time validation remains literal-IP-only, a separate path). One known residual, documented
-and to be hardened before a route wires this live: the reserved check is gated to `https`, so an
-`http://localhost`-style `token_endpoint` (which the shared scheme policy still admits) reaches
-loopback — a bounded loopback-only SSRF, not arbitrary internal hosts. No route calls any of these
-modules yet, and neither the `id_token` verification (signature/issuer/audience/nonce), the callback
-route, nor session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to
+re-resolved (anti DNS-rebinding); the same primitive now also does the JWKS GET. This closes the
+DNS-name→private-IP hole for these live-fetch paths (discovery-time validation remains
+literal-IP-only, a separate path). The earlier http-path residual is now closed: rather than
+skipping the reserved check on `http`, the fetch requires every resolved address to be loopback on
+`http` (rejecting a non-loopback resolution of `localhost`), preserving the dev/test loopback seam
+while removing the http-downgrade-to-loopback asymmetry. `oidc_id_token` verifies an ID token as a
+sibling of the Supabase verifier (which it leaves untouched): it fetches the JWKS SSRF-safely,
+checks the signature against a JWK selected by `kid`, and enforces a public-key-only algorithm
+allowlist that (double-gated with jsonwebtoken's own key-family guard, and verified against forged
+HS256-with-public-key, `alg=none`, oct-key-in-JWKS, and cross-family tokens) prevents algorithm
+confusion, plus exact `iss`, `aud`==`client_id` (array membership), `exp` with leeway, `azp` when
+present, and — the OIDC-specific check the Supabase verifier lacks — a constant-time `nonce` match
+against the expected nonce. No route calls any of these modules yet, and neither the callback
+route nor session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to
 the caller with no persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal

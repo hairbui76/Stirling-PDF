@@ -28,6 +28,7 @@ pub mod office_sanitizer;
 pub mod office_to_pdf;
 pub mod oidc_authorization;
 pub mod oidc_discovery;
+pub mod oidc_id_token;
 pub mod oidc_live_token;
 pub mod oidc_token;
 mod page_selection;
