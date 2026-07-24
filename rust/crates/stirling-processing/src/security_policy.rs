@@ -256,6 +256,7 @@ fn is_non_demo_path(path: &str) -> bool {
                 | "/api/v1/auth/mfa/enable"
                 | "/api/v1/auth/mfa/disable"
                 | "/api/v1/auth/mfa/setup/cancel"
+                | "/api/v1/auth/mfa/recovery-codes/regenerate"
         )
 }
 
@@ -334,6 +335,12 @@ mod tests {
         );
         assert_eq!(
             endpoint_policy(&Method::POST, "/api/v1/user/change-password"),
+            EndpointPolicy::NonDemoUser
+        );
+        // Regenerating one's own recovery codes is a sensitive self-service MFA
+        // action, classified exactly like the sibling enable/disable routes.
+        assert_eq!(
+            endpoint_policy(&Method::POST, "/api/v1/auth/mfa/recovery-codes/regenerate"),
             EndpointPolicy::NonDemoUser
         );
         for path in [

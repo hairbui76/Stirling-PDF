@@ -427,8 +427,13 @@ hardware signing remains desktop-loopback gated.
 
 An opt-in secured router now provides durable local BCrypt identities, persistent lockout,
 revocable rotating opaque sessions, digest-only one-time-issued API keys, AES-GCM-protected TOTP
-seeds with replay protection, roles, teams, one-time invitations, local-user administration,
-typed post-handler audit records, and administrator audit retrieval/export/retention/statistics.
+seeds with replay protection, MFA recovery/backup codes (a net-new hardening with no Java
+equivalent: 10 single-use codes auto-issued when MFA is enabled, stored only as SHA-256 digests,
+substitutable for the TOTP factor at login — never a password bypass — atomically consumed one-time,
+feeding the shared MFA lockout on failure; regeneration requires a fresh non-replayable TOTP and the
+remaining count surfaces on `/api/v1/auth/me`), roles, teams, one-time invitations, local-user
+administration, typed post-handler audit records, and administrator audit
+retrieval/export/retention/statistics.
 Password, username, role, team, and account-state changes
 revoke live sessions, and the repository preserves at least one enabled administrator. Existing
 foundation databases are backfilled into the Default team. Java-compatible local user/team/invite
@@ -522,9 +527,11 @@ not a one-and-done fix. Explicitly and deliberately still open: operator-configu
 prefixes and DNS-name resolution (a domain that resolves to a private address) are undetectable
 without out-of-band deployment knowledge or an actual, TOCTOU-safe resolve-and-pin mechanism neither
 of which exist here yet; native IPv6 special-purpose ranges beyond the embedding forms above (e.g.
-IPv6 benchmarking, Discard-Only) were not audited. Recovery
-codes, SAML2, desktop callbacks, device identities, ownership for additional
-durable proprietary resources, and independent security review remain.
+IPv6 benchmarking, Discard-Only) were not audited. SAML2 (scoped and deferred — no sound pure-Rust
+XML-signature/canonicalization foundation exists; it needs a `libxmlsec1` native dependency or a
+from-scratch C14N/XSW build, a decision left to the maintainers), desktop callbacks, device
+identities, ownership for additional durable proprietary resources, and independent security review
+remain.
 
 The standalone Rust runtime now performs bounded startup discovery for its optional
 command-line dependencies, including Java-compatible QPDF and WeasyPrint minimum

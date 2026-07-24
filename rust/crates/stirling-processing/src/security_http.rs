@@ -398,6 +398,10 @@ fn auth_routes(
             post(disable_mfa_by_admin),
         )
         .route("/api/v1/auth/mfa/setup/cancel", post(cancel_mfa_setup))
+        .route(
+            "/api/v1/auth/mfa/recovery-codes/regenerate",
+            post(regenerate_recovery_codes),
+        )
         .route("/api/v1/user/register", post(register_user))
         .route("/api/v1/user/change-username", post(change_username))
         .route("/api/v1/user/change-password", post(change_password))
@@ -1147,7 +1151,13 @@ async fn enable_mfa(
     })
     .await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "enabled": true })).into_response(),
+        // The freshly issued recovery codes are returned exactly once here; only
+        // their digests are persisted, so they can never be surfaced again.
+        Ok(Ok(recovery_codes)) => Json(serde_json::json!({
+            "enabled": true,
+            "recoveryCodes": recovery_codes,
+        }))
+        .into_response(),
         Ok(Err(SecurityError::MfaSetupRequired)) => named_json_error(
             StatusCode::BAD_REQUEST,
             "MFA setup required",
@@ -1205,6 +1215,45 @@ async fn cancel_mfa_setup(
             StatusCode::CONFLICT,
             "MFA already enabled",
             "MFA already enabled",
+        ),
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+/// Regenerates the authenticated caller's MFA recovery codes. The operation is
+/// scoped strictly to `context.user_id` (never a request-supplied identifier)
+/// and, mirroring [`disable_mfa`], requires a fresh TOTP code as re-auth for
+/// this sensitive action. The new plaintext codes are returned exactly once;
+/// the prior set is invalidated.
+async fn regenerate_recovery_codes(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(context): Extension<AuthContext>,
+    Json(request): Json<MfaCodeRequest>,
+) -> Response {
+    if request.code.trim().is_empty() {
+        return named_json_error(
+            StatusCode::BAD_REQUEST,
+            "MFA code is required",
+            "MFA code is required",
+        );
+    }
+    let result = task::spawn_blocking(move || {
+        store.regenerate_recovery_codes(context.user_id, &request.code, Utc::now().timestamp())
+    })
+    .await;
+    match result {
+        Ok(Ok(recovery_codes)) => {
+            Json(serde_json::json!({ "recoveryCodes": recovery_codes })).into_response()
+        }
+        Ok(Err(SecurityError::MfaSetupRequired)) => named_json_error(
+            StatusCode::BAD_REQUEST,
+            "MFA is not enabled",
+            "MFA is not enabled",
+        ),
+        Ok(Err(SecurityError::InvalidMfa)) => named_json_error(
+            StatusCode::UNAUTHORIZED,
+            "Invalid two-factor code",
+            "Invalid two-factor code",
         ),
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
     }
@@ -2577,8 +2626,30 @@ fn invalid_form_response() -> Response {
     )
 }
 
-async fn current_user(Extension(context): Extension<AuthContext>) -> Response {
-    Json(serde_json::json!({ "user": authentication_user(&context) })).into_response()
+async fn current_user(
+    Extension(store): Extension<Arc<SecurityStore>>,
+    Extension(context): Extension<AuthContext>,
+) -> Response {
+    let user_id = context.user_id;
+    // Report MFA status alongside the account so a UI can prompt to enable MFA
+    // and warn when recovery codes are running low. Scoped to the caller.
+    let mfa = task::spawn_blocking(move || {
+        let enabled = store.mfa_is_enabled(user_id)?;
+        let recovery_codes_remaining = store.remaining_recovery_codes(user_id)?;
+        Ok::<_, SecurityError>((enabled, recovery_codes_remaining))
+    })
+    .await;
+    match mfa {
+        Ok(Ok((enabled, recovery_codes_remaining))) => Json(serde_json::json!({
+            "user": authentication_user(&context),
+            "mfa": {
+                "enabled": enabled,
+                "recoveryCodesRemaining": recovery_codes_remaining,
+            },
+        }))
+        .into_response(),
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
 }
 
 async fn refresh(
@@ -3730,6 +3801,265 @@ mod tests {
         let replay = login_request(&app, Some(&next_code)).await?;
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response_json(replay).await?["error"], "invalid_mfa_code");
+        Ok(())
+    }
+
+    const RECOVERY_REGENERATE_PATH: &str = "/api/v1/auth/mfa/recovery-codes/regenerate";
+
+    fn recovery_codes_from(value: &Value) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        value
+            .as_array()
+            .ok_or("missing recovery codes")?
+            .iter()
+            .map(|code| code.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "non-string recovery code".into())
+    }
+
+    async fn access_token_of(
+        response: axum::response::Response,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        response_json(response).await?["session"]["access_token"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "missing access token".into())
+    }
+
+    /// Drives the full HTTP setup -> enable flow for the given access token and
+    /// returns the account's TOTP secret and the initial recovery-code set that
+    /// the enable response hands back exactly once.
+    async fn enable_mfa_over_http(
+        app: &Router,
+        access_token: &str,
+        enable_at: i64,
+    ) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+        let setup = authorized_get(app, "/api/v1/auth/mfa/setup", access_token).await?;
+        assert_eq!(setup.status(), StatusCode::OK);
+        let secret = response_json(setup).await?["secret"]
+            .as_str()
+            .ok_or("missing MFA secret")?
+            .to_owned();
+        let enable_code = totp_code_at(&secret, enable_at).ok_or("missing enable TOTP")?;
+        let enable = authorized_json_post(
+            app,
+            "/api/v1/auth/mfa/enable",
+            access_token,
+            serde_json::json!({ "code": enable_code }),
+        )
+        .await?;
+        assert_eq!(enable.status(), StatusCode::OK);
+        let body = response_json(enable).await?;
+        assert_eq!(body["enabled"], true);
+        Ok((secret, recovery_codes_from(&body["recoveryCodes"])?))
+    }
+
+    async fn create_enabled_web_user(
+        app: &Router,
+        admin_token: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let created = authorized_multipart_post(
+            app,
+            "/api/v1/user/admin/saveUser",
+            admin_token,
+            &[
+                ("username", username),
+                ("password", password),
+                ("role", "ROLE_USER"),
+                ("authType", "WEB"),
+            ],
+        )
+        .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    async fn login_user(
+        app: &Router,
+        username: &str,
+        password: &str,
+        mfa_code: Option<&str>,
+    ) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+        let mut body = serde_json::json!({ "username": username, "password": password });
+        if let Some(code) = mfa_code {
+            body["mfaCode"] = Value::String(code.to_owned());
+        }
+        Ok(app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn enabling_mfa_issues_recovery_codes_that_log_in_and_appear_in_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router()?;
+        let access_token = access_token_of(login_request(&app, None).await?).await?;
+        let now = Utc::now().timestamp();
+
+        let (_secret, codes) = enable_mfa_over_http(&app, &access_token, now).await?;
+        assert_eq!(codes.len(), 10);
+        // The batch is internally distinct.
+        assert_eq!(
+            codes.iter().collect::<std::collections::HashSet<_>>().len(),
+            10
+        );
+
+        // MFA status reports the codes exist as a COUNT only -- never the
+        // plaintext, which is surfaced solely by the enable/regenerate response.
+        let me =
+            response_json(authorized_get(&app, "/api/v1/auth/me", &access_token).await?).await?;
+        assert_eq!(me["mfa"]["enabled"], true);
+        assert_eq!(me["mfa"]["recoveryCodesRemaining"], 10);
+        assert!(me["mfa"].get("recoveryCodes").is_none());
+
+        // MFA is now required at login, and a recovery code satisfies it.
+        let missing = login_request(&app, None).await?;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(missing).await?["error"], "mfa_required");
+        let with_code = login_request(&app, Some(&codes[0])).await?;
+        assert_eq!(with_code.status(), StatusCode::OK);
+
+        // Single-use: the consumed code is refused on replay, and the status
+        // count decrements to reflect the spent code.
+        let replay = login_request(&app, Some(&codes[0])).await?;
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let me =
+            response_json(authorized_get(&app, "/api/v1/auth/me", &access_token).await?).await?;
+        assert_eq!(me["mfa"]["recoveryCodesRemaining"], 9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn regenerating_recovery_codes_replaces_the_set_and_requires_a_fresh_totp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router()?;
+        let access_token = access_token_of(login_request(&app, None).await?).await?;
+        let now = Utc::now().timestamp();
+        let (secret, first_codes) = enable_mfa_over_http(&app, &access_token, now).await?;
+
+        // Re-auth requirement (mirrors disable_mfa): a code that is not a valid
+        // current TOTP is refused, leaving the existing set intact.
+        let wrong = authorized_json_post(
+            &app,
+            RECOVERY_REGENERATE_PATH,
+            &access_token,
+            serde_json::json!({ "code": "not-a-totp" }),
+        )
+        .await?;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(wrong).await?["error"],
+            "Invalid two-factor code"
+        );
+        // An empty code is a 400 before any store work.
+        let empty = authorized_json_post(
+            &app,
+            RECOVERY_REGENERATE_PATH,
+            &access_token,
+            serde_json::json!({ "code": "" }),
+        )
+        .await?;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        // The original set still authenticates after the refused attempts.
+        assert_eq!(
+            login_request(&app, Some(&first_codes[0])).await?.status(),
+            StatusCode::OK
+        );
+
+        // A fresh TOTP step (later than the enable step) yields a NEW set of ten,
+        // fully disjoint from the superseded one.
+        let regen_code = totp_code_at(&secret, now + 30).ok_or("missing regen TOTP")?;
+        let regen = authorized_json_post(
+            &app,
+            RECOVERY_REGENERATE_PATH,
+            &access_token,
+            serde_json::json!({ "code": regen_code }),
+        )
+        .await?;
+        assert_eq!(regen.status(), StatusCode::OK);
+        let second_codes = recovery_codes_from(&response_json(regen).await?["recoveryCodes"])?;
+        assert_eq!(second_codes.len(), 10);
+        assert!(first_codes.iter().all(|code| !second_codes.contains(code)));
+
+        // Drive invalidation end-to-end through login: a still-unconsumed code
+        // from the OLD set no longer authenticates, while one from the new set
+        // does. (first_codes[0] was consumed above, so probe first_codes[1].)
+        let stale = login_request(&app, Some(&first_codes[1])).await?;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        let fresh = login_request(&app, Some(&second_codes[0])).await?;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_code_routes_require_authentication_and_are_scoped_to_the_caller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router()?;
+
+        // Unauthenticated regeneration is rejected by the security boundary.
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::post(RECOVERY_REGENERATE_PATH)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &serde_json::json!({ "code": "123456" }),
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        // Two independent web accounts, each with their own enabled MFA + codes.
+        let admin_token = access_token_of(login_request(&app, None).await?).await?;
+        create_enabled_web_user(&app, &admin_token, "second@example.test", "second-password")
+            .await?;
+        let user_token = access_token_of(
+            login_user(&app, "second@example.test", "second-password", None).await?,
+        )
+        .await?;
+        let now = Utc::now().timestamp();
+        let (admin_secret, _admin_codes) = enable_mfa_over_http(&app, &admin_token, now).await?;
+        let (_user_secret, user_codes) = enable_mfa_over_http(&app, &user_token, now).await?;
+
+        // The admin regenerates ITS OWN codes. The request body carries only a
+        // `code`, so the operation can only ever touch the authenticated caller.
+        let regen_code = totp_code_at(&admin_secret, now + 30).ok_or("missing regen TOTP")?;
+        let regen = authorized_json_post(
+            &app,
+            RECOVERY_REGENERATE_PATH,
+            &admin_token,
+            serde_json::json!({ "code": regen_code }),
+        )
+        .await?;
+        assert_eq!(regen.status(), StatusCode::OK);
+
+        // Caller-scoping: the OTHER user's codes are untouched -- one still
+        // authenticates them at login.
+        let scoped = login_user(
+            &app,
+            "second@example.test",
+            "second-password",
+            Some(&user_codes[0]),
+        )
+        .await?;
+        assert_eq!(scoped.status(), StatusCode::OK);
+
+        // A body that attempts to name another user is rejected outright: the
+        // route accepts only `code`, so it can never be pointed elsewhere.
+        let injected = authorized_json_post(
+            &app,
+            RECOVERY_REGENERATE_PATH,
+            &admin_token,
+            serde_json::json!({ "code": regen_code, "userId": 1 }),
+        )
+        .await?;
+        assert!(injected.status().is_client_error());
         Ok(())
     }
 

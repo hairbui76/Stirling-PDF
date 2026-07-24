@@ -1871,13 +1871,21 @@ impl SecurityStore {
     }
 
     /// Enables pending MFA after validating and consuming the submitted TOTP
-    /// time step.
+    /// time step, and issues the user's initial single-use recovery-code set in
+    /// the same transaction so an enabled account always has backup codes. The
+    /// plaintext codes are returned exactly once for the caller to display; only
+    /// their digests are persisted (see [`Self::generate_recovery_codes`]).
     ///
     /// # Errors
     ///
     /// Returns an error for missing setup, invalid/replayed codes, or protected
     /// state failures.
-    pub fn enable_mfa(&self, user_id: i64, code: &str, now: i64) -> Result<(), SecurityError> {
+    pub fn enable_mfa(
+        &self,
+        user_id: i64,
+        code: &str,
+        now: i64,
+    ) -> Result<Vec<String>, SecurityError> {
         let mfa = self
             .read_mfa(user_id)?
             .ok_or(SecurityError::MfaSetupRequired)?;
@@ -1885,19 +1893,23 @@ impl SecurityStore {
             return Err(SecurityError::MfaAlreadyEnabled);
         }
         let step = self.validated_mfa_step(user_id, &mfa, code, now)?;
-        let connection = self.lock()?;
-        let updated = connection.execute(
+        let entries = build_recovery_code_entries();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
             "UPDATE security_mfa
              SET enabled = 1, required = 0, last_used_step = ?1, updated_at = ?2
              WHERE user_id = ?3 AND enabled = 0
                AND (last_used_step IS NULL OR last_used_step < ?1)",
             params![step, now, user_id],
         )?;
-        if updated == 1 {
-            Ok(())
-        } else {
-            Err(SecurityError::InvalidMfa)
+        if updated != 1 {
+            transaction.rollback()?;
+            return Err(SecurityError::InvalidMfa);
         }
+        replace_recovery_codes(&transaction, user_id, &entries, now)?;
+        transaction.commit()?;
+        Ok(entries.into_iter().map(|(code, _)| code).collect())
     }
 
     /// Disables MFA after validating a fresh TOTP code. A user without enabled
@@ -2002,30 +2014,53 @@ impl SecurityStore {
         user_id: i64,
         now: i64,
     ) -> Result<Vec<String>, SecurityError> {
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(RECOVERY_CODE_COUNT);
-        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(RECOVERY_CODE_COUNT);
-        while entries.len() < RECOVERY_CODE_COUNT {
-            let code = generate_recovery_code();
-            let digest = token_digest(&normalize_recovery_code(&code));
-            // Guard against the (astronomically unlikely) intra-batch digest
-            // collision so every INSERT can rely on the UNIQUE constraint.
-            if seen.insert(digest.clone()) {
-                entries.push((code, digest));
-            }
-        }
+        let entries = build_recovery_code_entries();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM security_recovery_codes WHERE user_id = ?1",
-            [user_id],
-        )?;
-        for (_, digest) in &entries {
-            transaction.execute(
-                "INSERT INTO security_recovery_codes (user_id, code_hash, created_at, consumed_at)
-                 VALUES (?1, ?2, ?3, NULL)",
-                params![user_id, digest, now],
-            )?;
+        replace_recovery_codes(&transaction, user_id, &entries, now)?;
+        transaction.commit()?;
+        Ok(entries.into_iter().map(|(code, _)| code).collect())
+    }
+
+    /// Regenerates the caller's recovery-code set after re-authenticating with a
+    /// fresh TOTP step, mirroring the re-auth requirement of
+    /// [`Self::disable_mfa`]. MFA must already be enabled. The submitted TOTP
+    /// step is consumed (its `last_used_step` is bumped) so it cannot be
+    /// replayed, and the prior set is atomically replaced in the same
+    /// transaction. The new plaintext codes are returned exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::MfaSetupRequired`] when MFA is not enabled,
+    /// [`SecurityError::InvalidMfa`] for an invalid or replayed code, or a
+    /// protected-state / persistence error.
+    pub fn regenerate_recovery_codes(
+        &self,
+        user_id: i64,
+        code: &str,
+        now: i64,
+    ) -> Result<Vec<String>, SecurityError> {
+        let mfa = self
+            .read_mfa(user_id)?
+            .ok_or(SecurityError::MfaSetupRequired)?;
+        if !mfa.enabled {
+            return Err(SecurityError::MfaSetupRequired);
         }
+        let step = self.validated_mfa_step(user_id, &mfa, code, now)?;
+        let entries = build_recovery_code_entries();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE security_mfa SET last_used_step = ?1, updated_at = ?2
+             WHERE user_id = ?3 AND enabled = 1
+               AND (last_used_step IS NULL OR last_used_step < ?1)",
+            params![step, now, user_id],
+        )?;
+        if updated != 1 {
+            transaction.rollback()?;
+            return Err(SecurityError::InvalidMfa);
+        }
+        replace_recovery_codes(&transaction, user_id, &entries, now)?;
         transaction.commit()?;
         Ok(entries.into_iter().map(|(code, _)| code).collect())
     }
@@ -6148,6 +6183,48 @@ fn token_digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+/// Builds a fresh batch of [`RECOVERY_CODE_COUNT`] recovery codes paired with
+/// their persisted digests, de-duplicating digests within the batch so every
+/// INSERT can rely on the UNIQUE constraint. The plaintext codes never leave
+/// this batch except through the caller's single return value.
+fn build_recovery_code_entries() -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(RECOVERY_CODE_COUNT);
+    while entries.len() < RECOVERY_CODE_COUNT {
+        let code = generate_recovery_code();
+        let digest = token_digest(&normalize_recovery_code(&code));
+        // Guard against the (astronomically unlikely) intra-batch digest
+        // collision so every INSERT can rely on the UNIQUE constraint.
+        if seen.insert(digest.clone()) {
+            entries.push((code, digest));
+        }
+    }
+    entries
+}
+
+/// Replaces the user's stored recovery-code digests within an open transaction:
+/// the prior set is deleted and the supplied digests are inserted unconsumed.
+/// Regeneration therefore invalidates every previously issued code.
+fn replace_recovery_codes(
+    transaction: &Transaction,
+    user_id: i64,
+    entries: &[(String, Vec<u8>)],
+    now: i64,
+) -> Result<(), SecurityError> {
+    transaction.execute(
+        "DELETE FROM security_recovery_codes WHERE user_id = ?1",
+        [user_id],
+    )?;
+    for (_, digest) in entries {
+        transaction.execute(
+            "INSERT INTO security_recovery_codes (user_id, code_hash, created_at, consumed_at)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![user_id, digest, now],
+        )?;
+    }
+    Ok(())
+}
+
 /// Produces one human-typeable recovery code: CSPRNG octets Base32-encoded
 /// (RFC 4648 alphabet, matching the TOTP-seed convention) and dash-grouped for
 /// transcription, e.g. `AB2C-D3EF-GH4J-K5MN`.
@@ -7166,6 +7243,108 @@ mod tests {
             "correct-password",
         )?;
         assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn enabling_mfa_auto_issues_a_live_recovery_code_set() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let context = store.authenticate_password("admin", "test-only-password", 1_000, "setup")?;
+        let secret = store.begin_mfa_setup(context.user_id, 1_001)?;
+        let enable_time = 30_000;
+        let enable_code = totp_code_at(&secret, enable_time).ok_or("missing TOTP")?;
+
+        // Enabling returns an initial set of ten codes in the same operation.
+        let codes = store.enable_mfa(context.user_id, &enable_code, enable_time)?;
+        assert_eq!(codes.len(), 10);
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 10);
+
+        // The auto-issued codes are immediately usable at the login MFA step.
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(codes[0].as_str()),
+            enable_time + 60,
+            "auto-issued",
+        )?;
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 9);
+        drop(secret);
+        Ok(())
+    }
+
+    #[test]
+    fn regenerate_requires_a_fresh_totp_and_invalidates_the_prior_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let context = store.authenticate_password("admin", "test-only-password", 1_000, "setup")?;
+        let secret = store.begin_mfa_setup(context.user_id, 1_001)?;
+        let enable_time = 30_000;
+        let enable_code = totp_code_at(&secret, enable_time).ok_or("missing TOTP")?;
+        let first = store.enable_mfa(context.user_id, &enable_code, enable_time)?;
+
+        // The enable step is already consumed, so replaying it cannot regenerate.
+        assert!(matches!(
+            store.regenerate_recovery_codes(context.user_id, &enable_code, enable_time),
+            Err(SecurityError::InvalidMfa)
+        ));
+        // A malformed code is refused as well.
+        assert!(matches!(
+            store.regenerate_recovery_codes(context.user_id, "not-a-totp", enable_time + 60),
+            Err(SecurityError::InvalidMfa)
+        ));
+        // Neither refusal touched the live set.
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 10);
+
+        // A fresh step regenerates: ten new codes, disjoint from the old set.
+        let regen_time = enable_time + 60;
+        let regen_code = totp_code_at(&secret, regen_time).ok_or("missing regen TOTP")?;
+        let second = store.regenerate_recovery_codes(context.user_id, &regen_code, regen_time)?;
+        assert_eq!(second.len(), 10);
+        assert!(first.iter().all(|code| !second.contains(code)));
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 10);
+
+        // A code from the superseded set is dead; a new code authenticates.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "test-only-password",
+                Some(first[0].as_str()),
+                regen_time + 60,
+                "stale",
+            ),
+            Err(SecurityError::InvalidMfa)
+        ));
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(second[0].as_str()),
+            regen_time + 90,
+            "fresh",
+        )?;
+        drop(secret);
+        Ok(())
+    }
+
+    #[test]
+    fn regenerate_is_refused_until_mfa_is_enabled() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let context = store.authenticate_password("admin", "test-only-password", 1_000, "setup")?;
+        // No MFA at all.
+        assert!(matches!(
+            store.regenerate_recovery_codes(context.user_id, "123456", 2_000),
+            Err(SecurityError::MfaSetupRequired)
+        ));
+        // A pending (not-yet-enabled) setup is still insufficient.
+        let secret = store.begin_mfa_setup(context.user_id, 2_001)?;
+        assert!(matches!(
+            store.regenerate_recovery_codes(context.user_id, "123456", 2_100),
+            Err(SecurityError::MfaSetupRequired)
+        ));
+        drop(secret);
         Ok(())
     }
 

@@ -414,11 +414,10 @@ acceptable for the short bounded TTL of an in-flight login handshake.
 
 Net-new hardening with no Java equivalent, complementing the existing TOTP MFA:
 recovery codes let a user whose authenticator is unavailable still complete the
-second factor. This is **slice 1 — store functions plus login integration only;
-there are no HTTP routes yet** (exposing generation/consumption on the wire, and
-auto-issuing a set when MFA is first enabled, are slice 2). `generate_recovery_codes`
-is therefore a standalone library function for now, not yet called by
-`enable_mfa`.
+second factor. Slice 1 added the store functions plus login integration; **slice
+2 exposes them over HTTP** — an enabled account is auto-issued a set the moment
+MFA is turned on, a caller-scoped route regenerates that set, and the unconsumed
+count is surfaced in the MFA status.
 
 - **Generation.** `SecurityStore::generate_recovery_codes(user_id, now)` mints
   ten CSPRNG codes, each 80 bits of entropy (10 octets) Base32-encoded (RFC 4648,
@@ -427,7 +426,33 @@ is therefore a standalone library function for now, not yet called by
   set: within one Immediate transaction it `DELETE`s all of the user's existing
   rows, then inserts the new digests — so regenerating invalidates the entire old
   set. The plaintext codes are returned **exactly once** for the caller to
-  display; they are never stored or returned again.
+  display; they are never stored, logged, or returned again. The batch-building
+  and transactional-replacement steps are shared helpers
+  (`build_recovery_code_entries` / `replace_recovery_codes`) reused by every
+  issuing path below.
+
+- **Auto-issue on enable.** `enable_mfa(user_id, code, now)` now returns
+  `Vec<String>`: in the **same** Immediate transaction that flips MFA on, it
+  replaces the user's recovery-code set and returns the fresh plaintext, so an
+  account can never be MFA-enabled without a live backup set. `POST
+  /api/v1/auth/mfa/enable` surfaces them once as `recoveryCodes` alongside
+  `enabled: true`.
+
+- **Regeneration route.** `regenerate_recovery_codes(user_id, code, now)` mirrors
+  `disable_mfa`'s re-auth: MFA must be enabled and the caller must submit a fresh,
+  non-replayed TOTP step (consumed by bumping `last_used_step` in the same
+  transaction that replaces the set), else `InvalidMfa`. `POST
+  /api/v1/auth/mfa/recovery-codes/regenerate` returns the new `recoveryCodes` once
+  and invalidates the prior set. The route is classified `NonDemoUser` (exactly
+  like the sibling `mfa/setup|enable|disable` routes) and is **caller-scoped**:
+  the handler operates only on `AuthContext.user_id`, never a request-supplied
+  identifier — the `MfaCodeRequest` body carries only `code` and rejects unknown
+  fields, so a caller cannot target another account.
+
+- **Status count.** `GET /api/v1/auth/me` reports `mfa: { enabled,
+  recoveryCodesRemaining }` (from `mfa_is_enabled` + `remaining_recovery_codes`)
+  so a UI can warn when codes run low. Only the count is exposed here — never the
+  plaintext codes.
 
 - **Hashed storage.** Only the SHA-256 digest of each code is persisted, in the
   new `security_recovery_codes` table, via the same `token_digest` helper used
@@ -478,7 +503,17 @@ a working session, single-use consumption (a spent code is refused a second
 time), that a failed recovery attempt feeds the shared MFA lockout to the point
 of account lockout, that regenerating invalidates the entire prior set while the
 new set works, that codes are inert while MFA is disabled, and that a valid code
-never bypasses a wrong password. HTTP
+never bypasses a wrong password. Slice-2 store tests additionally prove
+`enable_mfa` auto-issues ten live codes, and that `regenerate_recovery_codes`
+requires a fresh (non-replayed) TOTP, refuses a malformed code, requires MFA to
+be enabled, and swaps the set. HTTP recovery-code tests (in `security_http.rs`,
+alongside the TOTP MFA flow) drive the full wire path: enabling MFA returns ten
+codes that authenticate at the login MFA step, the regenerate route requires a
+fresh TOTP and its new set logs in while the old set no longer does, `GET
+/auth/me` reflects the remaining count decrementing after a code is consumed at
+login, and the routes reject unauthenticated callers (`401`) and stay scoped to
+the caller (another user's set is untouched; a body naming another user is
+rejected). HTTP
 coverage proves the public/private policy split, Java response shapes,
 administrator activation, post-activation login, preference persistence, and
 initial-setup completion against the real processing router. Bulk-invite HTTP
