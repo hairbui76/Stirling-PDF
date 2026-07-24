@@ -410,18 +410,75 @@ cache in the id-token verifier, and durable (cross-process) `state` storage —
 the store is in-memory, so pending logins do not survive a restart, which is
 acceptable for the short bounded TTL of an in-flight login handshake.
 
+## MFA recovery codes (backup codes)
+
+Net-new hardening with no Java equivalent, complementing the existing TOTP MFA:
+recovery codes let a user whose authenticator is unavailable still complete the
+second factor. This is **slice 1 — store functions plus login integration only;
+there are no HTTP routes yet** (exposing generation/consumption on the wire, and
+auto-issuing a set when MFA is first enabled, are slice 2). `generate_recovery_codes`
+is therefore a standalone library function for now, not yet called by
+`enable_mfa`.
+
+- **Generation.** `SecurityStore::generate_recovery_codes(user_id, now)` mints
+  ten CSPRNG codes, each 80 bits of entropy (10 octets) Base32-encoded (RFC 4648,
+  the same alphabet as the TOTP seed) and dash-grouped into four four-character
+  groups for transcription (e.g. `AB2C-D3EF-GH4J-K5MN`). It replaces any prior
+  set: within one Immediate transaction it `DELETE`s all of the user's existing
+  rows, then inserts the new digests — so regenerating invalidates the entire old
+  set. The plaintext codes are returned **exactly once** for the caller to
+  display; they are never stored or returned again.
+
+- **Hashed storage.** Only the SHA-256 digest of each code is persisted, in the
+  new `security_recovery_codes` table, via the same `token_digest` helper used
+  for API-key and invite secrets (recovery codes are high-entropy, so SHA-256,
+  not BCrypt). Codes are canonicalized before hashing (dashes/spaces dropped,
+  letters upper-cased), so display grouping and casing do not affect matching.
+
+- **Single-use consumption.** `verify_and_consume_recovery_code(user_id,
+  submitted, now)` SHA-256s the normalized input and runs
+  `UPDATE security_recovery_codes SET consumed_at = ? WHERE user_id = ? AND
+  code_hash = ? AND consumed_at IS NULL` inside an Immediate transaction, treating
+  rows-affected == 1 as success and rolling back otherwise. This mirrors the TOTP
+  `last_used_step` guard exactly, so a code can never be spent twice even under
+  concurrent login attempts. `remaining_recovery_codes(user_id)` reports the
+  unconsumed count.
+
+- **Login substitution.** `authenticate_login` runs the password stage **first**
+  and reaches the recovery path only when MFA is **enabled** for the user. When
+  the submitted `mfa_code` is not a valid, non-replayed TOTP step, it is tried as
+  a single-use recovery code *before* the failure is recorded. A successful
+  consume completes login exactly as a valid TOTP would — the shared lockout
+  counter is cleared and the same `AuthContext` is returned for the caller to
+  issue a session from. A failed recovery attempt falls through to
+  `record_mfa_failure`, feeding the *same* persistent lockout counter as a failed
+  TOTP or a failed password. Consequently a recovery code is strictly a second
+  factor: it never bypasses a wrong password (the password stage rejects first),
+  never works while MFA is disabled (that path returns before any code is
+  consulted), and a consumed code never works again.
+
 ## Persistence and migration
 
 `security_users.initial_setup_completed` defaults to false. Existing Rust
 security databases receive the column through an idempotent migration.
 `security_user_settings` uses `(user_id, setting_key)` as its primary key and a
 cascading foreign key, so deleting an account also removes its preferences.
+`security_recovery_codes` is a brand-new table created in the same
+`CREATE TABLE IF NOT EXISTS` init batch (no migration needed); it carries a
+cascading `user_id` foreign key (deleting an account removes its codes), a
+`UNIQUE` `code_hash`, and a `user_id` index.
 
 ## Verification
 
 Store tests cover disabled registration, case-insensitive duplicates, username
 validation, durable settings replacement, initial-setup persistence, legacy
-schema migration, input limits, and the transactional five-user ceiling. HTTP
+schema migration, input limits, and the transactional five-user ceiling. MFA
+recovery-code store tests prove a generated code substitutes for TOTP and issues
+a working session, single-use consumption (a spent code is refused a second
+time), that a failed recovery attempt feeds the shared MFA lockout to the point
+of account lockout, that regenerating invalidates the entire prior set while the
+new set works, that codes are inert while MFA is disabled, and that a valid code
+never bypasses a wrong password. HTTP
 coverage proves the public/private policy split, Java response shapes,
 administrator activation, post-activation login, preference persistence, and
 initial-setup completion against the real processing router. Bulk-invite HTTP

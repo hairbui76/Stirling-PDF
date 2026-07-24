@@ -8,7 +8,7 @@
 //! the surrounding middleware and route set pass security review.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     path::Path,
     sync::{
@@ -20,6 +20,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{DEFAULT_COST, hash, verify};
+use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt as _;
 use rusqlite::{
@@ -57,6 +58,12 @@ const MAX_ROLE_BYTES: usize = 64;
 const MAX_AUDIT_VALUE_BYTES: usize = 512;
 const MAX_FAILED_LOGINS: i64 = 5;
 const LOCKOUT_SECONDS: i64 = 15 * 60;
+// MFA backup codes: a fresh set replaces any prior one. Each code carries 80
+// bits of CSPRNG entropy (10 octets -> 16 Base32 characters), grouped for
+// human transcription and stored only as its SHA-256 digest.
+const RECOVERY_CODE_COUNT: usize = 10;
+const RECOVERY_CODE_BYTES: usize = 10;
+const RECOVERY_CODE_GROUP: usize = 4;
 const ACCESS_TOKEN_PREFIX: &str = "spdf_at_";
 const REFRESH_TOKEN_PREFIX: &str = "spdf_rt_";
 const API_KEY_PREFIX: &str = "spdf_ak_";
@@ -1734,7 +1741,10 @@ impl SecurityStore {
     }
 
     /// Verifies password and, when enabled, a non-replayed TOTP step before
-    /// returning a login context. Failed TOTP codes participate in the same
+    /// returning a login context. When the submitted code is not a valid TOTP
+    /// step it is tried as a single-use recovery (backup) code, which is only
+    /// honored while MFA is enabled and only after the password stage succeeds.
+    /// Failed TOTP and failed recovery attempts alike participate in the same
     /// persistent lockout counter as password failures.
     ///
     /// # Errors
@@ -1766,6 +1776,17 @@ impl SecurityStore {
         let step = match self.validated_mfa_step(context.user_id, &mfa, code, now) {
             Ok(step) => step,
             Err(SecurityError::InvalidMfa) => {
+                // The submitted value was not a valid TOTP step. Before failing,
+                // try it as a single-use recovery code (reached only because
+                // MFA is enabled and the password stage already succeeded). A
+                // successful consume completes login exactly like a valid TOTP:
+                // clear the lockout counter and return the same context, leaving
+                // session issuance to the caller. A failed attempt falls through
+                // to the shared MFA lockout, identical to a failed TOTP.
+                if self.verify_and_consume_recovery_code(context.user_id, code, now)? {
+                    self.clear_login_failures(&context.username)?;
+                    return Ok(context);
+                }
                 self.record_mfa_failure(&context.username, now)?;
                 return Err(SecurityError::InvalidMfa);
             }
@@ -1962,6 +1983,101 @@ impl SecurityStore {
     /// Returns an error when persistent state is unavailable.
     pub fn mfa_is_enabled(&self, user_id: i64) -> Result<bool, SecurityError> {
         Ok(self.read_mfa(user_id)?.is_some_and(|mfa| mfa.enabled))
+    }
+
+    /// Issues a fresh set of single-use MFA recovery codes, invalidating any
+    /// previously generated set for the user. The plaintext codes are returned
+    /// exactly once for the caller to display; only their SHA-256 digests are
+    /// persisted, so the set can never be recovered later — only regenerated.
+    ///
+    /// This is a standalone library function: it does not itself require MFA to
+    /// be enabled, but the codes are only ever honored by the login path while
+    /// MFA is enabled (see `authenticate_login`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn generate_recovery_codes(
+        &self,
+        user_id: i64,
+        now: i64,
+    ) -> Result<Vec<String>, SecurityError> {
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(RECOVERY_CODE_COUNT);
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(RECOVERY_CODE_COUNT);
+        while entries.len() < RECOVERY_CODE_COUNT {
+            let code = generate_recovery_code();
+            let digest = token_digest(&normalize_recovery_code(&code));
+            // Guard against the (astronomically unlikely) intra-batch digest
+            // collision so every INSERT can rely on the UNIQUE constraint.
+            if seen.insert(digest.clone()) {
+                entries.push((code, digest));
+            }
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM security_recovery_codes WHERE user_id = ?1",
+            [user_id],
+        )?;
+        for (_, digest) in &entries {
+            transaction.execute(
+                "INSERT INTO security_recovery_codes (user_id, code_hash, created_at, consumed_at)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params![user_id, digest, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(entries.into_iter().map(|(code, _)| code).collect())
+    }
+
+    /// Atomically consumes a single unused recovery code for the user. Returns
+    /// `true` when exactly one matching unconsumed code was marked used, `false`
+    /// when no live code matched (unknown, already consumed, or wrong user).
+    ///
+    /// The consume runs in an Immediate transaction with a rows-affected == 1
+    /// guard, mirroring the TOTP `last_used_step` bump, so a code can never be
+    /// spent twice even under concurrent login attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn verify_and_consume_recovery_code(
+        &self,
+        user_id: i64,
+        submitted: &str,
+        now: i64,
+    ) -> Result<bool, SecurityError> {
+        let digest = token_digest(&normalize_recovery_code(submitted));
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE security_recovery_codes SET consumed_at = ?1
+             WHERE user_id = ?2 AND code_hash = ?3 AND consumed_at IS NULL",
+            params![now, user_id, digest],
+        )?;
+        if updated != 1 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Reports how many of the user's recovery codes remain unconsumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state is unavailable.
+    pub fn remaining_recovery_codes(&self, user_id: i64) -> Result<i64, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM security_recovery_codes
+                 WHERE user_id = ?1 AND consumed_at IS NULL",
+                [user_id],
+                |row| row.get(0),
+            )
+            .map_err(SecurityError::from)
     }
 
     /// Lists teams with live member counts for administrator views.
@@ -5552,7 +5668,15 @@ fn initialize_user_security_schema(connection: &Connection) -> Result<(), Securi
              setting_key TEXT NOT NULL,
              setting_value TEXT NOT NULL,
              PRIMARY KEY(user_id, setting_key)
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS security_recovery_codes (
+             user_id INTEGER NOT NULL REFERENCES security_users(user_id) ON DELETE CASCADE,
+             code_hash BLOB NOT NULL UNIQUE,
+             created_at INTEGER NOT NULL,
+             consumed_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS security_recovery_codes_user_idx
+             ON security_recovery_codes(user_id);",
     )?;
     Ok(())
 }
@@ -6022,6 +6146,31 @@ fn validate_token(token: &str, prefix: &str) -> Result<(), SecurityError> {
 
 fn token_digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// Produces one human-typeable recovery code: CSPRNG octets Base32-encoded
+/// (RFC 4648 alphabet, matching the TOTP-seed convention) and dash-grouped for
+/// transcription, e.g. `AB2C-D3EF-GH4J-K5MN`.
+fn generate_recovery_code() -> String {
+    let mut bytes = [0_u8; RECOVERY_CODE_BYTES];
+    rand::rng().fill(&mut bytes);
+    let encoded = BASE32_NOPAD.encode(&bytes);
+    encoded
+        .as_bytes()
+        .chunks(RECOVERY_CODE_GROUP)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Canonicalizes a recovery code for hashing so display grouping and casing do
+/// not affect matching: dashes, spaces, and any other non-alphanumeric input
+/// are dropped and letters are upper-cased before the SHA-256 digest is taken.
+fn normalize_recovery_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -6793,6 +6942,230 @@ mod tests {
             Err(SecurityError::MfaAlreadyEnabled)
         ));
         drop(secret);
+        Ok(())
+    }
+
+    fn store_with_mfa_admin() -> Result<(SecurityStore, i64), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let context =
+            store.authenticate_password("admin", "test-only-password", 1_000, "mfa-setup")?;
+        let secret = store.begin_mfa_setup(context.user_id, 1_001)?;
+        let enable_time = 30_000;
+        let enable_code = totp_code_at(&secret, enable_time).ok_or("missing TOTP")?;
+        store.enable_mfa(context.user_id, &enable_code, enable_time)?;
+        drop(secret);
+        Ok((store, context.user_id))
+    }
+
+    fn admin_failure_count(store: &SecurityStore) -> Result<i64, Box<dyn std::error::Error>> {
+        let count = store.lock()?.query_row(
+            "SELECT COALESCE(
+                 (SELECT failure_count FROM security_login_attempts
+                  WHERE username_norm = 'admin'),
+                 0
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    #[test]
+    fn recovery_code_substitutes_for_totp_and_issues_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, user_id) = store_with_mfa_admin()?;
+        let codes = store.generate_recovery_codes(user_id, 40_000)?;
+        assert_eq!(codes.len(), 10);
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        // No TOTP is supplied; the recovery code is submitted in its place and
+        // must complete login exactly as a valid TOTP would, yielding a context
+        // from which a real session can be issued.
+        let context = store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(codes[0].as_str()),
+            60_000,
+            "recovery-login",
+        )?;
+        let tokens =
+            store.issue_session(&context, 60_000, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL)?;
+        assert!(tokens.access_token.starts_with("spdf_at_"));
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_code_is_single_use() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, user_id) = store_with_mfa_admin()?;
+        let codes = store.generate_recovery_codes(user_id, 40_000)?;
+
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(codes[0].as_str()),
+            60_000,
+            "first",
+        )?;
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
+
+        // The same code must never authenticate a second time.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "test-only-password",
+                Some(codes[0].as_str()),
+                60_030,
+                "replay",
+            ),
+            Err(SecurityError::InvalidMfa)
+        ));
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_recovery_code_feeds_the_shared_mfa_lockout() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (store, user_id) = store_with_mfa_admin()?;
+        let codes = store.generate_recovery_codes(user_id, 40_000)?;
+        assert_eq!(admin_failure_count(&store)?, 0);
+
+        // A single wrong recovery code is rejected, counted against the shared
+        // lockout, and consumes nothing.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "test-only-password",
+                Some("AAAA-AAAA-AAAA-AAAA"),
+                60_000,
+                "wrong-recovery",
+            ),
+            Err(SecurityError::InvalidMfa)
+        ));
+        assert_eq!(admin_failure_count(&store)?, 1);
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        // Drive the same counter to the lockout threshold (constant `now`, so
+        // the failures accumulate rather than resetting).
+        for _ in 1..5 {
+            assert!(matches!(
+                store.authenticate_login(
+                    "admin",
+                    "test-only-password",
+                    Some("AAAA-AAAA-AAAA-AAAA"),
+                    60_000,
+                    "wrong-recovery",
+                ),
+                Err(SecurityError::InvalidMfa)
+            ));
+        }
+        assert_eq!(admin_failure_count(&store)?, 5);
+
+        // Locked: even a genuine recovery code is refused at the password
+        // stage's lock gate, so it is never consumed.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "test-only-password",
+                Some(codes[0].as_str()),
+                60_000,
+                "locked",
+            ),
+            Err(SecurityError::AccountLocked)
+        ));
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn regenerating_recovery_codes_invalidates_the_prior_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, user_id) = store_with_mfa_admin()?;
+        let first = store.generate_recovery_codes(user_id, 40_000)?;
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        let second = store.generate_recovery_codes(user_id, 41_000)?;
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        // A code from the superseded set no longer authenticates.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "test-only-password",
+                Some(first[0].as_str()),
+                60_000,
+                "stale",
+            ),
+            Err(SecurityError::InvalidMfa)
+        ));
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        // A code from the current set does, and decrements the remaining count.
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(second[0].as_str()),
+            60_030,
+            "fresh",
+        )?;
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_code_is_inert_when_mfa_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "test-only-password")?);
+        let context = store.authenticate_password("admin", "test-only-password", 1_000, "setup")?;
+        // Codes exist, but MFA is never enabled for this user.
+        let codes = store.generate_recovery_codes(context.user_id, 40_000)?;
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 10);
+
+        // Password alone authenticates (no second factor is required), and the
+        // recovery code passed in the mfa_code slot is never consulted, so it
+        // stays unconsumed.
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(codes[0].as_str()),
+            60_000,
+            "no-mfa",
+        )?;
+        assert_eq!(store.remaining_recovery_codes(context.user_id)?, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_code_does_not_bypass_a_wrong_password() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, user_id) = store_with_mfa_admin()?;
+        let codes = store.generate_recovery_codes(user_id, 40_000)?;
+
+        // Wrong password + a valid recovery code is rejected at the password
+        // stage, before any second-factor logic runs, so the code is untouched.
+        assert!(matches!(
+            store.authenticate_login(
+                "admin",
+                "wrong-password",
+                Some(codes[0].as_str()),
+                60_000,
+                "wrong-password",
+            ),
+            Err(SecurityError::InvalidCredentials)
+        ));
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 10);
+
+        // The very same code still authenticates once the correct password is
+        // supplied, proving the rejected attempt neither consumed nor spent it.
+        store.authenticate_login(
+            "admin",
+            "test-only-password",
+            Some(codes[0].as_str()),
+            60_030,
+            "correct-password",
+        )?;
+        assert_eq!(store.remaining_recovery_codes(user_id)?, 9);
         Ok(())
     }
 
