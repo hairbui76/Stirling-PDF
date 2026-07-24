@@ -193,10 +193,23 @@ fn host_is_reserved_ip_literal(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
-    match unbracketed.parse::<IpAddr>() {
-        Ok(IpAddr::V4(address)) => ipv4_is_reserved(address),
-        Ok(IpAddr::V6(address)) => ipv6_is_reserved(address),
-        Err(_) => false,
+    unbracketed.parse::<IpAddr>().is_ok_and(ip_addr_is_reserved)
+}
+
+/// True when `address` — a concrete IP, whether a literal or one a hostname was
+/// resolved to — falls in any of the private/reserved ranges enumerated by
+/// [`ipv4_is_reserved`]/[`ipv6_is_reserved`].
+///
+/// Exposed `pub(crate)` so a caller that has *already resolved* a hostname to
+/// concrete addresses can vet each one against the exact same predicate rather
+/// than reimplementing it. In particular [`crate::oidc_live_token`]'s live token
+/// fetch uses this to reject a domain name that resolves into these ranges — the
+/// DNS-based SSRF hole that [`host_is_reserved_ip_literal`]'s literal-only check
+/// (documented on [`validated_endpoint_url`]) deliberately leaves open.
+pub(crate) fn ip_addr_is_reserved(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => ipv4_is_reserved(address),
+        IpAddr::V6(address) => ipv6_is_reserved(address),
     }
 }
 

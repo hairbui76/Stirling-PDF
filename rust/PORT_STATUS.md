@@ -458,10 +458,19 @@ now builds the token-exchange request (RFC 6749 §4.1.3 `grant_type=authorizatio
 the public-client PKCE case — constructed, not sent, since the live fetch is SSRF-gated and a later
 slice) and parses the token response into typed success/error/malformed shapes, enforcing OIDC
 Core's `id_token`-required rule and classifying fail-closed (a contradictory or nonconformant body
-is rejected, never mis-accepted). No route calls any of these modules yet, and neither the live
-token fetch, the `id_token` verification (signature/issuer/audience/nonce), the callback route, nor
-session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to the caller
-with no persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
+is rejected, never mis-accepted). `oidc_live_token` performs the actual token exchange SSRF-safely:
+it resolves the `token_endpoint` host, rejects before connecting if ANY resolved address is
+reserved/private (reusing the same reviewed reserved-IP predicate as discovery — now shared via a
+`pub(crate) ip_addr_is_reserved`, a pure extraction verified to leave all 19 discovery SSRF tests
+green), then pins the vetted address via `resolve_to_addrs` so the live TCP connection cannot be
+re-resolved (anti DNS-rebinding). This closes the DNS-name→private-IP hole for the token-fetch path
+(discovery-time validation remains literal-IP-only, a separate path). One known residual, documented
+and to be hardened before a route wires this live: the reserved check is gated to `https`, so an
+`http://localhost`-style `token_endpoint` (which the shared scheme policy still admits) reaches
+loopback — a bounded loopback-only SSRF, not arbitrary internal hosts. No route calls any of these
+modules yet, and neither the `id_token` verification (signature/issuer/audience/nonce), the callback
+route, nor session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to
+the caller with no persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,

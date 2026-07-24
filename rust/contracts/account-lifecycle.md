@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (discovery + authorization-redirect + token request/response construction only — not a login flow yet)
+## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange only — not a login flow yet)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -107,10 +107,14 @@ delivers:
 - The check is literal-address-only (no DNS lookup), so a domain name that
   resolves to any of the ranges above — including one that resolves
   differently at validation time than at the real connect time (DNS
-  rebinding) — is not caught by anything in this module today. That is a
-  documented gap for whoever wires the next OIDC ticket's real network fetch
-  against `jwks_uri` to close, most likely by pinning the resolved address
-  between validation and the real request rather than re-resolving.
+  rebinding) — is not caught by anything *in this discovery module*. The live
+  token-endpoint fetch closes exactly this hole on its own path (see
+  `oidc_live_token` below): it resolves the host, rejects if any resolved
+  address is reserved, and pins the vetted address for the actual connect.
+  This discovery-time check stays literal-only by design (it's a cheap
+  structural screen of an untrusted document, not a network operation); any
+  future live fetch of `jwks_uri` still needs the same resolve-and-pin
+  treatment `oidc_live_token` applies to `token_endpoint`.
 - NAT64's *Network-Specific Prefixes* (RFC 6052 section 2.2 also permits an
   operator to embed IPv4 addresses under a prefix of their own choosing,
   instead of the fixed Well-Known/Local-Use prefixes above) and 6rd
@@ -179,15 +183,49 @@ the OAuth2 success shape), or `Malformed` for a body that is neither a valid
 success nor a valid error. The `id_token` is extracted as an **opaque,
 unverified** string only.
 
-Still explicitly not done: the live fetch of the token endpoint (a separate,
-SSRF-gated slice — `token_endpoint`, though it comes from a validated discovery
-document, needs resolve-and-pin protection before it is POSTed to), `id_token`
-signature/issuer/audience/expiry/`nonce` verification, confidential-client
+`oidc_live_token` is the slice that actually sends that request — the first
+live network call of the arc, and the first to a provider-controlled URL, so it
+is SSRF-gated. `exchange_oidc_token` takes an `OidcTokenRequest`, POSTs its
+form body + content type to `token_endpoint` through a resolve-and-pin fetch
+primitive, and feeds the response `(status, body)` into
+`parse_oidc_token_response`, returning the typed `OidcTokenResponse` or a typed
+error (`InvalidEndpoint`, `BlockedAddress`, `Unavailable`, or a wrapped
+`OidcTokenError` carrying the provider error / missing-`id_token` /
+malformed cases from the parser).
+
+The SSRF guard is where this differs from discovery's literal-only check, and
+is deliberately stricter: `token_endpoint`, though it came from a validated
+discovery document, is still provider-controlled, and discovery's check does
+**not** catch a hostname that *resolves* into a private/reserved range. So
+before connecting, `oidc_live_token` (a) resolves the host to concrete
+address(es); (b) vets **every** resolved address against the *same*
+reserved-range predicate discovery uses — `oidc_discovery::ip_addr_is_reserved`
+was exposed `pub(crate)` and reused here, not reimplemented; (c) rejects the
+whole request before any TCP connection if *any* resolved address is reserved
+(closing the DNS-name → private-IP hole); and (d) pins those exact vetted
+addresses via `reqwest`'s `resolve_to_addrs`, so the socket cannot re-resolve
+the name to a different address between the check and the connect (anti
+DNS-rebinding / TOCTOU). It reuses discovery's other fetch conventions:
+no redirects, connect/read timeouts, and a response-size cap enforced
+independently of the advertised `Content-Length`. The reserved-IP rejection is
+gated to `https`, matching discovery's own reserved-IP check exactly — the only
+`http` target the shared scheme policy admits is a loopback literal (the
+dev/self-hosted seam), and a real spoofable provider is `https`, which gets the
+full resolve-and-pin path; the `http`-loopback allowance stays reachable so this
+is integration-testable against a loopback mock without relaxing production. Be
+precise about scope: this closes the DNS-name hole **for the token-fetch path
+only**; discovery-time endpoint validation remains a separate, literal-address
+check as described above.
+
+Still explicitly not done: `id_token`
+signature/issuer/audience/expiry/`nonce` verification (the response's `id_token`
+is still extracted as an opaque, unverified string), confidential-client
 (`client_secret`) authentication, the OAuth2 callback route, and session
 creation. There is still no generic OIDC login flow a browser could actually
 complete in Rust yet — just discovery, the authorization redirect + PKCE
-secrets, and now the token-request construction and token-response parsing that
-a later live-fetch slice will string together.
+secrets, the token-request construction and token-response parsing, and now the
+SSRF-safe live token exchange that strings them together, but with no id_token
+verification, callback, or session behind it.
 
 ## Persistence and migration
 
