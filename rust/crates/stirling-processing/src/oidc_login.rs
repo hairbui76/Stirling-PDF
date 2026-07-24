@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     oidc_authorization::{OidcAuthorizationError, build_oidc_authorization_request},
-    oidc_discovery::{OidcDiscoveryError, OidcProviderMetadata, discover_oidc_provider},
+    oidc_discovery::{OidcDiscoveryCache, OidcDiscoveryError, OidcProviderMetadata},
     oidc_id_token::{OidcIdTokenError, VerifiedOidcIdentity, verify_oidc_id_token},
     oidc_live_token::{OidcLiveTokenError, exchange_oidc_token},
     oidc_token::build_oidc_token_request,
@@ -57,6 +57,18 @@ use crate::{
 ///
 /// [`ExpiredState`]: OidcLoginError::ExpiredState
 const DEFAULT_LOGIN_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Absolute cap on the number of pending logins [`OidcLoginStateStore`] holds at
+/// once. The TTL alone bounds a *single* honest login's footprint, but nothing
+/// stops an attacker spamming `/authorize` from growing the map to
+/// (request-rate × TTL) entries between sweeps; this cap makes that growth
+/// bounded regardless of rate. A few thousand is comfortably above any plausible
+/// count of genuinely-concurrent in-flight logins (each entry is a human part-way
+/// through an `IdP` consent screen within [`DEFAULT_LOGIN_STATE_TTL`]) while
+/// keeping the worst-case memory footprint small (order of a few MB). When the
+/// store is full it **refuses** a new login rather than evicting a pending one —
+/// see [`OidcLoginStateStore::store`] for why eviction is the wrong move.
+const DEFAULT_MAX_LOGIN_STATE_ENTRIES: usize = 4_096;
 
 /// Length ceilings for the admin-configured provider fields, applied by
 /// [`OidcLoginProviderConfig::validate`]. `issuer` mirrors
@@ -95,6 +107,8 @@ impl OidcLoginProviderConfig {
     /// The issuer's *scheme/host policy* (HTTPS-first, loopback-only HTTP) is not
     /// re-checked here — [`discover_oidc_provider`] enforces it, and re-encoding
     /// that policy in a second place would risk the two drifting apart.
+    ///
+    /// [`discover_oidc_provider`]: crate::oidc_discovery::discover_oidc_provider
     ///
     /// # Errors
     ///
@@ -157,8 +171,12 @@ struct PendingLogin {
 /// - **Bounded TTL.** Entries live [`DEFAULT_LOGIN_STATE_TTL`] (tunable via
 ///   [`Self::with_ttl`]); an opportunistic sweep on each `store` keeps abandoned
 ///   logins from accumulating.
+/// - **Bounded size.** At most [`DEFAULT_MAX_LOGIN_STATE_ENTRIES`] pending logins
+///   (tunable via [`Self::with_ttl_and_capacity`]); at capacity a new [`Self::store`]
+///   is refused so `/authorize` spam can't grow the map without bound.
 pub struct OidcLoginStateStore {
     ttl: Duration,
+    max_entries: usize,
     entries: Mutex<HashMap<String, PendingLogin>>,
 }
 
@@ -169,24 +187,44 @@ impl Default for OidcLoginStateStore {
 }
 
 impl OidcLoginStateStore {
-    /// A store with the default [`DEFAULT_LOGIN_STATE_TTL`].
+    /// A store with the default [`DEFAULT_LOGIN_STATE_TTL`] and
+    /// [`DEFAULT_MAX_LOGIN_STATE_ENTRIES`].
     #[must_use]
     pub fn new() -> Self {
-        Self::with_ttl(DEFAULT_LOGIN_STATE_TTL)
+        Self::with_ttl_and_capacity(DEFAULT_LOGIN_STATE_TTL, DEFAULT_MAX_LOGIN_STATE_ENTRIES)
     }
 
-    /// A store with an explicit entry TTL (a deployment tuning knob; also lets a
-    /// test drive the expiry path deterministically with a zero TTL).
+    /// A store with an explicit entry TTL and the default size cap (a deployment
+    /// tuning knob; also lets a test drive the expiry path deterministically
+    /// with a zero TTL).
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_ttl_and_capacity(ttl, DEFAULT_MAX_LOGIN_STATE_ENTRIES)
+    }
+
+    /// A store with an explicit entry TTL and size cap. The capacity seam lets a
+    /// test force the cap small enough to exercise the at-capacity rejection
+    /// without inserting thousands of entries.
+    #[must_use]
+    pub fn with_ttl_and_capacity(ttl: Duration, max_entries: usize) -> Self {
         Self {
             ttl,
+            max_entries,
             entries: Mutex::new(HashMap::new()),
         }
     }
 
     /// Inserts a pending login under `state`, stamping its expiry from the store's
     /// TTL and opportunistically dropping any already-expired entries first.
+    ///
+    /// If the store is still at [`Self::max_entries`] capacity *after* that
+    /// sweep, a new `state` is refused with [`OidcLoginError::AtCapacity`] rather
+    /// than evicting an existing entry: every live entry is an in-flight honest
+    /// login's single-use CSRF `state`, and evicting one would silently break
+    /// that user's callback. Refusing the newcomer (which the caller surfaces as
+    /// a retryable error) is the safe direction. Replacing an *already-present*
+    /// `state` is always allowed — it doesn't grow the map — though in practice
+    /// `state` is a fresh CSPRNG value that never collides.
     fn store(&self, state: String, mut entry: PendingLogin) -> Result<(), OidcLoginError> {
         let now = Instant::now();
         entry.expires_at = now.checked_add(self.ttl).unwrap_or(now);
@@ -195,6 +233,9 @@ impl OidcLoginStateStore {
             .lock()
             .map_err(|_| OidcLoginError::StateUnavailable)?;
         entries.retain(|_, pending| pending.expires_at > now);
+        if entries.len() >= self.max_entries && !entries.contains_key(&state) {
+            return Err(OidcLoginError::AtCapacity);
+        }
         entries.insert(state, entry);
         Ok(())
     }
@@ -276,6 +317,13 @@ pub enum OidcLoginError {
     /// The state store's lock was poisoned.
     #[error("OIDC login state store is unavailable")]
     StateUnavailable,
+    /// The pending-login store is at its [`DEFAULT_MAX_LOGIN_STATE_ENTRIES`]
+    /// capacity. A new login is refused rather than evicting an in-flight honest
+    /// login's single-use `state`, so this is transient and retryable — the
+    /// authorize route maps it to the same generic 503 every other initiate
+    /// failure produces, revealing nothing about which limit was hit.
+    #[error("OIDC login state store is at capacity")]
+    AtCapacity,
     /// Authenticating the verified identity or issuing the session failed (see
     /// [`SecurityError`]).
     #[error(transparent)]
@@ -283,7 +331,8 @@ pub enum OidcLoginError {
 }
 
 /// Begins a generic-OIDC login: validates the provider config (fail-closed),
-/// discovers the provider over the SSRF-safe fetch, builds the authorization
+/// resolves the provider metadata through `discovery` (a live cached entry when
+/// one exists, otherwise the SSRF-safe discovery fetch), builds the authorization
 /// request with fresh `state`/`nonce`/PKCE secrets, **persists** the state entry
 /// (with the discovered metadata + nonce + code verifier + redirect URI + client
 /// id), and returns the authorization redirect URL and the `state`.
@@ -296,14 +345,16 @@ pub enum OidcLoginError {
 ///
 /// Returns [`OidcLoginError::InvalidProviderConfig`] for a bad config,
 /// [`OidcLoginError::Discovery`] if discovery fails,
-/// [`OidcLoginError::Authorization`] if the authorization URL can't be built, and
+/// [`OidcLoginError::Authorization`] if the authorization URL can't be built,
+/// [`OidcLoginError::AtCapacity`] if the state store is full, and
 /// [`OidcLoginError::StateUnavailable`] if the store lock is poisoned.
 pub fn initiate_oidc_login(
     provider: &OidcLoginProviderConfig,
     store: &OidcLoginStateStore,
+    discovery: &OidcDiscoveryCache,
 ) -> Result<InitiatedOidcLogin, OidcLoginError> {
     provider.validate()?;
-    let metadata = discover_oidc_provider(&provider.issuer)?;
+    let metadata = discovery.discover(&provider.issuer)?;
     let scopes: Vec<&str> = provider.scopes.iter().map(String::as_str).collect();
     let request = build_oidc_authorization_request(
         &metadata,
@@ -384,9 +435,12 @@ mod tests {
     use std::{
         io::{Read as _, Write as _},
         net::{TcpListener, TcpStream},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread::{self, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -394,12 +448,17 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey as _, traits::PublicKeyParts as _};
     use serde_json::{Value, json};
+    use zeroize::Zeroizing;
 
     use super::{
-        CompletedOidcLogin, OidcLoginError, OidcLoginProviderConfig, OidcLoginStateStore,
-        complete_oidc_login, initiate_oidc_login,
+        CompletedOidcLogin, DEFAULT_LOGIN_STATE_TTL, OidcLoginError, OidcLoginProviderConfig,
+        OidcLoginStateStore, PendingLogin, complete_oidc_login, initiate_oidc_login,
     };
-    use crate::{oidc_id_token::OidcIdTokenError, security::AuthenticationSource};
+    use crate::{
+        oidc_discovery::{OidcDiscoveryCache, OidcProviderMetadata},
+        oidc_id_token::OidcIdTokenError,
+        security::AuthenticationSource,
+    };
 
     const CLIENT_ID: &str = "oidc-login-test-client";
     const SUBJECT: &str = "oidc-subject-oidc-login-1";
@@ -480,6 +539,7 @@ mod tests {
     struct MockIdp {
         issuer: String,
         id_token_slot: Arc<Mutex<String>>,
+        discovery_hits: Arc<AtomicUsize>,
         _handle: JoinHandle<()>,
     }
 
@@ -489,6 +549,12 @@ mod tests {
             if let Ok(mut slot) = self.id_token_slot.lock() {
                 *slot = id_token;
             }
+        }
+
+        /// How many discovery-document fetches this mock has served — used to
+        /// prove the discovery cache collapses repeat initiations to one fetch.
+        fn discovery_hits(&self) -> usize {
+            self.discovery_hits.load(Ordering::SeqCst)
         }
     }
 
@@ -509,15 +575,24 @@ mod tests {
         .to_string();
         let id_token_slot = Arc::new(Mutex::new(String::new()));
         let slot_for_server = Arc::clone(&id_token_slot);
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_server = Arc::clone(&discovery_hits);
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let _ = handle_connection(&mut stream, &discovery, &jwks_json, &slot_for_server);
+                let _ = handle_connection(
+                    &mut stream,
+                    &discovery,
+                    &jwks_json,
+                    &slot_for_server,
+                    &hits_for_server,
+                );
             }
         });
         Ok(MockIdp {
             issuer,
             id_token_slot,
+            discovery_hits,
             _handle: handle,
         })
     }
@@ -527,6 +602,7 @@ mod tests {
         discovery: &str,
         jwks: &str,
         id_token_slot: &Arc<Mutex<String>>,
+        discovery_hits: &Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         // Read until the request quiesces (short read timeout) so a POST body is
         // fully drained before the response — avoids a mid-request reset. Mirrors
@@ -548,6 +624,7 @@ mod tests {
         let request = String::from_utf8_lossy(&data);
         let first_line = request.lines().next().unwrap_or("");
         let body = if first_line.starts_with("GET /.well-known/openid-configuration ") {
+            discovery_hits.fetch_add(1, Ordering::SeqCst);
             discovery.to_owned()
         } else if first_line.starts_with("GET /jwks.json ") {
             jwks.to_owned()
@@ -609,11 +686,12 @@ mod tests {
         idp: &MockIdp,
         fixture: &SigningFixture,
         store: &OidcLoginStateStore,
+        discovery: &OidcDiscoveryCache,
         security: &crate::security::SecurityStore,
         nonce_for_token: impl Fn(&str) -> String,
     ) -> Result<Result<CompletedOidcLogin, OidcLoginError>, Box<dyn std::error::Error>> {
         let provider = provider_config(&idp.issuer);
-        let initiated = initiate_oidc_login(&provider, store)?;
+        let initiated = initiate_oidc_login(&provider, store, discovery)?;
         // The state carried in the redirect URL is exactly the stored state.
         assert_eq!(
             query_param(&initiated.authorization_url, "state").as_deref(),
@@ -644,9 +722,10 @@ mod tests {
         let fixture = SigningFixture::new()?;
         let idp = start_mock_idp(fixture.jwks_json.clone())?;
         let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
         let security = crate::security::SecurityStore::in_memory()?;
 
-        let completed = run_login(&idp, &fixture, &store, &security, str::to_owned)??;
+        let completed = run_login(&idp, &fixture, &store, &discovery, &security, str::to_owned)??;
 
         // Identity + context.
         assert_eq!(completed.identity.subject, SUBJECT);
@@ -685,10 +764,11 @@ mod tests {
         let fixture = SigningFixture::new()?;
         let idp = start_mock_idp(fixture.jwks_json.clone())?;
         let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
         let security = crate::security::SecurityStore::in_memory()?;
 
         let provider = provider_config(&idp.issuer);
-        let initiated = initiate_oidc_login(&provider, &store)?;
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
         let login_nonce = query_param(&initiated.authorization_url, "nonce")
             .ok_or("authorization url has no nonce")?;
         idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
@@ -732,11 +812,12 @@ mod tests {
         let fixture = SigningFixture::new()?;
         let idp = start_mock_idp(fixture.jwks_json.clone())?;
         let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
         let security = crate::security::SecurityStore::in_memory()?;
 
         // A legitimate login is in flight...
         let provider = provider_config(&idp.issuer);
-        let initiated = initiate_oidc_login(&provider, &store)?;
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
 
         // ...but a forged callback arrives carrying a state this server never
         // issued. It is rejected as unknown BEFORE any token exchange (the CSRF
@@ -787,10 +868,11 @@ mod tests {
         let idp = start_mock_idp(fixture.jwks_json.clone())?;
         // A zero TTL: the entry is expired by the time the callback consumes it.
         let store = OidcLoginStateStore::with_ttl(Duration::from_secs(0));
+        let discovery = OidcDiscoveryCache::new();
         let security = crate::security::SecurityStore::in_memory()?;
 
         let provider = provider_config(&idp.issuer);
-        let initiated = initiate_oidc_login(&provider, &store)?;
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
         // No id token need be prepared: consume rejects before any network call.
         let result = complete_oidc_login(
             &initiated.state,
@@ -808,6 +890,151 @@ mod tests {
         Ok(())
     }
 
+    // ---- state-store size cap ----------------------------------------------
+
+    /// A throwaway pending login for the store-level cap test, so it can be
+    /// driven without standing up a mock `IdP` or a real discovery/token flow.
+    fn dummy_pending() -> PendingLogin {
+        PendingLogin {
+            nonce: "nonce".to_owned(),
+            code_verifier: Zeroizing::new("code-verifier".to_owned()),
+            redirect_uri: "http://127.0.0.1/login/oauth2/code/oidc".to_owned(),
+            provider: OidcProviderMetadata {
+                issuer: "https://issuer.example.test".to_owned(),
+                authorization_endpoint: "https://issuer.example.test/authorize".to_owned(),
+                token_endpoint: "https://issuer.example.test/token".to_owned(),
+                jwks_uri: "https://issuer.example.test/jwks.json".to_owned(),
+            },
+            client_id: CLIENT_ID.to_owned(),
+            expires_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn the_state_store_refuses_new_entries_at_capacity_and_recovers_after_a_consume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A tiny cap (2) makes the boundary trivial to reach directly, without
+        // inserting thousands of entries.
+        let store = OidcLoginStateStore::with_ttl_and_capacity(DEFAULT_LOGIN_STATE_TTL, 2);
+        store.store("state-1".to_owned(), dummy_pending())?;
+        store.store("state-2".to_owned(), dummy_pending())?;
+
+        // At capacity (2/2) a THIRD distinct state is refused — the two
+        // in-flight logins are left untouched rather than one being evicted.
+        assert!(
+            matches!(
+                store.store("state-3".to_owned(), dummy_pending()),
+                Err(OidcLoginError::AtCapacity)
+            ),
+            "a new state at capacity must be refused, not admitted by eviction"
+        );
+        assert_eq!(
+            store.len(),
+            2,
+            "the refused store must not disturb existing entries"
+        );
+
+        // Consuming one frees a slot, after which a new store succeeds again.
+        store.consume("state-1")?;
+        store.store("state-3".to_owned(), dummy_pending())?;
+        assert_eq!(store.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn at_capacity_a_new_initiation_is_rejected_until_a_slot_is_freed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        // A cap of one pending login makes the boundary trivial to hit through
+        // the real `initiate_oidc_login` path.
+        let store = OidcLoginStateStore::with_ttl_and_capacity(DEFAULT_LOGIN_STATE_TTL, 1);
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+        let provider = provider_config(&idp.issuer);
+
+        // The first login fills the single slot.
+        let first = initiate_oidc_login(&provider, &store, &discovery)?;
+        assert_eq!(store.len(), 1);
+
+        // The second is rejected as AtCapacity — evicting `first` would destroy
+        // an in-flight honest user's CSRF state, so the store refuses instead.
+        let rejected = initiate_oidc_login(&provider, &store, &discovery);
+        assert!(
+            matches!(rejected, Err(OidcLoginError::AtCapacity)),
+            "at capacity a new initiation must be rejected, got {:?}",
+            rejected.as_ref().err()
+        );
+        // The already-in-flight login is untouched.
+        assert_eq!(store.len(), 1);
+
+        // Completing the first login frees its slot...
+        let login_nonce = query_param(&first.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
+        complete_oidc_login(
+            &first.state,
+            "auth-code-xyz",
+            &store,
+            &security,
+            NOW,
+            "corr-oidc",
+        )?;
+        assert_eq!(store.len(), 0);
+
+        // ...so a fresh initiation succeeds again.
+        initiate_oidc_login(&provider, &store, &discovery)?;
+        assert_eq!(store.len(), 1);
+        Ok(())
+    }
+
+    // ---- discovery metadata cache ------------------------------------------
+
+    #[test]
+    fn repeated_initiations_for_one_issuer_share_a_single_discovery_fetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let provider = provider_config(&idp.issuer);
+
+        let first = initiate_oidc_login(&provider, &store, &discovery)?;
+        let second = initiate_oidc_login(&provider, &store, &discovery)?;
+
+        // Two distinct pending logins (distinct CSPRNG `state`)...
+        assert_ne!(first.state, second.state);
+        // ...but only ONE outbound discovery fetch: the second reused the cache.
+        assert_eq!(
+            idp.discovery_hits(),
+            1,
+            "the second initiation for the same issuer must reuse the cached discovery"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_the_discovery_cache_disabled_each_initiation_refetches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        // A zero-TTL cache disables caching — the red control proving the cache
+        // above is what collapses the fetch count, not some other coincidence.
+        let discovery = OidcDiscoveryCache::with_ttl_and_capacity(Duration::from_secs(0), 64);
+        let provider = provider_config(&idp.issuer);
+
+        initiate_oidc_login(&provider, &store, &discovery)?;
+        initiate_oidc_login(&provider, &store, &discovery)?;
+
+        assert_eq!(
+            idp.discovery_hits(),
+            2,
+            "with caching disabled each initiation must refetch discovery"
+        );
+        Ok(())
+    }
+
     // ---- nonce mismatch end-to-end -----------------------------------------
 
     #[test]
@@ -816,13 +1043,19 @@ mod tests {
         let fixture = SigningFixture::new()?;
         let idp = start_mock_idp(fixture.jwks_json.clone())?;
         let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
         let security = crate::security::SecurityStore::in_memory()?;
 
         // The IdP returns an otherwise-valid id token, but its `nonce` is NOT the
         // one this login generated — the replay-binding check must reject it.
-        let result = run_login(&idp, &fixture, &store, &security, |_login_nonce| {
-            "a-different-nonce-not-the-login-one-00000000".to_owned()
-        })?;
+        let result = run_login(
+            &idp,
+            &fixture,
+            &store,
+            &discovery,
+            &security,
+            |_login_nonce| "a-different-nonce-not-the-login-one-00000000".to_owned(),
+        )?;
         assert!(
             matches!(
                 result,

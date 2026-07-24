@@ -284,8 +284,8 @@ systems.
   id, empty/unparseable redirect URI, or a whitespace-bearing scope), called at
   the top of `initiate_oidc_login`.
 
-- **Single-use, TTL-bounded `state` store.** `OidcLoginStateStore` is an
-  in-memory `Mutex<HashMap>` over a monotonic `Instant` clock, modeled on
+- **Single-use, TTL-bounded, size-capped `state` store.** `OidcLoginStateStore`
+  is an in-memory `Mutex<HashMap>` over a monotonic `Instant` clock, modeled on
   `mobile_scanner`'s session store, keyed by the CSPRNG `state` and holding one
   pending login's `nonce`, PKCE `code_verifier`, `redirect_uri`, the discovered
   `OidcProviderMetadata` (so the callback uses the exact endpoints discovered at
@@ -297,7 +297,18 @@ systems.
   rejection **is** the CSRF defense: because `state` is CSPRNG and only a login
   this server actually started has a matching live entry, a forged/replayed
   callback resolves to nothing. (A store `store` also opportunistically sweeps
-  expired entries so abandoned logins can't accumulate.)
+  expired entries so abandoned logins can't accumulate.) The store is also
+  **size-capped** at `DEFAULT_MAX_LOGIN_STATE_ENTRIES` (4 096) pending logins:
+  the TTL bounds one honest login's footprint, but nothing stops an attacker
+  spamming `/authorize` from growing the map to (rate × TTL) entries between
+  sweeps, so after the opportunistic sweep, if the store is still full, a *new*
+  `state` is refused with `AtCapacity` rather than evicting an in-flight entry
+  (evicting one would silently destroy an honest user's single-use CSRF state).
+  `AtCapacity` is transient/retryable and, like every other `initiate` failure,
+  collapses to the authorize route's generic `503` (see below) — leaking neither
+  the stage nor the limit. The cap (a few thousand) sits far above any plausible
+  count of genuinely-concurrent in-flight logins while keeping the worst-case
+  footprint to a few MB; it is tunable via the `with_ttl_and_capacity` seam.
 
 - **`authenticate_oidc_identity`.** A sibling to
   `authenticate_supabase_identity` on `SecurityStore` that maps a
@@ -314,10 +325,11 @@ systems.
   an issuer and a subject (i.e. are the same account at the same provider). The
   id-token verifier gained an optional bounded `sid` claim to feed this mapping.
 
-- **Orchestration.** `initiate_oidc_login(provider, store)` validates the config,
-  discovers the provider (SSRF-safe), builds the authorization request
-  (`state`/`nonce`/PKCE), **stores** the state entry, and returns the
-  authorization redirect URL + `state`. `complete_oidc_login(state, code, store,
+- **Orchestration.** `initiate_oidc_login(provider, store, discovery)` validates
+  the config, resolves the provider metadata through `discovery` (see the
+  discovery cache below), builds the authorization request (`state`/`nonce`/PKCE),
+  **stores** the state entry, and returns the authorization redirect URL +
+  `state`. `complete_oidc_login(state, code, store,
   security, now, correlation_id)` **consumes** the state entry (rejecting
   unknown/expired before any network call — the CSRF/single-use gate), exchanges
   the code at the stored `token_endpoint` with the stored PKCE verifier, verifies
@@ -327,15 +339,37 @@ systems.
   access/refresh TTLs) — returning the session tokens, the `AuthContext`, and the
   verified identity.
 
+- **Discovery metadata cache.** `OidcDiscoveryCache` (in `oidc_discovery`) is a
+  bounded, TTL'd `Mutex<HashMap>` of `OidcProviderMetadata` keyed by issuer,
+  built once and shared behind an `Arc` alongside the state store. Without it,
+  every `/authorize` did a fresh outbound `.well-known/openid-configuration`
+  fetch — an amplification vector toward the configured `IdP` and a
+  `spawn_blocking` thread held per call. `discover(issuer)` serves a live cached
+  entry when one exists and otherwise falls through to the **unchanged**,
+  SSRF-safe `discover_oidc_provider` (a cached entry is therefore always one that
+  already passed every issuer/endpoint check — caching never bypasses those
+  protections); the network fetch runs *outside* the lock, so a slow/unreachable
+  `IdP` can't wedge the mutex (at the cost of a bounded cold-start thundering
+  herd of concurrent misses for one issuer, each doing a real fetch). TTL is
+  `DEFAULT_DISCOVERY_CACHE_TTL` (5 min) with a `DEFAULT_DISCOVERY_CACHE_MAX_ENTRIES`
+  (64) issuer cap; both are tunable via `with_ttl_and_capacity`. **Staleness
+  tradeoff:** if a provider rotates an `authorization_endpoint`/`token_endpoint`/
+  `jwks_uri` within the window, logins started during it use the previous
+  metadata until the entry expires (≤ TTL); signing-**key** rotation is
+  unaffected, since JWKS material is fetched fresh at id-token verification time,
+  not cached here. The issuer key comes from admin config, never request input,
+  so an attacker cannot push the issuer cap.
+
 - **HTTP routes.** `security_http` now exposes the two routes that put
   `initiate_oidc_login`/`complete_oidc_login` on the wire, inside the opt-in
   reviewed secured router's public auth surface:
   - `POST /api/v1/auth/oidc/authorize` calls `initiate_oidc_login` and returns
     `{ "authorizationUrl", "state" }` as JSON — consistent with the JSON bodies
     every other auth route returns (rather than emitting a `302`; turning the URL
-    into a browser redirect is the frontend's job, see below). Provider-side
-    failures (bad config, unreachable/invalid `IdP`) collapse to a generic
-    `503`, leaking no stage detail.
+    into a browser redirect is the frontend's job, see below). Every `initiate`
+    failure — a bad config, an unreachable/invalid `IdP`, or the state store
+    being momentarily at capacity (`AtCapacity`) — collapses to the same generic
+    retryable `503`, leaking neither which stage failed nor which limit was hit.
   - `GET /api/v1/auth/oidc/callback?code=…&state=…` calls `complete_oidc_login`
     and, on success, returns the session **exactly** as `POST /api/v1/auth/login`
     does — the same `{ user, session }` `AuthenticationResponse` shape with the
@@ -349,10 +383,12 @@ systems.
     retryable `503`s.
   Both routes are **public** (the browser has no session yet), classified in
   `security_policy::endpoint_policy` — `authorize` on `POST`, `callback` on
-  `GET`, on those verbs only. The single-use `OidcLoginStateStore` is one shared
-  `Arc` built once when the secured router is assembled and handed to both routes
-  via a request extension (alongside the existing `SecurityStore`), so the state
-  `authorize` persists is the state `callback` consumes. The provider config
+  `GET`, on those verbs only. The single-use `OidcLoginStateStore` and the
+  `OidcDiscoveryCache` are each one shared `Arc` built once when the secured
+  router is assembled and handed to the routes via a request extension (alongside
+  the existing `SecurityStore`) — so the state `authorize` persists is the state
+  `callback` consumes, and repeated `authorize` calls reuse one discovery fetch.
+  The provider config
   rides on `SecurityHttpConfig::oidc_login_provider`
   (`RuntimeConfig::oidc_login_provider_config()`); when it is `None` (no
   `security.oauth2.issuer` configured) **neither route is mounted** — a request

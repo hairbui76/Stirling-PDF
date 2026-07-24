@@ -13,9 +13,11 @@
 //! validate the same discovery document.
 
 use std::{
+    collections::HashMap,
     io::Read as _,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use reqwest::{Url, blocking::Client, redirect::Policy};
@@ -28,6 +30,28 @@ const MAX_ISSUER_BYTES: usize = 2_048;
 const MAX_DISCOVERY_DOCUMENT_BYTES: u64 = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lifetime of a cached provider-metadata entry in [`OidcDiscoveryCache`].
+///
+/// A provider's discovery document is fairly static — its
+/// `authorization_endpoint`/`token_endpoint`/`jwks_uri` change only across
+/// deliberate reconfigurations — so caching for a few minutes collapses the
+/// per-`/authorize` refetch (an outbound amplification toward the `IdP` plus a
+/// `spawn_blocking` thread held for the fetch) down to at most one fetch per
+/// issuer per TTL, while keeping staleness bounded: if a provider rotates an
+/// endpoint, logins started within the window keep using the previous metadata
+/// only until the entry expires (≤ this TTL). Signing-key rotation is a
+/// *separate* concern and is unaffected — JWKS material is fetched fresh at
+/// id-token verification time, not stored here.
+const DEFAULT_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Absolute cap on the number of distinct issuers held in an
+/// [`OidcDiscoveryCache`]. A deployment configures a single OIDC issuer today,
+/// so this is generous headroom; the bound is a belt-and-braces memory guard.
+/// Unlike the login-state store's cap, this key can never be pushed by an
+/// attacker — it is the admin-configured issuer, not request input — so a full
+/// cache simply falls back to an uncached fetch rather than needing eviction.
+const DEFAULT_DISCOVERY_CACHE_MAX_ENTRIES: usize = 64;
 
 /// The subset of an OIDC provider's discovery document this codebase currently
 /// needs. Extra fields present in a real-world discovery document (e.g.
@@ -101,6 +125,117 @@ pub fn discover_oidc_provider(issuer: &str) -> Result<OidcProviderMetadata, Oidc
         token_endpoint: document.token_endpoint,
         jwks_uri: document.jwks_uri,
     })
+}
+
+/// One cached discovery result and when it stops being served.
+struct CachedProviderMetadata {
+    metadata: OidcProviderMetadata,
+    expires_at: Instant,
+}
+
+/// Bounded, TTL'd cache of discovered [`OidcProviderMetadata`], keyed by the
+/// issuer string passed to [`Self::discover`]. Repeated logins against the same
+/// configured provider reuse one discovery fetch instead of hitting the `IdP`'s
+/// `.well-known/openid-configuration` on every `/authorize`.
+///
+/// **Caching never weakens discovery.** A cache miss or an expired entry falls
+/// through to a real [`discover_oidc_provider`] call — the unchanged, SSRF-safe
+/// fetch-and-validate path — so a cached entry is always one that already
+/// passed every issuer/endpoint check. The network fetch runs *outside* the
+/// lock, so a slow or unreachable `IdP` cannot wedge the mutex for other
+/// issuers, at the cost of a possible thundering herd of concurrent cold-start
+/// misses for the same issuer (each does a real fetch; whichever finishes last
+/// wins the cache slot). That is a bounded, cold-start-only cost and still far
+/// cheaper than the previous fetch-on-every-call behaviour.
+///
+/// Modeled on the same `Mutex<HashMap>`-over-monotonic-`Instant` shape as
+/// [`crate::oidc_login::OidcLoginStateStore`], and — like that store — built
+/// once and shared behind an `Arc` for the lifetime of the secured router.
+pub struct OidcDiscoveryCache {
+    ttl: Duration,
+    max_entries: usize,
+    entries: Mutex<HashMap<String, CachedProviderMetadata>>,
+}
+
+impl Default for OidcDiscoveryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OidcDiscoveryCache {
+    /// A cache with the default [`DEFAULT_DISCOVERY_CACHE_TTL`] and
+    /// [`DEFAULT_DISCOVERY_CACHE_MAX_ENTRIES`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_ttl_and_capacity(
+            DEFAULT_DISCOVERY_CACHE_TTL,
+            DEFAULT_DISCOVERY_CACHE_MAX_ENTRIES,
+        )
+    }
+
+    /// A cache with an explicit TTL and capacity (a deployment tuning knob; also
+    /// lets a test force a zero TTL to disable caching, or a tiny capacity to
+    /// exercise the bound).
+    #[must_use]
+    pub fn with_ttl_and_capacity(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the metadata for `issuer`, serving a live cached copy when one
+    /// exists and otherwise performing — and caching — a fresh, SSRF-safe
+    /// [`discover_oidc_provider`] fetch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`OidcDiscoveryError`] from the underlying discovery fetch
+    /// on a cache miss or expiry. A poisoned cache lock is deliberately *not*
+    /// fatal: the fetch is still performed, so discovery degrades to uncached
+    /// rather than failing the login.
+    pub fn discover(&self, issuer: &str) -> Result<OidcProviderMetadata, OidcDiscoveryError> {
+        if let Some(cached) = self.cached_fresh(issuer) {
+            return Ok(cached);
+        }
+        // Miss or expiry: fetch OUTSIDE the lock (blocking network I/O up to
+        // REQUEST_TIMEOUT). This is the unchanged SSRF-safe validation path.
+        let metadata = discover_oidc_provider(issuer)?;
+        self.store(issuer, &metadata);
+        Ok(metadata)
+    }
+
+    /// A live (unexpired) cached copy for `issuer`, if any. A poisoned lock is
+    /// treated as a miss.
+    fn cached_fresh(&self, issuer: &str) -> Option<OidcProviderMetadata> {
+        let entries = self.entries.lock().ok()?;
+        let cached = entries.get(issuer)?;
+        (cached.expires_at > Instant::now()).then(|| cached.metadata.clone())
+    }
+
+    /// Records freshly discovered metadata under `issuer`, stamping its expiry
+    /// from the cache TTL and opportunistically dropping expired entries first.
+    /// At capacity a *new* issuer is simply not admitted (the next lookup for it
+    /// re-fetches); refreshing an already-cached issuer is always allowed since
+    /// it does not grow the map. A poisoned lock is a no-op (uncached).
+    fn store(&self, issuer: &str, metadata: &OidcProviderMetadata) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        entries.retain(|_, cached| cached.expires_at > now);
+        if entries.contains_key(issuer) || entries.len() < self.max_entries {
+            entries.insert(
+                issuer.to_owned(),
+                CachedProviderMetadata {
+                    metadata: metadata.clone(),
+                    expires_at: now.checked_add(self.ttl).unwrap_or(now),
+                },
+            );
+        }
+    }
 }
 
 /// Validates the issuer and returns it normalized (trimmed of exactly one
@@ -406,10 +541,15 @@ mod tests {
     use std::{
         io::{Read as _, Write as _},
         net::TcpListener,
-        thread,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::Duration,
     };
 
-    use super::{OidcDiscoveryError, discover_oidc_provider};
+    use super::{OidcDiscoveryCache, OidcDiscoveryError, discover_oidc_provider};
 
     /// Binds a loopback listener, builds `{"http://127.0.0.1:port", ...}` as
     /// the issuer, has `build_body` produce the discovery-document JSON to
@@ -811,5 +951,96 @@ mod tests {
                 "expected {issuer} to be rejected, got {result:?}"
             );
         }
+    }
+
+    // ---- discovery metadata cache -------------------------------------------
+
+    /// A loopback discovery server that serves the well-formed document for its
+    /// own issuer on *every* request (a persistent loop, unlike the one-shot
+    /// [`discover_against_fixture`]) and counts how many discovery fetches it
+    /// received, so a test can prove the cache collapses repeat lookups to one
+    /// outbound fetch.
+    struct CountingIdp {
+        issuer: String,
+        discovery_hits: Arc<AtomicUsize>,
+        _handle: JoinHandle<()>,
+    }
+
+    fn start_counting_idp() -> Result<CountingIdp, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let issuer = format!("http://{address}");
+        let body = well_formed_body(&issuer);
+        let discovery_hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_server = Arc::clone(&discovery_hits);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buffer = [0_u8; 2048];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                if !request.starts_with("GET /.well-known/openid-configuration ") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                hits_for_server.fetch_add(1, Ordering::SeqCst);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Ok(CountingIdp {
+            issuer,
+            discovery_hits,
+            _handle: handle,
+        })
+    }
+
+    #[test]
+    fn caches_provider_metadata_and_serves_repeat_lookups_without_refetching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let idp = start_counting_idp()?;
+        let cache = OidcDiscoveryCache::new();
+
+        let first = cache.discover(&idp.issuer)?;
+        let second = cache.discover(&idp.issuer)?;
+
+        // Same metadata both times, but the second lookup was served from the
+        // cache — only ONE outbound discovery fetch reached the IdP.
+        assert_eq!(first, second);
+        assert_eq!(
+            idp.discovery_hits.load(Ordering::SeqCst),
+            1,
+            "a second lookup for the same issuer must not refetch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disabled_cache_refetches_on_every_lookup() -> Result<(), Box<dyn std::error::Error>> {
+        let idp = start_counting_idp()?;
+        // A zero TTL disables caching (every entry is already expired by the
+        // next lookup). This is the red control for the green test above: with
+        // caching effectively off, each lookup must hit the network.
+        let cache = OidcDiscoveryCache::with_ttl_and_capacity(Duration::from_secs(0), 64);
+
+        cache.discover(&idp.issuer)?;
+        cache.discover(&idp.issuer)?;
+
+        assert_eq!(
+            idp.discovery_hits.load(Ordering::SeqCst),
+            2,
+            "with caching disabled each lookup must refetch"
+        );
+        Ok(())
     }
 }

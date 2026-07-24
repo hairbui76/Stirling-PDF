@@ -501,11 +501,15 @@ browser flow), scoped to exactly those verb+path pairs, mounted only when a prov
 (absent → 404), and a callback failure (unknown/expired/replayed state, exchange/verify/nonce
 failure) returns one generic 401 that doesn't distinguish CSRF-state-miss from verification failure.
 This completes the generic OIDC login path within the opt-in secured router (which still fails
-closed in production). Known pre-production follow-ups before that router is ever exposed: the
-public `/authorize` route's state store is TTL-bounded but has no absolute size cap, and discovery
-is refetched (uncached) per call — a size cap plus a discovery cache or `/authorize` rate-limit are
-needed before production exposure. Confidential-client `client_secret` auth, a JWKS cache, durable
-cross-process login-flow state, and the frontend redirect/cookie UX also remain. The discovery document's own returned endpoint URLs
+closed in production). The public `/authorize` route is now DoS-hardened: the login-state store has
+an absolute size cap (4096 entries; a new login is refused with a generic 503 when full, never
+evicting a pending honest login), and OIDC discovery is cached per issuer (5-min TTL, bounded)
+instead of refetched per call — so an unauthenticated flood can neither grow memory unboundedly nor
+amplify outbound fetches at the IdP. One residual before production exposure: with refuse-newcomer,
+a sustained flood that keeps the store full can make legitimate logins return a retryable 503 until
+entries expire, so a `/authorize` rate-limit is still a pre-production follow-up. Confidential-client
+`client_secret` auth, a JWKS cache, durable cross-process login-flow state, and the frontend
+redirect/cookie UX also remain. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,

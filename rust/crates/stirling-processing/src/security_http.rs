@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     license::LicenseError,
+    oidc_discovery::OidcDiscoveryCache,
     oidc_login::{
         OidcLoginError, OidcLoginProviderConfig, OidcLoginStateStore, complete_oidc_login,
         initiate_oidc_login,
@@ -353,12 +354,17 @@ pub(crate) fn secure_router_with_mail(
         license_tier: config.license_tier,
     };
     // A single shared state store, created once here so the authorize and
-    // callback routes correlate against the same pending-login table. `None`
+    // callback routes correlate against the same pending-login table, plus a
+    // single shared discovery cache so repeated `/authorize` calls reuse one
+    // provider-metadata fetch instead of re-hitting the IdP each time. `None`
     // provider config leaves the OIDC login routes unmounted (fail-closed off).
-    let oidc_login = config
-        .oidc_login_provider
-        .clone()
-        .map(|provider| (provider, Arc::new(OidcLoginStateStore::new())));
+    let oidc_login = config.oidc_login_provider.clone().map(|provider| {
+        (
+            provider,
+            Arc::new(OidcLoginStateStore::new()),
+            Arc::new(OidcDiscoveryCache::new()),
+        )
+    });
     router
         .merge(auth_routes(oidc_login))
         .layer(middleware::from_fn_with_state(
@@ -370,7 +376,13 @@ pub(crate) fn secure_router_with_mail(
         .layer(Extension(SecurityMailState { smtp }))
 }
 
-fn auth_routes(oidc_login: Option<(OidcLoginProviderConfig, Arc<OidcLoginStateStore>)>) -> Router {
+fn auth_routes(
+    oidc_login: Option<(
+        OidcLoginProviderConfig,
+        Arc<OidcLoginStateStore>,
+        Arc<OidcDiscoveryCache>,
+    )>,
+) -> Router {
     let mut router = Router::new()
         .merge(crate::security_audit_http::routes())
         .merge(crate::portal_audit::routes())
@@ -449,12 +461,13 @@ fn auth_routes(oidc_login: Option<(OidcLoginProviderConfig, Arc<OidcLoginStateSt
     // from a request extension, mirroring how every other handler reaches the
     // `SecurityStore`. Both routes are public (the browser has no session yet);
     // `is_public_auth` in `security_policy` classifies them accordingly.
-    if let Some((provider, store)) = oidc_login {
+    if let Some((provider, store, discovery)) = oidc_login {
         router = router
             .route("/api/v1/auth/oidc/authorize", post(oidc_authorize))
             .route("/api/v1/auth/oidc/callback", get(oidc_callback))
             .layer(Extension(provider))
-            .layer(Extension(store));
+            .layer(Extension(store))
+            .layer(Extension(discovery));
     }
     router.layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
 }
@@ -995,19 +1008,23 @@ struct OidcCallbackQuery {
 async fn oidc_authorize(
     Extension(provider): Extension<OidcLoginProviderConfig>,
     Extension(store): Extension<Arc<OidcLoginStateStore>>,
+    Extension(discovery): Extension<Arc<OidcDiscoveryCache>>,
 ) -> Response {
     // Discovery and state persistence are blocking (SSRF-safe `reqwest::blocking`
     // plus a `std::sync::Mutex`), so run them off the async executor like `login`.
-    let result = task::spawn_blocking(move || initiate_oidc_login(&provider, &store)).await;
+    let result =
+        task::spawn_blocking(move || initiate_oidc_login(&provider, &store, &discovery)).await;
     match result {
         Ok(Ok(initiated)) => Json(OidcAuthorizeResponse {
             authorization_url: initiated.authorization_url,
             state: initiated.state,
         })
         .into_response(),
-        // A bad provider config or an unreachable/invalid IdP is a server-side
-        // problem, not the caller's; report service-unavailable without leaking
-        // which stage failed.
+        // Every initiate failure is a server-side / transient condition, not the
+        // caller's fault: a bad provider config, an unreachable/invalid IdP, or
+        // the state store being momentarily at capacity (`AtCapacity`). All
+        // collapse to the same retryable service-unavailable, leaking neither
+        // which stage failed nor which limit was hit.
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
     }
 }
