@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (first slice only — discovery, not login)
+## Generic OIDC login (discovery + authorization-redirect construction only — not a login flow yet)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -131,11 +131,39 @@ The narrow HTTP+loopback allowance for the issuer itself is
 unaffected: it already only matches the three loopback literals, not
 arbitrary private ranges, and is not the scheme a real provider would use.
 
-This is fetch-and-validate only. Redirect-URL construction, state/nonce/PKCE
-handling, the OAuth2 callback route, the authorization-code-for-token exchange,
-and session creation are all separate, not-yet-started work — there is no
-generic OIDC login flow in Rust yet, just the ability to determine whether an
-issuer is a well-formed provider and what its three key endpoints are.
+Discovery itself is fetch-and-validate only, but `oidc_authorization` now
+builds on it for the next slice: given an `OidcProviderMetadata`, a
+`client_id`, a `redirect_uri`, and requested scopes,
+`oidc_authorization::build_oidc_authorization_request` generates a random
+`state` (CSRF protection), `nonce` (replay protection — verified against the
+eventual ID token's own `nonce` claim, once token exchange exists), and a PKCE
+`code_verifier`/`code_challenge` pair (RFC 7636, mitigates authorization-code
+interception), then builds the full `{authorization_endpoint}?...` redirect
+URL per OpenID Connect Core 1.0 section 3.1.2.1's Authentication Request
+parameters — always including the `openid` scope even if the caller's
+requested scopes omit it, per that section's requirement that omitting it
+makes the request's behavior "entirely unspecified." `state`/`nonce`/the PKCE
+`code_verifier` reuse this codebase's established token-generation convention
+(`security.rs`'s `random_secret`: 32 random octets from `rand::rng()`,
+base64url-no-pad encoded), which also happens to satisfy RFC 7636 section
+4.1's own recommendation for the code verifier specifically (its 43-character
+result is exactly the RFC's minimum `code_verifier` length, and base64url's
+alphabet is a strict subset of the RFC's required character set). Every
+parameter is encoded via the `url` crate's `query_pairs_mut`, so a
+`redirect_uri` that carries its own query string is encoded as a single
+opaque value rather than merging into (and colliding with) the authorization
+URL's own query string, and an `authorization_endpoint` that already has a
+query string of its own is appended to rather than clobbered.
+
+This does not persist `state`/`nonce`/`code_verifier` anywhere (no session,
+cookie, or other storage) — the caller must hold onto the returned values
+until the callback arrives, by whatever mechanism a later ticket wires up.
+The OAuth2 callback route, the authorization-code-for-token exchange, and
+session creation are all separate, not-yet-started work — there is still no
+generic OIDC login flow a browser could actually complete in Rust yet, just
+the ability to determine whether an issuer is a well-formed provider, what
+its three key endpoints are, and now, the redirect URL and secrets needed to
+start an authorization request against it.
 
 ## Persistence and migration
 

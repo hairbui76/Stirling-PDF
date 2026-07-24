@@ -26,6 +26,7 @@ pub mod mobile_scanner;
 pub mod ocr_pdf;
 pub mod office_sanitizer;
 pub mod office_to_pdf;
+pub mod oidc_authorization;
 pub mod oidc_discovery;
 mod page_selection;
 pub mod pdf_ai_comments;
