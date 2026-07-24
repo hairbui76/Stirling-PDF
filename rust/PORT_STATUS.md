@@ -453,10 +453,15 @@ redirect request: CSRF `state`, replay-protection `nonce`, and a PKCE `code_veri
 pair (RFC 7636 S256, cross-checked against the RFC's own worked example), all generated with the
 same CSPRNG/base64url-no-pad convention already used for session/API-key tokens elsewhere in this
 crate, assembled into the full authorization URL via proper query encoding (not string
-concatenation, which would mishandle a `redirect_uri` carrying its own query string). No route
-calls either module yet, and neither the callback route, code-for-token exchange, nor session
-creation exist — the generated `state`/`nonce`/`code_verifier` are returned to the caller with no
-persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
+concatenation, which would mishandle a `redirect_uri` carrying its own query string). `oidc_token`
+now builds the token-exchange request (RFC 6749 §4.1.3 `grant_type=authorization_code` form body for
+the public-client PKCE case — constructed, not sent, since the live fetch is SSRF-gated and a later
+slice) and parses the token response into typed success/error/malformed shapes, enforcing OIDC
+Core's `id_token`-required rule and classifying fail-closed (a contradictory or nonconformant body
+is rejected, never mis-accepted). No route calls any of these modules yet, and neither the live
+token fetch, the `id_token` verification (signature/issuer/audience/nonce), the callback route, nor
+session creation exist — the generated `state`/`nonce`/`code_verifier` are returned to the caller
+with no persistence mechanism of their own; wiring that up is later work. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,

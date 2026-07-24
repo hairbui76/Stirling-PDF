@@ -5200,6 +5200,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "x509-certificate",
  "x509-parser",

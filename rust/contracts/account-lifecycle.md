@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (discovery + authorization-redirect construction only — not a login flow yet)
+## Generic OIDC login (discovery + authorization-redirect + token request/response construction only — not a login flow yet)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -158,12 +158,36 @@ query string of its own is appended to rather than clobbered.
 This does not persist `state`/`nonce`/`code_verifier` anywhere (no session,
 cookie, or other storage) — the caller must hold onto the returned values
 until the callback arrives, by whatever mechanism a later ticket wires up.
-The OAuth2 callback route, the authorization-code-for-token exchange, and
-session creation are all separate, not-yet-started work — there is still no
-generic OIDC login flow a browser could actually complete in Rust yet, just
-the ability to determine whether an issuer is a well-formed provider, what
-its three key endpoints are, and now, the redirect URL and secrets needed to
-start an authorization request against it.
+
+`oidc_token` is the next slice, still pure functions with no network call:
+`build_oidc_token_request` assembles the RFC 6749 section 4.1.3 / RFC 7636
+section 4.5 authorization-code-for-token request for the public-client PKCE
+case (`grant_type=authorization_code`, `code`, `redirect_uri`, `code_verifier`,
+`client_id`), returning the `application/x-www-form-urlencoded` body, the
+target `token_endpoint` (passed through untouched), and the content type —
+**constructed, not sent**. The body is form-encoded via the `url` crate's
+`form_urlencoded::Serializer` (the same machinery `oidc_authorization` uses for
+the authorization URL), so a `code` carrying base64url/opaque `+`/`/`/`=`
+characters or a `redirect_uri` with its own query string round-trips without
+corrupting the body. `parse_oidc_token_response` takes a response status +
+JSON body and returns either a typed `OidcTokenResponse` (`id_token`,
+`access_token`, `token_type`, optional `expires_in`) or a typed error: an
+RFC 6749 section 5.2 provider error (`error` + optional
+`error_description`/`error_uri`), a `MissingIdToken` rejection (OpenID Connect
+Core 1.0 section 3.1.3.3 requires `id_token` in the token response, on top of
+the OAuth2 success shape), or `Malformed` for a body that is neither a valid
+success nor a valid error. The `id_token` is extracted as an **opaque,
+unverified** string only.
+
+Still explicitly not done: the live fetch of the token endpoint (a separate,
+SSRF-gated slice — `token_endpoint`, though it comes from a validated discovery
+document, needs resolve-and-pin protection before it is POSTed to), `id_token`
+signature/issuer/audience/expiry/`nonce` verification, confidential-client
+(`client_secret`) authentication, the OAuth2 callback route, and session
+creation. There is still no generic OIDC login flow a browser could actually
+complete in Rust yet — just discovery, the authorization redirect + PKCE
+secrets, and now the token-request construction and token-response parsing that
+a later live-fetch slice will string together.
 
 ## Persistence and migration
 
