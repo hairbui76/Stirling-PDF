@@ -4,26 +4,25 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-23):** `cargo fmt --check`, strict locked all-target
-workspace Clippy, and `cargo test --workspace --no-fail-fast` all pass with the
-pinned PDFium runtime, with four exceptions, each confirmed via a clean-tree
-(`git stash`) rerun to be pre-existing and unrelated to any change made in this
-pass: two `stirling-ai-engine` `process_smoke` tests
+**Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
+workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **475 passed / 1
+failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
+a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
+unrelated to recent work; it is the only failure in the processing library suite.
+Separately, a small number of tests are environmental (not code defects) and are
+not exercisable in this sandbox: two `stirling-ai-engine` `process_smoke` tests
 (`binary_serves_ephemeral_port_with_auth_and_post_contracts`,
-`binary_infers_keyless_ollama_and_completes_an_http_agent_request`) time out in
-this sandbox's network/process-timing environment; `stirling-processing`'s
-`pdf_markdown::tests::infers_heading_from_font_size_end_to_end` fails
-independent of the signing work in this pass; and two `stirling-processing`
-integration tests that depend on state outside this sandbox —
-`ai_workflow_endpoint`'s AI-engine-backed tests (503 instead of 200, the AI
-engine dependency is not reachable here) and
-`policy_config_endpoint::disconnecting_a_policy_stream_does_not_cancel_the_run`
-(a wall-clock timing assertion) — also fail here on a clean tree. All 111
-AI-engine library tests and all 443 processing library tests otherwise pass
-(442 of 443, excluding the one pre-existing `pdf_markdown` failure above), as
-does the complete endpoint/integration matrix aside from the two exceptions
-just noted. External-runtime happy paths remain conditional on their
-respective tools and services.
+`binary_infers_keyless_ollama_and_completes_an_http_agent_request`) time out on
+network/process-timing; and two `stirling-processing` integration tests depend on
+state outside this sandbox — `ai_workflow_endpoint`'s AI-engine-backed tests (503
+because the AI engine is unreachable here) and
+`policy_config_endpoint::disconnecting_a_policy_stream_does_not_cancel_the_run` (a
+wall-clock timing assertion). All 111 AI-engine library tests otherwise pass, as
+does the endpoint/integration matrix aside from those environmental cases.
+External-runtime happy paths remain conditional on their respective tools and
+services. (This snapshot supersedes an earlier one that undercounted the
+processing library suite at 443 tests.)
 
 **Route-count scoping note:** the Rust service registers 313 HTTP routes total.
 Only a subset of those are directly comparable to Java's OSS `controller/api`
@@ -496,10 +495,14 @@ PKCS#12 file re-wrapped with a separately generated password (or an explicit dep
 rejects links and malformed key/certificate pairs, and is mounted only in the opt-in secured
 router. Static proprietary route entitlement and trusted Keygen tier derivation are ported; Windows
 secret-file ACL hardening plus an external KMS/HSM option remain review gates. Traditional (non-PKCS#8)
-EC PEM now falls back through P-256, P-384, and P-521; its DEK-Info cipher coverage (AES-128/192/256-CBC,
+EC PEM signing supports P-256 and P-384. Its DEK-Info cipher coverage (AES-128/192/256-CBC,
 DES-EDE3-CBC, DES-CBC) already matches everything realistically produced by current tooling — RC2/RC4/
 CAMELLIA are deprecated legacy PEM ciphers nobody deliberately picks for a signing workflow and are not
-planned. A live SoftHSM/token compatibility matrix and broader Windows smart-card coverage
+planned. **P-521 EC keys parse (the traditional-PEM→PKCS#8 path accepts them) but cannot yet be used
+to sign: the `x509-certificate` 0.25.0 signer backend implements only `Secp256r1`/`Secp384r1` (no
+P-521 curve variant exists in it), so a P-521 key is rejected end-to-end with a clean error (no
+panic, no signature). Closing this needs upstream P-521 support in the signer, not just the parser.**
+A live SoftHSM/token compatibility matrix and broader Windows smart-card coverage
 remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
 full signing or PAdES parity.
