@@ -14,7 +14,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, HttpBody as _, to_bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Extension, Multipart, Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -31,6 +31,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     license::LicenseError,
+    oidc_login::{
+        OidcLoginError, OidcLoginProviderConfig, OidcLoginStateStore, complete_oidc_login,
+        initiate_oidc_login,
+    },
     runtime_config::RuntimeConfig,
     security::{
         AuthContext, DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, SecurityAuditContext,
@@ -75,6 +79,10 @@ pub struct SecurityHttpConfig {
     pub audit_capture_operation_results: bool,
     pub license_tier: LicenseTier,
     pub external_jwt: Option<Arc<SupabaseJwtVerifier>>,
+    /// Generic-OIDC login provider (public-client PKCE). `None` disables the
+    /// `/api/v1/auth/oidc/*` login routes entirely (they are not mounted),
+    /// mirroring the "absent issuer ⇒ off" convention of [`Self::external_jwt`].
+    pub oidc_login_provider: Option<OidcLoginProviderConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -308,6 +316,7 @@ pub fn secure_router(router: Router, store: Arc<SecurityStore>) -> Router {
             audit_capture_operation_results: false,
             license_tier: LicenseTier::Normal,
             external_jwt: None,
+            oidc_login_provider: None,
         },
     )
 }
@@ -343,8 +352,15 @@ pub(crate) fn secure_router_with_mail(
         audit_capture_operation_results: config.audit_capture_operation_results,
         license_tier: config.license_tier,
     };
+    // A single shared state store, created once here so the authorize and
+    // callback routes correlate against the same pending-login table. `None`
+    // provider config leaves the OIDC login routes unmounted (fail-closed off).
+    let oidc_login = config
+        .oidc_login_provider
+        .clone()
+        .map(|provider| (provider, Arc::new(OidcLoginStateStore::new())));
     router
-        .merge(auth_routes())
+        .merge(auth_routes(oidc_login))
         .layer(middleware::from_fn_with_state(
             middleware_state,
             enforce_security,
@@ -354,8 +370,8 @@ pub(crate) fn secure_router_with_mail(
         .layer(Extension(SecurityMailState { smtp }))
 }
 
-fn auth_routes() -> Router {
-    Router::new()
+fn auth_routes(oidc_login: Option<(OidcLoginProviderConfig, Arc<OidcLoginStateStore>)>) -> Router {
+    let mut router = Router::new()
         .merge(crate::security_audit_http::routes())
         .merge(crate::portal_audit::routes())
         .route("/api/v1/auth/login", post(login))
@@ -427,8 +443,20 @@ fn auth_routes() -> Router {
         .route("/api/v1/invite/revoke/{invite_id}", delete(revoke_invite))
         .route("/api/v1/invite/cleanup", post(cleanup_invites))
         .route("/api/v1/invite/validate/{token}", get(validate_invite))
-        .route("/api/v1/invite/accept/{token}", post(accept_invite))
-        .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
+        .route("/api/v1/invite/accept/{token}", post(accept_invite));
+    // The generic-OIDC login routes only exist when a provider is configured.
+    // They share the single state store built above and read the provider config
+    // from a request extension, mirroring how every other handler reaches the
+    // `SecurityStore`. Both routes are public (the browser has no session yet);
+    // `is_public_auth` in `security_policy` classifies them accordingly.
+    if let Some((provider, store)) = oidc_login {
+        router = router
+            .route("/api/v1/auth/oidc/authorize", post(oidc_authorize))
+            .route("/api/v1/auth/oidc/callback", get(oidc_callback))
+            .layer(Extension(provider))
+            .layer(Extension(store));
+    }
+    router.layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
 }
 
 async fn enforce_security(
@@ -940,6 +968,110 @@ async fn login(
             "Invalid two-factor code",
         ),
         Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OidcAuthorizeResponse {
+    authorization_url: String,
+    state: String,
+}
+
+/// The provider's redirect back to us carries the authorization `code` and the
+/// `state` we issued. Both are required; a provider may append extra params
+/// (e.g. `iss`, `session_state`), so unknown fields are ignored, not rejected.
+#[derive(Deserialize)]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+}
+
+/// Begins a generic-OIDC login: discovers the provider, builds the authorization
+/// request, persists the single-use `state`, and returns the redirect URL plus
+/// that `state` as JSON — consistent with the JSON bodies every other auth route
+/// returns. Turning the URL into an actual browser redirect (and mirroring the
+/// `state` into a cookie) is a separate frontend concern, out of scope here.
+async fn oidc_authorize(
+    Extension(provider): Extension<OidcLoginProviderConfig>,
+    Extension(store): Extension<Arc<OidcLoginStateStore>>,
+) -> Response {
+    // Discovery and state persistence are blocking (SSRF-safe `reqwest::blocking`
+    // plus a `std::sync::Mutex`), so run them off the async executor like `login`.
+    let result = task::spawn_blocking(move || initiate_oidc_login(&provider, &store)).await;
+    match result {
+        Ok(Ok(initiated)) => Json(OidcAuthorizeResponse {
+            authorization_url: initiated.authorization_url,
+            state: initiated.state,
+        })
+        .into_response(),
+        // A bad provider config or an unreachable/invalid IdP is a server-side
+        // problem, not the caller's; report service-unavailable without leaking
+        // which stage failed.
+        Ok(Err(_)) | Err(_) => service_unavailable_response(),
+    }
+}
+
+/// Completes a generic-OIDC login from the provider's callback: extracts `code`
+/// and `state`, exchanges and verifies through [`complete_oidc_login`], and on
+/// success issues a session and returns it EXACTLY as [`login`] does (the same
+/// [`AuthenticationResponse`] shape). Missing `code`/`state` is a 400; every
+/// other failure collapses to a generic 401 (see [`oidc_callback_error_response`]).
+async fn oidc_callback(
+    Extension(store): Extension<Arc<OidcLoginStateStore>>,
+    Extension(security): Extension<Arc<SecurityStore>>,
+    Extension(correlation): Extension<RequestCorrelation>,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Response {
+    let (Some(code), Some(state)) = (query.code, query.state) else {
+        return json_error(StatusCode::BAD_REQUEST, "Invalid request");
+    };
+    if code.is_empty() || state.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "Invalid request");
+    }
+    let correlation_id = correlation.0;
+    let result = task::spawn_blocking(move || {
+        complete_oidc_login(
+            &state,
+            &code,
+            &store,
+            &security,
+            Utc::now().timestamp(),
+            &correlation_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(completed)) => Json(AuthenticationResponse {
+            user: authentication_user(&completed.context),
+            session: completed.tokens,
+        })
+        .into_response(),
+        Ok(Err(error)) => oidc_callback_error_response(&error),
+        Err(_) => service_unavailable_response(),
+    }
+}
+
+/// Maps a completion failure to an HTTP response. Infrastructure faults (a
+/// poisoned store lock, or a repository/crypto failure while provisioning the
+/// verified identity) are retryable 503s; every genuine login rejection —
+/// unknown/expired/replayed `state`, a failed token exchange, a failed id-token
+/// (or nonce) verification, or an account-level denial — collapses to one
+/// generic 401 so the response never reveals which check tripped.
+fn oidc_callback_error_response(error: &OidcLoginError) -> Response {
+    match error {
+        OidcLoginError::StateUnavailable
+        | OidcLoginError::Identity(
+            SecurityError::Poisoned
+            | SecurityError::Storage(_)
+            | SecurityError::PasswordHash(_)
+            | SecurityError::Filesystem(_)
+            | SecurityError::SecretProtection(_)
+            | SecurityError::MfaConfiguration
+            | SecurityError::IntegrationProtectionUnavailable
+            | SecurityError::AuditEventLimitExceeded,
+        ) => service_unavailable_response(),
+        _ => json_error(StatusCode::UNAUTHORIZED, "Authentication failed"),
     }
 }
 
@@ -4086,6 +4218,7 @@ mod tests {
                 audit_capture_operation_results: false,
                 license_tier: LicenseTier::Enterprise,
                 external_jwt: Some(verifier),
+                oidc_login_provider: None,
             },
         );
         Ok((app, token, store))
@@ -4180,6 +4313,7 @@ mod tests {
                 audit_capture_operation_results: false,
                 license_tier,
                 external_jwt: None,
+                oidc_login_provider: None,
             },
         );
         Ok((app, store))
@@ -4213,6 +4347,7 @@ mod tests {
                 audit_capture_operation_results: capture_operation_results,
                 license_tier: LicenseTier::Enterprise,
                 external_jwt: None,
+                oidc_login_provider: None,
             },
         );
         Ok((app, store))

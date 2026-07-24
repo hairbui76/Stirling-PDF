@@ -493,9 +493,19 @@ issues a session by REUSING the exact reviewed external-identity path the Supaba
 (`resolve_external_user`/`context_for_user`/`issue_session`, keyed by `(issuer, subject)` so an
 OIDC identity can never collide with a Supabase one; role/permissions are server-derived, not
 token-controllable). A minimal `security.oauth2.*` provider config (issuer/client_id/redirect_uri/
-scopes, public-client PKCE) drives it, off unless an issuer is set. The two HTTP routes (authorize
-+ callback) that call these two functions are the one remaining OIDC slice; confidential-client
-`client_secret` auth, a JWKS cache, and durable cross-process login-flow state remain open. The discovery document's own returned endpoint URLs
+scopes, public-client PKCE) drives it, off unless an issuer is set. Both HTTP routes now exist in
+the opt-in reviewed secured router: `POST /api/v1/auth/oidc/authorize` (returns the authorization
+URL + state) and `GET /api/v1/auth/oidc/callback` (issues a session identically to the password
+login handler — same `AuthenticationResponse`/opaque tokens). They are public (a pre-session
+browser flow), scoped to exactly those verb+path pairs, mounted only when a provider is configured
+(absent → 404), and a callback failure (unknown/expired/replayed state, exchange/verify/nonce
+failure) returns one generic 401 that doesn't distinguish CSRF-state-miss from verification failure.
+This completes the generic OIDC login path within the opt-in secured router (which still fails
+closed in production). Known pre-production follow-ups before that router is ever exposed: the
+public `/authorize` route's state store is TTL-bounded but has no absolute size cap, and discovery
+is refetched (uncached) per call — a size cap plus a discovery cache or `/authorize` rate-limit are
+needed before production exposure. Confidential-client `client_secret` auth, a JWKS cache, durable
+cross-process login-flow state, and the frontend redirect/cookie UX also remain. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,

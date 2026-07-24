@@ -440,6 +440,7 @@ fn secured_app_with_settings(
         audit_capture_operation_results: runtime_config.security_audit_capture_operation_results(),
         license_tier: tier,
         external_jwt: None,
+        oidc_login_provider: None,
     };
     let router =
         app_with_runtime_config(UPLOAD_BYTES, TimestampSettings::default(), runtime_config);

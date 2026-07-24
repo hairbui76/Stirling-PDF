@@ -1753,6 +1753,7 @@ fn reviewed_security_http_config(
         audit_capture_operation_results: runtime_config.security_audit_capture_operation_results(),
         license_tier: verified_license.tier,
         external_jwt,
+        oidc_login_provider: runtime_config.oidc_login_provider_config(),
     })
 }
 

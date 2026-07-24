@@ -40,7 +40,7 @@ rejecting control-bearing keys and NUL-bearing values. Replacement deletes old
 keys and inserts the new map in one transaction, so a failure cannot expose a
 partially updated profile.
 
-## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange + ID-token verification + login orchestration — library-complete; two HTTP routes remain)
+## Generic OIDC login (discovery + authorization-redirect + SSRF-safe token exchange + ID-token verification + login orchestration + the two HTTP routes — complete in the reviewed secured router)
 
 Java's proprietary backend registers a generic OIDC provider via
 `OAuth2Configuration.oidcClientRegistration()`, which uses Spring's
@@ -327,14 +327,52 @@ systems.
   access/refresh TTLs) — returning the session tokens, the `AuthContext`, and the
   verified identity.
 
-Still explicitly not done: the two HTTP routes (the authorization-redirect
-initiation endpoint and the OAuth2 callback endpoint) that would expose
-`initiate_oidc_login`/`complete_oidc_login` to a browser — that is the remaining
-slice. Also still out of scope: confidential-client (`client_secret`)
-authentication, a bounded JWKS cache in the id-token verifier, and durable
-(cross-process) `state` storage — the store is in-memory, so pending logins do
-not survive a restart, which is acceptable for the short bounded TTL of an
-in-flight login handshake.
+- **HTTP routes.** `security_http` now exposes the two routes that put
+  `initiate_oidc_login`/`complete_oidc_login` on the wire, inside the opt-in
+  reviewed secured router's public auth surface:
+  - `POST /api/v1/auth/oidc/authorize` calls `initiate_oidc_login` and returns
+    `{ "authorizationUrl", "state" }` as JSON — consistent with the JSON bodies
+    every other auth route returns (rather than emitting a `302`; turning the URL
+    into a browser redirect is the frontend's job, see below). Provider-side
+    failures (bad config, unreachable/invalid `IdP`) collapse to a generic
+    `503`, leaking no stage detail.
+  - `GET /api/v1/auth/oidc/callback?code=…&state=…` calls `complete_oidc_login`
+    and, on success, returns the session **exactly** as `POST /api/v1/auth/login`
+    does — the same `{ user, session }` `AuthenticationResponse` shape with the
+    same opaque `spdf_at_`/`spdf_rt_` tokens — so callers treat an OIDC session
+    identically to a password session. Missing/empty `code` or `state` is a
+    `400`; every genuine login rejection (unknown/expired/replayed `state`,
+    token-exchange or id-token/nonce verification failure, account-level denial)
+    collapses to one generic `401`, so the response never reveals whether a
+    CSRF-`state` miss or a verification failure tripped. Infrastructure faults (a
+    poisoned store lock, a repository/crypto failure while provisioning) are
+    retryable `503`s.
+  Both routes are **public** (the browser has no session yet), classified in
+  `security_policy::endpoint_policy` — `authorize` on `POST`, `callback` on
+  `GET`, on those verbs only. The single-use `OidcLoginStateStore` is one shared
+  `Arc` built once when the secured router is assembled and handed to both routes
+  via a request extension (alongside the existing `SecurityStore`), so the state
+  `authorize` persists is the state `callback` consumes. The provider config
+  rides on `SecurityHttpConfig::oidc_login_provider`
+  (`RuntimeConfig::oidc_login_provider_config()`); when it is `None` (no
+  `security.oauth2.issuer` configured) **neither route is mounted** — a request
+  gets a `404` — mirroring the "absent issuer ⇒ feature off" convention the
+  Supabase JWT verifier already follows.
+
+This completes the OIDC login path within the reviewed secured router. That
+router remains opt-in and still refuses secured-mode startup in the production
+binary, so — as with every other auth feature living behind this boundary — the
+routes are reachable only from the integration/review harness (`app_with_reviewed_security`)
+for now; the boundary is unchanged.
+
+Out of scope here, and noted as follow-ups: the **frontend redirect/cookie UX**
+(the callback returning the session tokens as JSON is the backend boundary; a
+browser-facing flow that issues a `302` to the provider, then sets the session
+in a cookie on callback, is a separate frontend concern). Also still out of
+scope: confidential-client (`client_secret`) authentication, a bounded JWKS
+cache in the id-token verifier, and durable (cross-process) `state` storage —
+the store is in-memory, so pending logins do not survive a restart, which is
+acceptable for the short bounded TTL of an in-flight login handshake.
 
 ## Persistence and migration
 
@@ -353,4 +391,11 @@ administrator activation, post-activation login, preference persistence, and
 initial-setup completion against the real processing router. Bulk-invite HTTP
 coverage exercises configuration gates, mixed results, extended roles,
 case-insensitive duplicates, missing teams, capacity ordering, credential mail,
-forced-change login, and retained accounts after SMTP failure.
+forced-change login, and retained accounts after SMTP failure. OIDC login HTTP
+coverage (`tests/oidc_login_endpoint.rs`) drives the full handshake through the
+routes against a loopback mock `IdP`: `authorize` → `callback` issues a working
+session whose access token authenticates `GET /api/v1/auth/me`, a never-issued
+`state` and a replayed `state` are each rejected `401` at the route (no session),
+a mismatched `nonce` collapses to the same generic `401`, missing/empty
+`code`/`state` is `400`, and both routes are absent (`404`) when no provider is
+configured.

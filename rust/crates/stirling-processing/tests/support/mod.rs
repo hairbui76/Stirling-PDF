@@ -40,6 +40,7 @@ pub(crate) fn reviewed_security_app_at_tier(
         audit_capture_operation_results: runtime_config.security_audit_capture_operation_results(),
         license_tier,
         external_jwt,
+        oidc_login_provider: runtime_config.oidc_login_provider_config(),
     };
     let router = app_with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
     Ok(secure_router_with_config(router, store, config))

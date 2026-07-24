@@ -203,14 +203,19 @@ fn is_public_static(method: &Method, path: &str) -> bool {
 }
 
 fn is_public_auth(method: &Method, path: &str) -> bool {
-    method == Method::POST
+    (method == Method::POST
         && matches!(
             path,
             "/api/v1/auth/login"
                 | "/api/v1/auth/refresh"
                 | "/api/v1/auth/logout"
                 | "/api/v1/user/register"
-        )
+                // Begins an OIDC login; the browser has no session yet.
+                | "/api/v1/auth/oidc/authorize"
+        ))
+        // The provider's callback is a GET redirect carrying `code`+`state`;
+        // it authenticates via the single-use state, so it must be public too.
+        || (method == Method::GET && path == "/api/v1/auth/oidc/callback")
 }
 
 fn is_public_invitation(method: &Method, path: &str) -> bool {
@@ -273,6 +278,8 @@ mod tests {
             (Method::POST, "/api/v1/auth/refresh"),
             (Method::POST, "/api/v1/auth/logout"),
             (Method::POST, "/api/v1/user/register"),
+            (Method::POST, "/api/v1/auth/oidc/authorize"),
+            (Method::GET, "/api/v1/auth/oidc/callback"),
             (Method::GET, "/api/v1/invite/validate/token"),
             (Method::POST, "/api/v1/invite/accept/token"),
             (Method::GET, "/api/v1/mobile-scanner/files/id"),
@@ -280,6 +287,17 @@ mod tests {
         ] {
             assert_eq!(endpoint_policy(&method, path), EndpointPolicy::Public);
         }
+        // The OIDC login routes are public only on their intended verb: a GET on
+        // the authorize route (or POST on the callback) is not part of the frozen
+        // public surface.
+        assert_eq!(
+            endpoint_policy(&Method::GET, "/api/v1/auth/oidc/authorize"),
+            EndpointPolicy::Authenticated
+        );
+        assert_eq!(
+            endpoint_policy(&Method::POST, "/api/v1/auth/oidc/callback"),
+            EndpointPolicy::Authenticated
+        );
         assert_eq!(
             endpoint_policy(&Method::GET, "/api/v1/config/app-config"),
             EndpointPolicy::Authenticated
