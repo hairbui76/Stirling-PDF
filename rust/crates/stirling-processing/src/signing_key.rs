@@ -9,7 +9,7 @@ use std::fmt;
 
 use cryptographic_message_syntax::{SignedDataBuilder, SignerBuilder};
 use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
-use pkcs8::{EncryptedPrivateKeyInfoRef, SecretDocument};
+use pkcs8::{DecodePrivateKey, EncryptedPrivateKeyInfoRef, SecretDocument};
 use thiserror::Error;
 use x509_certificate::{CapturedX509Certificate, InMemorySigningKeyPair, Sign};
 use zeroize::Zeroizing;
@@ -234,16 +234,34 @@ impl PemSigningKey {
         private_key: SigningSecret,
         certificates: Vec<CapturedX509Certificate>,
     ) -> Result<Self, SigningKeyError> {
-        let parsed_private_key = InMemorySigningKeyPair::from_pkcs8_pem(private_key.as_bytes());
+        // The ticket assumed the direct PKCS#8 PEM upload path and the
+        // traditional/encrypted paths already converge on
+        // `from_pkcs8_der_with_certificates`; investigating the code showed
+        // they did not — this path consumed PEM via a separate
+        // `InMemorySigningKeyPair::from_pkcs8_pem`. Route the PEM to DER here
+        // (using the same `pem` crate `x509-certificate::from_pkcs8_pem`
+        // decodes with internally, so this is behavior-identical, including its
+        // leniency toward non-RFC-7468-wrapped bodies) and delegate, so the
+        // P-521 rejection lives in exactly one place and both paths get the
+        // clear message from the same DER-based check.
+        let der = pem::parse(private_key.as_bytes())
+            .map(pem::Pem::into_contents)
+            .map_err(|_| SigningKeyError::InvalidPrivateKey)?;
         drop(private_key);
-        let private_key = parsed_private_key.map_err(|_| SigningKeyError::InvalidPrivateKey)?;
-        Self::from_parsed_key_with_certificates(private_key, certificates)
+        Self::from_pkcs8_der_with_certificates(SigningSecret::new(der), certificates)
     }
 
     fn from_pkcs8_der_with_certificates(
         private_key: SigningSecret,
         certificates: Vec<CapturedX509Certificate>,
     ) -> Result<Self, SigningKeyError> {
+        // Single P-521 rejection point for every entry form (traditional EC
+        // PEM, encrypted PKCS#8, and direct PKCS#8 PEM, which all reach this
+        // function as PKCS#8 DER): reject with a specific message before the
+        // generic parse below, which would otherwise fail a P-521 key with the
+        // vague `InvalidPrivateKey` (the signer backend maps every EC key to
+        // secp384r1 and then rejects a P-521 key).
+        reject_unsupported_signing_curve_der(private_key.as_bytes())?;
         let parsed_private_key = InMemorySigningKeyPair::from_pkcs8_der(private_key.as_bytes());
         drop(private_key);
         let private_key = parsed_private_key.map_err(|_| SigningKeyError::InvalidPrivateKey)?;
@@ -398,6 +416,22 @@ impl SigningKey for PemSigningKey {
     }
 }
 
+/// Rejects a P-521 (secp521r1) EC private key handed in as PKCS#8 DER.
+///
+/// P-521 keys parse fine (legacy traditional-EC-PEM parsing even converts them
+/// to PKCS#8 forward-compatibly) but cannot be used for signing: the signer
+/// backend (`x509-certificate`) implements only secp256r1/secp384r1 and would
+/// otherwise fail a P-521 key with the generic `InvalidPrivateKey` message.
+/// `p521::SecretKey::from_pkcs8_der` succeeds only for a genuine P-521 key — a
+/// P-256/P-384 key fails that parse — so this never false-positives on a
+/// supported curve.
+fn reject_unsupported_signing_curve_der(pkcs8_der: &[u8]) -> Result<(), SigningKeyError> {
+    if p521::SecretKey::from_pkcs8_der(pkcs8_der).is_ok() {
+        return Err(SigningKeyError::UnsupportedSigningKeyCurve);
+    }
+    Ok(())
+}
+
 /// Errors shared by local and hardware key providers.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SigningKeyError {
@@ -409,6 +443,10 @@ pub enum SigningKeyError {
     EmptySignature,
     #[error("the private key could not be parsed as PKCS#8")]
     InvalidPrivateKey,
+    #[error(
+        "P-521 (secp521r1) EC keys are not supported for signing; use a P-256 (prime256v1) or P-384 (secp384r1) key"
+    )]
+    UnsupportedSigningKeyCurve,
     #[error("a password is required for an encrypted private key")]
     PrivateKeyPasswordRequired,
     #[error("the encrypted PKCS#8 private key or password is invalid or unsupported")]
@@ -642,6 +680,58 @@ mod tests {
             )
             .err(),
             Some(SigningKeyError::InvalidEncryptedPrivateKey)
+        );
+        Ok(())
+    }
+
+    /// P-521 keys parse (legacy traditional-EC-PEM parsing even converts them
+    /// to PKCS#8) but cannot sign — the `x509-certificate` backend implements
+    /// only secp256r1/secp384r1. Both entry forms — a traditional (SEC1) EC
+    /// PEM and a direct PKCS#8 PEM — must be rejected with the specific
+    /// `UnsupportedSigningKeyCurve` error, not the vague `InvalidPrivateKey`.
+    #[test]
+    #[allow(deprecated)]
+    fn pem_provider_rejects_p521_keys_with_a_specific_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use p521::elliptic_curve::Generate;
+        use pkcs8::EncodePrivateKey;
+
+        // A valid certificate chain is required to reach the key-parse step;
+        // it need not match the P-521 key, since the curve rejection happens
+        // before the key/certificate match check.
+        let (certificate, _) = self_signed_ecdsa_key_pair(None);
+        let certificate_pem = certificate.encode_pem();
+        let p521_key = p521::SecretKey::generate_from_rng(&mut rand::rng());
+
+        // Entry form 1: traditional (SEC1) EC PEM.
+        let traditional_pem = pem_document("EC PRIVATE KEY", &p521_key.to_sec1_der()?);
+        assert_eq!(
+            PemSigningKey::from_pem(
+                SigningSecret::new(traditional_pem.into_bytes()),
+                None,
+                certificate_pem.as_bytes(),
+            )
+            .err(),
+            Some(SigningKeyError::UnsupportedSigningKeyCurve)
+        );
+
+        // Entry form 2: direct PKCS#8 PEM upload.
+        let pkcs8_pem = pem_document("PRIVATE KEY", p521_key.to_pkcs8_der()?.as_bytes());
+        assert_eq!(
+            PemSigningKey::from_pem(
+                SigningSecret::new(pkcs8_pem.into_bytes()),
+                None,
+                certificate_pem.as_bytes(),
+            )
+            .err(),
+            Some(SigningKeyError::UnsupportedSigningKeyCurve)
+        );
+
+        // The user-facing message names the unsupported curve specifically.
+        assert!(
+            SigningKeyError::UnsupportedSigningKeyCurve
+                .to_string()
+                .contains("P-521")
         );
         Ok(())
     }

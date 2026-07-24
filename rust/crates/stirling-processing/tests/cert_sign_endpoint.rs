@@ -83,6 +83,38 @@ async fn signs_a_pdf_with_an_uploaded_pem_key_and_der_certificate() -> TestResul
     Ok(())
 }
 
+/// A P-521 key parses but cannot sign (the `x509-certificate` backend
+/// implements only secp256r1/secp384r1). The endpoint must return 400 with the
+/// specific "P-521 not supported" message, not a vague failure or a 500.
+#[tokio::test]
+#[allow(deprecated)]
+async fn rejects_a_p521_signing_key_with_a_specific_message() -> TestResult {
+    use p521::elliptic_curve::Generate;
+    use pkcs8::EncodePrivateKey;
+
+    // The certificate need not match the P-521 key: the curve rejection
+    // happens before the key/certificate match check.
+    let (certificate, _) = self_signed_ecdsa_key_pair(None);
+    let p521_key = p521::SecretKey::generate_from_rng(&mut rand::rng());
+    let private_key = pem_document("PRIVATE KEY", p521_key.to_pkcs8_der()?.as_bytes());
+    let response = post_cert_sign(
+        &single_page_pdf()?,
+        &private_key,
+        certificate.constructed_data(),
+        &[("name", "Stirling Test")],
+    )
+    .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("P-521"),
+        "expected a P-521-specific rejection message, got: {body}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[allow(deprecated)]
 async fn signs_a_pdf_with_an_encrypted_pkcs8_pem_key() -> TestResult {

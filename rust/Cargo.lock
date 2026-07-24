@@ -5167,6 +5167,7 @@ dependencies = [
  "p384 0.14.0",
  "p521",
  "pdfium-render",
+ "pem",
  "pkcs8 0.11.0",
  "pulldown-cmark",
  "rand 0.10.2",
