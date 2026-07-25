@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **912 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **934 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -23,6 +23,16 @@ does the endpoint/integration matrix aside from those environmental cases.
 External-runtime happy paths remain conditional on their respective tools and
 services. (This snapshot supersedes an earlier one that undercounted the
 processing library suite at 443 tests.)
+
+**Security-review hardening (2026-07-25):** an AI-assisted security review of the secured/crypto/SSRF
+surface (adversarially verified) found the surface broadly sound (no critical/high; no auth-bypass /
+priv-esc / cross-tenant leak / key leakage / forgeable signature / remote traversal) and surfaced 4 Medium
+issues, all now fixed and test-proven: (1) bcrypt no longer runs under the global `Mutex<Connection>` +
+per-IP auth rate-limiting; (2) tower-http request/body timeouts + concurrency limit at `into_router()`
+(covering the OSS and secured routers) + a bounded webhook body assemble (no 100 MiB pre-HMAC buffer);
+(3) OIDC callback `state` is now bound to the initiating browser via a cookie (login-CSRF, RFC 9700);
+(4) the cloud-metadata SSRF deny now covers all embedded-IPv4 forms and applies to result URLs. This is
+AI-assisted and does not replace the independent human security review the production cutover requires.
 
 **Route-count scoping note:** the Rust service registers 313 HTTP routes total.
 Only a subset of those are directly comparable to Java's OSS `controller/api`
@@ -337,7 +347,7 @@ auto-rename/auto-split, plus:
   async-job allowlist), matching Java's `@AutoJobPostMapping`. With these plus `admin-settings`, a
   systematic route cross-check finds no remaining bounded parity gap in the OSS-core + proprietary
   `controller/api` route surface. What remains: the standing deferred-external set (SaaS/cloud, SAML2),
-  upstream-blocked items (P-521 signing, Windows-cert async), the H2-only `ui-data/database`, and
+  upstream-blocked items (Windows-cert async), the H2-only `ui-data/database`, and
   unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
   blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
   of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
@@ -667,10 +677,14 @@ secret-file ACL hardening plus an external KMS/HSM option remain review gates. T
 EC PEM signing supports P-256 and P-384. Its DEK-Info cipher coverage (AES-128/192/256-CBC,
 DES-EDE3-CBC, DES-CBC) already matches everything realistically produced by current tooling — RC2/RC4/
 CAMELLIA are deprecated legacy PEM ciphers nobody deliberately picks for a signing workflow and are not
-planned. **P-521 EC keys parse (the traditional-PEM→PKCS#8 path accepts them) but cannot yet be used
-to sign: the `x509-certificate` 0.25.0 signer backend implements only `Secp256r1`/`Secp384r1` (no
-P-521 curve variant exists in it), so a P-521 key is rejected end-to-end with a clean error (no
-panic, no signature). Closing this needs upstream P-521 support in the signer, not just the parser.**
+planned. **P-521 signing now works** (2026-07-25): rather than the `x509-certificate` 0.25.0 convenience
+signer (which only implements `Secp256r1`/`Secp384r1`), the P-521 path signs the CMS `SignerInfo` directly
+with the pure-Rust `p521` crate (ECDSA-P521 + SHA-512 → `ecdsa-with-SHA512` / `secp521r1`), reusing the
+existing `/ByteRange`+`/Contents` reservation. Independently verified with OpenSSL 3 (`cms -verify` passes;
+tampered content and wrong keys are rejected). **Known pre-existing bug (separate, still open):** the
+P-384 CMS path emits a SHA-256 `digestAlgorithm` against an `ecdsa-with-SHA384` `signatureAlgorithm`, a
+mismatch strict verifiers (Adobe) reject — the P-521 work makes the P-521 path consistent (SHA-512) but
+did not touch P-384.
 A live SoftHSM/token compatibility matrix and broader Windows smart-card coverage
 remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
