@@ -108,6 +108,7 @@ mod policy_outputs;
 mod policy_s3;
 mod policy_sources;
 mod policy_triggers;
+mod portal_api_keys;
 mod portal_audit;
 mod process_executor;
 mod proprietary_ui_data;
@@ -1619,6 +1620,7 @@ impl ProcessingRuntime {
                     .layer(DefaultBodyLimit::max(max_upload_bytes)),
             )
             .merge(proprietary_ui_data::routes(proprietary_ui_data_config))
+            .merge(portal_api_keys::routes())
             .merge(login_agreement_admin::routes(login_agreements))
             .merge(tessdata_admin::routes(tessdata_admin))
             .merge(personal_signatures::routes())
