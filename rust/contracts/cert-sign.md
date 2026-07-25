@@ -31,15 +31,23 @@ P12 bytes, and passwords use request-lifetime zeroizing wrappers and are never
 written to temporary files. Invalid passwords, aliases, keys, certificates,
 and key/certificate mismatches return `400` without exposing parser details.
 
-EC curve support for signing is P-256 and P-384 only (the `x509-certificate`
-signer backend implements no other named curve). A P-521 (secp521r1) key is
-*parsed* successfully — the traditional-EC-PEM reader converts it to PKCS#8
-forward-compatibly, and it can arrive as a traditional EC PEM, a direct PKCS#8
-PEM, or inside a PKCS#12/JKS archive — but is then explicitly rejected at the
-common PKCS#8 consumption step with a specific `400` message ("P-521
-(secp521r1) EC keys are not supported for signing; use a P-256 (prime256v1) or
-P-384 (secp384r1) key") rather than the generic "could not be parsed as PKCS#8"
-error, so the caller can tell an unsupported-curve key from a malformed one.
+EC curve support for signing is P-256, P-384, and P-521. P-256/P-384 (and RSA,
+Ed25519) sign through the `cryptographic-message-syntax` + `x509-certificate`
+CMS backend. P-521 (secp521r1) signs through a dedicated pure-Rust `p521` path
+because that backend's CMS signer implements only secp256r1/secp384r1: at the
+common PKCS#8 consumption step a genuine P-521 key is routed to a
+`p521::ecdsa::SigningKey` and every other curve/algorithm falls through to the
+unchanged backend. A P-521 key may arrive as a traditional EC PEM, a direct
+PKCS#8 PEM, or inside a PKCS#12/JKS archive. Its detached CMS `SignerInfo` uses
+`digestAlgorithm` SHA-512 (2.16.840.1.101.3.4.2.3) and `signatureAlgorithm`
+`ecdsa-with-SHA512` (1.2.840.10045.4.3.4) — the natural P-521 pairing — signed
+with deterministic RFC 6979 nonces; the invisible-incremental `/ByteRange` +
+`/Contents` reservation is shared unchanged with the other curves. Because
+`x509-certificate` cannot resolve `ecdsa-with-SHA512`, the crate's own CMS
+verifier cannot check a P-521 signature; tests verify it independently with the
+`p521` crate (and OpenSSL when `STIRLING_VERIFY_OPENSSL` is set). A key whose
+public half does not match the certificate still returns `400`
+(`CertificateKeyMismatch`) for every curve.
 
 The signer appends an AcroForm signature field and detached CMS container in an
 incremental revision. `/ByteRange` excludes only the fixed `/Contents`

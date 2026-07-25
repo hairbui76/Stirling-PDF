@@ -7,12 +7,41 @@
 
 use std::fmt;
 
-use cryptographic_message_syntax::{SignedDataBuilder, SignerBuilder};
+use bcder::{
+    Captured, Mode, Oid,
+    encode::{PrimitiveContent, Values},
+};
+use bytes::Bytes;
+use cryptographic_message_syntax::{
+    SignedDataBuilder, SignerBuilder,
+    asn1::rfc5652::{
+        CertificateChoices, CertificateSet, CmsVersion, DigestAlgorithmIdentifiers,
+        EncapsulatedContentInfo, IssuerAndSerialNumber, OID_CONTENT_TYPE, OID_ID_DATA,
+        OID_ID_SIGNED_DATA, OID_MESSAGE_DIGEST, OID_SIGNING_TIME, SignatureValue, SignedAttributes,
+        SignedData, SignerIdentifier, SignerInfo, SignerInfos,
+    },
+};
 use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
+use p521::ecdsa::signature::Signer as _;
 use pkcs8::{DecodePrivateKey, EncryptedPrivateKeyInfoRef, SecretDocument};
+use sha2::{Digest as _, Sha512};
 use thiserror::Error;
-use x509_certificate::{CapturedX509Certificate, InMemorySigningKeyPair, Sign};
+use x509_certificate::{
+    CapturedX509Certificate, DigestAlgorithm, InMemorySigningKeyPair, Sign,
+    asn1time::UtcTime,
+    rfc5280::AlgorithmIdentifier,
+    rfc5652::{Attribute, AttributeValue},
+};
 use zeroize::Zeroizing;
+
+/// DER content octets for the `ecdsa-with-SHA512` signature algorithm OID
+/// (1.2.840.10045.4.3.4). This pairing is not expressible via
+/// `x509_certificate::SignatureAlgorithm`, whose EC variants stop at SHA-384,
+/// so the P-521 CMS path builds the `AlgorithmIdentifier` from this OID
+/// directly. The `secp521r1` curve OID (1.3.132.0.35) and `id-ecPublicKey` live
+/// in the signing certificate's `SubjectPublicKeyInfo`, so they are not
+/// re-encoded here.
+const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 
 mod jks;
 mod legacy_pem;
@@ -143,7 +172,77 @@ pub trait SigningKey: Send {
 pub struct PemSigningKey {
     certificate_chain: CertificateChain,
     certificates: Vec<CapturedX509Certificate>,
-    private_key: InMemorySigningKeyPair,
+    private_key: SigningKeyMaterial,
+}
+
+/// The parsed private key behind a [`PemSigningKey`].
+///
+/// P-256/P-384/RSA/Ed25519 keys sign through the
+/// `cryptographic-message-syntax` + `x509-certificate` CMS backend. P-521
+/// (secp521r1) keys sign through a dedicated pure-Rust `p521` path because that
+/// backend's CMS signer implements only secp256r1/secp384r1; everything else is
+/// left on the original, unchanged path.
+enum SigningKeyMaterial {
+    X509(InMemorySigningKeyPair),
+    // Boxed to keep the enum small: `InMemorySigningKeyPair` boxes its key
+    // internally, whereas `p521::ecdsa::SigningKey` embeds the scalar and point.
+    P521(Box<P521SigningKey>),
+}
+
+impl SigningKeyMaterial {
+    /// Whether this key's public half matches the signing certificate.
+    ///
+    /// The X.509 backend compares raw `SubjectPublicKeyInfo` bytes. The P-521
+    /// path parses the certificate's SEC1 point (accepting either compressed or
+    /// uncompressed form) and compares curve points, so an equivalent key still
+    /// matches regardless of point encoding.
+    fn matches_certificate(&self, signing_certificate: &CapturedX509Certificate) -> bool {
+        match self {
+            Self::X509(key) => key.public_key_data() == signing_certificate.public_key_data(),
+            Self::P521(key) => {
+                p521::PublicKey::from_sec1_bytes(&signing_certificate.public_key_data())
+                    .is_ok_and(|certificate_public_key| certificate_public_key == key.public_key())
+            }
+        }
+    }
+}
+
+/// A P-521 (secp521r1) ECDSA signing key.
+///
+/// Signs with SHA-512 — the natural digest pairing for P-521 — using
+/// deterministic RFC 6979 nonces, producing DER-encoded ECDSA signatures for
+/// CMS. The secret scalar stays inside `p521::ecdsa::SigningKey`, which zeroizes
+/// on drop; it is never exposed, serialized, or logged.
+struct P521SigningKey {
+    signing_key: p521::ecdsa::SigningKey,
+}
+
+impl P521SigningKey {
+    /// Parses a PKCS#8 DER key iff it is a genuine P-521 key.
+    ///
+    /// Returns `None` for every other curve/algorithm — a P-256/P-384/RSA/
+    /// Ed25519 key fails this parse — so callers use it as the P-521
+    /// discriminator before falling back to the X.509 backend.
+    fn from_pkcs8_der(pkcs8_der: &[u8]) -> Option<Self> {
+        let secret_key = p521::SecretKey::from_pkcs8_der(pkcs8_der).ok()?;
+        let signing_key = p521::ecdsa::SigningKey::from(&secret_key);
+        drop(secret_key);
+        Some(Self { signing_key })
+    }
+
+    /// The public key corresponding to this signing key.
+    fn public_key(&self) -> p521::PublicKey {
+        self.signing_key.verifying_key().into()
+    }
+
+    /// ECDSA-P521 signature over `SHA-512(message)`, DER-encoded.
+    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
+        let signature: p521::ecdsa::DerSignature = self
+            .signing_key
+            .try_sign(message)
+            .map_err(|_| SigningKeyError::ProviderFailure)?;
+        Ok(signature.as_bytes().to_vec())
+    }
 }
 
 impl PemSigningKey {
@@ -255,21 +354,28 @@ impl PemSigningKey {
         private_key: SigningSecret,
         certificates: Vec<CapturedX509Certificate>,
     ) -> Result<Self, SigningKeyError> {
-        // Single P-521 rejection point for every entry form (traditional EC
-        // PEM, encrypted PKCS#8, and direct PKCS#8 PEM, which all reach this
-        // function as PKCS#8 DER): reject with a specific message before the
-        // generic parse below, which would otherwise fail a P-521 key with the
-        // vague `InvalidPrivateKey` (the signer backend maps every EC key to
-        // secp384r1 and then rejects a P-521 key).
-        reject_unsupported_signing_curve_der(private_key.as_bytes())?;
-        let parsed_private_key = InMemorySigningKeyPair::from_pkcs8_der(private_key.as_bytes());
-        drop(private_key);
-        let private_key = parsed_private_key.map_err(|_| SigningKeyError::InvalidPrivateKey)?;
-        Self::from_parsed_key_with_certificates(private_key, certificates)
+        // Every entry form (traditional EC PEM, encrypted PKCS#8, direct PKCS#8
+        // PEM, and PKCS#12/JKS archives) reaches this function as PKCS#8 DER.
+        // A genuine P-521 key parses only through the `p521` path and is signed
+        // there; a P-256/P-384 key fails that parse and falls through to the
+        // unchanged `x509-certificate` backend (which also serves RSA/Ed25519).
+        let material = if let Some(p521_key) =
+            P521SigningKey::from_pkcs8_der(private_key.as_bytes())
+        {
+            drop(private_key);
+            SigningKeyMaterial::P521(Box::new(p521_key))
+        } else {
+            let parsed_private_key = InMemorySigningKeyPair::from_pkcs8_der(private_key.as_bytes());
+            drop(private_key);
+            SigningKeyMaterial::X509(
+                parsed_private_key.map_err(|_| SigningKeyError::InvalidPrivateKey)?,
+            )
+        };
+        Self::from_material_with_certificates(material, certificates)
     }
 
-    fn from_parsed_key_with_certificates(
-        private_key: InMemorySigningKeyPair,
+    fn from_material_with_certificates(
+        private_key: SigningKeyMaterial,
         certificates: Vec<CapturedX509Certificate>,
     ) -> Result<Self, SigningKeyError> {
         let certificate_chain = CertificateChain::new(
@@ -281,7 +387,7 @@ impl PemSigningKey {
         let Some(signing_certificate) = certificates.first() else {
             return Err(SigningKeyError::EmptyCertificateChain);
         };
-        if private_key.public_key_data() != signing_certificate.public_key_data() {
+        if !private_key.matches_certificate(signing_certificate) {
             return Err(SigningKeyError::CertificateKeyMismatch);
         }
 
@@ -302,17 +408,24 @@ impl PemSigningKey {
     ///
     /// Returns an error if the provider cannot generate valid CMS bytes.
     pub fn detached_cms_der(&self, signed_pdf_bytes: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
-        let signing_certificate = self
-            .certificates
-            .first()
-            .cloned()
-            .ok_or(SigningKeyError::EmptyCertificateChain)?;
-        SignedDataBuilder::default()
-            .content_external(signed_pdf_bytes.to_vec())
-            .signer(SignerBuilder::new(&self.private_key, signing_certificate))
-            .certificates(self.certificates.iter().cloned())
-            .build_der()
-            .map_err(|_| SigningKeyError::CmsGeneration)
+        match &self.private_key {
+            SigningKeyMaterial::X509(private_key) => {
+                let signing_certificate = self
+                    .certificates
+                    .first()
+                    .cloned()
+                    .ok_or(SigningKeyError::EmptyCertificateChain)?;
+                SignedDataBuilder::default()
+                    .content_external(signed_pdf_bytes.to_vec())
+                    .signer(SignerBuilder::new(private_key, signing_certificate))
+                    .certificates(self.certificates.iter().cloned())
+                    .build_der()
+                    .map_err(|_| SigningKeyError::CmsGeneration)
+            }
+            SigningKeyMaterial::P521(private_key) => {
+                build_p521_detached_cms(private_key, &self.certificates, signed_pdf_bytes)
+            }
+        }
     }
 }
 
@@ -408,28 +521,140 @@ impl SigningKey for PemSigningKey {
 
     #[allow(deprecated)]
     fn sign(&mut self, signed_attributes_der: &[u8]) -> Result<Signature, SigningKeyError> {
-        let (signature, _) = self
-            .private_key
-            .sign(signed_attributes_der)
-            .map_err(|_| SigningKeyError::ProviderFailure)?;
+        let signature = match &self.private_key {
+            SigningKeyMaterial::X509(private_key) => {
+                let (signature, _) = private_key
+                    .sign(signed_attributes_der)
+                    .map_err(|_| SigningKeyError::ProviderFailure)?;
+                signature
+            }
+            SigningKeyMaterial::P521(private_key) => private_key.sign_der(signed_attributes_der)?,
+        };
         Signature::new(signature)
     }
 }
 
-/// Rejects a P-521 (secp521r1) EC private key handed in as PKCS#8 DER.
+/// Builds a detached CMS `SignedData` (DER) for a P-521 signing key.
 ///
-/// P-521 keys parse fine (legacy traditional-EC-PEM parsing even converts them
-/// to PKCS#8 forward-compatibly) but cannot be used for signing: the signer
-/// backend (`x509-certificate`) implements only secp256r1/secp384r1 and would
-/// otherwise fail a P-521 key with the generic `InvalidPrivateKey` message.
-/// `p521::SecretKey::from_pkcs8_der` succeeds only for a genuine P-521 key — a
-/// P-256/P-384 key fails that parse — so this never false-positives on a
-/// supported curve.
-fn reject_unsupported_signing_curve_der(pkcs8_der: &[u8]) -> Result<(), SigningKeyError> {
-    if p521::SecretKey::from_pkcs8_der(pkcs8_der).is_ok() {
-        return Err(SigningKeyError::UnsupportedSigningKeyCurve);
-    }
-    Ok(())
+/// The `cryptographic-message-syntax` `SignerBuilder` hardcodes a SHA-256 digest
+/// and derives the signature algorithm from `x509_certificate::SignatureAlgorithm`,
+/// whose EC variants stop at SHA-384 — so it cannot express the SHA-512 digest
+/// and `ecdsa-with-SHA512` signature algorithm P-521 requires. This assembles the
+/// `SignerInfo`/`SignedData` from the crate's own RFC 5652 ASN.1 types instead,
+/// mirroring the builder's structure exactly (external content, `id-signedData`
+/// eContentType, the content-type/message-digest/signing-time signed attributes,
+/// DER-sorted, `IssuerAndSerialNumber` signer id) so the output verifies through
+/// the same code path as the P-256/P-384 signatures. Only the digest, the
+/// signature algorithm, and the signing curve differ.
+fn build_p521_detached_cms(
+    private_key: &P521SigningKey,
+    certificates: &[CapturedX509Certificate],
+    signed_pdf_bytes: &[u8],
+) -> Result<Vec<u8>, SigningKeyError> {
+    let signing_certificate = certificates
+        .first()
+        .ok_or(SigningKeyError::EmptyCertificateChain)?;
+
+    // digestAlgorithm = SHA-512 (2.16.840.1.101.3.4.2.3), parameters absent.
+    let digest_algorithm: AlgorithmIdentifier = DigestAlgorithm::Sha512.into();
+    // signatureAlgorithm = ecdsa-with-SHA512 (1.2.840.10045.4.3.4), parameters absent.
+    let signature_algorithm = AlgorithmIdentifier {
+        algorithm: Oid(Bytes::copy_from_slice(OID_ECDSA_WITH_SHA512)),
+        parameters: None,
+    };
+
+    // messageDigest = SHA-512 over the externally-signed content (the covered
+    // PDF byte range). This is the detached/external signature form: the content
+    // is digested but not embedded.
+    let message_digest = Sha512::digest(signed_pdf_bytes);
+
+    let content_type_oid = Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref()));
+    let mut signed_attributes = SignedAttributes::default();
+    signed_attributes.push(Attribute {
+        typ: Oid(Bytes::copy_from_slice(OID_CONTENT_TYPE.as_ref())),
+        values: vec![AttributeValue::new(Captured::from_values(
+            Mode::Der,
+            content_type_oid.encode_ref(),
+        ))],
+    });
+    signed_attributes.push(Attribute {
+        typ: Oid(Bytes::copy_from_slice(OID_MESSAGE_DIGEST.as_ref())),
+        values: vec![AttributeValue::new(Captured::from_values(
+            Mode::Der,
+            message_digest.as_slice().encode(),
+        ))],
+    });
+    signed_attributes.push(Attribute {
+        typ: Oid(Bytes::copy_from_slice(OID_SIGNING_TIME.as_ref())),
+        values: vec![AttributeValue::new(Captured::from_values(
+            Mode::Der,
+            UtcTime::now().encode(),
+        ))],
+    });
+    // RFC 5652: signed attributes are DER, i.e. the SET must be sorted. Store the
+    // sorted form so the encoded SignerInfo matches the bytes that get signed.
+    let signed_attributes = signed_attributes
+        .as_sorted()
+        .map_err(|_| SigningKeyError::CmsGeneration)?;
+
+    let signer_identifier = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+        issuer: signing_certificate.issuer_name().clone(),
+        serial_number: signing_certificate.serial_number_asn1().clone(),
+    });
+
+    let mut signer_info = SignerInfo {
+        version: CmsVersion::V1,
+        sid: signer_identifier,
+        digest_algorithm: digest_algorithm.clone(),
+        signed_attributes: Some(signed_attributes),
+        signature_algorithm,
+        signature: SignatureValue::new(Bytes::new()),
+        unsigned_attributes: None,
+        signed_attributes_data: None,
+    };
+
+    // The signed content is the DER of the signed attributes, re-tagged from
+    // `IMPLICIT [0]` to `EXPLICIT SET OF` per RFC 5652 §5.4. `sign_der` then
+    // ECDSA-signs `SHA-512` of that content.
+    let signed_content = signer_info
+        .signed_attributes_digested_content()
+        .map_err(|_| SigningKeyError::CmsGeneration)?
+        .ok_or(SigningKeyError::CmsGeneration)?;
+    let signature = private_key.sign_der(&signed_content)?;
+    signer_info.signature = SignatureValue::new(Bytes::from(signature));
+
+    let mut digest_algorithms = DigestAlgorithmIdentifiers::default();
+    digest_algorithms.push(digest_algorithm);
+
+    let mut signer_infos = SignerInfos::default();
+    signer_infos.push(signer_info);
+
+    let mut certificate_set = CertificateSet::default();
+    certificate_set.extend(
+        certificates
+            .iter()
+            .cloned()
+            .map(|certificate| CertificateChoices::Certificate(Box::new(certificate.into()))),
+    );
+
+    let signed_data = SignedData {
+        version: CmsVersion::V1,
+        digest_algorithms,
+        content_info: EncapsulatedContentInfo {
+            content_type: Oid(Bytes::copy_from_slice(OID_ID_SIGNED_DATA.as_ref())),
+            content: None,
+        },
+        certificates: Some(certificate_set),
+        crls: None,
+        signer_infos,
+    };
+
+    let mut der = Vec::new();
+    signed_data
+        .encode_ref()
+        .write_encoded(Mode::Der, &mut der)
+        .map_err(|_| SigningKeyError::CmsGeneration)?;
+    Ok(der)
 }
 
 /// Errors shared by local and hardware key providers.
@@ -443,10 +668,6 @@ pub enum SigningKeyError {
     EmptySignature,
     #[error("the private key could not be parsed as PKCS#8")]
     InvalidPrivateKey,
-    #[error(
-        "P-521 (secp521r1) EC keys are not supported for signing; use a P-256 (prime256v1) or P-384 (secp384r1) key"
-    )]
-    UnsupportedSigningKeyCurve,
     #[error("a password is required for an encrypted private key")]
     PrivateKeyPasswordRequired,
     #[error("the encrypted PKCS#8 private key or password is invalid or unsupported")]
@@ -684,54 +905,167 @@ mod tests {
         Ok(())
     }
 
-    /// P-521 keys parse (legacy traditional-EC-PEM parsing even converts them
-    /// to PKCS#8) but cannot sign — the `x509-certificate` backend implements
-    /// only secp256r1/secp384r1. Both entry forms — a traditional (SEC1) EC
-    /// PEM and a direct PKCS#8 PEM — must be rejected with the specific
-    /// `UnsupportedSigningKeyCurve` error, not the vague `InvalidPrivateKey`.
+    /// A P-521 (secp521r1) private key and its self-signed certificate.
+    /// Generated with OpenSSL (`ecparam secp521r1` + `req -x509 -sha512`); the
+    /// certificate carries `ecdsa-with-SHA512` as its own signature algorithm.
+    const P521_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBwjfNy3ndVkidl8/i\n\
+V2pPvah68CP9+MDrdk223SvIQTigHgAidxkIXw3spX3uSIZLNIXagXxxEEvkpBiv\n\
+3Z6UNhOhgYkDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC+kFwgDDunFexpDJf\n\
+fUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFAiqfJndYEYQ2utLGA\n\
+UWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCLrPLRA6DuJEpamSp0\n\
+sA==\n\
+-----END PRIVATE KEY-----\n";
+
+    const P521_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIICGTCCAXqgAwIBAgIURyuRCEttmk0wOq2ytxrpIgOZlJcwCgYIKoZIzj0EAwQw\n\
+HjEcMBoGA1UEAwwTU3RpcmxpbmcgUC01MjEgVGVzdDAeFw0yNjA3MjUxNDUxMDVa\n\
+Fw0zNjA3MjIxNDUxMDVaMB4xHDAaBgNVBAMME1N0aXJsaW5nIFAtNTIxIFRlc3Qw\n\
+gZswEAYHKoZIzj0CAQYFK4EEACMDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC\n\
++kFwgDDunFexpDJffUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFA\n\
+iqfJndYEYQ2utLGAUWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCL\n\
+rPLRA6DuJEpamSp0sKNTMFEwHQYDVR0OBBYEFAg5plmhxEqSaLrJqbFy8hQkL6hA\n\
+MB8GA1UdIwQYMBaAFAg5plmhxEqSaLrJqbFy8hQkL6hAMA8GA1UdEwEB/wQFMAMB\n\
+Af8wCgYIKoZIzj0EAwQDgYwAMIGIAkIBTCtwawyMW65d7KK1C6rYZcm61/S1uUMC\n\
+4MiORYKcKBlAe/dFgs3gZ6dvLU/rswaau+6NECe0RYvjhTYkBh/aQNYCQgEdm5gs\n\
+0OhBQ0hHKV6fln9/bStY/qH3kOBG1jD60nj8AKV61+EWtRuBX4gmlYMY4CWhTE1U\n\
+amwXixTh3YlrdOneww==\n\
+-----END CERTIFICATE-----\n";
+
+    /// Independently verifies a P-521 detached CMS without the
+    /// `cryptographic-message-syntax` high-level verifier — that verifier
+    /// resolves algorithms through `x509_certificate::SignatureAlgorithm`, whose
+    /// EC variants stop at SHA-384, so it cannot even parse an
+    /// `ecdsa-with-SHA512` `SignerInfo`. This decodes the low-level RFC 5652
+    /// ASN.1 and checks the SHA-512 digest and the ECDSA-P521 signature with the
+    /// `p521` crate directly, the way an external verifier (e.g. OpenSSL) would.
+    fn assert_p521_detached_cms_verifies(
+        cms: &[u8],
+        signed_pdf_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use cryptographic_message_syntax::asn1::rfc5652::SignedData as Asn1SignedData;
+        use p521::ecdsa::{Signature as EcdsaSignature, signature::Verifier};
+        use sha2::{Digest as _, Sha512};
+
+        // digestAlgorithm = SHA-512 (2.16.840.1.101.3.4.2.3).
+        const OID_SHA512: &[u8] = &[96, 134, 72, 1, 101, 3, 4, 2, 3];
+
+        let expected_digest = Sha512::digest(signed_pdf_bytes);
+        // The signed messageDigest attribute must carry SHA-512(content),
+        // encoded as an OCTET STRING (tag 0x04, length 0x40).
+        let mut expected_message_digest = vec![0x04u8, 0x40u8];
+        expected_message_digest.extend_from_slice(expected_digest.as_slice());
+        assert!(
+            cms.windows(expected_message_digest.len())
+                .any(|window| window == expected_message_digest),
+            "CMS must bind SHA-512 of the signed content via the messageDigest attribute"
+        );
+
+        let secret_key = p521::SecretKey::from_pkcs8_pem(P521_PKCS8_PEM)?;
+        let signing_key = p521::ecdsa::SigningKey::from(&secret_key);
+
+        let signed_data = Asn1SignedData::decode_ber(cms)?;
+        assert!(
+            !signed_data.signer_infos.is_empty(),
+            "at least one SignerInfo"
+        );
+        for signer_info in signed_data.signer_infos.iter() {
+            assert_eq!(
+                signer_info.digest_algorithm.algorithm.as_ref(),
+                OID_SHA512,
+                "digestAlgorithm must be SHA-512"
+            );
+            assert_eq!(
+                signer_info.signature_algorithm.algorithm.as_ref(),
+                super::OID_ECDSA_WITH_SHA512,
+                "signatureAlgorithm must be ecdsa-with-SHA512"
+            );
+            let signed_content = signer_info
+                .signed_attributes_digested_content()?
+                .ok_or("signed attributes present")?;
+            let signature = EcdsaSignature::from_der(signer_info.signature.to_bytes().as_ref())?;
+            signing_key
+                .verifying_key()
+                .verify(&signed_content, &signature)?;
+        }
+        Ok(())
+    }
+
+    /// A genuine P-521 key now signs (the earlier fail-closed rejection is
+    /// gone). Both entry forms — a direct PKCS#8 PEM and a traditional (SEC1)
+    /// EC PEM converted forward to PKCS#8 — must produce a detached CMS that
+    /// independently verifies as ECDSA-P521 over SHA-512.
     #[test]
-    #[allow(deprecated)]
-    fn pem_provider_rejects_p521_keys_with_a_specific_error()
+    fn pem_provider_signs_p521_pkcs8_key_and_generates_verifiable_cms()
     -> Result<(), Box<dyn std::error::Error>> {
+        let signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(P521_PKCS8_PEM.as_bytes().to_vec()),
+            P521_CERTIFICATE_PEM.as_bytes(),
+        )?;
+        assert_eq!(signer.source(), SigningKeySource::UploadedPem);
+
+        let signed_pdf_bytes = b"p521-pkcs8-pdf-byte-range";
+        let cms = signer.detached_cms_der(signed_pdf_bytes)?;
+        assert_p521_detached_cms_verifies(&cms, signed_pdf_bytes)
+    }
+
+    #[test]
+    fn pem_provider_signs_traditional_p521_ec_pem() -> Result<(), Box<dyn std::error::Error>> {
+        // Derive the traditional (SEC1) EC PEM form from the same fixture key so
+        // the legacy-PEM P-521 -> PKCS#8 conversion path is exercised too.
+        let secret_key = p521::SecretKey::from_pkcs8_pem(P521_PKCS8_PEM)?;
+        let traditional_pem = pem_document("EC PRIVATE KEY", secret_key.to_sec1_der()?.as_ref());
+
+        let signer = PemSigningKey::from_pem(
+            SigningSecret::new(traditional_pem.into_bytes()),
+            None,
+            P521_CERTIFICATE_PEM.as_bytes(),
+        )?;
+
+        let signed_pdf_bytes = b"p521-traditional-pdf-byte-range";
+        let cms = signer.detached_cms_der(signed_pdf_bytes)?;
+        assert_p521_detached_cms_verifies(&cms, signed_pdf_bytes)
+    }
+
+    /// The `SigningKey::sign` trait path (detached signature over caller-supplied
+    /// attribute bytes) must also route through the P-521 signer and produce a
+    /// DER ECDSA-P521/SHA-512 signature that verifies with the fixture key.
+    #[test]
+    fn p521_signing_key_trait_sign_produces_verifiable_signature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use p521::ecdsa::{Signature as EcdsaSignature, signature::Verifier};
+
+        let mut signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(P521_PKCS8_PEM.as_bytes().to_vec()),
+            P521_CERTIFICATE_PEM.as_bytes(),
+        )?;
+        let attributes = b"arbitrary-signed-attributes-der";
+        let signature = signer.sign(attributes)?;
+
+        let secret_key = p521::SecretKey::from_pkcs8_pem(P521_PKCS8_PEM)?;
+        let signing_key = p521::ecdsa::SigningKey::from(&secret_key);
+        let parsed = EcdsaSignature::from_der(signature.as_bytes())?;
+        signing_key.verifying_key().verify(attributes, &parsed)?;
+        Ok(())
+    }
+
+    /// A P-521 key whose public half does not match the certificate is rejected
+    /// with the same `CertificateKeyMismatch` used by every other curve — the
+    /// curve is no longer a reason for rejection, but a wrong key still is.
+    #[test]
+    fn p521_provider_rejects_mismatched_certificate() -> Result<(), Box<dyn std::error::Error>> {
         use p521::elliptic_curve::Generate;
         use pkcs8::EncodePrivateKey;
 
-        // A valid certificate chain is required to reach the key-parse step;
-        // it need not match the P-521 key, since the curve rejection happens
-        // before the key/certificate match check.
-        let (certificate, _) = self_signed_ecdsa_key_pair(None);
-        let certificate_pem = certificate.encode_pem();
-        let p521_key = p521::SecretKey::generate_from_rng(&mut rand::rng());
-
-        // Entry form 1: traditional (SEC1) EC PEM.
-        let traditional_pem = pem_document("EC PRIVATE KEY", &p521_key.to_sec1_der()?);
+        let unrelated_key = p521::SecretKey::generate_from_rng(&mut rand::rng());
+        let unrelated_pkcs8 = pem_document("PRIVATE KEY", unrelated_key.to_pkcs8_der()?.as_bytes());
         assert_eq!(
-            PemSigningKey::from_pem(
-                SigningSecret::new(traditional_pem.into_bytes()),
-                None,
-                certificate_pem.as_bytes(),
+            PemSigningKey::from_pkcs8_pem(
+                SigningSecret::new(unrelated_pkcs8.into_bytes()),
+                P521_CERTIFICATE_PEM.as_bytes(),
             )
             .err(),
-            Some(SigningKeyError::UnsupportedSigningKeyCurve)
-        );
-
-        // Entry form 2: direct PKCS#8 PEM upload.
-        let pkcs8_pem = pem_document("PRIVATE KEY", p521_key.to_pkcs8_der()?.as_bytes());
-        assert_eq!(
-            PemSigningKey::from_pem(
-                SigningSecret::new(pkcs8_pem.into_bytes()),
-                None,
-                certificate_pem.as_bytes(),
-            )
-            .err(),
-            Some(SigningKeyError::UnsupportedSigningKeyCurve)
-        );
-
-        // The user-facing message names the unsupported curve specifically.
-        assert!(
-            SigningKeyError::UnsupportedSigningKeyCurve
-                .to_string()
-                .contains("P-521")
+            Some(SigningKeyError::CertificateKeyMismatch)
         );
         Ok(())
     }
