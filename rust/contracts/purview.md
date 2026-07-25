@@ -79,6 +79,38 @@ disabled case with a distinct message; this port folds it into the same opaque e
 leaking strictly less than Java. Unlike Java, the caller identity is passed explicitly
 (not read from a thread-local), so the `can_use` check always runs.
 
+### Step validator (`validate_steps`) — save-time confused-deputy guard
+
+Ported from Java `IntegrationStepValidator` (a `PipelineStepValidator` run by
+`PolicyValidator.validateSteps`). An integration step names a connection by id, but the
+worker thread that later runs it carries **no** principal — so `resolve_config` lets the
+lookup through unchecked there. `validate_steps` runs on the request thread, while the
+saving caller's identity is available, and forces the ownership check by resolving each
+step's connection (the resolved config is discarded — the call *is* the check). Without
+it, a caller could name any connection id in a step and have the server dial that tenant's
+endpoint with that tenant's stored credentials.
+
+Wiring / behaviour:
+
+- Called from `save_policy` (between the source loop and output validation — Rust order
+  sources → steps → output → trigger → size) and from the ad-hoc run path
+  (`submit_ad_hoc`, steps-then-output), mirroring Java's `PolicyValidator.validate` and
+  `PolicyController.validateAdHocRun`.
+- A step whose operation is not under `/api/v1/integration/` is skipped.
+- A prefixed operation with no registered connection type → `unknown integration step: <op>`
+  (fail-closed).
+- `connectionId` is parsed with a dedicated `Value → i64` mirroring
+  `ApiConnectionResolver.connectionId(Object)`: absent / JSON null / blank string →
+  `<op> requires a 'connectionId' parameter`; a number or numeric string → that id;
+  anything else → `'connectionId' is not a valid connection reference: <value>`.
+  (Not the S3 `connection_id` helper, whose message is hard-coded to the s3 path.)
+- **Divergence:** the registry lists only the *ported* subset —
+  `purview-apply-label` and `purview-read-label` (both `PURVIEW`). Java's map also carries
+  `external-api-call` (`API`) and `consigno-submit` / `consigno-fetch-signed` (`CONSIGNO`);
+  neither the custom-API step nor Consigno exists in this port, so those operations are
+  *not* registered and, being under the integration prefix, fail closed as
+  `unknown integration step` rather than being resolved.
+
 ## `SensitivityLabel` — the MSIP key contract
 
 A label is persisted as ordered `MSIP_Label_<GUID>_<Attribute>` pairs (Java
@@ -152,7 +184,6 @@ packet as "no packet"; a writer propagates the error rather than dropping a huge
 
 ## Gaps (explicit)
 
-- The `IntegrationStepValidator` save-time confused-deputy guard is **deferred**.
 - The Graph taxonomy lookup is **intentionally not built** — `clientId`/`clientSecret`
   therefore gate nothing that currently runs.
 
@@ -163,4 +194,9 @@ Unit tests cover the GUID/injection guard, both-or-neither credentials, the tena
 tolerant `SetDate`/`ContentBits`/`Method` parsing, the `ENCRYPT` protected bit, XMP
 escape/splice/strip primitives (prefixed and bare close tags, case-insensitively), Info-wins
 de-duplication, the opaque `resolve_config` outcomes, the protected-label refusal, and the
-apply→reload round-trip preserving other tenants' labels. `task engine:check` is clean.
+apply→reload round-trip preserving other tenants' labels. The step validator adds coverage
+for the ported-subset registry (Consigno / external-api fail closed), the
+`ApiConnectionResolver.connectionId` parsing matrix, the skip / unknown-step /
+required-parameter / invalid-reference messages, and an end-to-end `validate_steps` proving
+the resolve authz actually runs (a bad id → the opaque `resolve_config` error).
+`task engine:check` is clean.

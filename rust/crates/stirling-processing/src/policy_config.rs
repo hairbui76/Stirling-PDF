@@ -14,7 +14,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    integration_config::{IntegrationConfigService, IntegrationFailure, mask_config, merge_config},
+    integration_config::{
+        IntegrationConfigService, IntegrationFailure, IntegrationType, mask_config, merge_config,
+    },
     policy_ledger::ProcessedLedger,
     security::{AuthContext, SecurityError, SecurityStore},
     storage::StorageConfig,
@@ -24,6 +26,34 @@ const EDITOR_ID: &str = "editor";
 const EDITOR_TYPE: &str = "editor";
 const WEBHOOK_TYPE: &str = "webhook";
 const MAX_POLICY_JSON_BYTES: usize = 1024 * 1024;
+
+/// The step parameter naming the integration connection to dereference, matching
+/// Java `IntegrationStepValidator.CONNECTION_ID_PARAM` /
+/// `ApiConnectionResolver.connectionId`.
+const CONNECTION_ID_PARAM: &str = "connectionId";
+
+/// Operations under this prefix are integration steps whose `connectionId` is
+/// authorization-checked at save time, matching Java
+/// `IntegrationStepValidator.INTEGRATION_PREFIX`.
+const INTEGRATION_PREFIX: &str = "/api/v1/integration/";
+
+/// Which connection type each integration step dereferences, mirroring Java
+/// `IntegrationStepValidator.STEP_CONNECTION_TYPES`. Only the **ported** subset is
+/// listed: Java also maps `external-api-call` (`API`) and `consigno-*` (`CONSIGNO`),
+/// neither of which exists in this port — an intentional divergence. A step under
+/// [`INTEGRATION_PREFIX`] that is absent here is rejected rather than waved through,
+/// so a new endpoint cannot silently skip the confused-deputy check by forgetting to
+/// register (fail-closed).
+const INTEGRATION_STEP_TYPES: &[(&str, IntegrationType)] = &[
+    (
+        "/api/v1/integration/purview-apply-label",
+        IntegrationType::Purview,
+    ),
+    (
+        "/api/v1/integration/purview-read-label",
+        IntegrationType::Purview,
+    ),
+];
 
 /// Reason key for an implied root backed by the local server file-storage
 /// directory. Surfaced verbatim to the admin UI so it can label each root,
@@ -794,6 +824,7 @@ impl PolicyConfigService {
                 })?;
             self.validate_source(&source, context)?;
         }
+        self.validate_steps(&incoming.steps, context)?;
         self.validate_output(&incoming.output, context)?;
         self.validate_trigger(&incoming, context)?;
         validate_serialized_size(&incoming)?;
@@ -876,6 +907,31 @@ impl PolicyConfigService {
                 "unknown source type: {value}"
             ))),
         }
+    }
+
+    /// Save-time confused-deputy guard for a policy's steps, ported from Java
+    /// `IntegrationStepValidator.validate` (registered as a `PipelineStepValidator`
+    /// and invoked by `PolicyValidator.validateSteps`). Each integration step names
+    /// a connection by id; the worker thread that later runs it carries **no**
+    /// principal, so `resolve_config` there lets the lookup through unchecked. This
+    /// runs while the saving caller's identity is still available, forcing the
+    /// ownership check to run — otherwise a caller could name any connection id in a
+    /// step and have the server dial that tenant's endpoint with that tenant's
+    /// stored credentials. Non-integration steps are skipped; the resolved config is
+    /// discarded because the call itself is the authorization check.
+    pub(crate) fn validate_steps(
+        &self,
+        steps: &[PolicyStep],
+        context: &AuthContext,
+    ) -> Result<(), PolicyFailure> {
+        for step in steps {
+            if let Some((connection_id, integration_type)) = integration_step_connection(step)? {
+                self.integrations
+                    .resolve_config(connection_id, integration_type, context)
+                    .map_err(policy_integration_error)?;
+            }
+        }
+        Ok(())
     }
 
     fn validate_output(
@@ -1180,6 +1236,87 @@ fn validate_schedule_time(schedule: &Map<String, Value>) -> Result<(), PolicyFai
         Err(PolicyFailure::BadRequest(
             "invalid schedule: schedule needs a time of day ('at')".to_owned(),
         ))
+    }
+}
+
+/// Classifies a step for the confused-deputy guard, returning the connection it
+/// dereferences (id + type) or `None` when the step is not an integration step and
+/// should be skipped. Ported from Java `IntegrationStepValidator.validate`:
+///
+/// - an operation not under [`INTEGRATION_PREFIX`] → `Ok(None)` (skip);
+/// - a prefixed operation with no registered type → `unknown integration step`
+///   (fail-closed, so an unported endpoint such as `consigno-*` cannot slip
+///   through unchecked);
+/// - a registered step with no resolvable `connectionId` → the same
+///   `requires a 'connectionId' parameter` error Java raises after its `null` check.
+///
+/// The returned pair is what the caller then authorization-checks; this function is
+/// pure so the classification/parsing can be exercised without a live store.
+fn integration_step_connection(
+    step: &PolicyStep,
+) -> Result<Option<(i64, IntegrationType)>, PolicyFailure> {
+    let operation = step.operation.as_str();
+    if !operation.starts_with(INTEGRATION_PREFIX) {
+        return Ok(None);
+    }
+    let integration_type = integration_step_type(operation).ok_or_else(|| {
+        PolicyFailure::BadRequest(format!("unknown integration step: {operation}"))
+    })?;
+    let connection_id =
+        step_connection_id(step.parameters.get(CONNECTION_ID_PARAM))?.ok_or_else(|| {
+            PolicyFailure::BadRequest(format!(
+                "{operation} requires a '{CONNECTION_ID_PARAM}' parameter"
+            ))
+        })?;
+    Ok(Some((connection_id, integration_type)))
+}
+
+/// The connection type a registered integration step dereferences, or `None` for an
+/// operation that is not a (ported) integration step. Mirrors a lookup in Java's
+/// `STEP_CONNECTION_TYPES` map.
+fn integration_step_type(operation: &str) -> Option<IntegrationType> {
+    INTEGRATION_STEP_TYPES
+        .iter()
+        .find(|(step_operation, _)| *step_operation == operation)
+        .map(|&(_, integration_type)| integration_type)
+}
+
+/// Parses an integration step's `connectionId` parameter into a numeric connection
+/// id, mirroring Java `ApiConnectionResolver.connectionId(Object)`. An absent
+/// parameter, a JSON null, or a blank string all yield `Ok(None)` — the caller turns
+/// that into a "requires a 'connectionId' parameter" error, so blank and absent are
+/// indistinguishable. A JSON number or a numeric string yields `Ok(Some(id))`;
+/// anything else is an invalid connection reference.
+///
+/// This is deliberately **not** [`parse_connection_id_param`] (which takes an
+/// already-stringified form field) nor the S3 `connection_id` helper (whose error is
+/// hard-coded to the s3 source path).
+fn step_connection_id(reference: Option<&Value>) -> Result<Option<i64>, PolicyFailure> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let parsed = match reference {
+        Value::Null => return Ok(None),
+        Value::String(value) if value.trim().is_empty() => return Ok(None),
+        Value::Number(number) => number.as_i64(),
+        Value::String(value) => value.trim().parse::<i64>().ok(),
+        other => other.to_string().trim().parse::<i64>().ok(),
+    };
+    parsed.map(Some).ok_or_else(|| {
+        PolicyFailure::BadRequest(format!(
+            "'{CONNECTION_ID_PARAM}' is not a valid connection reference: {}",
+            connection_reference_display(reference)
+        ))
+    })
+}
+
+/// Renders a rejected `connectionId` value for the invalid-reference error the same
+/// way Java's string concatenation of the raw `Object` does: a JSON string shows its
+/// bare text (no quotes), any other value its compact JSON form.
+fn connection_reference_display(reference: &Value) -> String {
+    match reference {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -2273,6 +2410,508 @@ mod tests {
         for policy in &selected {
             assert!(service.policy_references_webhook(policy, &real_id)?);
         }
+        Ok(())
+    }
+
+    // ---- TESTER: integration-step confused-deputy guard (IntegrationStepValidator) ----
+
+    fn step(operation: &str, parameters: Map<String, Value>) -> super::PolicyStep {
+        super::PolicyStep {
+            operation: operation.to_owned(),
+            parameters,
+            ..Default::default()
+        }
+    }
+
+    fn connection_param(value: Value) -> Map<String, Value> {
+        let mut parameters = Map::new();
+        parameters.insert("connectionId".to_owned(), value);
+        parameters
+    }
+
+    #[test]
+    fn integration_step_type_lists_only_the_ported_purview_subset() {
+        use super::{IntegrationType, integration_step_type};
+        assert_eq!(
+            integration_step_type("/api/v1/integration/purview-apply-label"),
+            Some(IntegrationType::Purview)
+        );
+        assert_eq!(
+            integration_step_type("/api/v1/integration/purview-read-label"),
+            Some(IntegrationType::Purview)
+        );
+        // Java maps these too, but they are NOT ported: they must miss the registry so
+        // the guard fails them closed rather than resolving an absent connection type.
+        assert_eq!(
+            integration_step_type("/api/v1/integration/external-api-call"),
+            None
+        );
+        assert_eq!(
+            integration_step_type("/api/v1/integration/consigno-submit"),
+            None
+        );
+        assert_eq!(
+            integration_step_type("/api/v1/integration/consigno-fetch-signed"),
+            None
+        );
+        assert_eq!(integration_step_type("/api/v1/misc/compress-pdf"), None);
+    }
+
+    #[test]
+    fn step_connection_id_mirrors_api_connection_resolver_parsing() {
+        use super::step_connection_id;
+        // Absent, JSON null, and blank/whitespace strings all read as "no id" (None),
+        // which the caller turns into the requires-parameter error.
+        assert!(matches!(step_connection_id(None), Ok(None)));
+        assert!(matches!(step_connection_id(Some(&Value::Null)), Ok(None)));
+        assert!(matches!(
+            step_connection_id(Some(&Value::String(String::new()))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::String("   ".to_owned()))),
+            Ok(None)
+        ));
+        // A JSON number resolves directly; a numeric string (the form-field shape)
+        // resolves after trimming; negatives are preserved.
+        assert!(matches!(
+            step_connection_id(Some(&Value::from(42))),
+            Ok(Some(42))
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::String("42".to_owned()))),
+            Ok(Some(42))
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::String("  7 ".to_owned()))),
+            Ok(Some(7))
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::from(-3))),
+            Ok(Some(-3))
+        ));
+        // Non-numeric strings and non-scalar values are invalid references; the raw
+        // string shows without quotes (Java concatenates the Object's toString).
+        assert!(matches!(
+            step_connection_id(Some(&Value::String("abc".to_owned()))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "'connectionId' is not a valid connection reference: abc"
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::Object(Map::new()))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "'connectionId' is not a valid connection reference: {}"
+        ));
+        assert!(matches!(
+            step_connection_id(Some(&Value::Bool(true))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "'connectionId' is not a valid connection reference: true"
+        ));
+    }
+
+    #[test]
+    fn integration_step_classification_skips_non_integration_and_fails_closed() {
+        use super::integration_step_connection;
+        // A non-integration operation is skipped entirely — no connectionId required.
+        assert!(matches!(
+            integration_step_connection(&step("/api/v1/misc/compress-pdf", Map::new())),
+            Ok(None)
+        ));
+        // A prefixed but unregistered endpoint (Consigno / external-api are unported)
+        // fails closed with the exact Java message.
+        assert!(matches!(
+            integration_step_connection(&step(
+                "/api/v1/integration/consigno-submit",
+                connection_param(Value::from(1)),
+            )),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "unknown integration step: /api/v1/integration/consigno-submit"
+        ));
+        // A registered step missing its connectionId reports the required-parameter
+        // error (Java's post-`connectionId(...)` null check), byte-for-byte.
+        assert!(matches!(
+            integration_step_connection(&step(
+                "/api/v1/integration/purview-apply-label",
+                Map::new(),
+            )),
+            Err(PolicyFailure::BadRequest(message))
+                if message
+                    == "/api/v1/integration/purview-apply-label requires a 'connectionId' parameter"
+        ));
+        // A blank-string connectionId reads as absent -> same required-parameter error.
+        assert!(matches!(
+            integration_step_connection(&step(
+                "/api/v1/integration/purview-read-label",
+                connection_param(Value::String("  ".to_owned())),
+            )),
+            Err(PolicyFailure::BadRequest(message))
+                if message
+                    == "/api/v1/integration/purview-read-label requires a 'connectionId' parameter"
+        ));
+        // A well-formed step surfaces the (id, type) pair the caller then authz-checks.
+        assert!(matches!(
+            integration_step_connection(&step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(99)),
+            )),
+            Ok(Some((99, super::IntegrationType::Purview)))
+        ));
+    }
+
+    #[test]
+    fn validate_steps_runs_the_resolve_authz_check() -> Result<(), PolicyFailure> {
+        use super::{IntegrationType, PolicyConfigService, policy_integration_error};
+        use crate::integration_config::{IntegrationConfigRequest, IntegrationConfigService};
+        use crate::resource_access::{DefaultAccessPolicy, OwnerScope};
+        use crate::security::SecurityStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+        let integrations = Arc::new(IntegrationConfigService::new(
+            Arc::clone(&store),
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        let ctx = webhook_admin_context();
+
+        // A SERVER-scoped Purview connection (server scope leaves owner ids null so the
+        // in-memory user FK is not exercised); enabled by default and usable by an admin.
+        let mut config = Map::new();
+        config.insert(
+            "tenantId".to_owned(),
+            Value::String("CB46C030-1825-4E81-A295-151C039DBF02".to_owned()),
+        );
+        integrations
+            .create(
+                IntegrationConfigRequest {
+                    integration_type: Some(IntegrationType::Purview),
+                    name: Some("tenant".to_owned()),
+                    scope: Some(OwnerScope::Server),
+                    config: Some(config),
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .map_err(policy_integration_error)?;
+        let connection_id = store.list_integration_configs()?[0].id;
+
+        let service = PolicyConfigService::new(
+            Arc::clone(&store),
+            Arc::clone(&integrations),
+            Vec::new(),
+            Path::new("/srv/configs"),
+            Vec::new(),
+        );
+
+        // Non-integration steps require no connection and pass.
+        service.validate_steps(&[step("/api/v1/misc/compress-pdf", Map::new())], &ctx)?;
+
+        // A purview step naming the owned+enabled connection resolves cleanly, by a
+        // numeric id and by the equivalent numeric string.
+        service.validate_steps(
+            &[step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(connection_id)),
+            )],
+            &ctx,
+        )?;
+        service.validate_steps(
+            &[step(
+                "/api/v1/integration/purview-read-label",
+                connection_param(Value::String(connection_id.to_string())),
+            )],
+            &ctx,
+        )?;
+
+        // ADVERSARIAL confused deputy: naming a connection id that does not exist
+        // collapses into the opaque resolve error, proving resolve_config actually runs
+        // and that its failure maps through policy_integration_error to a 400.
+        assert!(matches!(
+            service.validate_steps(
+                &[step(
+                    "/api/v1/integration/purview-apply-label",
+                    connection_param(Value::from(connection_id + 9_999)),
+                )],
+                &ctx,
+            ),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "unknown or inaccessible purview connection"
+        ));
+
+        // An unported prefixed endpoint fails closed BEFORE any resolve.
+        assert!(matches!(
+            service.validate_steps(
+                &[step(
+                    "/api/v1/integration/consigno-submit",
+                    connection_param(Value::from(connection_id)),
+                )],
+                &ctx,
+            ),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "unknown integration step: /api/v1/integration/consigno-submit"
+        ));
+        Ok(())
+    }
+
+    // ---- TESTER: end-to-end save_policy parity for the confused-deputy step guard ----
+    // These drive the guard through the real save_policy entry point (not the free fn) so
+    // they also prove a rejected step leaves NOTHING persisted and that the guard re-runs on
+    // every save — the actual PolicyValidator.validate contract.
+
+    fn seed_connection(
+        integration_type: super::IntegrationType,
+        enabled: bool,
+    ) -> crate::integration_config::NewIntegrationConfig {
+        use crate::resource_access::{DefaultAccessPolicy, OwnerScope};
+        let mut config = Map::new();
+        config.insert("tenantId".to_owned(), Value::String("tenant".to_owned()));
+        crate::integration_config::NewIntegrationConfig {
+            integration_type,
+            name: "seeded".to_owned(),
+            // Server scope leaves the owner ids null so the in-memory user FK is not exercised.
+            scope: OwnerScope::Server,
+            owner_user_id: None,
+            owner_team_id: None,
+            enabled,
+            locked: false,
+            // EXPLICIT_ONLY: nobody but an admin/owner/grantee may use it, so a non-admin
+            // stranger is genuinely locked out (foreign-connection parity).
+            default_access: DefaultAccessPolicy::ExplicitOnly,
+            config,
+        }
+    }
+
+    fn policy_with_step(policy_step: super::PolicyStep) -> super::PolicyDefinition {
+        super::PolicyDefinition {
+            id: String::new(),
+            name: "Labeling pipeline".to_owned(),
+            owner: None,
+            enabled: false,
+            trigger: None,
+            source_ids: Vec::new(),
+            steps: vec![policy_step],
+            output: super::OutputSpec::default(),
+            team_id: None,
+        }
+    }
+
+    #[test]
+    fn save_policy_gates_integration_steps_and_never_persists_a_rejected_one()
+    -> Result<(), PolicyFailure> {
+        use super::IntegrationType;
+        use crate::security::SecurityStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+        // An enabled Purview connection (accept target), a same-scope S3 decoy (wrong type),
+        // and a disabled Purview connection — all resolvable by id, all seeded directly.
+        let purview =
+            store.create_integration_config(&seed_connection(IntegrationType::Purview, true))?;
+        let s3 = store.create_integration_config(&seed_connection(IntegrationType::S3, true))?;
+        let disabled =
+            store.create_integration_config(&seed_connection(IntegrationType::Purview, false))?;
+        let service = webhook_service(Arc::clone(&store));
+        let ctx = webhook_admin_context();
+
+        // ACCEPT: a purview step naming the enabled connection persists and round-trips out.
+        let saved = service.save_policy(
+            policy_with_step(step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(purview.id)),
+            )),
+            &ctx,
+        )?;
+        assert!(!saved.id.is_empty());
+        assert_eq!(service.get_policy(&saved.id, &ctx)?.id, saved.id);
+        let baseline = service.list_policies(&ctx)?.len();
+
+        let reject = |def: super::PolicyDefinition, expected: &str| -> Result<(), PolicyFailure> {
+            match service.save_policy(def, &ctx) {
+                Err(PolicyFailure::BadRequest(message)) => {
+                    assert_eq!(message.as_str(), expected, "wrong rejection message");
+                }
+                other => panic!("expected BadRequest({expected:?}), got {other:?}"),
+            }
+            assert_eq!(
+                service.list_policies(&ctx)?.len(),
+                baseline,
+                "a rejected policy must never be persisted"
+            );
+            Ok(())
+        };
+
+        // REJECT wrong type: a purview step naming the S3 connection collapses into the SAME
+        // opaque error as a missing one (anti-enumeration) — resolve_config's type filter.
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(s3.id)),
+            )),
+            "unknown or inaccessible purview connection",
+        )?;
+        // REJECT disabled: the port folds Java's distinct "disabled" message into the opaque one.
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/purview-read-label",
+                connection_param(Value::from(disabled.id)),
+            )),
+            "unknown or inaccessible purview connection",
+        )?;
+        // REJECT non-existent id -> opaque.
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(purview.id + 9_999)),
+            )),
+            "unknown or inaccessible purview connection",
+        )?;
+        // REJECT missing connectionId -> the required-parameter error (Java's null check).
+        reject(
+            policy_with_step(step("/api/v1/integration/purview-apply-label", Map::new())),
+            "/api/v1/integration/purview-apply-label requires a 'connectionId' parameter",
+        )?;
+        // REJECT non-numeric connectionId -> invalid-reference, raw value shown without quotes.
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::String("not-an-id".to_owned())),
+            )),
+            "'connectionId' is not a valid connection reference: not-an-id",
+        )?;
+        // REJECT unported prefixed endpoint -> fails closed. DIVERGENCE: Java maps
+        // external-api-call to IntegrationType.API and WOULD accept it; the port has no API-step
+        // port, so it rejects rather than resolving an absent type. Documented in purview.md.
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/external-api-call",
+                connection_param(Value::from(purview.id)),
+            )),
+            "unknown integration step: /api/v1/integration/external-api-call",
+        )?;
+
+        // ACCEPT: a non-integration operation is skipped entirely (persists with no connection).
+        let compress = service.save_policy(
+            policy_with_step(step("/api/v1/misc/compress-pdf", Map::new())),
+            &ctx,
+        )?;
+        assert!(!compress.id.is_empty());
+        // PARSE PARITY end-to-end: a numeric-STRING connectionId resolves exactly like the number.
+        let via_string = service.save_policy(
+            policy_with_step(step(
+                "/api/v1/integration/purview-read-label",
+                connection_param(Value::String(purview.id.to_string())),
+            )),
+            &ctx,
+        )?;
+        assert!(!via_string.id.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn save_policy_revalidates_steps_on_every_save_not_just_create() -> Result<(), PolicyFailure> {
+        use super::IntegrationType;
+        use crate::security::SecurityStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+        let purview =
+            store.create_integration_config(&seed_connection(IntegrationType::Purview, true))?;
+        let service = webhook_service(Arc::clone(&store));
+        let ctx = webhook_admin_context();
+
+        // First save succeeds against the enabled connection.
+        let saved = service.save_policy(
+            policy_with_step(step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(purview.id)),
+            )),
+            &ctx,
+        )?;
+
+        // The connection is disabled out from under the stored policy.
+        let mut flip = store
+            .get_integration_config(purview.id)?
+            .ok_or_else(|| PolicyFailure::BadRequest("connection vanished".to_owned()))?;
+        flip.enabled = false;
+        store.update_integration_config(&flip)?;
+
+        // Re-saving the SAME policy re-runs validate_steps and now rejects: the guard fires on
+        // every save, not only on create (parity with PolicyValidator.validate being unconditional).
+        let mut resave = policy_with_step(step(
+            "/api/v1/integration/purview-apply-label",
+            connection_param(Value::from(purview.id)),
+        ));
+        resave.id = saved.id.clone();
+        resave.name = "Renamed".to_owned();
+        assert!(matches!(
+            service.save_policy(resave, &ctx),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "unknown or inaccessible purview connection"
+        ));
+        // The rejected re-save left the stored policy untouched (original name preserved).
+        assert_eq!(
+            service.get_policy(&saved.id, &ctx)?.name,
+            "Labeling pipeline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_steps_rejects_a_connection_the_caller_may_not_use() -> Result<(), PolicyFailure> {
+        use super::IntegrationType;
+        use crate::security::{AuthContext, AuthenticationSource, SecurityStore};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+        // Enabled + EXPLICIT_ONLY: only an admin/owner/grantee may use it.
+        let purview =
+            store.create_integration_config(&seed_connection(IntegrationType::Purview, true))?;
+        let service = webhook_service(Arc::clone(&store));
+
+        // A plain non-admin, non-owner, un-granted user: is_admin false, is_owner false (null
+        // owner ids), no grant, EXPLICIT_ONLY -> can_use false -> the resolve authz check
+        // collapses to the opaque error (confused-deputy foreign-connection parity).
+        let stranger = AuthContext {
+            user_id: 7,
+            username: "stranger".to_owned(),
+            authentication_source: AuthenticationSource::AccessToken,
+            authentication_type: "web".to_owned(),
+            roles: ["ROLE_USER"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            team_id: Some(1),
+            permissions: BTreeSet::new(),
+            external_subject: None,
+            force_password_change: false,
+            session_id: "session".to_owned(),
+            correlation_id: "request".to_owned(),
+        };
+        assert!(matches!(
+            service.validate_steps(
+                &[step(
+                    "/api/v1/integration/purview-apply-label",
+                    connection_param(Value::from(purview.id)),
+                )],
+                &stranger,
+            ),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "unknown or inaccessible purview connection"
+        ));
+
+        // Sanity: an admin CAN use the very same connection (is_admin short-circuit), proving the
+        // rejection above is the ownership check and not a broken/absent connection.
+        service.validate_steps(
+            &[step(
+                "/api/v1/integration/purview-apply-label",
+                connection_param(Value::from(purview.id)),
+            )],
+            &webhook_admin_context(),
+        )?;
         Ok(())
     }
 }
