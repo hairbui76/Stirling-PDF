@@ -2623,6 +2623,8 @@ const ASYNC_JOB_PROCESSING_PATHS: &[&str] = &[
     SANITIZE_PDF_PATH,
     SCALE_PAGES_PATH,
     SCANNER_EFFECT_PATH,
+    smtp_mail::SEND_EMAIL_PATH,
+    SETTINGS_UPDATE_ANALYTICS_PATH,
     SHOW_JAVASCRIPT_PATH,
     SPLIT_BY_SIZE_PATH,
     SPLIT_CHAPTERS_PATH,
@@ -13831,9 +13833,14 @@ fn map_overlay_error(error: &OverlayError) -> ApiError {
 mod tests {
     use std::fs;
 
+    use axum::{body::Body, extract::Request, http::Method};
     use tempfile::tempdir;
 
-    use super::{DEFAULT_MAX_UPLOAD_BYTES, TimestampSettings, parse_data_size};
+    use super::smtp_mail;
+    use super::{
+        DEFAULT_MAX_UPLOAD_BYTES, SETTINGS_UPDATE_ANALYTICS_PATH, TimestampSettings,
+        is_async_job_request, parse_data_size, supports_async_jobs,
+    };
     use crate::runtime_config::RuntimeConfig;
 
     #[test]
@@ -13867,6 +13874,71 @@ mod tests {
             settings.custom_tsa_urls,
             ["https://custom-tsa.example.test"]
         );
+        Ok(())
+    }
+
+    fn build_request(
+        method: Method,
+        uri: impl AsRef<str>,
+    ) -> Result<Request, Box<dyn std::error::Error>> {
+        Ok(Request::builder()
+            .method(method)
+            .uri(uri.as_ref())
+            .body(Body::empty())?)
+    }
+
+    #[test]
+    fn analytics_and_send_email_paths_are_async_capable() {
+        // @AutoJobPostMapping parity: both handlers sit behind submit_async_job,
+        // so the allowlist must recognise them as async-capable.
+        assert!(supports_async_jobs(SETTINGS_UPDATE_ANALYTICS_PATH));
+        assert!(supports_async_jobs(smtp_mail::SEND_EMAIL_PATH));
+    }
+
+    #[test]
+    fn unlisted_paths_are_not_async_capable() {
+        assert!(!supports_async_jobs(
+            "/api/v1/settings/get-enable-analytics"
+        ));
+        assert!(!supports_async_jobs("/api/v1/general/not-a-real-endpoint"));
+        assert!(!supports_async_jobs(""));
+    }
+
+    #[test]
+    fn async_post_is_recognised_for_analytics_and_send_email()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Content-type-agnostic: the wrapper keys off method + path + ?async=true,
+        // regardless of whether the POST body is form-encoded or JSON.
+        for path in [SETTINGS_UPDATE_ANALYTICS_PATH, smtp_mail::SEND_EMAIL_PATH] {
+            let request = build_request(Method::POST, format!("{path}?async=true"))?;
+            assert!(
+                is_async_job_request(&request),
+                "expected async recognition for {path}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_async_flag_or_wrong_method_is_not_an_async_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // No async flag -> synchronous, even on an allowlisted path.
+        let sync_post = build_request(Method::POST, SETTINGS_UPDATE_ANALYTICS_PATH)?;
+        assert!(!is_async_job_request(&sync_post));
+
+        // async=false is explicitly not async.
+        let disabled = build_request(
+            Method::POST,
+            format!("{}?async=false", smtp_mail::SEND_EMAIL_PATH),
+        )?;
+        assert!(!is_async_job_request(&disabled));
+
+        // GET is never an async job, even with the flag set.
+        let get = build_request(
+            Method::GET,
+            format!("{SETTINGS_UPDATE_ANALYTICS_PATH}?async=true"),
+        )?;
+        assert!(!is_async_job_request(&get));
         Ok(())
     }
 }
