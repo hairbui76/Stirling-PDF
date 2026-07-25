@@ -146,9 +146,13 @@ use std::{
     collections::BTreeMap,
     env,
     io::ErrorKind,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -165,6 +169,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::{
@@ -173,7 +178,11 @@ use tokio::{
     task,
 };
 use tokio_util::io::ReaderStream;
-use tower_http::trace::TraceLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::{
+    timeout::{RequestBodyTimeoutLayer, TimeoutLayer},
+    trace::TraceLayer,
+};
 use zeroize::Zeroizing;
 
 use crate::pdf_merge::{
@@ -1711,11 +1720,15 @@ impl ProcessingRuntime {
     }
 
     pub fn into_router(self) -> Router {
-        self.router
+        // Assembly boundary for the DoS transport guardrails: every production
+        // and test entry point funnels the fully-merged router through here, so
+        // wrapping it once covers BOTH the OSS router and the reviewed-security
+        // router without touching the individual route modules.
+        apply_transport_limits(self.router, TransportLimits::production())
     }
 
     pub fn router(&self) -> Router {
-        self.router.clone()
+        apply_transport_limits(self.router.clone(), TransportLimits::production())
     }
 }
 
@@ -1880,6 +1893,148 @@ fn initialize_policy_ledger(
         .recover_interrupted(chrono::Utc::now().timestamp_millis())
         .map_err(SecurityStartupError::Repository)?;
     Ok(Some(ledger))
+}
+
+/// Path prefix whose requests are metered against the stricter per-IP bucket.
+/// The auth routes drive bcrypt work and account lockout, so a flood there is
+/// far more expensive than ordinary traffic and is throttled early.
+const AUTH_ROUTE_PREFIX: &str = "/api/v1/auth";
+
+/// How many rate-limit checks pass between opportunistic prunes of the keyed
+/// state stores. Pruning drops fully-replenished per-IP entries so a flood of
+/// distinct source IPs cannot grow the maps without bound.
+const RATE_LIMIT_PRUNE_INTERVAL: u64 = 10_000;
+
+/// Transport-level `DoS` guardrails applied at the router assembly boundary.
+/// Kept as data (not hard-coded in the layer stack) so tests can drive the same
+/// wiring with tiny timeouts and buckets.
+#[derive(Clone, Copy)]
+struct TransportLimits {
+    /// Ceiling on total time for one request, handler included. Long work is
+    /// offloaded to async jobs, so a synchronous request that outruns this is
+    /// treated as stuck and aborted with `408`.
+    request_timeout: Duration,
+    /// Maximum idle gap between request-body frames. The timer resets on every
+    /// frame, so an honest large upload streams freely while a slowloris that
+    /// dribbles or stalls its body — holding a connection open while buffering
+    /// toward the upload limit — is cut off.
+    body_read_timeout: Duration,
+    /// Process-wide cap on concurrently handled requests.
+    max_concurrent_requests: usize,
+    /// Sustained per-IP request rate for general traffic.
+    general_per_second: u32,
+    /// Per-IP burst capacity for general traffic before `429`s begin.
+    general_burst: u32,
+    /// Sustained per-IP request rate for the authentication routes.
+    auth_per_second: u32,
+    /// Per-IP burst capacity for authentication traffic — deliberately far
+    /// smaller so a credential-stuffing / bcrypt flood from one IP is throttled.
+    auth_burst: u32,
+}
+
+impl TransportLimits {
+    fn production() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(900),
+            body_read_timeout: Duration::from_secs(30),
+            max_concurrent_requests: 1_024,
+            general_per_second: 100,
+            general_burst: 400,
+            auth_per_second: 5,
+            auth_burst: 30,
+        }
+    }
+}
+
+/// Per-IP rate-limit state shared by the enforcement middleware across every
+/// cloned copy of the router service.
+struct RateLimitState {
+    general: DefaultKeyedRateLimiter<IpAddr>,
+    auth: DefaultKeyedRateLimiter<IpAddr>,
+    checks_since_prune: AtomicU64,
+}
+
+impl RateLimitState {
+    fn new(limits: &TransportLimits) -> Self {
+        Self {
+            general: RateLimiter::keyed(rate_quota(
+                limits.general_per_second,
+                limits.general_burst,
+            )),
+            auth: RateLimiter::keyed(rate_quota(limits.auth_per_second, limits.auth_burst)),
+            checks_since_prune: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one request from `ip` and reports whether it is allowed. Auth
+    /// traffic is metered against the stricter bucket.
+    fn permit(&self, ip: IpAddr, is_auth: bool) -> bool {
+        if self.checks_since_prune.fetch_add(1, Ordering::Relaxed) >= RATE_LIMIT_PRUNE_INTERVAL {
+            self.checks_since_prune.store(0, Ordering::Relaxed);
+            self.general.retain_recent();
+            self.auth.retain_recent();
+        }
+        let limiter = if is_auth { &self.auth } else { &self.general };
+        limiter.check_key(&ip).is_ok()
+    }
+}
+
+fn rate_quota(per_second: u32, burst: u32) -> Quota {
+    let rate = NonZeroU32::new(per_second).unwrap_or(NonZeroU32::MIN);
+    let burst = NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN);
+    Quota::per_second(rate).allow_burst(burst)
+}
+
+/// Best-effort peer IP for rate-limit keying. Falls back to loopback (a single
+/// shared bucket) when connection info is absent so a missing extension can
+/// never silently disable the limiter.
+fn client_ip(request: &Request) -> IpAddr {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |ConnectInfo(addr)| {
+            addr.ip()
+        })
+}
+
+async fn enforce_rate_limits(
+    State(state): State<Arc<RateLimitState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let ip = client_ip(&request);
+    let is_auth = request.uri().path().starts_with(AUTH_ROUTE_PREFIX);
+    if state.permit(ip, is_auth) {
+        next.run(request).await
+    } else {
+        (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response()
+    }
+}
+
+/// Wraps a fully-assembled router in the transport-level `DoS` guardrails: a
+/// per-frame body read timeout (slowloris), an overall request timeout, a
+/// process-wide concurrency cap, and per-IP rate limiting (stricter on the auth
+/// routes). Applied at [`ProcessingRuntime::into_router`] so it covers the OSS
+/// and the reviewed-security routers alike.
+fn apply_transport_limits(router: Router, limits: TransportLimits) -> Router {
+    let rate_limit_state = Arc::new(RateLimitState::new(&limits));
+    router
+        // Innermost added layer: the per-frame body read timeout.
+        .layer(RequestBodyTimeoutLayer::new(limits.body_read_timeout))
+        // Overall per-request ceiling → 408 on a stuck request.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            limits.request_timeout,
+        ))
+        // Process-wide cap on in-flight requests, shared across service clones.
+        .layer(GlobalConcurrencyLimitLayer::new(
+            limits.max_concurrent_requests,
+        ))
+        // Outermost: cheapest possible rejection, before any resource commit.
+        .layer(middleware::from_fn_with_state(
+            rate_limit_state,
+            enforce_rate_limits,
+        ))
 }
 
 pub fn app(max_upload_bytes: usize) -> Router {
@@ -13895,6 +14050,102 @@ mod tests {
             .method(method)
             .uri(uri.as_ref())
             .body(Body::empty())?)
+    }
+
+    // FINDING #2 (DoS): an auth flood from a single IP must be throttled with
+    // 429 by the per-IP rate limiter applied at the router assembly boundary.
+    #[tokio::test]
+    async fn auth_flood_from_one_ip_is_rate_limited() -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+
+        use axum::{Router, http::StatusCode, routing::post};
+        use tower::ServiceExt as _;
+
+        use super::{TransportLimits, apply_transport_limits, with_test_connect_info};
+
+        // A tiny auth bucket makes the flood boundary deterministic; general
+        // traffic is left effectively unlimited so it cannot mask the result.
+        let limits = TransportLimits {
+            request_timeout: Duration::from_secs(5),
+            body_read_timeout: Duration::from_secs(5),
+            max_concurrent_requests: 64,
+            general_per_second: 10_000,
+            general_burst: 10_000,
+            auth_per_second: 1,
+            auth_burst: 3,
+        };
+        let app = with_test_connect_info(apply_transport_limits(
+            Router::new().route("/api/v1/auth/login", post(|| async { StatusCode::OK })),
+            limits,
+        ));
+
+        let mut ok = 0_usize;
+        let mut limited = 0_usize;
+        for _ in 0..12 {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/login")
+                .body(Body::empty())?;
+            match app.clone().oneshot(request).await?.status() {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => limited += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        // The burst of 3 (plus at most one cell replenished mid-run) is admitted;
+        // the rest of the flood is rejected with 429.
+        assert!(ok <= 4, "expected the auth bucket to cap admits, got {ok}");
+        assert!(
+            limited >= 7,
+            "expected a throttled flood, got {limited} rejects"
+        );
+        Ok(())
+    }
+
+    // FINDING #2 (DoS): a request that outruns the overall timeout is aborted
+    // with 408, while a prompt request under the same wiring still succeeds.
+    #[tokio::test]
+    async fn slow_request_is_aborted_by_the_overall_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+
+        use axum::{Router, http::StatusCode, routing::get};
+        use tower::ServiceExt as _;
+
+        use super::{TransportLimits, apply_transport_limits, with_test_connect_info};
+
+        // Relax the rate limits so only the request timeout is under test.
+        let limits = TransportLimits {
+            request_timeout: Duration::from_millis(80),
+            body_read_timeout: Duration::from_secs(5),
+            max_concurrent_requests: 64,
+            general_per_second: 10_000,
+            general_burst: 10_000,
+            auth_per_second: 10_000,
+            auth_burst: 10_000,
+        };
+        let app = with_test_connect_info(apply_transport_limits(
+            Router::new()
+                .route(
+                    "/slow",
+                    get(|| async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        StatusCode::OK
+                    }),
+                )
+                .route("/fast", get(|| async { StatusCode::OK })),
+            limits,
+        ));
+
+        let slow = app
+            .clone()
+            .oneshot(build_request(Method::GET, "/slow")?)
+            .await?;
+        assert_eq!(slow.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let fast = app.oneshot(build_request(Method::GET, "/fast")?).await?;
+        assert_eq!(fast.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[test]

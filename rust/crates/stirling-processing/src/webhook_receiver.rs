@@ -15,11 +15,12 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -32,6 +33,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
+use tokio::time::timeout;
 use tracing::{error, info};
 
 use crate::{policy_config::PolicyConfigService, policy_triggers::PolicyTriggerRuntime};
@@ -47,6 +49,14 @@ const SIGNATURE_HEADER: &str = "X-Stirling-Signature";
 const FILENAME_HEADER: &str = "X-Stirling-Filename";
 const SHA256_PREFIX: &str = "sha256=";
 
+/// Upper bound on the wall-clock time allowed to buffer one delivery body before
+/// HMAC verification. The size gate (`413`) is enforced before a byte is read
+/// and the router applies a per-frame body read timeout; this total-time ceiling
+/// additionally bounds a body that trickles in just under the per-frame timeout,
+/// so a slowloris can neither hold the connection open nor buffer toward
+/// `webhookMaxBytes` ahead of the signature check.
+const WEBHOOK_ASSEMBLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // Response bodies. The two 404s are byte-for-byte identical so a probe cannot
 // tell "id malformed" from "no such source" — that is the anti-enumeration
 // property of this endpoint.
@@ -59,6 +69,7 @@ const PAUSED: &str = "Webhook source is paused; deliveries are not accepted";
 const EMPTY_BODY: &str = "Empty request body";
 const COULD_NOT_STORE: &str = "Could not store delivery";
 const RECEIVER_UNAVAILABLE: &str = "Webhook receiver unavailable";
+const SLOW_BODY: &str = "Delivery body was not received in time";
 
 /// Route state. [`PolicyTriggerRuntime`] is cheap to clone (it is internally
 /// `Arc`-backed) and owns the `fire_for_webhook` dispatch loop.
@@ -145,9 +156,13 @@ async fn receive(
     }
     let declared_cap = usize::try_from(declared).unwrap_or(usize::MAX);
     // A body longer than the declared length (or an unreadable one) is a bad
-    // request; nothing beyond `declared` bytes is ever buffered.
-    let Ok(body) = to_bytes(body, declared_cap).await else {
-        return reject(StatusCode::BAD_REQUEST, BODY_EXCEEDS_DECLARED);
+    // request; a body that cannot finish buffering within the assemble ceiling
+    // is a timed-out delivery. Nothing beyond `declared` bytes is ever buffered,
+    // and neither rejection runs any signature work.
+    let body = match assemble_body(body, declared_cap, WEBHOOK_ASSEMBLE_TIMEOUT).await {
+        BodyAssembly::Body(bytes) => bytes,
+        BodyAssembly::TooLong => return reject(StatusCode::BAD_REQUEST, BODY_EXCEEDS_DECLARED),
+        BodyAssembly::TimedOut => return reject(StatusCode::REQUEST_TIMEOUT, SLOW_BODY),
     };
     // 5–7. Verify the signature over the ACTUAL received bytes, then reject a
     //       paused source, then an empty body — in that order.
@@ -214,6 +229,32 @@ pub(crate) fn is_valid_webhook_id(id: &str) -> bool {
 fn webhook_signing_secret(options: &Map<String, Value>) -> Option<String> {
     let secret = options.get("signingSecret")?.as_str()?.trim();
     (!secret.is_empty()).then(|| secret.to_owned())
+}
+
+/// Outcome of buffering a delivery body under both a size cap and a wall-clock
+/// ceiling. Keeping the three cases distinct lets the caller preserve the exact
+/// reject ordering (`413` size gate first, then `400` over-declared, then `408`
+/// too-slow) with no signature work on any rejection path.
+enum BodyAssembly {
+    Body(Bytes),
+    TooLong,
+    TimedOut,
+}
+
+/// Buffers at most `declared_cap` bytes, aborting if assembly outruns
+/// `assemble_timeout`. The caller has already rejected an over-limit declared
+/// length with `413` before calling this, so nothing beyond the declared length
+/// is ever read here.
+async fn assemble_body(
+    body: Body,
+    declared_cap: usize,
+    assemble_timeout: Duration,
+) -> BodyAssembly {
+    match timeout(assemble_timeout, to_bytes(body, declared_cap)).await {
+        Ok(Ok(bytes)) => BodyAssembly::Body(bytes),
+        Ok(Err(_)) => BodyAssembly::TooLong,
+        Err(_elapsed) => BodyAssembly::TimedOut,
+    }
 }
 
 /// Parses a non-negative `Content-Length`, mirroring the servlet's
@@ -446,13 +487,14 @@ fn normalize_absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DELIVERY_NAME, PostBodyDecision, UNIQUE_PREFIX_LEN, decide_delivery, display_name,
-        hmac_sha256, is_valid_webhook_id, parse_content_length, routes, sanitize_delivery_filename,
-        spool_name, spool_paths, store_delivery, verify_signature, webhook_signing_secret,
+        BodyAssembly, DEFAULT_DELIVERY_NAME, PostBodyDecision, UNIQUE_PREFIX_LEN, assemble_body,
+        decide_delivery, display_name, hmac_sha256, is_valid_webhook_id, parse_content_length,
+        routes, sanitize_delivery_filename, spool_name, spool_paths, store_delivery,
+        verify_signature, webhook_signing_secret,
     };
     use axum::{
         Router,
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     };
     use serde_json::{Map, Value};
@@ -1393,6 +1435,54 @@ mod tests {
                     seen.push(message);
                 }
             }
+        }
+    }
+
+    // FINDING #2 (DoS): the body assemble step must be bounded in time so a
+    // slowloris cannot hold a connection open while dribbling bytes toward the
+    // webhook size limit ahead of the HMAC check.
+    #[tokio::test]
+    async fn assemble_body_aborts_a_stalled_stream() {
+        use std::time::Duration;
+
+        use futures_util::stream;
+
+        // A body that yields no frames and never completes models a client that
+        // opens the connection and then stalls. With a real per-frame timeout it
+        // errors; the assemble ceiling guarantees it cannot hang the handler.
+        let body = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
+        let outcome = assemble_body(body, 1_024, Duration::from_millis(50)).await;
+        assert!(matches!(outcome, BodyAssembly::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn assemble_body_returns_a_prompt_body_within_the_ceiling() {
+        use std::time::Duration;
+
+        let body = Body::from(vec![1_u8, 2, 3, 4]);
+        let outcome = assemble_body(body, 1_024, Duration::from_secs(5)).await;
+        match outcome {
+            BodyAssembly::Body(bytes) => assert_eq!(&bytes[..], &[1, 2, 3, 4]),
+            other => panic!("expected a buffered body, got {}", assembly_label(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_body_rejects_a_body_over_the_declared_cap() {
+        use std::time::Duration;
+
+        // Ten bytes offered against a four-byte declared cap: the over-declared
+        // body is rejected before any signature work, exactly as `to_bytes` caps.
+        let body = Body::from(vec![0_u8; 10]);
+        let outcome = assemble_body(body, 4, Duration::from_secs(5)).await;
+        assert!(matches!(outcome, BodyAssembly::TooLong));
+    }
+
+    fn assembly_label(outcome: &BodyAssembly) -> &'static str {
+        match outcome {
+            BodyAssembly::Body(_) => "Body",
+            BodyAssembly::TooLong => "TooLong",
+            BodyAssembly::TimedOut => "TimedOut",
         }
     }
 }
