@@ -4,19 +4,22 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Extension, Multipart, Path, rejection::JsonRejection},
     http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use futures_util::StreamExt as _;
+use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
+    classification::CLASSIFY_AND_LABEL_PATH,
     policy_config::{PolicyConfigService, PolicyDefinition, PolicyFailure, PolicySource},
     policy_execution::{PolicyExecutionFailure, PolicyExecutionService},
     policy_ledger::ProcessedLedger,
@@ -24,6 +27,15 @@ use crate::{
     policy_triggers::{PolicyChangeNotifier, trigger_metadata},
     security::{AuthContext, SecurityAuditContext},
 };
+
+/// Client-supplied document-count cap: the frontend meters one document per call,
+/// but the value is clamped defensively before it could reach billing. Mirrors
+/// Java `ClassificationMeterController.MAX_DOCUMENTS`.
+const MAX_CLASSIFY_DOCUMENTS: i64 = 10_000;
+
+/// Fallback audit label when the client omits a policy name. Mirrors Java
+/// `ClassificationMeterController`'s `"Classification"` default.
+const DEFAULT_CLASSIFY_POLICY_NAME: &str = "Classification";
 
 #[derive(Clone, Copy)]
 struct PolicyHttpSettings {
@@ -49,6 +61,7 @@ pub(crate) fn routes(
             get(source_document_counts),
         )
         .route("/api/v1/policies", get(list_policies).post(save_policy))
+        .route("/api/v1/policies/classify/meter", post(classify_meter))
         .route("/api/v1/policies/order", put(reorder_policies))
         .route("/api/v1/policies/overview", get(policy_overview))
         .route("/api/v1/policies/triggers", get(available_triggers))
@@ -185,6 +198,71 @@ async fn policy_overview(
 
 async fn available_triggers() -> Json<Vec<crate::policy_triggers::TriggerInfo>> {
     Json(trigger_metadata())
+}
+
+/// Frontend payload for [`classify_meter`]. Mirrors Java
+/// `ClassificationMeterController.ClassifyMeterRequest`. `labels` is part of the
+/// wire contract but, as in Java, is never read server-side, so it is accepted and
+/// silently ignored (serde skips unknown fields by default).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClassifyMeterRequest {
+    #[serde(default)]
+    policy_name: Option<String>,
+    #[serde(default)]
+    document_count: Option<i64>,
+}
+
+/// Meters + audits a client-side (non-AI) classification run so both classify
+/// paths read alike in the audit trail. Side-effect only: it performs no
+/// classification. Mirrors Java `ClassificationMeterController.meterClassification`.
+///
+/// The body is optional (Java `@RequestBody(required = false)`): an absent, empty,
+/// or unparseable body collapses to defaults. Billing is a deferred no-op — the
+/// SaaS-only `ClassificationRunBiller` bean is absent in the proprietary runtime,
+/// exactly as `biller.getIfAvailable()` returns `null` in Java — so the clamped
+/// document count is only traced (Java still computes it even when the biller is
+/// absent) and the endpoint always returns `202 Accepted` with an empty body.
+async fn classify_meter(
+    audit_context: Option<Extension<SecurityAuditContext>>,
+    body: Bytes,
+) -> Response {
+    // Tolerate an absent/empty/malformed body: any parse failure collapses to the
+    // request defaults, matching Java's `required = false` semantics.
+    let request = serde_json::from_slice::<ClassifyMeterRequest>(&body).unwrap_or_default();
+    let documents = clamp_document_count(request.document_count);
+    let policy_name = resolve_policy_name(request.policy_name.as_deref());
+
+    // Stamp the run so the audit trail records it as a policy run, like the AI
+    // classify path: policyName plus policySteps=[classify-and-label].
+    if let Some(Extension(audit_context)) = audit_context.as_ref() {
+        audit_context.set_policy(policy_name, [CLASSIFY_AND_LABEL_PATH.to_owned()]);
+    }
+
+    // Billing is deferred: the SaaS-only biller is absent in this runtime, so the
+    // metered count is only traced here.
+    tracing::debug!(
+        documents,
+        policy_name,
+        "metered client-side classification run"
+    );
+
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// Clamps the client-supplied document count into `1..=MAX_CLASSIFY_DOCUMENTS`,
+/// defaulting an absent/null value to `1`. Mirrors Java's floor/ceiling guards.
+fn clamp_document_count(count: Option<i64>) -> i64 {
+    count.unwrap_or(1).clamp(1, MAX_CLASSIFY_DOCUMENTS)
+}
+
+/// Resolves the audit label: a blank or absent policy name falls back to
+/// [`DEFAULT_CLASSIFY_POLICY_NAME`], mirroring Java's `isBlank()` guard.
+fn resolve_policy_name(raw: Option<&str>) -> &str {
+    match raw.map(str::trim) {
+        Some(name) if !name.is_empty() => name,
+        _ => DEFAULT_CLASSIFY_POLICY_NAME,
+    }
 }
 
 /// Read-only admin view of the Stirling-owned folder roots always permitted for
@@ -411,4 +489,125 @@ fn execution_error(error: PolicyExecutionFailure) -> Response {
 
 fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
+}
+
+#[cfg(test)]
+mod classify_meter_tests {
+    //! Parity tests for `POST /api/v1/policies/classify/meter`, mirroring Java
+    //! `ClassificationMeterController`: optional-body defaults, count clamping,
+    //! blank-name fallback, policy-run audit stamping, and an always-202 reply.
+
+    use super::{
+        CLASSIFY_AND_LABEL_PATH, DEFAULT_CLASSIFY_POLICY_NAME, clamp_document_count,
+        classify_meter, resolve_policy_name,
+    };
+    use crate::security::SecurityAuditContext;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request, StatusCode};
+    use axum::routing::post;
+    use tower::ServiceExt as _;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const METER_PATH: &str = "/api/v1/policies/classify/meter";
+
+    fn router() -> Router {
+        Router::new().route(METER_PATH, post(classify_meter))
+    }
+
+    async fn meter(ctx: Option<&SecurityAuditContext>, body: Body) -> TestResult {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(METER_PATH)
+            .header("content-type", "application/json")
+            .body(body)?;
+        if let Some(ctx) = ctx {
+            request.extensions_mut().insert(ctx.clone());
+        }
+        let response = router().oneshot(request).await?;
+        // Every path replies 202 with an empty body — the endpoint is fire-and-forget.
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), 64).await?;
+        assert!(bytes.is_empty(), "meter response body must be empty");
+        Ok(())
+    }
+
+    #[test]
+    fn clamp_document_count_applies_floor_and_ceiling() {
+        assert_eq!(clamp_document_count(None), 1); // null/absent -> 1
+        assert_eq!(clamp_document_count(Some(0)), 1); // < 1 -> 1
+        assert_eq!(clamp_document_count(Some(-42)), 1);
+        assert_eq!(clamp_document_count(Some(1)), 1);
+        assert_eq!(clamp_document_count(Some(500)), 500);
+        assert_eq!(clamp_document_count(Some(10_000)), 10_000);
+        assert_eq!(clamp_document_count(Some(10_001)), 10_000); // > cap -> cap
+        assert_eq!(clamp_document_count(Some(i64::MAX)), 10_000);
+    }
+
+    #[test]
+    fn resolve_policy_name_falls_back_when_blank() {
+        assert_eq!(resolve_policy_name(None), DEFAULT_CLASSIFY_POLICY_NAME);
+        assert_eq!(resolve_policy_name(Some("")), DEFAULT_CLASSIFY_POLICY_NAME);
+        assert_eq!(
+            resolve_policy_name(Some("   ")),
+            DEFAULT_CLASSIFY_POLICY_NAME
+        );
+        assert_eq!(resolve_policy_name(Some("Legal Hold")), "Legal Hold");
+        assert_eq!(resolve_policy_name(Some("  Legal Hold  ")), "Legal Hold"); // trimmed
+    }
+
+    #[tokio::test]
+    async fn stamps_policy_run_from_body() -> TestResult {
+        let ctx = SecurityAuditContext::new(true);
+        // `labels` is part of the wire contract but ignored, as in Java.
+        meter(
+            Some(&ctx),
+            Body::from(r#"{"policyName":"  Legal Hold  ","documentCount":5,"labels":["a","b"]}"#),
+        )
+        .await?;
+        let enrichment = ctx.snapshot();
+        // Stamped as a policy run: trimmed name + the AI classify step, so both
+        // classify paths read alike in the audit trail.
+        assert_eq!(enrichment.policy_name.as_deref(), Some("Legal Hold"));
+        assert_eq!(
+            enrichment.policy_steps,
+            vec![CLASSIFY_AND_LABEL_PATH.to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_body_stamps_default_policy_name() -> TestResult {
+        let ctx = SecurityAuditContext::new(true);
+        meter(Some(&ctx), Body::empty()).await?;
+        let enrichment = ctx.snapshot();
+        assert_eq!(
+            enrichment.policy_name.as_deref(),
+            Some(DEFAULT_CLASSIFY_POLICY_NAME)
+        );
+        assert_eq!(
+            enrichment.policy_steps,
+            vec![CLASSIFY_AND_LABEL_PATH.to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_body_collapses_to_defaults() -> TestResult {
+        let ctx = SecurityAuditContext::new(true);
+        meter(Some(&ctx), Body::from("{not valid json")).await?;
+        assert_eq!(
+            ctx.snapshot().policy_name.as_deref(),
+            Some(DEFAULT_CLASSIFY_POLICY_NAME)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_when_audit_context_absent() -> TestResult {
+        // No audit plan (e.g. auditing disabled) means no injected context; the
+        // handler must still succeed rather than depend on the enrichment seam.
+        meter(None, Body::from(r#"{"documentCount":-3}"#)).await
+    }
 }
