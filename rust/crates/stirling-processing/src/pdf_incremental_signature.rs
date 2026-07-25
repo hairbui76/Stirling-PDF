@@ -577,6 +577,118 @@ mod tests {
         Ok(())
     }
 
+    /// A P-521 (secp521r1) private key and its self-signed `ecdsa-with-SHA512`
+    /// certificate (OpenSSL-generated), shared with `signing_key`'s unit tests.
+    const P521_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBwjfNy3ndVkidl8/i\n\
+V2pPvah68CP9+MDrdk223SvIQTigHgAidxkIXw3spX3uSIZLNIXagXxxEEvkpBiv\n\
+3Z6UNhOhgYkDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC+kFwgDDunFexpDJf\n\
+fUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFAiqfJndYEYQ2utLGA\n\
+UWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCLrPLRA6DuJEpamSp0\n\
+sA==\n\
+-----END PRIVATE KEY-----\n";
+
+    const P521_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIICGTCCAXqgAwIBAgIURyuRCEttmk0wOq2ytxrpIgOZlJcwCgYIKoZIzj0EAwQw\n\
+HjEcMBoGA1UEAwwTU3RpcmxpbmcgUC01MjEgVGVzdDAeFw0yNjA3MjUxNDUxMDVa\n\
+Fw0zNjA3MjIxNDUxMDVaMB4xHDAaBgNVBAMME1N0aXJsaW5nIFAtNTIxIFRlc3Qw\n\
+gZswEAYHKoZIzj0CAQYFK4EEACMDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC\n\
++kFwgDDunFexpDJffUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFA\n\
+iqfJndYEYQ2utLGAUWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCL\n\
+rPLRA6DuJEpamSp0sKNTMFEwHQYDVR0OBBYEFAg5plmhxEqSaLrJqbFy8hQkL6hA\n\
+MB8GA1UdIwQYMBaAFAg5plmhxEqSaLrJqbFy8hQkL6hAMA8GA1UdEwEB/wQFMAMB\n\
+Af8wCgYIKoZIzj0EAwQDgYwAMIGIAkIBTCtwawyMW65d7KK1C6rYZcm61/S1uUMC\n\
+4MiORYKcKBlAe/dFgs3gZ6dvLU/rswaau+6NECe0RYvjhTYkBh/aQNYCQgEdm5gs\n\
+0OhBQ0hHKV6fln9/bStY/qH3kOBG1jD60nj8AKV61+EWtRuBX4gmlYMY4CWhTE1U\n\
+amwXixTh3YlrdOneww==\n\
+-----END CERTIFICATE-----\n";
+
+    /// The full cert-sign path (reserved `/ByteRange` + `/Contents`) must work
+    /// unchanged for a P-521 key: the placeholder is agnostic to how the CMS is
+    /// produced, so the only new behavior is the P-521 CMS itself. The CMS is
+    /// verified independently with `p521` because the `cryptographic-message-syntax`
+    /// verifier can't resolve `ecdsa-with-SHA512`.
+    #[test]
+    fn signs_the_exact_byte_range_with_a_p521_key() -> Result<(), Box<dyn std::error::Error>> {
+        use cryptographic_message_syntax::asn1::rfc5652::SignedData as Asn1SignedData;
+        use p521::ecdsa::{Signature as EcdsaSignature, signature::Verifier};
+        use pkcs8::DecodePrivateKey;
+        use sha2::{Digest as _, Sha512};
+
+        // ecdsa-with-SHA512 = 1.2.840.10045.4.3.4; SHA-512 = 2.16.840.1.101.3.4.2.3.
+        const OID_ECDSA_WITH_SHA512: &[u8] = &[42, 134, 72, 206, 61, 4, 3, 4];
+        const OID_SHA512: &[u8] = &[96, 134, 72, 1, 101, 3, 4, 2, 3];
+
+        let source = one_page_pdf()?;
+        let placeholder = PdfSignaturePlaceholder::prepare(&source, 8_192)?;
+        let signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(P521_PKCS8_PEM.as_bytes().to_vec()),
+            P521_CERTIFICATE_PEM.as_bytes(),
+        )?;
+        let signed_bytes = placeholder.signed_bytes();
+        let cms = signer.detached_cms_der(&signed_bytes)?;
+        let signed_pdf = placeholder.complete(&cms)?;
+
+        assert!(signed_pdf.starts_with(&source));
+        let document = Document::load_mem(&signed_pdf)?;
+        let acro_form_id = document.catalog()?.get(b"AcroForm")?.as_reference()?;
+        let acro_form = document.get_object(acro_form_id)?.as_dict()?;
+        let fields = acro_form.get(b"Fields")?.as_array()?;
+        assert_eq!(fields.len(), 1);
+        let field_id = fields[0].as_reference()?;
+        let field = document.get_object(field_id)?.as_dict()?;
+        let signature_id = field.get(b"V")?.as_reference()?;
+        let signature = document.get_object(signature_id)?.as_dict()?;
+        let byte_range = signature
+            .get(b"ByteRange")?
+            .as_array()?
+            .iter()
+            .map(Object::as_i64)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(byte_range.len(), 4);
+        let range_start = usize::try_from(byte_range[1])?;
+        let second_start = usize::try_from(byte_range[2])?;
+        let second_length = usize::try_from(byte_range[3])?;
+        let mut reconstructed = signed_pdf[..range_start].to_vec();
+        reconstructed.extend_from_slice(&signed_pdf[second_start..second_start + second_length]);
+        assert_eq!(reconstructed, signed_bytes);
+
+        let cms_from_pdf = signature.get(b"Contents")?.as_str()?;
+        assert_eq!(&cms_from_pdf[..cms.len()], cms);
+        assert!(cms_from_pdf[cms.len()..].iter().all(|byte| *byte == 0));
+
+        // Independent P-521 verification of the CMS recovered from the PDF.
+        let expected_digest = Sha512::digest(&reconstructed);
+        let mut expected_message_digest = vec![0x04u8, 0x40u8];
+        expected_message_digest.extend_from_slice(expected_digest.as_slice());
+        assert!(
+            cms.windows(expected_message_digest.len())
+                .any(|window| window == expected_message_digest),
+            "CMS must bind SHA-512 of the covered byte range"
+        );
+        let secret_key = p521::SecretKey::from_pkcs8_pem(P521_PKCS8_PEM)?;
+        let verifier_key = p521::ecdsa::SigningKey::from(&secret_key);
+        let signed_data = Asn1SignedData::decode_ber(&cms)?;
+        assert!(!signed_data.signer_infos.is_empty());
+        for signer_info in signed_data.signer_infos.iter() {
+            assert_eq!(signer_info.digest_algorithm.algorithm.as_ref(), OID_SHA512);
+            assert_eq!(
+                signer_info.signature_algorithm.algorithm.as_ref(),
+                OID_ECDSA_WITH_SHA512
+            );
+            let signed_content = signer_info
+                .signed_attributes_digested_content()?
+                .ok_or("signed attributes present")?;
+            let ecdsa_signature =
+                EcdsaSignature::from_der(signer_info.signature.to_bytes().as_ref())?;
+            verifier_key
+                .verifying_key()
+                .verify(&signed_content, &ecdsa_signature)?;
+        }
+        verify_cms_with_openssl_when_requested(&cms, &reconstructed)?;
+        Ok(())
+    }
+
     #[test]
     fn rejects_invalid_reservations_and_oversized_cms() -> Result<(), Box<dyn std::error::Error>> {
         let source = one_page_pdf()?;
