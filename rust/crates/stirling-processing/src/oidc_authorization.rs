@@ -158,7 +158,11 @@ fn effective_scope(scopes: &[&str]) -> String {
 /// every character this can produce is already RFC-7636-safe. `state` and
 /// `nonce` aren't bound by that RFC, but reuse the same generation for the
 /// same entropy and encoding.
-fn random_url_safe_token() -> String {
+///
+/// `pub(crate)` so [`crate::oidc_login`] can mint the login-CSRF browser-binding
+/// value with the identical entropy/encoding convention rather than duplicating
+/// it.
+pub(crate) fn random_url_safe_token() -> String {
     let mut bytes = [0_u8; RANDOM_TOKEN_BYTES];
     rand::rng().fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)

@@ -56,6 +56,12 @@ const REFRESH_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 const AUTOMATION_HEADER: HeaderName = HeaderName::from_static("x-stirling-automation");
+/// Name of the cookie carrying the OIDC login-CSRF browser binding. Set at
+/// `/authorize`, required back at `/callback` (see [`oidc_authorize`]).
+const OIDC_CSRF_COOKIE: &str = "spdf_oidc_csrf";
+/// Path the OIDC browser-binding cookie is scoped to: the OIDC login routes
+/// only, so it is never attached to unrelated requests.
+const OIDC_COOKIE_PATH: &str = "/api/v1/auth/oidc";
 const AUDIT_LEVEL_OFF: u8 = 0;
 const AUDIT_LEVEL_BASIC: u8 = 1;
 const AUDIT_LEVEL_STANDARD: u8 = 2;
@@ -1007,23 +1013,37 @@ struct OidcCallbackQuery {
 /// Begins a generic-OIDC login: discovers the provider, builds the authorization
 /// request, persists the single-use `state`, and returns the redirect URL plus
 /// that `state` as JSON — consistent with the JSON bodies every other auth route
-/// returns. Turning the URL into an actual browser redirect (and mirroring the
-/// `state` into a cookie) is a separate frontend concern, out of scope here.
+/// returns. It ALSO sets the login-CSRF browser-binding cookie
+/// ([`OIDC_CSRF_COOKIE`], `HttpOnly; Secure; SameSite=Lax`) that
+/// [`oidc_callback`] requires the browser to present back before completing the
+/// login — a server-enforced defense (RFC 9700), not an optional frontend step.
+/// Turning the returned URL into an actual browser redirect remains the
+/// frontend's job.
 async fn oidc_authorize(
     Extension(provider): Extension<OidcLoginProviderConfig>,
     Extension(store): Extension<Arc<OidcLoginStateStore>>,
     Extension(discovery): Extension<Arc<OidcDiscoveryCache>>,
 ) -> Response {
+    // The cookie's Max-Age tracks the store's state TTL, so it expires with the
+    // pending login. Read before the store is moved into the blocking closure.
+    let cookie_max_age = store.state_ttl();
     // Discovery and state persistence are blocking (SSRF-safe `reqwest::blocking`
     // plus a `std::sync::Mutex`), so run them off the async executor like `login`.
     let result =
         task::spawn_blocking(move || initiate_oidc_login(&provider, &store, &discovery)).await;
     match result {
-        Ok(Ok(initiated)) => Json(OidcAuthorizeResponse {
-            authorization_url: initiated.authorization_url,
-            state: initiated.state,
-        })
-        .into_response(),
+        Ok(Ok(initiated)) => {
+            let cookie = oidc_binding_cookie(&initiated.browser_binding, cookie_max_age);
+            let mut response = Json(OidcAuthorizeResponse {
+                authorization_url: initiated.authorization_url,
+                state: initiated.state,
+            })
+            .into_response();
+            if let Some(cookie) = cookie {
+                response.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            response
+        }
         // Every initiate failure is a server-side / transient condition, not the
         // caller's fault: a bad provider config, an unreachable/invalid IdP, or
         // the state store being momentarily at capacity (`AtCapacity`). All
@@ -1033,15 +1053,55 @@ async fn oidc_authorize(
     }
 }
 
+/// Builds the `Set-Cookie` value binding a pending OIDC login to the browser
+/// that started it. `value` is the login's [`InitiatedOidcLogin::browser_binding`];
+/// [`oidc_callback`] requires the browser to present it back, which is the
+/// server-enforced login-CSRF defense (RFC 9700).
+///
+/// Attributes: `HttpOnly` (script can't read it), `Secure` (never sent over
+/// plaintext HTTP), `SameSite=Lax` (rides the top-level GET redirect back from
+/// the `IdP`, but not cross-site subrequests), `Path` scopes it to the OIDC login
+/// routes, and `Max-Age` matches the server-side state TTL.
+///
+/// [`InitiatedOidcLogin::browser_binding`]: crate::oidc_login::InitiatedOidcLogin::browser_binding
+fn oidc_binding_cookie(value: &str, max_age: Duration) -> Option<HeaderValue> {
+    // `value` is CSPRNG base64url (cookie-token safe), so this never fails in
+    // practice; on the impossible failure we omit the cookie, which fails closed
+    // (the callback then rejects for want of a binding).
+    HeaderValue::from_str(&format!(
+        "{OIDC_CSRF_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path={OIDC_COOKIE_PATH}; Max-Age={}",
+        max_age.as_secs()
+    ))
+    .ok()
+}
+
+/// Reads the OIDC login browser-binding cookie ([`OIDC_CSRF_COOKIE`]) from a
+/// request's `Cookie` header, if present. The header may pack several cookies
+/// separated by `;`; only ours is returned.
+fn oidc_binding_cookie_value(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| name.trim() == OIDC_CSRF_COOKIE)
+        .map(|(_, value)| value.trim().to_owned())
+}
+
 /// Completes a generic-OIDC login from the provider's callback: extracts `code`
-/// and `state`, exchanges and verifies through [`complete_oidc_login`], and on
-/// success issues a session and returns it EXACTLY as [`login`] does (the same
-/// [`AuthenticationResponse`] shape). Missing `code`/`state` is a 400; every
-/// other failure collapses to a generic 401 (see [`oidc_callback_error_response`]).
+/// and `state`, reads the login-CSRF browser-binding cookie ([`OIDC_CSRF_COOKIE`])
+/// set at [`oidc_authorize`], exchanges and verifies through [`complete_oidc_login`]
+/// (which requires that cookie to equal the binding stored for this login before
+/// it does anything else), and on success issues a session and returns it EXACTLY
+/// as [`login`] does (the same [`AuthenticationResponse`] shape). Missing
+/// `code`/`state` is a 400; every other failure — including an absent or wrong
+/// browser-binding cookie (the login-CSRF rejection) — collapses to one generic
+/// 401 (see [`oidc_callback_error_response`]), revealing nothing about which
+/// check tripped.
 async fn oidc_callback(
     Extension(store): Extension<Arc<OidcLoginStateStore>>,
     Extension(security): Extension<Arc<SecurityStore>>,
     Extension(correlation): Extension<RequestCorrelation>,
+    headers: HeaderMap,
     Query(query): Query<OidcCallbackQuery>,
 ) -> Response {
     let (Some(code), Some(state)) = (query.code, query.state) else {
@@ -1050,11 +1110,17 @@ async fn oidc_callback(
     if code.is_empty() || state.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "Invalid request");
     }
+    // Login-CSRF binding (RFC 9700): hand the browser's binding cookie to
+    // `complete_oidc_login`, which rejects the login unless it equals the binding
+    // stored for this `state`. A cross-site forged callback carries `state`+`code`
+    // but not the victim browser's cookie, so it can't satisfy this.
+    let browser_binding = oidc_binding_cookie_value(&headers);
     let correlation_id = correlation.0;
     let result = task::spawn_blocking(move || {
         complete_oidc_login(
             &state,
             &code,
+            browser_binding.as_deref(),
             &store,
             &security,
             Utc::now().timestamp(),
@@ -1076,9 +1142,10 @@ async fn oidc_callback(
 /// Maps a completion failure to an HTTP response. Infrastructure faults (a
 /// poisoned store lock, or a repository/crypto failure while provisioning the
 /// verified identity) are retryable 503s; every genuine login rejection —
-/// unknown/expired/replayed `state`, a failed token exchange, a failed id-token
-/// (or nonce) verification, or an account-level denial — collapses to one
-/// generic 401 so the response never reveals which check tripped.
+/// an absent/wrong browser-binding cookie (login-CSRF), an unknown/expired/replayed
+/// `state`, a failed token exchange, a failed id-token (or nonce) verification,
+/// or an account-level denial — collapses to one generic 401 so the response
+/// never reveals which check tripped.
 fn oidc_callback_error_response(error: &OidcLoginError) -> Response {
     match error {
         OidcLoginError::StateUnavailable
@@ -1092,8 +1159,16 @@ fn oidc_callback_error_response(error: &OidcLoginError) -> Response {
             | SecurityError::IntegrationProtectionUnavailable
             | SecurityError::AuditEventLimitExceeded,
         ) => service_unavailable_response(),
-        _ => json_error(StatusCode::UNAUTHORIZED, "Authentication failed"),
+        _ => oidc_authentication_failed(),
     }
+}
+
+/// The single generic 401 every genuine OIDC callback rejection collapses to
+/// (absent/wrong browser binding, unknown/expired/replayed `state`, a failed
+/// token or id-token verification, an account denial), so the response never
+/// reveals which check tripped.
+fn oidc_authentication_failed() -> Response {
+    json_error(StatusCode::UNAUTHORIZED, "Authentication failed")
 }
 
 async fn setup_mfa(
@@ -2914,9 +2989,10 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
 mod tests {
     use super::{
         API_KEY_HEADER, AUDIT_LEVEL_STANDARD, AUDIT_LEVEL_VERBOSE, AUTOMATION_HEADER,
-        MAX_AUDIT_RESULT_CHARS, SecurityAuditFileCaptureConfig, SecurityHttpConfig,
-        SecurityStartupError, audit_client_ip, bounded_operation_result, inferred_audit_event,
-        initialize_security_store, random_temporary_password, secure_router,
+        MAX_AUDIT_RESULT_CHARS, OIDC_CSRF_COOKIE, SecurityAuditFileCaptureConfig,
+        SecurityHttpConfig, SecurityStartupError, audit_client_ip, bounded_operation_result,
+        inferred_audit_event, initialize_security_store, oidc_binding_cookie,
+        oidc_binding_cookie_value, random_temporary_password, secure_router,
         secure_router_with_config,
     };
     use crate::admin_settings::AdminSettingsService;
@@ -2978,6 +3054,83 @@ mod tests {
 
         request.headers_mut().remove("x-real-ip");
         assert_eq!(audit_client_ip(&request).as_deref(), Some("192.0.2.44"));
+        Ok(())
+    }
+
+    #[test]
+    fn oidc_binding_cookie_carries_the_login_csrf_hardening_attributes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cookie = oidc_binding_cookie("binding-value-abc", std::time::Duration::from_secs(600))
+            .ok_or("cookie should build for a base64url value")?;
+        let value = cookie.to_str()?;
+        assert!(value.starts_with(&format!("{OIDC_CSRF_COOKIE}=binding-value-abc")));
+        // Every attribute that makes this a server-enforced login-CSRF binding.
+        assert!(
+            value.contains("HttpOnly"),
+            "cookie must be HttpOnly: {value}"
+        );
+        assert!(value.contains("Secure"), "cookie must be Secure: {value}");
+        assert!(
+            value.contains("SameSite=Lax"),
+            "cookie must be SameSite=Lax: {value}"
+        );
+        assert!(
+            value.contains("Path=/api/v1/auth/oidc"),
+            "cookie must be path-scoped to the OIDC routes: {value}"
+        );
+        assert!(
+            value.contains("Max-Age=600"),
+            "cookie Max-Age must track the state TTL: {value}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oidc_binding_cookie_value_is_read_from_a_multi_cookie_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Present among other cookies, with padding whitespace.
+        let request = Request::get("/api/v1/auth/oidc/callback")
+            .header(
+                header::COOKIE,
+                format!("session=xyz; {OIDC_CSRF_COOKIE}=the-binding ; theme=dark"),
+            )
+            .body(Body::empty())?;
+        assert_eq!(
+            oidc_binding_cookie_value(request.headers()).as_deref(),
+            Some("the-binding")
+        );
+
+        // Absent ⇒ None (a callback with no binding cookie is rejected upstream).
+        let no_cookie = Request::get("/api/v1/auth/oidc/callback")
+            .header(header::COOKIE, "session=xyz; theme=dark")
+            .body(Body::empty())?;
+        assert_eq!(oidc_binding_cookie_value(no_cookie.headers()), None);
+
+        // No Cookie header at all ⇒ None.
+        let bare = Request::get("/api/v1/auth/oidc/callback").body(Body::empty())?;
+        assert_eq!(oidc_binding_cookie_value(bare.headers()), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_without_a_binding_cookie_is_a_generic_401()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = test_router_with_oidc()?;
+        // A syntactically-valid callback (code+state present) but no binding
+        // cookie: the route is public (reaches the handler, not the auth
+        // middleware) and collapses to the generic "Authentication failed" 401,
+        // never a 500 and never a distinguishing message.
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/auth/oidc/callback?code=some-code&state=some-state")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await?["message"],
+            "Authentication failed"
+        );
         Ok(())
     }
 
@@ -4664,6 +4817,38 @@ mod tests {
             },
         );
         Ok((app, store))
+    }
+
+    /// A router with the generic-OIDC login routes mounted (a structurally-valid
+    /// provider config, enough to mount `/authorize` + `/callback`; no live `IdP`
+    /// is contacted by the callback path when the state store is empty).
+    fn test_router_with_oidc() -> Result<Router, Box<dyn std::error::Error>> {
+        let store = Arc::new(SecurityStore::in_memory()?);
+        assert!(store.bootstrap_admin("admin", "test password")?);
+        let app = secure_router_with_config(
+            Router::new().route("/health", get(|| async { "ok" })),
+            Arc::clone(&store),
+            SecurityHttpConfig {
+                totp_issuer: "Stirling PDF".to_owned(),
+                invites_enabled: true,
+                invite_expiry_hours: 168,
+                frontend_url: String::new(),
+                backend_url: String::new(),
+                audit_enabled: false,
+                audit_level: AUDIT_LEVEL_STANDARD,
+                audit_file_capture: SecurityAuditFileCaptureConfig::default(),
+                audit_capture_operation_results: false,
+                license_tier: LicenseTier::Enterprise,
+                external_jwt: None,
+                oidc_login_provider: Some(crate::oidc_login::OidcLoginProviderConfig {
+                    issuer: "https://issuer.example.test".to_owned(),
+                    client_id: "test-client".to_owned(),
+                    redirect_uri: "https://app.example.test/login/oauth2/code/oidc".to_owned(),
+                    scopes: vec!["openid".to_owned()],
+                }),
+            },
+        );
+        Ok(app)
     }
 
     fn test_router_with_audit_config(

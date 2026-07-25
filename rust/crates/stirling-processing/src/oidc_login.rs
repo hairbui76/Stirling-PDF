@@ -25,9 +25,11 @@
 //! - [`initiate_oidc_login`]: discover → build authorization request → **store**
 //!   the state entry → return the redirect URL + `state`.
 //! - [`complete_oidc_login`]: **consume** the state entry (single-use; unknown or
-//!   expired ⇒ reject — this is the CSRF defense) → exchange the code → verify the
-//!   id token (including the `nonce` bound to the stored one) → authenticate the
-//!   identity → issue a session → return the session tokens + verified identity.
+//!   expired ⇒ reject) → require the callback's browser-binding cookie to equal
+//!   the one stored for this login (login-CSRF defense, RFC 9700; unknown/absent
+//!   ⇒ reject) → exchange the code → verify the id token (including the `nonce`
+//!   bound to the stored one) → authenticate the identity → issue a session →
+//!   return the session tokens + verified identity.
 
 use std::{
     collections::HashMap,
@@ -35,11 +37,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::{
-    oidc_authorization::{OidcAuthorizationError, build_oidc_authorization_request},
+    oidc_authorization::{
+        OidcAuthorizationError, build_oidc_authorization_request, random_url_safe_token,
+    },
     oidc_discovery::{OidcDiscoveryCache, OidcDiscoveryError, OidcProviderMetadata},
     oidc_id_token::{OidcIdTokenError, VerifiedOidcIdentity, verify_oidc_id_token},
     oidc_live_token::{OidcLiveTokenError, exchange_oidc_token},
@@ -139,6 +144,14 @@ impl OidcLoginProviderConfig {
 /// authorization redirect and the callback. Keyed by the CSPRNG `state` in
 /// [`OidcLoginStateStore`]; never leaves this module.
 struct PendingLogin {
+    /// Login-CSRF binding to the browser that started this login (RFC 9700). A
+    /// fresh CSPRNG value set as an `HttpOnly` cookie at `/authorize`; the
+    /// callback must present it back (via that cookie) and it must equal this.
+    /// Unlike `state` — which travels through the `IdP` and the redirect URL —
+    /// this never leaves the browser↔server channel, so a cross-site forged
+    /// callback (which cannot read or set the victim's cookie) can't reproduce
+    /// it. Verified by [`complete_oidc_login`] before any token exchange.
+    browser_binding: String,
     /// Replay/CSRF binding: the eventual id token's `nonce` must equal this.
     nonce: String,
     /// PKCE code verifier, sent in the token exchange.
@@ -259,6 +272,14 @@ impl OidcLoginStateStore {
         Ok(entry)
     }
 
+    /// The TTL each pending-login entry is stored with. The authorize route uses
+    /// it as the browser-binding cookie's `Max-Age`, so the cookie expires in
+    /// lockstep with the server-side state entry it is bound to.
+    #[must_use]
+    pub fn state_ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Number of live (not-yet-consumed) entries. Test-only visibility into the
     /// store, e.g. to assert an entry survived a rejected callback.
     #[cfg(test)]
@@ -267,14 +288,20 @@ impl OidcLoginStateStore {
     }
 }
 
-/// What [`initiate_oidc_login`] returns: the URL to send the browser to, and the
-/// `state` the server must correlate the eventual callback against (already
-/// stored server-side; returned so a route can also, e.g., mirror it into a
-/// cookie if it wants defense in depth).
+/// What [`initiate_oidc_login`] returns: the URL to send the browser to, the
+/// `state` the server correlates the eventual callback against (already stored
+/// server-side), and the login-CSRF `browser_binding` the route MUST set as a
+/// cookie so the callback can require it back.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitiatedOidcLogin {
     pub authorization_url: String,
     pub state: String,
+    /// Login-CSRF browser-binding value (see [`PendingLogin::browser_binding`]).
+    /// The route MUST set this as an `HttpOnly`, `Secure`, `SameSite=Lax` cookie
+    /// scoped to the callback path, and the callback (via [`complete_oidc_login`])
+    /// requires the browser to present it back. This is the server-enforced
+    /// login-CSRF defense (RFC 9700), not an optional hardening step.
+    pub browser_binding: String,
 }
 
 /// What [`complete_oidc_login`] returns: the freshly issued opaque session
@@ -311,6 +338,14 @@ pub enum OidcLoginError {
     /// callback) or already consumed. This is the CSRF/single-use rejection.
     #[error("OIDC login state is unknown")]
     UnknownState,
+    /// The callback did not present the browser-binding cookie set at
+    /// `/authorize`, or presented a value that did not equal the one stored for
+    /// this login. This is the login-CSRF rejection (RFC 9700): a genuine
+    /// callback rides the initiating browser's cookie; a cross-site forged one
+    /// (attacker's `state`+`code`, victim's browser) cannot. The route collapses
+    /// it into the same generic 401 as every other callback rejection.
+    #[error("OIDC login browser binding did not match")]
+    BrowserBindingMismatch,
     /// The callback `state` matched an entry that had passed its TTL.
     #[error("OIDC login state has expired")]
     ExpiredState,
@@ -333,13 +368,16 @@ pub enum OidcLoginError {
 /// Begins a generic-OIDC login: validates the provider config (fail-closed),
 /// resolves the provider metadata through `discovery` (a live cached entry when
 /// one exists, otherwise the SSRF-safe discovery fetch), builds the authorization
-/// request with fresh `state`/`nonce`/PKCE secrets, **persists** the state entry
-/// (with the discovered metadata + nonce + code verifier + redirect URI + client
-/// id), and returns the authorization redirect URL and the `state`.
+/// request with fresh `state`/`nonce`/PKCE secrets, mints a fresh login-CSRF
+/// `browser_binding`, **persists** the state entry (holding the discovered
+/// metadata, nonce, code verifier, redirect URI, client id, and browser
+/// binding), and returns the authorization redirect URL, the `state`, and the
+/// `browser_binding`.
 ///
-/// The caller redirects the browser to [`InitiatedOidcLogin::authorization_url`]
-/// and, when the provider calls back, passes the callback's `state` + `code` to
-/// [`complete_oidc_login`] with the same `store`.
+/// The caller redirects the browser to [`InitiatedOidcLogin::authorization_url`],
+/// sets [`InitiatedOidcLogin::browser_binding`] as an `HttpOnly` cookie, and,
+/// when the provider calls back, passes the callback's `state` + `code` **and
+/// that cookie's value** to [`complete_oidc_login`] with the same `store`.
 ///
 /// # Errors
 ///
@@ -362,9 +400,13 @@ pub fn initiate_oidc_login(
         &provider.redirect_uri,
         &scopes,
     )?;
+    // A fresh secret, independent of `state`/`nonce`, bound to the initiating
+    // browser via an HttpOnly cookie the route sets from `InitiatedOidcLogin`.
+    let browser_binding = random_url_safe_token();
     store.store(
         request.state.clone(),
         PendingLogin {
+            browser_binding: browser_binding.clone(),
             nonce: request.nonce,
             code_verifier: request.code_verifier,
             redirect_uri: provider.redirect_uri.clone(),
@@ -377,28 +419,37 @@ pub fn initiate_oidc_login(
     Ok(InitiatedOidcLogin {
         authorization_url: request.redirect_url,
         state: request.state,
+        browser_binding,
     })
 }
 
-/// Completes a generic-OIDC login from a callback's `state` + `code`.
+/// Completes a generic-OIDC login from a callback's `state` + `code` and the
+/// browser-binding cookie value.
 ///
 /// Consumes the single-use `state` entry (rejecting an unknown/expired one — the
-/// CSRF/single-use defense), exchanges `code` at the stored `token_endpoint`
+/// single-use defense), requires `browser_binding` (the value of the cookie set
+/// at initiation) to equal the one stored for this login — the login-CSRF
+/// defense (RFC 9700) — then exchanges `code` at the stored `token_endpoint`
 /// using the stored PKCE verifier, verifies the returned id token against the
 /// stored provider metadata and the stored `nonce`, authenticates the resulting
 /// identity through [`SecurityStore::authenticate_oidc_identity`], and issues an
 /// opaque session with the crate's default access/refresh TTLs.
 ///
+/// `browser_binding` is [`None`] when the callback carried no such cookie, which
+/// is treated exactly like a wrong value: rejected.
+///
 /// # Errors
 ///
 /// Returns [`OidcLoginError::UnknownState`]/[`OidcLoginError::ExpiredState`] for
-/// a bad `state`, [`OidcLoginError::TokenExchange`] if the code exchange fails,
-/// [`OidcLoginError::IdToken`] if the id token (or its `nonce`) fails
-/// verification, [`OidcLoginError::Identity`] if authentication or session
+/// a bad `state`, [`OidcLoginError::BrowserBindingMismatch`] if the browser
+/// binding is absent or wrong, [`OidcLoginError::TokenExchange`] if the code
+/// exchange fails, [`OidcLoginError::IdToken`] if the id token (or its `nonce`)
+/// fails verification, [`OidcLoginError::Identity`] if authentication or session
 /// issuance fails, and [`OidcLoginError::StateUnavailable`] on a poisoned store.
 pub fn complete_oidc_login(
     state: &str,
     code: &str,
+    browser_binding: Option<&str>,
     store: &OidcLoginStateStore,
     security: &SecurityStore,
     now: i64,
@@ -407,6 +458,14 @@ pub fn complete_oidc_login(
     // Consume BEFORE any network call: an unknown/expired/forged state is
     // rejected here, so a bogus callback never reaches the provider at all.
     let pending = store.consume(state)?;
+    // Login-CSRF binding (RFC 9700): the callback must ride the initiating
+    // browser's cookie. A cross-site forged callback carries a valid `state`
+    // (and `code`) but not the victim browser's cookie, so `browser_binding` is
+    // absent or wrong and the login is rejected here — still before any token
+    // exchange. Consuming the state first keeps it single-use even on this path.
+    if !browser_binding.is_some_and(|value| binding_matches(value, &pending.browser_binding)) {
+        return Err(OidcLoginError::BrowserBindingMismatch);
+    }
     let token_request = build_oidc_token_request(
         &pending.provider.token_endpoint,
         &pending.client_id,
@@ -428,6 +487,16 @@ pub fn complete_oidc_login(
         context,
         identity,
     })
+}
+
+/// Constant-time equality for the login-CSRF browser binding. The binding is
+/// single-use and server-stored (each pending entry is consumed on the first
+/// callback), so a timing side-channel is not a realistic oracle here, but a
+/// constant-time compare (over equal-length inputs) is cheap defense-in-depth —
+/// mirroring [`crate::oidc_id_token`]'s `nonce` check.
+fn binding_matches(actual: &str, expected: &str) -> bool {
+    let (actual, expected) = (actual.as_bytes(), expected.as_bytes());
+    actual.len() == expected.len() && actual.ct_eq(expected).into()
 }
 
 #[cfg(test)]
@@ -707,6 +776,10 @@ mod tests {
         Ok(complete_oidc_login(
             &initiated.state,
             "auth-code-xyz",
+            // The genuine callback rides the browser-binding cookie set at
+            // initiation; the CSRF-scenario tests below drive the absent/wrong
+            // cases directly instead of through this happy-path helper.
+            Some(&initiated.browser_binding),
             store,
             security,
             NOW,
@@ -777,6 +850,7 @@ mod tests {
         let first = complete_oidc_login(
             &initiated.state,
             "auth-code-xyz",
+            Some(&initiated.browser_binding),
             &store,
             &security,
             NOW,
@@ -791,6 +865,7 @@ mod tests {
         let replay = complete_oidc_login(
             &initiated.state,
             "auth-code-xyz",
+            Some(&initiated.browser_binding),
             &store,
             &security,
             NOW + 1,
@@ -825,6 +900,7 @@ mod tests {
         let forged = complete_oidc_login(
             "attacker-forged-state-value",
             "auth-code-xyz",
+            None,
             &store,
             &security,
             NOW,
@@ -851,12 +927,177 @@ mod tests {
         let completed = complete_oidc_login(
             &initiated.state,
             "auth-code-xyz",
+            Some(&initiated.browser_binding),
             &store,
             &security,
             NOW,
             "corr-oidc",
         )?;
         assert_eq!(completed.identity.subject, SUBJECT);
+        Ok(())
+    }
+
+    // ---- login-CSRF: browser binding (RFC 9700) ----------------------------
+
+    /// The core login-CSRF closure. Everything a cross-site forged callback CAN
+    /// carry is valid here — a live `state`, a usable `code`, an id token whose
+    /// `nonce` matches — yet the callback presents NO browser-binding cookie (the
+    /// victim's browser never held the attacker's cookie). It must be rejected
+    /// *before* any token exchange, and the pending state must be consumed so it
+    /// can't be retried.
+    #[test]
+    fn a_callback_without_the_browser_binding_cookie_is_rejected_login_csrf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+
+        let provider = provider_config(&idp.issuer);
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
+        let login_nonce = query_param(&initiated.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
+
+        let forged = complete_oidc_login(
+            &initiated.state,
+            "auth-code-xyz",
+            // No cookie ⇒ no binding presented.
+            None,
+            &store,
+            &security,
+            NOW,
+            "corr-oidc-csrf",
+        );
+        assert!(
+            matches!(forged, Err(OidcLoginError::BrowserBindingMismatch)),
+            "a callback lacking the browser-binding cookie must be rejected, got {:?}",
+            forged.as_ref().err()
+        );
+        // Rejected before provisioning any user and the single-use state burned.
+        assert!(security.list_users(NOW)?.is_empty());
+        assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    /// The classic login-CSRF attack shape: the attacker starts their OWN login
+    /// (obtaining `state_a` + cookie `binding_a`) and lures the victim's browser
+    /// to the callback with `state_a`. The victim's browser sends its own OIDC
+    /// cookie (or none) — never `binding_a` — so the binding presented does not
+    /// equal the one stored for `state_a`, and the login is rejected.
+    #[test]
+    fn a_callback_with_a_wrong_browser_binding_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+
+        let provider = provider_config(&idp.issuer);
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
+        let login_nonce = query_param(&initiated.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
+
+        let rejected = complete_oidc_login(
+            &initiated.state,
+            "auth-code-xyz",
+            // A binding value from some other browser — not the one stored.
+            Some("some-other-browsers-binding-value-000000000"),
+            &store,
+            &security,
+            NOW,
+            "corr-oidc-csrf",
+        );
+        assert!(
+            matches!(rejected, Err(OidcLoginError::BrowserBindingMismatch)),
+            "a callback presenting the wrong browser binding must be rejected, got {:?}",
+            rejected.as_ref().err()
+        );
+        assert!(security.list_users(NOW)?.is_empty());
+        assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    /// The binding is a distinct secret from `state` (so a `state` leaked via the
+    /// URL/`IdP`/referer does not hand an attacker the binding), and presenting
+    /// the correct binding completes the login — the green control proving the
+    /// two rejections above are the binding check, not some unrelated failure.
+    #[test]
+    fn the_browser_binding_is_a_distinct_secret_and_the_correct_one_completes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+
+        let provider = provider_config(&idp.issuer);
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
+        assert!(
+            !initiated.browser_binding.is_empty(),
+            "a binding must be minted"
+        );
+        assert_ne!(
+            initiated.browser_binding, initiated.state,
+            "the browser binding must not equal the state that travels in the URL"
+        );
+
+        let login_nonce = query_param(&initiated.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
+        let completed = complete_oidc_login(
+            &initiated.state,
+            "auth-code-xyz",
+            Some(&initiated.browser_binding),
+            &store,
+            &security,
+            NOW,
+            "corr-oidc",
+        )?;
+        assert_eq!(completed.identity.subject, SUBJECT);
+        assert_eq!(store.len(), 0);
+        Ok(())
+    }
+
+    /// Two concurrent logins mint two independent bindings, so one login's cookie
+    /// can't complete the other — the bindings aren't a shared/static value.
+    #[test]
+    fn two_logins_get_independent_bindings() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+        let provider = provider_config(&idp.issuer);
+
+        let first = initiate_oidc_login(&provider, &store, &discovery)?;
+        let second = initiate_oidc_login(&provider, &store, &discovery)?;
+        assert_ne!(
+            first.browser_binding, second.browser_binding,
+            "distinct logins must mint distinct bindings"
+        );
+
+        // The FIRST login's binding must not complete the SECOND login's state.
+        let second_nonce = query_param(&second.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &second_nonce))?);
+        let crossed = complete_oidc_login(
+            &second.state,
+            "auth-code-xyz",
+            Some(&first.browser_binding),
+            &store,
+            &security,
+            NOW,
+            "corr-oidc",
+        );
+        assert!(
+            matches!(crossed, Err(OidcLoginError::BrowserBindingMismatch)),
+            "one login's binding must not satisfy another login's callback, got {:?}",
+            crossed.as_ref().err()
+        );
         Ok(())
     }
 
@@ -877,6 +1118,7 @@ mod tests {
         let result = complete_oidc_login(
             &initiated.state,
             "auth-code-xyz",
+            Some(&initiated.browser_binding),
             &store,
             &security,
             NOW,
@@ -896,6 +1138,7 @@ mod tests {
     /// driven without standing up a mock `IdP` or a real discovery/token flow.
     fn dummy_pending() -> PendingLogin {
         PendingLogin {
+            browser_binding: "browser-binding".to_owned(),
             nonce: "nonce".to_owned(),
             code_verifier: Zeroizing::new("code-verifier".to_owned()),
             redirect_uri: "http://127.0.0.1/login/oauth2/code/oidc".to_owned(),
@@ -975,6 +1218,7 @@ mod tests {
         complete_oidc_login(
             &first.state,
             "auth-code-xyz",
+            Some(&first.browser_binding),
             &store,
             &security,
             NOW,
