@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **475 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **716 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -281,6 +281,58 @@ auto-rename/auto-split, plus:
   documents row, and an async rotate proves queued preservation. Custom administrative multipart
   readers now report through the same explicit typed enrichment boundary. See
   `contracts/portal-audit.md`.
+- Secured `GET /api/v1/admin/settings/policies/implied-folder-roots` (ADMIN) — read-only list of the
+  Stirling-owned folder roots always permitted for folder automations: the local server-storage base
+  path (reason `serverStorage`) and each pipeline watched folder (reason `watchedFolder`), each
+  `{path, reason}` with an absolute path. Ports Java `FolderAccessSettingsController` +
+  `FolderAccessGuard.impliedRoots`. Paired parity fix: the Rust folder-access decision now models those
+  implied roots — a server-storage/watched-folder path is permitted even with an empty/absent
+  `policies.allowedFolderRoots` — porting `FolderAccessGuard.requirePermitted` ordering (protected-config
+  reject → implied allow → empty-allowlist reject → allowlist membership). See `contracts/policy-config.md`.
+- Webhook policy subsystem — a secured-router control plane (a fourth `webhook` input-source type via
+  `/api/v1/sources`, with server-minted CSPRNG `webhookId`/`signingSecret`, reveal-on-create-then-mask,
+  and the secret encrypted at rest; a matching `webhook` trigger listed by `GET /api/v1/policies/triggers`,
+  enabled-only LIGHT delivery dispatch, and a FULL reconcile safety-net) plus the port's **only new PUBLIC
+  route** — the HMAC-authenticated receiver `POST /api/v1/webhooks/{webhookId}` (constant-time HMAC-SHA256
+  over the raw body, anti-enumeration 404s, Content-Length/DoS bounds enforced before the signature,
+  path-safe atomic spool, `@Hidden`, and fail-closed on a missing secret). The public allowlist exposes
+  exactly `POST /api/v1/webhooks/*` (other verbs stay Authenticated). Ports Java `WebhookReceiverController`,
+  `WebhookSignatures`, `WebhookSpool`, `WebhookIds`, `WebhookConfig`, `WebhookInputSource`, `WebhookTrigger`.
+  The subsystem is now **end-to-end**: `resolve_source` has a real `"webhook"` arm, so a fired webhook
+  policy consumes the spooled delivery via the folder-consume lifecycle (spool-dir read, `.part`/dotfile
+  skip, ledger claim/settle, display-name pipeline filename, cross-policy delete, retain-on-failure;
+  `WebhookInputSource.resolve`/`completeConsumed` ported). See `contracts/webhook-receiver.md` and
+  `contracts/policy-config.md`.
+- Portal-gated `GET /api/v1/integrations/capabilities` — reports `{customApi: allowCustomApiIntegrations
+  && isAdmin}` so the portal offers the free-form custom-API option only to callers who can use it. Ports
+  Java `IntegrationConfigController.capabilities`; `policies.allowCustomApiIntegrations` defaults `true`.
+  Paired parity fix: `IntegrationConfigService::create`/`update` now enforce `requireCustomApiAllowed`
+  server-side for `API`-type configs (flag on + admin) rather than merely hiding the option in the
+  capability response. See `contracts/resource-access-integrations.md`.
+- Secured `GET /api/v1/proprietary/ui-data/{login, account, audit-dashboard, teams, teams/{id}}` — thin
+  read projections over already-ported stores (`SecurityStore`) plus a startup snapshot of server-owned
+  config, porting the non-mutating routes of Java `ProprietaryUIDataController` (new
+  `proprietary_ui_data.rs`). `login` is public (first-time-setup/default-credentials + OAuth2 provider
+  list); `account` is an `/auth/me` superset with the MFA secret masked; `audit-dashboard` (admin +
+  verified Enterprise) projects the audit config plus the `AuditLevel`/`AuditEventType` enum listings and
+  `retentionDays`; `teams`/`teams/{id}` (admin) reuse `list_teams` plus new per-team latest-activity and
+  team-leader queries in `security.rs`. SAML2 provider entries are deliberately omitted (SAML2 deferred),
+  so the login `altLogin` flag is OAuth2-only — a documented divergence for a SAML2-only config; OAuth2
+  providers are unaffected. Two minor divergences: an unknown `teams/{id}` returns `404` (Java accidentally
+  `500`s) and "last activity" derives from session `created_at` (the Rust store has no per-request
+  `lastRequest`). Only `PortalApiKeysController` (`/proprietary/ui-data/infrastructure/api-keys`, needs
+  schema work) and the H2-only `ui-data/database` route remain deferred from this controller. See
+  `contracts/ui-data.md`.
+- Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
+  Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
+  app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the
+  label's `MSIP_Label_<GUID>_<Attr>` pairs onto both the Info dictionary and the XMP packet (replacing
+  only the same tenant's labels, refusing a protected/`ENCRYPT` label) and returns the re-saved PDF;
+  read returns the PDF byte-for-byte unchanged plus an `X-Stirling-Tool-Report` JSON report. A step's
+  `connectionId` resolves to the `PURVIEW` connection through one opaque anti-enumeration error.
+  Secured-router-gated (mounts only in the opt-in secured runtime). Ports Java `PurviewLabelController`,
+  `ApiConnectionResolver`, `PdfSensitivityLabels`, and `AiToolResponseHeaders`. See
+  `contracts/purview.md`.
 
 ## Remaining (not yet ported)
 
@@ -329,7 +381,11 @@ auto-rename/auto-split, plus:
   with matrix/state/color data. Generated text can also restore bounded embedded font dictionaries,
   nested font-program streams, Type0/CID encodings, and existing Type3 CharProcs, refusing edits that
   cannot round-trip through the source encoding. Document XMP packets round-trip as bounded base64
-  metadata. Cached partial export can redraw edited text/images over bounded retained vector content.
+  metadata. Info and annotation dates now round-trip through the PDF `D:...`↔ISO-8601 conversion
+  (offset normalized to `+00'00'`, the key omitted on a parse failure, and the annotation overlay
+  converts ISO→`D:` so it never writes an invalid literal), and `/Trapped` is read/written as a COS
+  Name — both previously documented parity gaps, now closed. Cached partial export can redraw edited
+  text/images over bounded retained vector content.
   The full-document rebuild path now ports that same strip-and-regenerate strategy for a page that
   mixes a preserved `content_streams` entry with edited `textElements`/`imageElements`: it strips only
   the represented text or represented-image draws whose element list was actually resubmitted, and
@@ -337,8 +393,21 @@ auto-rename/auto-split, plus:
   `textElements`/`imageElements` are plain lists rather than optional, an empty list is read as "not
   resubmitted," not "delete everything of this type," so a client cannot yet clear just one content
   type on a mixed page through this endpoint (the lazy/partial endpoint already supports that). This
-  is strip-and-regenerate, not Java's token-level in-place `Tj`/`TJ` rewriting, so it is not yet
-  byte-level parity with `PdfJsonConversionService`. Generated text that mixes a character the
+  mixed-edit regeneration is now the fallback: for a text-only mixed edit (non-empty `textElements`, no
+  image edits) on a simple `Type1`/`TrueType`/`MMType1` font, the full-document rebuild first attempts
+  Java's token-preserving in-place `Tj`/`TJ` rewrite (`rewrite_text_operators`, porting
+  `rewriteTextOperators`) — it swaps only each show-text string operand for the replacement re-encoded
+  through the same font and carries every other token (positioning, `TJ` kerning, vector ops) through
+  byte-for-byte, so a boundary-aligned edit round-trips token-for-token. It defers wholesale to
+  strip-and-regenerate, with no partial rewrite, on any unsupported case (`Type0`/`Type3` or
+  unresolvable font, a Standard-14 fallback being needed, an encode failure, a glyph-count/cursor
+  mismatch, invoked-Form text, or an interior-kerned multi-string `TJ`). This partially closes the
+  byte-parity gap with `PdfJsonConversionService`; still open are `Type0`/`Type3`, interior-kerning-run
+  rewrite, true Type3 glyph synthesis, and byte-parity for those deferred classes. Two seeming gaps are
+  confirmed parity rather than Rust shortfalls: Java's `TextRunAccumulator` also merges same-baseline
+  kerned glyphs with no kerning-gap check (so an interior-kerning run defers on both sides), and Java's
+  partial-export path (`determineRegenerateMode` with `forceRegenerate=true`) also always regenerates
+  (so the Rust `partial/{jobId}` path always regenerating is parity). Generated text that mixes a character the
   restored font (Type3 or otherwise) can represent with one it cannot now degrades gracefully —
   the unrepresentable run falls back to Standard-14 instead of refusing the whole element's edit —
   rather than fabricating a genuinely new glyph. A character representable by neither the restored
@@ -647,13 +716,20 @@ file ledger now supplies atomic claims, bounded interrupted retries, settlement/
 presence cleanup, and boot recovery. `FULL`/`LIGHT` folder and S3 source sweeps consume that ledger;
 inline, atomic folder, and conditional S3 sinks complete delivery. Manual trigger/history routes,
 trigger metadata, wall-clock schedules, debounced folder events, startup reconciliation, and
-periodic reconciliation are active in the reviewed runtime. Ad-hoc streamed runs emit
+periodic reconciliation are active in the reviewed runtime. The webhook input-source type, its
+enabled-only trigger dispatch, the FULL reconcile safety-net, and the public HMAC receiver/spool
+(`POST /api/v1/webhooks/{webhookId}`) are now ported. **The webhook subsystem is now end-to-end: a
+delivery is spooled by the receiver and consumed by a webhook policy run — `resolve_source` has a real
+`"webhook"` arm that reads the per-webhook spool dir through the folder-consume lifecycle (ledger
+claim/settle, display-name filename, cross-policy delete, retain-on-failure), porting
+`WebhookInputSource.resolve`/`completeConsumed`.** Ad-hoc streamed runs emit
 Java-compatible started/completed step events and a terminal owner-scoped run view without
 cancelling work on disconnect. Java's dormant `WAITING_FOR_INPUT` scaffolding has no live resume
 route to port, while automatic trigger state is process-local pending the broader distributed
 runtime. See
-`contracts/resource-access-integrations.md` and
-`contracts/policy-config.md`.
+`contracts/resource-access-integrations.md`,
+`contracts/policy-config.md`, and
+`contracts/webhook-receiver.md`.
 
 The processing service now also ports team-scoped classification-label CRUD
 and the `classify-and-label` PDF bridge. Label mutation is administrator-only in

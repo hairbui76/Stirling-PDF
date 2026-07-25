@@ -52,6 +52,10 @@ pub(crate) fn routes(
         .route("/api/v1/policies/order", put(reorder_policies))
         .route("/api/v1/policies/overview", get(policy_overview))
         .route("/api/v1/policies/triggers", get(available_triggers))
+        .route(
+            "/api/v1/admin/settings/policies/implied-folder-roots",
+            get(implied_folder_roots),
+        )
         .route("/api/v1/policies/run", axum::routing::post(run_ad_hoc))
         .route(
             "/api/v1/policies/run/stream",
@@ -181,6 +185,21 @@ async fn policy_overview(
 
 async fn available_triggers() -> Json<Vec<crate::policy_triggers::TriggerInfo>> {
     Json(trigger_metadata())
+}
+
+/// Read-only admin view of the Stirling-owned folder roots always permitted for
+/// folder automations (server storage, pipeline watched folders), regardless of
+/// `policies.allowedFolderRoots`. Mirrors Java's
+/// `FolderAccessSettingsController.impliedFolderRoots`; the service enforces the
+/// `hasRole('ADMIN')` gate.
+async fn implied_folder_roots(
+    Extension(service): Extension<Arc<PolicyConfigService>>,
+    Extension(context): Extension<AuthContext>,
+) -> Response {
+    match service.list_implied_folder_roots(&context) {
+        Ok(roots) => Json(roots).into_response(),
+        Err(error) => policy_error(error),
+    }
 }
 
 async fn save_policy(

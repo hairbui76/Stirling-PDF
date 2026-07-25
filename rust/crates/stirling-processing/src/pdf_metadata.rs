@@ -149,7 +149,7 @@ fn replace_info_dictionary(
     document.trailer.set("Info", info_id);
 }
 
-fn document_info_text(document: &Document, key: &[u8]) -> Option<String> {
+pub(crate) fn document_info_text(document: &Document, key: &[u8]) -> Option<String> {
     let info = document_info_dictionary(document)?;
     let (_, value) = document.dereference(info.get(key).ok()?).ok()?;
     lopdf::decode_text_string(value).ok()
@@ -162,7 +162,7 @@ fn document_info_date(document: &Document, key: &[u8]) -> Option<String> {
     lopdf::decode_text_string(value).ok()
 }
 
-fn document_info_dictionary(document: &Document) -> Option<&Dictionary> {
+pub(crate) fn document_info_dictionary(document: &Document) -> Option<&Dictionary> {
     let (_, info) = document
         .dereference(document.trailer.get(b"Info").ok()?)
         .ok()?;
@@ -272,7 +272,7 @@ fn ensure_info_dictionary(document: &mut Document) -> Result<ObjectId, lopdf::Er
     Ok(info_id)
 }
 
-fn apply_custom_metadata(info: &mut Dictionary, options: &MetadataOptions) {
+pub(crate) fn apply_custom_metadata(info: &mut Dictionary, options: &MetadataOptions) {
     for (key, value) in &options.all_request_params {
         if !is_standard_key(key) && !key.contains("customKey") && !key.contains("customValue") {
             info.set(key.as_bytes(), Object::string_literal(value.as_str()));
@@ -350,7 +350,7 @@ fn pdf_date_from_java_request(value: &str) -> Option<String> {
     ))
 }
 
-fn format_pdf_date_with_offset(naive: &NaiveDateTime, offset_seconds: i32) -> String {
+pub(crate) fn format_pdf_date_with_offset(naive: &NaiveDateTime, offset_seconds: i32) -> String {
     let sign = if offset_seconds < 0 { '-' } else { '+' };
     let offset_minutes = offset_seconds.unsigned_abs() / 60;
     format!(

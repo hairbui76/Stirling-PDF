@@ -110,6 +110,9 @@ mod policy_sources;
 mod policy_triggers;
 mod portal_audit;
 mod process_executor;
+mod proprietary_ui_data;
+mod purview;
+mod purview_http;
 mod resource_access;
 pub mod runtime_config;
 mod runtime_dependencies;
@@ -132,6 +135,7 @@ mod tessdata_admin;
 pub mod ui_data;
 pub mod url_to_pdf;
 pub mod vector_conversion;
+mod webhook_receiver;
 mod workflow_signing;
 mod workflow_signing_http;
 
@@ -1499,6 +1503,8 @@ impl ProcessingRuntime {
         let policy_source_readiness = runtime_config.pipeline_directory_config().readiness;
         let policy_trigger_settings = runtime_config.policy_trigger_settings();
         let policy_stream_timeout = runtime_config.policy_stream_timeout();
+        let policy_webhook_max_bytes = runtime_config.policies_webhook_max_bytes();
+        let policy_install_root = runtime_config.installation_root();
         let integration_service = Arc::new(integration_config::IntegrationConfigService::new(
             Arc::clone(&security_store),
             resource_access::DefaultAccessPolicy::from_config(
@@ -1507,6 +1513,7 @@ impl ProcessingRuntime {
             true,
             policies_enabled,
             runtime_config.policies_allow_private_s3_endpoints(),
+            runtime_config.allow_custom_api_integrations(),
         ));
         let processed_ledger = initialize_policy_ledger(policies_enabled, &security_store)?;
         let policy_service = processed_ledger.as_ref().map(|_| {
@@ -1518,6 +1525,11 @@ impl ProcessingRuntime {
                     .settings_path()
                     .parent()
                     .unwrap_or_else(|| Path::new(".")),
+                policy_config::implied_folder_roots(
+                    &runtime_config
+                        .storage_config(u64::try_from(max_upload_bytes).unwrap_or(u64::MAX)),
+                    &runtime_config.pipeline_directory_config().watched_folders,
+                ),
             ))
         });
         let mcp_config = runtime_config.mcp_config();
@@ -1588,6 +1600,10 @@ impl ProcessingRuntime {
             )
             .map_err(|error| SecurityStartupError::WorkflowSigning(Box::new(error)))?,
         );
+        // Snapshot the login/audit configuration before `runtime_config` is
+        // moved into the runtime; the read projections never re-parse settings.
+        let proprietary_ui_data_config =
+            proprietary_ui_data::UiDataConfig::from_runtime_config(&runtime_config);
         let mut runtime =
             Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
         runtime.license_refresh_runtime = Some(license::LicenseRefreshRuntime::new(
@@ -1597,7 +1613,12 @@ impl ProcessingRuntime {
         ));
         runtime.router = runtime
             .router
-            .merge(integration_http::routes(integration_service))
+            .merge(integration_http::routes(Arc::clone(&integration_service)))
+            .merge(
+                purview_http::routes(integration_service)
+                    .layer(DefaultBodyLimit::max(max_upload_bytes)),
+            )
+            .merge(proprietary_ui_data::routes(proprietary_ui_data_config))
             .merge(login_agreement_admin::routes(login_agreements))
             .merge(tessdata_admin::routes(tessdata_admin))
             .merge(personal_signatures::routes())
@@ -1635,6 +1656,8 @@ impl ProcessingRuntime {
                 trigger: policy_trigger_settings,
                 stream_timeout: policy_stream_timeout,
                 max_upload_bytes,
+                webhook_max_bytes: policy_webhook_max_bytes,
+                install_root: policy_install_root,
             },
         );
         runtime.router = secure_router_with_mail(
@@ -1763,6 +1786,8 @@ struct PolicyRouteSettings {
     trigger: runtime_config::PolicyTriggerSettings,
     stream_timeout: Duration,
     max_upload_bytes: usize,
+    webhook_max_bytes: u64,
+    install_root: PathBuf,
 }
 
 fn attach_policy_routes(
@@ -1794,17 +1819,21 @@ fn attach_policy_routes(
         Arc::clone(&processed_ledger),
         settings.readiness,
         s3,
+        // Cloned because `settings.install_root` is moved into the public webhook
+        // receiver below; the runner needs it to derive per-webhook spool dirs.
+        settings.install_root.clone(),
     ));
     let trigger_notifier = policy_triggers::PolicyChangeNotifier::default();
-    runtime.policy_trigger_runtime = Some(policy_triggers::PolicyTriggerRuntime::new(
+    let trigger_runtime = policy_triggers::PolicyTriggerRuntime::new(
         Arc::clone(&policy_service),
         Arc::clone(&source_runner),
         settings.trigger,
         trigger_notifier.clone(),
-    ));
+    );
+    runtime.policy_trigger_runtime = Some(trigger_runtime.clone());
     runtime.router = runtime.router.clone().merge(
         policy_http::routes(
-            policy_service,
+            Arc::clone(&policy_service),
             execution_service,
             source_runner,
             processed_ledger,
@@ -1813,6 +1842,16 @@ fn attach_policy_routes(
         )
         .layer(DefaultBodyLimit::max(settings.max_upload_bytes)),
     );
+    // The public inbound webhook receiver is mounted OUTSIDE the shared upload
+    // body limit: it is authenticated by an HMAC signature, not a session, and
+    // enforces its own `policies.webhookMaxBytes` bound via the declared
+    // Content-Length plus a capped read (see `webhook_receiver`).
+    runtime.router = runtime.router.clone().merge(webhook_receiver::routes(
+        policy_service,
+        trigger_runtime,
+        settings.install_root,
+        settings.webhook_max_bytes,
+    ));
 }
 
 fn initialize_policy_ledger(

@@ -70,7 +70,7 @@ const API_KEY_PREFIX: &str = "spdf_ak_";
 const SESSION_ID_PREFIX: &str = "spdf_sid_";
 const INVITE_TOKEN_PREFIX: &str = "spdf_inv_";
 const DEFAULT_TEAM_NAME: &str = "Default";
-const INTERNAL_TEAM_NAME: &str = "Internal";
+pub(crate) const INTERNAL_TEAM_NAME: &str = "Internal";
 const INTERNAL_API_USERNAME: &str = "STIRLING-PDF-BACKEND-API-USER";
 const MAX_TEAM_NAME_BYTES: usize = 100;
 const MAX_EXTERNAL_ISSUER_BYTES: usize = 2_048;
@@ -2141,6 +2141,167 @@ impl SecurityStore {
             .map_err(SecurityError::from)
     }
 
+    /// Reports whether the login page should surface the default administrator
+    /// credentials, mirroring Java
+    /// `ProprietaryUIDataController.getLoginData`'s `showDefaultCredentials` /
+    /// `firstTimeSetup` computation: `true` when there are no real users (the
+    /// internal API user excluded), or exactly one real user which is the
+    /// default `admin` account still on its first login (its initial setup not
+    /// yet completed — the Rust equivalent of Java's `isFirstLogin`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn first_time_setup_required(&self) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        let count = real_user_count(&connection)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        if count == 1 {
+            // Java looks up the literal `admin` account (case-insensitively) and
+            // checks its first-login flag; `username_norm` is the lowercased key.
+            let admin_first_login: Option<bool> = connection
+                .query_row(
+                    "SELECT initial_setup_completed = 0
+                     FROM security_users WHERE username_norm = 'admin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(admin_first_login.unwrap_or(false));
+        }
+        Ok(false)
+    }
+
+    /// Reports whether MFA is *required* for the user, mirroring Java
+    /// `MfaService.isMfaRequired` (default `false` when no MFA row exists).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn mfa_is_required(&self, user_id: i64) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT required FROM security_mfa WHERE user_id = ?1",
+                [user_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(SecurityError::from)
+    }
+
+    /// Returns the latest session activity per team (the internal team
+    /// excluded), mirroring Java `SessionRepository.findLatestActivityByTeam`.
+    /// Each entry is `(team_id, latest_activity)` where the activity is the most
+    /// recent session `created_at` (unix seconds) across the team's members, or
+    /// `None` when no member has ever had a session.
+    ///
+    /// Parity note: the Java query aggregates `MAX(lastRequest)` from Spring
+    /// Session's per-request `lastRequest`; the Rust session store records only
+    /// `created_at`, so this uses the latest session creation time as the
+    /// closest available "last activity" signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn latest_session_activity_per_team(
+        &self,
+    ) -> Result<Vec<(i64, Option<i64>)>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT t.team_id, MAX(s.created_at)
+             FROM security_teams t
+             LEFT JOIN security_users u ON u.team_id = t.team_id
+             LEFT JOIN security_sessions s ON s.user_id = u.user_id
+             WHERE t.name <> ?1
+             GROUP BY t.team_id
+             ORDER BY t.team_id",
+        )?;
+        statement
+            .query_map([INTERNAL_TEAM_NAME], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Returns `(team_id, user_id, username)` for every LEADER (team-owner)
+    /// membership on a non-internal team, ordered by team then username. Mirrors
+    /// Java `TeamMembershipRepository.findByRoleFetchingUserAndTeam(LEADER)`
+    /// (the internal team filtered out). A LEADER is an `is_owner = 1` row of
+    /// `security_team_memberships`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn team_leaders(&self) -> Result<Vec<(i64, i64, String)>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT m.team_id, m.user_id, u.username
+             FROM security_team_memberships m
+             JOIN security_users u ON u.user_id = m.user_id
+             JOIN security_teams t ON t.team_id = m.team_id
+             WHERE m.is_owner = 1 AND t.name <> ?1
+             ORDER BY m.team_id, u.username COLLATE NOCASE",
+        )?;
+        statement
+            .query_map([INTERNAL_TEAM_NAME], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Resolves a team's display name, or `None` when the id is unknown. Used by
+    /// the team-details projection to distinguish "not found" from the internal
+    /// team (which is never exposed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn team_name(&self, team_id: i64) -> Result<Option<String>, SecurityError> {
+        let connection = self.lock()?;
+        team_name_by_id(&connection, team_id)
+    }
+
+    /// Returns `(username, latest_activity)` for every member of one team,
+    /// mirroring Java `SessionRepository.findLatestSessionByTeamId`. The
+    /// activity is the most recent session `created_at` (unix seconds) for that
+    /// user, or `None` when they have never had a session. See
+    /// [`Self::latest_session_activity_per_team`] for the `lastRequest` parity
+    /// note.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn latest_session_by_team(
+        &self,
+        team_id: i64,
+    ) -> Result<Vec<(String, Option<i64>)>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT u.username, MAX(s.created_at)
+             FROM security_users u
+             LEFT JOIN security_sessions s ON s.user_id = u.user_id
+             WHERE u.team_id = ?1
+             GROUP BY u.user_id, u.username
+             ORDER BY u.username COLLATE NOCASE",
+        )?;
+        statement
+            .query_map([team_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
     /// Creates a uniquely named team.
     ///
     /// # Errors
@@ -3793,7 +3954,7 @@ impl SecurityStore {
             .map_err(Into::into)
     }
 
-    fn list_all_policy_sources(&self) -> Result<Vec<PolicySource>, SecurityError> {
+    pub(crate) fn list_all_policy_sources(&self) -> Result<Vec<PolicySource>, SecurityError> {
         let cipher = self.integration_cipher()?;
         let connection = self.lock()?;
         let mut statement = connection.prepare("SELECT source_json FROM policy_sources")?;
@@ -5525,7 +5686,7 @@ fn initialize_resource_access_schema(connection: &Connection) -> Result<(), Secu
              ON resource_grants(principal_type, principal_id);
          CREATE TABLE IF NOT EXISTS integration_configs (
              integration_config_id INTEGER PRIMARY KEY AUTOINCREMENT,
-             integration_type TEXT NOT NULL CHECK(integration_type IN ('S3', 'MCP', 'API')),
+             integration_type TEXT NOT NULL CHECK(integration_type IN ('S3', 'MCP', 'API', 'PURVIEW')),
              name TEXT NOT NULL,
              scope TEXT NOT NULL CHECK(scope IN ('USER', 'TEAM', 'SERVER')),
              owner_user_id INTEGER
@@ -7539,6 +7700,150 @@ mod tests {
             store.delete_team(team_id),
             Err(SecurityError::TeamNotEmpty)
         ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod proprietary_ui_data_store_tests {
+    use super::{INTERNAL_TEAM_NAME, SecurityStore};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn first_time_setup_true_when_no_real_users() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        // No users at all → defaults must be surfaced.
+        assert!(store.first_time_setup_required()?);
+        Ok(())
+    }
+
+    #[test]
+    fn first_time_setup_true_for_lone_admin_on_first_login() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        // A single admin that has not completed initial setup keeps defaults on.
+        assert!(store.first_time_setup_required()?);
+        Ok(())
+    }
+
+    #[test]
+    fn first_time_setup_false_after_admin_completes_setup() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let admin = store.authenticate_password("admin", "admin-test-password", 1_000, "setup")?;
+        store.complete_initial_setup(admin.user_id)?;
+        assert!(!store.first_time_setup_required()?);
+        Ok(())
+    }
+
+    #[test]
+    fn first_time_setup_false_with_multiple_real_users() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        store.create_local_user("second", "second-test-password", ["ROLE_USER"], None)?;
+        assert!(!store.first_time_setup_required()?);
+        Ok(())
+    }
+
+    #[test]
+    fn first_time_setup_ignores_internal_api_user() -> TestResult {
+        // A lone internal API user is not a real user, so setup is still needed.
+        let store = SecurityStore::in_memory()?;
+        store.create_local_user(
+            "STIRLING-PDF-BACKEND-API-USER",
+            "internal-api-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        assert!(store.first_time_setup_required()?);
+        Ok(())
+    }
+
+    #[test]
+    fn mfa_is_required_defaults_false_without_row() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let admin = store.authenticate_password("admin", "admin-test-password", 1_000, "mfa")?;
+        assert!(!store.mfa_is_required(admin.user_id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn team_queries_exclude_internal_team_and_expose_leaders() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let team_id = store.create_team("Engineering")?;
+        let owner_id =
+            store.create_local_user("lead", "lead-test-password", ["ROLE_USER"], Some(team_id))?;
+        store.set_team_owner(team_id, owner_id, true)?;
+
+        // The internal team never appears in any team projection.
+        let activity = store.latest_session_activity_per_team()?;
+        let teams = store.list_teams()?;
+        let internal_id = teams
+            .iter()
+            .find(|team| team.name.eq_ignore_ascii_case(INTERNAL_TEAM_NAME))
+            .map(|team| team.id)
+            .ok_or("internal team should be seeded")?;
+        assert!(
+            !activity.iter().any(|(id, _)| *id == internal_id),
+            "internal team must be filtered from activity"
+        );
+
+        // The created team has no sessions yet → activity is None.
+        let engineering = activity
+            .iter()
+            .find(|(id, _)| *id == team_id)
+            .ok_or("engineering team should be present")?;
+        assert!(engineering.1.is_none());
+
+        // The owner is reported as a leader of the team.
+        let leaders = store.team_leaders()?;
+        assert!(
+            leaders
+                .iter()
+                .any(|(tid, uid, name)| *tid == team_id && *uid == owner_id && name == "lead")
+        );
+        assert!(
+            !leaders.iter().any(|(tid, _, _)| *tid == internal_id),
+            "internal team leaders must be filtered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_name_and_latest_session_reflect_activity() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let team_id = store.create_team("Design")?;
+        let member = store.create_local_user(
+            "artist",
+            "artist-test-password",
+            ["ROLE_USER"],
+            Some(team_id),
+        )?;
+        assert_eq!(store.team_name(team_id)?.as_deref(), Some("Design"));
+        assert!(store.team_name(999_999)?.is_none());
+
+        // Before any session the member's latest activity is None.
+        let before = store.latest_session_by_team(team_id)?;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, "artist");
+        assert!(before[0].1.is_none());
+
+        // After a session is issued its creation time is the latest activity.
+        let context =
+            store.authenticate_password("artist", "artist-test-password", 5_000, "login")?;
+        assert_eq!(context.user_id, member);
+        store.issue_session(
+            &context,
+            5_000,
+            super::DEFAULT_ACCESS_TTL,
+            super::DEFAULT_REFRESH_TTL,
+        )?;
+        let after = store.latest_session_by_team(team_id)?;
+        assert_eq!(after[0].1, Some(5_000));
         Ok(())
     }
 }

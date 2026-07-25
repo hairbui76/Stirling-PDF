@@ -794,6 +794,27 @@ impl RuntimeConfig {
         })
     }
 
+    /// Returns whether administrators may author free-form ("custom") API
+    /// integrations, mirroring Java's `policies.allowCustomApiIntegrations`
+    /// (default `true`) that `IntegrationConfigService`/`IntegrationConfigController`
+    /// gate custom-integration authoring on.
+    ///
+    /// Authoring a custom integration is admin-only regardless; turning this
+    /// off only blocks creating or editing them (vendor presets and existing
+    /// integrations keep working), so `true` remains the compatible default.
+    /// Both the underscored and Spring relaxed-binding compact environment
+    /// aliases are honoured, matching [`Self::policies_allow_private_s3_endpoints`].
+    #[must_use]
+    pub fn allow_custom_api_integrations(&self) -> bool {
+        env_bool("POLICIES_ALLOW_CUSTOM_API_INTEGRATIONS").unwrap_or_else(|| {
+            self.boolean(
+                &["policies", "allowCustomApiIntegrations"],
+                "POLICIES_ALLOWCUSTOMAPIINTEGRATIONS",
+                true,
+            )
+        })
+    }
+
     #[must_use]
     pub(crate) fn policies_allowed_folder_roots(&self) -> Vec<PathBuf> {
         env::var("POLICIES_ALLOWED_FOLDER_ROOTS")
@@ -810,6 +831,27 @@ impl RuntimeConfig {
             .into_iter()
             .map(PathBuf::from)
             .collect()
+    }
+
+    /// Largest inbound webhook-delivery body the public receiver will buffer,
+    /// mirroring Java's `ApplicationProperties.Policies.webhookMaxBytes`
+    /// (default `104857600`, i.e. 100 MiB). The receiver rejects a declared
+    /// `Content-Length` above this before reading a byte.
+    #[must_use]
+    pub(crate) fn policies_webhook_max_bytes(&self) -> u64 {
+        self.u64(
+            &["policies", "webhookMaxBytes"],
+            "POLICIES_WEBHOOKMAXBYTES",
+            104_857_600,
+        )
+    }
+
+    /// The Stirling installation root (`InstallationPathConfig.getPath()` in
+    /// Java), derived from the same settings-file source the policy runner uses.
+    /// The webhook spool lives under this directory.
+    #[must_use]
+    pub(crate) fn installation_root(&self) -> PathBuf {
+        installation_path(&self.settings_path)
     }
 
     #[must_use]
@@ -991,6 +1033,34 @@ impl RuntimeConfig {
             )
             .clamp(0, 3);
         u8::try_from(level).unwrap_or(2)
+    }
+
+    /// Returns the configured audit-event retention window in days, mirroring
+    /// Java's `premium.enterpriseFeatures.audit.retentionDays` (default `90`).
+    ///
+    /// The raw value is returned unclamped, exactly like Java's
+    /// `getRetentionDays()`: a value of zero or less means "retain
+    /// indefinitely" (Java's `getEffectiveRetentionDays()` maps it to `-1`),
+    /// so the sign is preserved rather than coerced back to the default.
+    #[must_use]
+    pub fn security_audit_retention_days(&self) -> i64 {
+        self.signed_integer(
+            &["premium", "enterpriseFeatures", "audit", "retentionDays"],
+            "PREMIUM_ENTERPRISEFEATURES_AUDIT_RETENTIONDAYS",
+            90,
+        )
+    }
+
+    /// Returns the ordered `AuditLevel` names (`OFF`, `BASIC`, `STANDARD`,
+    /// `VERBOSE`), mirroring Java's `stirling.software.proprietary.audit.AuditLevel`
+    /// enum whose integer levels `0..=3` index directly into this slice.
+    ///
+    /// Exposed for the audit-dashboard projection so it does not re-declare the
+    /// level vocabulary; the numeric level from [`Self::security_audit_level`]
+    /// is a valid index into the returned slice.
+    #[must_use]
+    pub fn audit_levels() -> &'static [&'static str] {
+        &["OFF", "BASIC", "STANDARD", "VERBOSE"]
     }
 
     #[must_use]
@@ -2556,6 +2626,134 @@ mod tests {
         fs::write(&settings, "system:\n  maxDPI: 360\n")?;
         let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
         assert_eq!(config.max_render_dpi(), 360);
+        Ok(())
+    }
+
+    #[test]
+    fn allow_custom_api_integrations_matches_java_default_and_yaml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+
+        // Java default is on: custom-integration authoring is permitted.
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert!(config.allow_custom_api_integrations());
+
+        // The operator can withdraw custom-integration authoring via YAML.
+        fs::write(
+            &settings,
+            "policies:\n  allowCustomApiIntegrations: false\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert!(!config.allow_custom_api_integrations());
+        Ok(())
+    }
+
+    #[test]
+    fn security_audit_retention_days_matches_java_default_and_yaml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+
+        // Java default retention window.
+        fs::write(&settings, "{}\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert_eq!(config.security_audit_retention_days(), 90);
+
+        // Zero (Java "retain indefinitely") is preserved unclamped rather than
+        // being coerced back to the default.
+        fs::write(
+            &settings,
+            "premium:\n  enterpriseFeatures:\n    audit:\n      retentionDays: 0\n",
+        )?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert_eq!(config.security_audit_retention_days(), 0);
+
+        // An explicit window overrides the default.
+        fs::write(
+            &settings,
+            "premium:\n  enterpriseFeatures:\n    audit:\n      retentionDays: 30\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert_eq!(config.security_audit_retention_days(), 30);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_levels_are_ordered_and_indexed_by_numeric_level() {
+        assert_eq!(
+            RuntimeConfig::audit_levels().to_vec(),
+            vec!["OFF", "BASIC", "STANDARD", "VERBOSE"]
+        );
+        // The Java default numeric level (STANDARD == 2) indexes into the slice.
+        assert_eq!(RuntimeConfig::audit_levels()[2], "STANDARD");
+    }
+
+    // Every AuditLevel enum member indexes into the slice at exactly its Java
+    // integer level, and the slice is the same width as the enum (0..=3). This
+    // locks the projection to the Java enum ordering, not just the STANDARD case.
+    #[test]
+    fn audit_levels_index_matches_every_java_enum_level() {
+        let levels = RuntimeConfig::audit_levels();
+        assert_eq!(levels.len(), 4);
+        assert_eq!(levels[0], "OFF");
+        assert_eq!(levels[1], "BASIC");
+        assert_eq!(levels[2], "STANDARD");
+        assert_eq!(levels[3], "VERBOSE");
+        // The clamped default level from the sibling accessor is a valid index.
+        let config = RuntimeConfig::from_files("missing-a.yml", "missing-b.yml");
+        let default_level = usize::from(config.security_audit_level());
+        assert_eq!(levels[default_level], "STANDARD");
+    }
+
+    // Java's getRetentionDays() returns the raw field; only
+    // getEffectiveRetentionDays() maps values <= 0 to -1. The raw accessor must
+    // therefore preserve a negative "retain indefinitely" sentinel unclamped.
+    #[test]
+    fn security_audit_retention_days_preserves_a_negative_sentinel_unclamped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "premium:\n  enterpriseFeatures:\n    audit:\n      retentionDays: -1\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert_eq!(config.security_audit_retention_days(), -1);
+        Ok(())
+    }
+
+    // A non-integer YAML value cannot resolve through `signed_integer`, so the
+    // Java default is retained rather than panicking — the same graceful
+    // degradation every other signed_integer-backed accessor exhibits.
+    #[test]
+    fn security_audit_retention_days_falls_back_when_the_value_is_not_an_integer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        fs::write(
+            &settings,
+            "premium:\n  enterpriseFeatures:\n    audit:\n      retentionDays: not-a-number\n",
+        )?;
+        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        assert_eq!(config.security_audit_retention_days(), 90);
+        Ok(())
+    }
+
+    // The loader merges custom_settings.yml on top of settings.yml, so a custom
+    // overlay withdrawing custom-integration authoring must win over a base file
+    // that leaves the Java default (true) in place.
+    #[test]
+    fn allow_custom_api_integrations_custom_settings_override_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        let custom = directory.path().join("custom_settings.yml");
+        fs::write(&settings, "policies:\n  allowCustomApiIntegrations: true\n")?;
+        fs::write(&custom, "policies:\n  allowCustomApiIntegrations: false\n")?;
+        let config = RuntimeConfig::from_files(settings, custom);
+        assert!(!config.allow_custom_api_integrations());
         Ok(())
     }
 

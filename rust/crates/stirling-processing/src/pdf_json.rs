@@ -22,6 +22,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, TimeZone, Utc};
 use image::{DynamicImage, GrayImage, ImageFormat, RgbImage, RgbaImage};
 use lopdf::{
     Dictionary, Document, Encoding, Object, Stream, StringFormat,
@@ -4497,8 +4498,12 @@ fn annotation_model(
         icon_name: dictionary_name(document, annotation, b"Name"),
         subject: dictionary_text(document, annotation, b"Subj"),
         author: dictionary_text(document, annotation, b"T"),
-        creation_date: dictionary_text(document, annotation, b"CreationDate"),
-        modification_date: dictionary_text(document, annotation, b"M"),
+        creation_date: dictionary_text(document, annotation, b"CreationDate")
+            .as_deref()
+            .and_then(pdf_date_to_iso_instant),
+        modification_date: dictionary_text(document, annotation, b"M")
+            .as_deref()
+            .and_then(pdf_date_to_iso_instant),
         raw_data: if include_raw_data {
             object_to_cos_value(document, object, &mut visited)
         } else {
@@ -7083,6 +7088,93 @@ fn dictionary_to_cos_entries(
     entries
 }
 
+/// Converts a PDF `D:YYYYMMDDHHmmSS(Z|±HH'mm')` date string to an ISO-8601 UTC
+/// instant (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Mirrors Java's `PDDocumentInformation.getCreationDate()` /
+/// `DateConverter.toCalendar` followed by `formatCalendar` (`Calendar.toInstant()
+/// .toString()`). `PDFBox`'s `DateConverter` seeds the calendar with a GMT base
+/// (`SimpleTimeZone(0, "GMT")`), so a date string with no timezone designator is
+/// interpreted as UTC; an explicit `Z` or `±HH'mm'` offset is applied and
+/// normalized back to UTC. Missing time components (no-seconds and date-only
+/// forms) default to zero per the PDF date grammar.
+///
+/// Returns `None` when the value cannot be parsed, mirroring Java's
+/// `formatCalendar(null)` / parse-failure paths that leave the field unset.
+pub(crate) fn pdf_date_to_iso_instant(value: &str) -> Option<String> {
+    let raw = value.trim();
+    let raw = raw
+        .strip_prefix("D:")
+        .or_else(|| raw.strip_prefix("d:"))
+        .unwrap_or(raw);
+    let digits_end = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (digits, zone) = raw.split_at(digits_end);
+    // Year is mandatory; every finer field defaults per the PDF date grammar.
+    let year: i32 = digits.get(0..4)?.parse().ok()?;
+    let field = |start: usize, default: u32| -> Option<u32> {
+        match digits.get(start..start + 2) {
+            Some(slice) => slice.parse().ok(),
+            None => Some(default),
+        }
+    };
+    let month = field(4, 1)?;
+    let day = field(6, 1)?;
+    let hour = field(8, 0)?;
+    let minute = field(10, 0)?;
+    let second = field(12, 0)?;
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
+    let offset = FixedOffset::east_opt(parse_pdf_zone_offset_seconds(zone)?)?;
+    let instant = offset
+        .from_local_datetime(&naive)
+        .single()?
+        .with_timezone(&Utc);
+    Some(instant.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+/// Parses the timezone tail of a PDF date (`Z`, `±HH'mm'`, or empty) into an
+/// offset in seconds east of UTC. Apostrophes and a missing minute field are
+/// tolerated; an absent designator is UTC, matching `PDFBox`'s GMT base calendar.
+fn parse_pdf_zone_offset_seconds(zone: &str) -> Option<i32> {
+    let zone = zone.trim();
+    let sign = match zone.bytes().next() {
+        None | Some(b'Z' | b'z') => return Some(0),
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        Some(_) => return None,
+    };
+    let digits: String = zone[1..].chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let hours: i32 = digits.get(0..2).unwrap_or(digits.as_str()).parse().ok()?;
+    let minutes: i32 = match digits.get(2..4) {
+        Some(slice) => slice.parse().ok()?,
+        None => 0,
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+/// Converts an ISO-8601 instant (as produced by [`pdf_date_to_iso_instant`] or
+/// Java's `Instant.toString()`) back to a PDF `D:YYYYMMDDHHmmSS+00'00'` string in
+/// UTC.
+///
+/// Mirrors Java `parseInstant(...).ifPresent(instant -> info.setCreationDate(
+/// toCalendar(instant)))`: the instant is normalized to a UTC calendar and
+/// `PDFBox` writes the `+00'00'` offset form. Reuses
+/// [`crate::pdf_metadata::format_pdf_date_with_offset`] with a zero offset.
+/// Returns `None` when the value is not a parseable instant, matching Java's
+/// `ifPresent` skip on `DateTimeParseException`.
+pub(crate) fn iso_instant_to_pdf_date(value: &str) -> Option<String> {
+    let instant = DateTime::parse_from_rfc3339(value.trim()).ok()?;
+    Some(crate::pdf_metadata::format_pdf_date_with_offset(
+        &instant.with_timezone(&Utc).naive_utc(),
+        0,
+    ))
+}
+
 fn extract_metadata(document: &Document) -> PdfJsonMetadata {
     let info = document
         .trailer
@@ -7097,6 +7189,22 @@ fn extract_metadata(document: &Document) -> PdfJsonMetadata {
             .and_then(|(_, value)| lopdf::decode_text_string(value).ok())
             .filter(|value| !value.is_empty())
     };
+    // `/Trapped` is a Name in a spec-conformant PDF; Java reads it via
+    // `getNameAsString`, which accepts a Name or a String. The `text` closure
+    // above only decodes Strings and would drop a Name, so read it explicitly.
+    let name = |key: &[u8]| {
+        info.as_ref()
+            .and_then(|info| info.get(key).ok())
+            .and_then(|value| document.dereference(value).ok())
+            .and_then(|(_, value)| {
+                value
+                    .as_name()
+                    .ok()
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .or_else(|| lopdf::decode_text_string(value).ok())
+            })
+            .filter(|value| !value.is_empty())
+    };
     let page_count = i32::try_from(document.get_pages().len()).ok();
     PdfJsonMetadata {
         title: text(b"Title"),
@@ -7105,14 +7213,18 @@ fn extract_metadata(document: &Document) -> PdfJsonMetadata {
         keywords: text(b"Keywords"),
         creator: text(b"Creator"),
         producer: text(b"Producer"),
-        creation_date: text(b"CreationDate"),
-        modification_date: text(b"ModDate"),
-        trapped: text(b"Trapped"),
+        creation_date: text(b"CreationDate")
+            .as_deref()
+            .and_then(pdf_date_to_iso_instant),
+        modification_date: text(b"ModDate")
+            .as_deref()
+            .and_then(pdf_date_to_iso_instant),
+        trapped: name(b"Trapped"),
         number_of_pages: page_count,
     }
 }
 
-fn extract_xmp_metadata(document: &Document) -> Option<String> {
+pub(crate) fn extract_xmp_metadata(document: &Document) -> Option<String> {
     let metadata = document.catalog().ok()?.get(b"Metadata").ok()?;
     let stream = resolved_stream(document, metadata)?;
     let bytes = stream
@@ -7121,7 +7233,7 @@ fn extract_xmp_metadata(document: &Document) -> Option<String> {
     (!bytes.is_empty()).then(|| STANDARD.encode(bytes))
 }
 
-fn restore_xmp_metadata(
+pub(crate) fn restore_xmp_metadata(
     document: &mut Document,
     catalog_id: lopdf::ObjectId,
     xmp_metadata: Option<&str>,
@@ -7338,7 +7450,7 @@ fn replace_document_metadata(document: &mut Document, metadata: &PdfJsonMetadata
     }
 }
 
-fn replace_document_xmp_metadata(
+pub(crate) fn replace_document_xmp_metadata(
     document: &mut Document,
     xmp_metadata: &str,
 ) -> Result<(), PdfJsonError> {
@@ -7741,6 +7853,255 @@ fn add_compressed_content_stream(
     Ok(Object::Reference(document.add_object(stream)))
 }
 
+/// Ordered cursor over a page's edited `textElements`, consumed in show order as
+/// the token rewrite walks the content stream. Port of Java
+/// `PdfJsonConversionService.TextElementCursor` (~L4401).
+struct TextElementCursor<'a> {
+    elements: &'a [PdfJsonTextElement],
+    index: usize,
+}
+
+impl<'a> TextElementCursor<'a> {
+    fn new(elements: &'a [PdfJsonTextElement]) -> Self {
+        Self { elements, index: 0 }
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.index < self.elements.len()
+    }
+
+    /// Consumes elements matching `expected_font` until their combined glyph
+    /// count covers `glyph_count`, mirroring Java `TextElementCursor.consume`.
+    /// Returns `None` — a defer signal — on a font mismatch or when the elements
+    /// run out before the count is satisfied.
+    fn consume(
+        &mut self,
+        expected_font: &[u8],
+        glyph_count: usize,
+    ) -> Option<Vec<&'a PdfJsonTextElement>> {
+        if glyph_count == 0 {
+            return Some(Vec::new());
+        }
+        let mut consumed = Vec::new();
+        let mut remaining = i64::try_from(glyph_count).ok()?;
+        while remaining > 0 && self.index < self.elements.len() {
+            let element = &self.elements[self.index];
+            if !cursor_font_matches(expected_font, element.font_id.as_deref()) {
+                return None;
+            }
+            consumed.push(element);
+            remaining -= i64::try_from(element_glyph_count(element)).ok()?;
+            self.index += 1;
+        }
+        if remaining > 0 {
+            return None;
+        }
+        Some(consumed)
+    }
+}
+
+/// Java `TextElementCursor.fontMatches`: an empty expected name matches anything;
+/// otherwise the element must carry exactly that font id.
+fn cursor_font_matches(expected: &[u8], actual: Option<&str>) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    actual.is_some_and(|actual| actual.as_bytes() == expected)
+}
+
+/// Java `TextElementCursor.countGlyphs(element)`: source `charCodes` length when
+/// present, else the text's Unicode code-point count (min 1), else 1. Using the
+/// original source-code count (not the edited text length) keeps the cursor
+/// aligned to the stream's original per-string glyph counts, while the
+/// replacement text is what gets re-encoded.
+fn element_glyph_count(element: &PdfJsonTextElement) -> usize {
+    if let Some(codes) = element
+        .char_codes
+        .as_ref()
+        .filter(|codes| !codes.is_empty())
+    {
+        return codes.len();
+    }
+    if let Some(text) = element.text.as_deref().filter(|text| !text.is_empty()) {
+        return text.chars().count().max(1);
+    }
+    1
+}
+
+/// Java `mergeText`: concatenates the consumed elements' replacement text. (The
+/// Java merge also concatenates `charCodes`, but those feed only the Type3
+/// encoder, which this simple-font path never reaches.)
+fn merge_element_text(consumed: &[&PdfJsonTextElement]) -> String {
+    consumed
+        .iter()
+        .map(|element| element.text.as_deref().unwrap_or(""))
+        .collect()
+}
+
+/// Resolves a page font resource to its inline simple-font dictionary for the
+/// token rewrite. Returns `None` — a defer signal — for a missing resource, a
+/// non-dictionary/unresolvable entry, or a `Type0`/`Type3` (or otherwise
+/// non-simple) font: the rewrite's one-byte-per-code glyph counting and simple
+/// encoder only hold for simple `Type1`/`TrueType`/`MMType1` fonts.
+fn resolve_simple_page_font(
+    document: &Document,
+    resources: &Dictionary,
+    name: &[u8],
+) -> Option<Dictionary> {
+    let fonts = dictionary_entry(document, resources, b"Font")?;
+    let font = resolved_dictionary(document, fonts.get(name).ok()?)?;
+    match font.get(b"Subtype").and_then(Object::as_name).ok() {
+        Some(b"Type1" | b"TrueType" | b"MMType1") => Some(font.clone()),
+        _ => None,
+    }
+}
+
+/// Java `encodeTextWithFont` (simple, non-Type3 branch): encodes `text` through
+/// the resolved simple font's own encoding, returning the sanitized bytes.
+/// Returns `None` (defer) when the font cannot represent the text losslessly —
+/// i.e. when Java would need a Standard-14 fallback or `font.encode` would throw.
+fn encode_simple_font_text(document: &Document, font: &Dictionary, text: &str) -> Option<Vec<u8>> {
+    // Java `font.encode("")` yields an empty string with no fallback.
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    let encoding = font
+        .get_font_encoding_with_limit(document, MAX_EMBEDDED_FONT_BYTES)
+        .ok()?;
+    let encoded = Document::encode_text(&encoding, text);
+    // Gate on a clean round-trip through the SAME font: an empty result or a
+    // decode that no longer matches means a character the font cannot represent,
+    // which is exactly the "a Standard-14 fallback would be needed" defer case.
+    if encoded.is_empty()
+        || Document::decode_text(&encoding, &encoded).ok().as_deref() != Some(text)
+    {
+        return None;
+    }
+    Some(sanitize_encoded_text(&encoded))
+}
+
+/// Java `sanitizeEncoded` / `isStrippedControlByte`: drops NUL and other C0
+/// control bytes (except tab / newline / carriage return) from encoded
+/// simple-font bytes.
+fn sanitize_encoded_text(encoded: &[u8]) -> Vec<u8> {
+    encoded
+        .iter()
+        .copied()
+        .filter(|byte| !is_stripped_control_byte(*byte))
+        .collect()
+}
+
+fn is_stripped_control_byte(value: u8) -> bool {
+    match value {
+        0x09 | 0x0A | 0x0D => false,
+        0x00..=0x1F => true,
+        _ => false,
+    }
+}
+
+/// Token-preserving in-place text rewrite — the Rust port of Java
+/// `PdfJsonConversionService.rewriteTextOperators` (~L3905). Decodes the page
+/// content stream, tracks the active simple font via `Tf`, and for each `Tj` (and
+/// each string element of a `TJ` array) consumes the matching edited
+/// `textElements` in show order and swaps ONLY the string operand for the
+/// replacement re-encoded through that same font. Every other token — `Td`/`TD`/
+/// `Tm`/`T*`/`Tc`/`Tw`/`cm`, a `TJ` array's numeric kerning adjustments, and any
+/// vector operator — is carried through unchanged, so the rewrite preserves the
+/// original layout instead of regenerating it.
+///
+/// Returns `Some(bytes)` with the re-encoded stream on success, or `None` to
+/// DEFER to the caller's strip-and-regenerate path (byte-for-byte the prior
+/// behavior). Deferral mirrors Java's `return false` on any of: missing page
+/// resources, a `Type0`/`Type3` (or unresolvable) active font, a `Tj`/`TJ`
+/// without its expected string/array operand, a Standard-14 fallback being
+/// needed, an encode failure, a glyph-count/cursor mismatch, or leftover
+/// unconsumed cursor elements.
+///
+/// Scope: the page content stream itself (not invoked Form `XObjects`, whose text
+/// stays in the cursor and forces a leftover-defer) and simple `WinAnsi` /
+/// Standard-14 / embedded-simple fonts; `Tj` and `TJ` only. A multi-string `TJ`
+/// whose editor `textElements` were exported at one-element-per-operator
+/// granularity (the Rust reader's model) defers via cursor mismatch, which is
+/// safe — the strip-and-regenerate path then handles it exactly as before.
+fn rewrite_text_operators(
+    document: &Document,
+    resources: &Object,
+    content_streams: &[PdfJsonStream],
+    elements: &[PdfJsonTextElement],
+) -> Option<Vec<u8>> {
+    if elements.is_empty() {
+        return None;
+    }
+    let Object::Dictionary(resources) = resources else {
+        return None;
+    };
+    let bytes = decode_content_streams_with_limit(content_streams, MAX_TEXT_CONTENT_BYTES).ok()?;
+    let mut content = Content::decode(&bytes).ok()?;
+    let mut cursor = TextElementCursor::new(elements);
+    let mut current_font_name: Option<Vec<u8>> = None;
+    let mut current_font: Option<Dictionary> = None;
+
+    for operation in &mut content.operations {
+        match operation.operator.as_str() {
+            "Tf" => {
+                if let Some(name) = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                {
+                    let name = name.to_vec();
+                    current_font = resolve_simple_page_font(document, resources, &name);
+                    current_font_name = Some(name);
+                } else {
+                    current_font = None;
+                    current_font_name = None;
+                }
+            }
+            "Tj" => {
+                let font = current_font.as_ref()?;
+                let expected = current_font_name.as_deref().unwrap_or(b"");
+                let glyph_count = match operation.operands.first() {
+                    Some(Object::String(bytes, _)) => bytes.len(),
+                    _ => return None,
+                };
+                let consumed = cursor.consume(expected, glyph_count)?;
+                let encoded =
+                    encode_simple_font_text(document, font, &merge_element_text(&consumed))?;
+                match operation.operands.first_mut() {
+                    Some(Object::String(slot, _)) => *slot = encoded,
+                    _ => return None,
+                }
+            }
+            "TJ" => {
+                let font = current_font.as_ref()?;
+                let expected = current_font_name.as_deref().unwrap_or(b"");
+                let Some(Object::Array(array)) = operation.operands.first_mut() else {
+                    return None;
+                };
+                for item in array.iter_mut() {
+                    if let Object::String(slot, _) = item {
+                        let glyph_count = slot.len();
+                        let consumed = cursor.consume(expected, glyph_count)?;
+                        let encoded = encode_simple_font_text(
+                            document,
+                            font,
+                            &merge_element_text(&consumed),
+                        )?;
+                        *slot = encoded;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if cursor.has_remaining() {
+        return None;
+    }
+    let encoded = content.encode().ok()?;
+    (encoded.len() <= MAX_TEXT_CONTENT_BYTES).then_some(encoded)
+}
+
 /// Builds a single page's `Contents` stream references and merged `Resources`
 /// object for [`convert_json_to_pdf`].
 ///
@@ -7771,6 +8132,28 @@ fn build_page_contents(
     let strip_text = !page_model.text_elements.is_empty();
     let strip_images = !page_model.image_elements.is_empty();
     let mixed_edit = !page_model.content_streams.is_empty() && (strip_text || strip_images);
+    // Token-preserving fast path (Java `rewriteTextOperators`): before stripping
+    // and regenerating a text-only mixed edit over a preserved stream, try to
+    // rewrite just the show-text string operands in place, keeping every other
+    // operator verbatim. Only attempted for text-only edits — image edits go
+    // through the strip-and-regenerate path below, which this text-only rewrite
+    // does not handle — and it defers (returns `None`) on any unsupported input,
+    // leaving that path's output byte-for-byte unchanged.
+    if mixed_edit && strip_text && !strip_images {
+        let rewritten = match resources.as_ref() {
+            Some(resources) => rewrite_text_operators(
+                document,
+                resources,
+                &page_model.content_streams,
+                &page_model.text_elements,
+            ),
+            None => None,
+        };
+        if let Some(rewritten) = rewritten {
+            let content_id = add_compressed_content_stream(document, rewritten)?;
+            return Ok((vec![content_id], resources));
+        }
+    }
     let mut content_ids: Vec<Object> = if mixed_edit {
         Vec::new()
     } else {
@@ -8020,14 +8403,24 @@ fn restored_annotation_dictionary(annotation: &PdfJsonAnnotation) -> Option<Dict
     if let Some(author) = &annotation.author {
         dictionary.set("T", Object::string_literal(author.as_str()));
     }
-    if let Some(creation_date) = &annotation.creation_date {
-        dictionary.set(
-            "CreationDate",
-            Object::string_literal(creation_date.as_str()),
-        );
+    // The structured dates are ISO-8601 instants (see `annotation_model`); they
+    // overlay the raw COS `/CreationDate` and `/M`, so they MUST be converted
+    // back to the PDF `D:...+00'00'` form — writing the ISO literal would corrupt
+    // the annotation date. On a conversion miss, the raw COS value is left in
+    // place rather than clobbered.
+    if let Some(creation_date) = annotation
+        .creation_date
+        .as_deref()
+        .and_then(iso_instant_to_pdf_date)
+    {
+        dictionary.set("CreationDate", Object::string_literal(creation_date));
     }
-    if let Some(modification_date) = &annotation.modification_date {
-        dictionary.set("M", Object::string_literal(modification_date.as_str()));
+    if let Some(modification_date) = annotation
+        .modification_date
+        .as_deref()
+        .and_then(iso_instant_to_pdf_date)
+    {
+        dictionary.set("M", Object::string_literal(modification_date));
     }
     Some(dictionary)
 }
@@ -9312,9 +9705,33 @@ fn build_info_dictionary(metadata: &PdfJsonMetadata) -> Dictionary {
     set("Keywords", &metadata.keywords);
     set("Creator", &metadata.creator);
     set("Producer", &metadata.producer);
-    set("CreationDate", &metadata.creation_date);
-    set("ModDate", &metadata.modification_date);
-    set("Trapped", &metadata.trapped);
+    // Dates arrive as ISO-8601 instants (mirroring Java's `formatCalendar`);
+    // write them back in PDF `D:...+00'00'` form. An unparseable instant is
+    // omitted, matching Java's `parseInstant(...).ifPresent(...)`.
+    if let Some(creation_date) = metadata
+        .creation_date
+        .as_deref()
+        .and_then(iso_instant_to_pdf_date)
+    {
+        info.set("CreationDate", Object::string_literal(creation_date));
+    }
+    if let Some(modification_date) = metadata
+        .modification_date
+        .as_deref()
+        .and_then(iso_instant_to_pdf_date)
+    {
+        info.set("ModDate", Object::string_literal(modification_date));
+    }
+    // `/Trapped` is a Name (mirrors `pdf_metadata::set_trapped`); only the
+    // spec-defined values are written, matching Java `PDDocumentInformation
+    // .setTrapped` which rejects anything else.
+    if let Some(trapped) = metadata
+        .trapped
+        .as_deref()
+        .filter(|value| matches!(*value, "True" | "False" | "Unknown"))
+    {
+        info.set("Trapped", Object::Name(trapped.as_bytes().to_vec()));
+    }
     info
 }
 
@@ -9384,6 +9801,278 @@ fn build_stream_from_model(model: &PdfJsonStream) -> Stream {
 #[cfg(test)]
 mod tests {
     use super::{PdfJsonCosType, PdfJsonDocumentMetadata, PdfJsonMetadata, PdfJsonPageDimension};
+
+    #[test]
+    fn pdf_date_to_iso_instant_matches_java_format_calendar() {
+        use super::pdf_date_to_iso_instant;
+
+        // Full form with explicit UTC designator.
+        assert_eq!(
+            pdf_date_to_iso_instant("D:20260717120000Z").as_deref(),
+            Some("2026-07-17T12:00:00Z")
+        );
+        // Positive offset is normalized back to UTC (12:00+05:30 -> 06:30Z).
+        assert_eq!(
+            pdf_date_to_iso_instant("D:20260717120000+05'30'").as_deref(),
+            Some("2026-07-17T06:30:00Z")
+        );
+        // Negative offset (08:00-08:00 -> 16:00Z).
+        assert_eq!(
+            pdf_date_to_iso_instant("D:20260717080000-08'00'").as_deref(),
+            Some("2026-07-17T16:00:00Z")
+        );
+        // No timezone designator -> UTC (PDFBox seeds a GMT calendar).
+        assert_eq!(
+            pdf_date_to_iso_instant("D:20260717120000").as_deref(),
+            Some("2026-07-17T12:00:00Z")
+        );
+        // No-seconds form.
+        assert_eq!(
+            pdf_date_to_iso_instant("D:202607171205").as_deref(),
+            Some("2026-07-17T12:05:00Z")
+        );
+        // Date-only form: finer fields default to the start of the day.
+        assert_eq!(
+            pdf_date_to_iso_instant("D:20260717").as_deref(),
+            Some("2026-07-17T00:00:00Z")
+        );
+        // The `D:` prefix is optional.
+        assert_eq!(
+            pdf_date_to_iso_instant("20260717120000Z").as_deref(),
+            Some("2026-07-17T12:00:00Z")
+        );
+        // Year-only is valid per the PDF grammar; finer fields default.
+        assert_eq!(
+            pdf_date_to_iso_instant("D:2026").as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn pdf_date_to_iso_instant_omits_unparseable_values() {
+        use super::pdf_date_to_iso_instant;
+
+        assert!(pdf_date_to_iso_instant("").is_none());
+        assert!(pdf_date_to_iso_instant("D:").is_none());
+        assert!(pdf_date_to_iso_instant("not a date").is_none());
+        assert!(pdf_date_to_iso_instant("D:abcd").is_none()); // no leading digits
+        assert!(pdf_date_to_iso_instant("D:20261317120000Z").is_none()); // month 13
+        assert!(pdf_date_to_iso_instant("D:20260732120000Z").is_none()); // day 32
+        assert!(pdf_date_to_iso_instant("D:20260717250000Z").is_none()); // hour 25
+        assert!(pdf_date_to_iso_instant("D:20260717120000+99'00'").is_none()); // offset hours 99
+    }
+
+    #[test]
+    fn iso_instant_to_pdf_date_writes_utc_offset_form() {
+        use super::iso_instant_to_pdf_date;
+
+        assert_eq!(
+            iso_instant_to_pdf_date("2026-07-17T12:00:00Z").as_deref(),
+            Some("D:20260717120000+00'00'")
+        );
+        // A non-UTC instant is normalized to UTC before formatting.
+        assert_eq!(
+            iso_instant_to_pdf_date("2026-07-17T12:00:00+05:30").as_deref(),
+            Some("D:20260717063000+00'00'")
+        );
+        assert!(iso_instant_to_pdf_date("").is_none());
+        assert!(iso_instant_to_pdf_date("2026-07-17").is_none()); // no time/offset
+        assert!(iso_instant_to_pdf_date("nonsense").is_none());
+    }
+
+    #[test]
+    fn info_date_round_trip_is_stable() {
+        use super::{iso_instant_to_pdf_date, pdf_date_to_iso_instant};
+
+        let iso = pdf_date_to_iso_instant("D:20260717120000Z");
+        assert_eq!(iso.as_deref(), Some("2026-07-17T12:00:00Z"));
+        let pdf = iso.as_deref().and_then(iso_instant_to_pdf_date);
+        assert_eq!(pdf.as_deref(), Some("D:20260717120000+00'00'"));
+        // Re-extracting yields the same instant: the pipeline is idempotent.
+        let reparsed = pdf.as_deref().and_then(pdf_date_to_iso_instant);
+        assert_eq!(reparsed.as_deref(), Some("2026-07-17T12:00:00Z"));
+    }
+
+    #[test]
+    fn build_info_dictionary_writes_pdf_dates_and_trapped_name() -> Result<(), lopdf::Error> {
+        use super::build_info_dictionary;
+
+        let metadata = PdfJsonMetadata {
+            creation_date: Some("2026-07-17T12:00:00Z".to_owned()),
+            modification_date: Some("2026-07-17T12:30:00Z".to_owned()),
+            trapped: Some("True".to_owned()),
+            ..PdfJsonMetadata::default()
+        };
+        let info = build_info_dictionary(&metadata);
+        assert_eq!(
+            info.get(b"CreationDate")?.as_str()?,
+            b"D:20260717120000+00'00'"
+        );
+        assert_eq!(info.get(b"ModDate")?.as_str()?, b"D:20260717123000+00'00'");
+        // Trapped is a Name, not a string literal.
+        assert_eq!(info.get(b"Trapped")?.as_name()?, b"True");
+        Ok(())
+    }
+
+    #[test]
+    fn build_info_dictionary_omits_invalid_dates_and_trapped() {
+        use super::build_info_dictionary;
+
+        let metadata = PdfJsonMetadata {
+            creation_date: Some("not-an-instant".to_owned()),
+            trapped: Some("Maybe".to_owned()),
+            ..PdfJsonMetadata::default()
+        };
+        let info = build_info_dictionary(&metadata);
+        assert!(info.get(b"CreationDate").is_err());
+        assert!(info.get(b"Trapped").is_err());
+    }
+
+    #[test]
+    fn extract_metadata_reads_trapped_name_and_iso_dates() {
+        use super::extract_metadata;
+        use lopdf::{Document, Object, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let info_id = document.add_object(dictionary! {
+            "CreationDate" => Object::string_literal("D:20260717120000Z"),
+            "ModDate" => Object::string_literal("D:20260717123000-01'00'"),
+            "Trapped" => Object::Name(b"True".to_vec()),
+        });
+        document.trailer.set("Info", info_id);
+
+        let metadata = extract_metadata(&document);
+        assert_eq!(
+            metadata.creation_date.as_deref(),
+            Some("2026-07-17T12:00:00Z")
+        );
+        // -01:00 offset normalized to UTC (12:30-01:00 -> 13:30Z).
+        assert_eq!(
+            metadata.modification_date.as_deref(),
+            Some("2026-07-17T13:30:00Z")
+        );
+        assert_eq!(metadata.trapped.as_deref(), Some("True"));
+    }
+
+    #[test]
+    fn extract_metadata_reads_trapped_string_like_get_name_as_string() {
+        use super::extract_metadata;
+        use lopdf::{Document, Object, dictionary};
+
+        // PDFBox `getNameAsString` also accepts a COSString for `/Trapped`.
+        let mut document = Document::with_version("1.7");
+        let info_id = document.add_object(dictionary! {
+            "Trapped" => Object::string_literal("Unknown"),
+        });
+        document.trailer.set("Info", info_id);
+
+        assert_eq!(
+            extract_metadata(&document).trapped.as_deref(),
+            Some("Unknown")
+        );
+    }
+
+    /// TESTER regression guard for the M2 coupling: `annotation_model` now exports
+    /// ISO instants, so the restore overlay MUST convert them back to a PDF `D:`
+    /// literal. Writing the raw ISO string here would corrupt the annotation date.
+    #[test]
+    fn restored_annotation_dictionary_overlays_valid_pdf_date_never_iso() -> Result<(), lopdf::Error>
+    {
+        use super::{PdfJsonAnnotation, restored_annotation_dictionary};
+
+        let annotation = PdfJsonAnnotation {
+            subtype: Some("Text".to_owned()),
+            rect: Some(vec![0.0, 0.0, 10.0, 10.0]),
+            creation_date: Some("2023-11-15T14:30:00Z".to_owned()),
+            modification_date: Some("2023-11-15T15:45:00Z".to_owned()),
+            ..PdfJsonAnnotation::default()
+        };
+        let dictionary = restored_annotation_dictionary(&annotation)
+            .ok_or_else(|| lopdf::Error::Syntax("annotation should restore".to_owned()))?;
+        // Both dates are PDF `D:...+00'00'` string literals, never the ISO instant.
+        assert_eq!(
+            dictionary.get(b"CreationDate")?.as_str()?,
+            b"D:20231115143000+00'00'"
+        );
+        assert_eq!(dictionary.get(b"M")?.as_str()?, b"D:20231115154500+00'00'");
+        Ok(())
+    }
+
+    /// TESTER adversarial: on a date-conversion miss the restore overlay leaves the
+    /// raw COS `/CreationDate` in place (never clobbered, never ISO-ified). Uses a
+    /// full `annotation_model` -> mutate -> restore round-trip so the raw-COS
+    /// projection is realistic.
+    #[test]
+    fn restored_annotation_dictionary_keeps_raw_date_on_conversion_miss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{annotation_model, restored_annotation_dictionary};
+        use lopdf::{Document, Object, dictionary};
+
+        let document = Document::with_version("1.7");
+        let annotation = dictionary! {
+            "Type" => Object::Name(b"Annot".to_vec()),
+            "Subtype" => Object::Name(b"Text".to_vec()),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "CreationDate" => Object::string_literal("D:20231115093000-05'00'"),
+            "M" => Object::string_literal("D:20231115093000-05'00'"),
+        };
+        let mut model = annotation_model(&document, &Object::Dictionary(annotation), true)
+            .ok_or("annotation_model should produce a model")?;
+        // Extraction produced the normalized ISO instant (09:30-05:00 -> 14:30Z).
+        assert_eq!(model.creation_date.as_deref(), Some("2023-11-15T14:30:00Z"));
+        // A value that no longer parses as an instant must not clobber the raw date.
+        model.creation_date = Some("not-an-instant".to_owned());
+        let restored = restored_annotation_dictionary(&model).ok_or("restore should succeed")?;
+        assert_eq!(
+            restored.get(b"CreationDate")?.as_str()?,
+            b"D:20231115093000-05'00'"
+        );
+        Ok(())
+    }
+
+    /// TESTER adversarial: a `/ModDate` present with no `/CreationDate` yields a
+    /// modification instant and a `None` creation date (Java `getCreationDate()`
+    /// null -> `formatCalendar(null)` -> null field).
+    #[test]
+    fn extract_metadata_reads_moddate_without_creationdate() {
+        use super::extract_metadata;
+        use lopdf::{Document, Object, dictionary};
+
+        let mut document = Document::with_version("1.7");
+        let info_id = document.add_object(dictionary! {
+            "ModDate" => Object::string_literal("D:20231115093000Z"),
+        });
+        document.trailer.set("Info", info_id);
+
+        let metadata = extract_metadata(&document);
+        assert_eq!(
+            metadata.modification_date.as_deref(),
+            Some("2023-11-15T09:30:00Z")
+        );
+        assert!(metadata.creation_date.is_none());
+    }
+
+    /// TESTER adversarial: writing only a `ModDate` with an invalid `Trapped`
+    /// leaves the neighbouring `Author` field intact and omits the absent
+    /// `CreationDate` and the rejected `Trapped`, without disturbing any other field.
+    #[test]
+    fn build_info_dictionary_moddate_only_keeps_author_and_omits_missing()
+    -> Result<(), lopdf::Error> {
+        use super::build_info_dictionary;
+
+        let metadata = PdfJsonMetadata {
+            author: Some("Ada Lovelace".to_owned()),
+            modification_date: Some("2023-11-15T09:30:00Z".to_owned()),
+            trapped: Some("Maybe".to_owned()),
+            ..PdfJsonMetadata::default()
+        };
+        let info = build_info_dictionary(&metadata);
+        assert_eq!(info.get(b"Author")?.as_str()?, b"Ada Lovelace");
+        assert_eq!(info.get(b"ModDate")?.as_str()?, b"D:20231115093000+00'00'");
+        assert!(info.get(b"CreationDate").is_err());
+        assert!(info.get(b"Trapped").is_err());
+        Ok(())
+    }
 
     #[test]
     fn metadata_omits_null_fields_like_jackson_non_null() -> Result<(), serde_json::Error> {
@@ -10490,6 +11179,439 @@ mod tests {
                     .is_some_and(|name| name.starts_with(b"RustImg"))
         }));
         Ok(())
+    }
+
+    /// Single-page PDF carrying a Helvetica `F1` font and `content` as its only
+    /// content stream, for the token-rewrite tests below.
+    fn text_source_pdf(content: &[u8]) -> lopdf::Document {
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let font_id = source.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let content_id = source.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page_object_id)], "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+        source
+    }
+
+    /// A page `resources` COS object exposing one simple font `F1` with the given
+    /// `subtype`, for the direct [`rewrite_text_operators`] defer tests.
+    fn simple_font_resources(subtype: &str) -> lopdf::Object {
+        use lopdf::{Object, dictionary};
+
+        Object::Dictionary(dictionary! {
+            "Font" => dictionary! {
+                "F1" => dictionary! {
+                    "Type" => "Font",
+                    "Subtype" => subtype,
+                    "BaseFont" => "Helvetica",
+                },
+            },
+        })
+    }
+
+    /// A preserved `contentStreams` model entry wrapping `content` verbatim
+    /// (unfiltered), for the direct [`rewrite_text_operators`] tests.
+    fn content_stream_model(content: &[u8]) -> super::PdfJsonStream {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        super::PdfJsonStream {
+            dictionary: None,
+            raw_data: Some(STANDARD.encode(content)),
+        }
+    }
+
+    /// A text-only edit over a preserved stream takes the token-preserving rewrite
+    /// path: only the `Tj` string operand changes, every other token (`Td`, the
+    /// `/F1` font reference, the unrelated vector ops) is carried through, a single
+    /// stream is emitted, and no generated `RustFont` is injected.
+    #[test]
+    fn build_page_contents_token_rewrites_text_only_tj() -> Result<(), Box<dyn std::error::Error>> {
+        use super::{build_page_contents, number_as_f32, pdf_to_json};
+        use lopdf::Document;
+
+        let content = b"0 1 0 rg 10 10 20 20 re f BT /F1 12 Tf 15 55 Td (Original text) Tj ET";
+        let mut source = text_source_pdf(content);
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("token-rewrite.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "token-rewrite.pdf", false)?;
+        assert_eq!(model.pages[0].content_streams.len(), 1);
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        assert!(model.pages[0].image_elements.is_empty());
+        // Edit only the text, keeping the reader-populated fontId / charCodes so
+        // the cursor stays aligned to the stream's original glyph counts.
+        model.pages[0].text_elements[0].text = Some("Edited text".to_owned());
+
+        let mut document = Document::with_version("1.7");
+        let (content_ids, resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+
+        // A single rewritten stream (strip-and-regenerate would emit a
+        // retained-vector stream plus a separate generated-text stream).
+        assert_eq!(content_ids.len(), 1);
+        let rewritten = decode_content_ids(&document, &content_ids)?;
+
+        // Only the string operand changed.
+        assert!(rewritten.operations.iter().any(|op| {
+            op.operator == "Tj"
+                && op.operands.first().and_then(|o| o.as_str().ok()) == Some(b"Edited text")
+        }));
+        // The original positioning operator survives verbatim — the regenerate
+        // path would emit `Tm` instead of the source's `Td`.
+        assert!(rewritten.operations.iter().any(|op| {
+            op.operator == "Td"
+                && op.operands.first().and_then(number_as_f32) == Some(15.0)
+                && op.operands.get(1).and_then(number_as_f32) == Some(55.0)
+        }));
+        // The original font resource is reused, not a generated `RustFont`.
+        assert!(rewritten.operations.iter().any(|op| {
+            op.operator == "Tf" && op.operands.first().and_then(|o| o.as_name().ok()) == Some(b"F1")
+        }));
+        // The unrelated vector operators are retained.
+        assert!(rewritten.operations.iter().any(|op| op.operator == "re"));
+        assert!(rewritten.operations.iter().any(|op| op.operator == "f"));
+        // No generated font was injected into the page resources.
+        let resources = resources.ok_or("missing resources")?;
+        let fonts = resources.as_dict()?.get(b"Font")?.as_dict()?;
+        assert!(fonts.has(b"F1"));
+        assert!(!fonts.iter().any(|(name, _)| name.starts_with(b"RustFont")));
+        Ok(())
+    }
+
+    /// A `TJ` array with a single string element is also token-rewritten: the one
+    /// string slot is swapped while the array structure survives.
+    #[test]
+    fn build_page_contents_token_rewrites_single_string_tj()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{build_page_contents, pdf_to_json};
+        use lopdf::Document;
+
+        let content = b"BT /F1 12 Tf 20 40 Td [(Original)] TJ ET";
+        let mut source = text_source_pdf(content);
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("tj-rewrite.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "tj-rewrite.pdf", false)?;
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        model.pages[0].text_elements[0].text = Some("Changed".to_owned());
+
+        let mut document = Document::with_version("1.7");
+        let (content_ids, _resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+        assert_eq!(content_ids.len(), 1);
+        let rewritten = decode_content_ids(&document, &content_ids)?;
+        assert!(rewritten.operations.iter().any(|op| {
+            op.operator == "TJ"
+                && op
+                    .operands
+                    .first()
+                    .and_then(|o| o.as_array().ok())
+                    .is_some_and(|array| {
+                        array
+                            .iter()
+                            .any(|item| item.as_str().ok() == Some(b"Changed"))
+                    })
+        }));
+        Ok(())
+    }
+
+    /// A multi-string `TJ` whose editor elements were exported one-per-operator
+    /// (the Rust reader's model) can't be token-rewritten per string, so the
+    /// rewrite defers via cursor mismatch and the strip-and-regenerate path runs —
+    /// injecting a generated `RustFont`, a marker the rewrite never produces.
+    #[test]
+    fn build_page_contents_defers_multi_string_tj_to_regeneration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{build_page_contents, pdf_to_json};
+        use lopdf::Document;
+
+        let content = b"BT /F1 12 Tf 20 40 Td [(Split) -60 (word)] TJ ET";
+        let mut source = text_source_pdf(content);
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("multi-tj.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "multi-tj.pdf", false)?;
+        // The reader merges the two TJ strings into ONE element.
+        assert_eq!(model.pages[0].text_elements.len(), 1);
+        assert_eq!(
+            model.pages[0].text_elements[0].text.as_deref(),
+            Some("Splitword")
+        );
+        model.pages[0].text_elements[0].text = Some("Edited".to_owned());
+
+        let mut document = Document::with_version("1.7");
+        let (_content_ids, resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+
+        let resources = resources.ok_or("missing resources")?;
+        let fonts = resources.as_dict()?.get(b"Font")?.as_dict()?;
+        assert!(fonts.iter().any(|(name, _)| name.starts_with(b"RustFont")));
+        Ok(())
+    }
+
+    /// Happy-path unit test of [`rewrite_text_operators`]: the `Tj` string is
+    /// swapped and the `Tm` positioning operator is preserved.
+    #[test]
+    fn rewrite_text_operators_swaps_only_the_string() -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PdfJsonTextElement, rewrite_text_operators};
+        use lopdf::{Document, content::Content};
+
+        let document = Document::with_version("1.7");
+        let resources = simple_font_resources("Type1");
+        let streams = vec![content_stream_model(
+            b"BT /F1 12 Tf 1 0 0 1 5 5 Tm (hi) Tj ET",
+        )];
+        let elements = vec![PdfJsonTextElement {
+            text: Some("ok".to_owned()),
+            font_id: Some("F1".to_owned()),
+            char_codes: Some(vec![0, 0]),
+            ..PdfJsonTextElement::default()
+        }];
+        let rewritten = rewrite_text_operators(&document, &resources, &streams, &elements)
+            .ok_or("rewrite should succeed")?;
+        let content = Content::decode(&rewritten)?;
+        assert!(content.operations.iter().any(|op| {
+            op.operator == "Tj" && op.operands.first().and_then(|o| o.as_str().ok()) == Some(b"ok")
+        }));
+        assert!(content.operations.iter().any(|op| op.operator == "Tm"));
+        Ok(())
+    }
+
+    /// [`rewrite_text_operators`] defers (returns `None`) for `Type0`/`Type3`
+    /// fonts, which the one-byte-per-code simple encoder does not support.
+    #[test]
+    fn rewrite_text_operators_defers_on_composite_and_type3_fonts() {
+        use super::{PdfJsonTextElement, rewrite_text_operators};
+        use lopdf::Document;
+
+        let document = Document::with_version("1.7");
+        let streams = vec![content_stream_model(b"BT /F1 12 Tf (hi) Tj ET")];
+        let elements = vec![PdfJsonTextElement {
+            text: Some("ok".to_owned()),
+            font_id: Some("F1".to_owned()),
+            char_codes: Some(vec![0, 0]),
+            ..PdfJsonTextElement::default()
+        }];
+        for subtype in ["Type0", "Type3"] {
+            let resources = simple_font_resources(subtype);
+            assert!(
+                rewrite_text_operators(&document, &resources, &streams, &elements).is_none(),
+                "expected defer for {subtype}"
+            );
+        }
+    }
+
+    /// [`rewrite_text_operators`] defers when the resolved font cannot represent
+    /// the replacement text — Java's "a Standard-14 fallback would be needed" case.
+    #[test]
+    fn rewrite_text_operators_defers_when_font_cannot_represent_text() {
+        use super::{PdfJsonTextElement, rewrite_text_operators};
+        use lopdf::Document;
+
+        let document = Document::with_version("1.7");
+        let resources = simple_font_resources("Type1");
+        let streams = vec![content_stream_model(b"BT /F1 12 Tf (hi) Tj ET")];
+        let elements = vec![PdfJsonTextElement {
+            text: Some("\u{4e2d}".to_owned()),
+            font_id: Some("F1".to_owned()),
+            char_codes: Some(vec![0, 0]),
+            ..PdfJsonTextElement::default()
+        }];
+        assert!(rewrite_text_operators(&document, &resources, &streams, &elements).is_none());
+    }
+
+    /// [`rewrite_text_operators`] defers on a font-id mismatch and on leftover
+    /// unconsumed cursor elements — Java's cursor-mismatch defer conditions.
+    #[test]
+    fn rewrite_text_operators_defers_on_font_mismatch_and_leftover_cursor() {
+        use super::{PdfJsonTextElement, rewrite_text_operators};
+        use lopdf::Document;
+
+        let document = Document::with_version("1.7");
+        let resources = simple_font_resources("Type1");
+        let streams = vec![content_stream_model(b"BT /F1 12 Tf (hi) Tj ET")];
+
+        // (a) the element's fontId does not match the active `Tf` resource name.
+        let mismatch = vec![PdfJsonTextElement {
+            text: Some("ok".to_owned()),
+            font_id: Some("F2".to_owned()),
+            char_codes: Some(vec![0, 0]),
+            ..PdfJsonTextElement::default()
+        }];
+        assert!(rewrite_text_operators(&document, &resources, &streams, &mismatch).is_none());
+
+        // (b) more elements than the stream's single text operator consumes.
+        let element = PdfJsonTextElement {
+            text: Some("ok".to_owned()),
+            font_id: Some("F1".to_owned()),
+            char_codes: Some(vec![0, 0]),
+            ..PdfJsonTextElement::default()
+        };
+        let leftover = vec![element.clone(), element];
+        assert!(rewrite_text_operators(&document, &resources, &streams, &leftover).is_none());
+    }
+
+    /// [`sanitize_encoded_text`] mirrors Java `sanitizeEncoded`: NUL and other C0
+    /// controls are dropped, tab / newline / carriage-return and printable bytes
+    /// are kept.
+    #[test]
+    fn sanitize_encoded_text_strips_control_bytes_like_java() {
+        use super::sanitize_encoded_text;
+
+        assert_eq!(
+            sanitize_encoded_text(&[0x00, b'A', 0x07, b'\t', b'\n', b'\r', 0x1F, b'B']),
+            vec![b'A', b'\t', b'\n', b'\r', b'B'],
+        );
+    }
+
+    /// Token rewrite preserves numeric kerning and positioning on a text-only edit.
+    /// Two single-string `TJ` arrays, each with a trailing numeric kerning
+    /// adjustment, on separate lines — so each reader element aligns 1:1 with its
+    /// show-string and the fast path fires. Editing one character of the FIRST run
+    /// must (a) leave both `-60`/`-40` kerning numbers and both `Td` positioning
+    /// operators intact (strip-and-regenerate would emit `Tm` and drop the kerns),
+    /// and (b) leave the UNEDITED run's string operand byte-identical. Interior
+    /// kerning (`[(Hel) -60 (lo)]`) instead defers, matching Java, whose run
+    /// accumulator likewise merges same-baseline glyphs across the kern — covered by
+    /// `build_page_contents_defers_multi_string_tj_to_regeneration`.
+    #[test]
+    fn build_page_contents_token_rewrite_preserves_kerning_and_positioning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{build_page_contents, number_as_f32, pdf_to_json};
+        use lopdf::{Document, Object};
+
+        let content = b"BT /F1 12 Tf 20 60 Td [(Hello) -60] TJ 0 -20 Td [(World) -40] TJ ET";
+        let mut source = text_source_pdf(content);
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("kern-boundary.pdf");
+        source.save(&source_path)?;
+
+        let mut model = pdf_to_json(&source_path, "kern-boundary.pdf", false)?;
+        assert_eq!(model.pages[0].text_elements.len(), 2);
+        assert_eq!(
+            model.pages[0].text_elements[1].text.as_deref(),
+            Some("World")
+        );
+        // Edit only the first run's text.
+        model.pages[0].text_elements[0].text = Some("Jello".to_owned());
+
+        let mut document = Document::with_version("1.7");
+        let (content_ids, resources) =
+            build_page_contents(&mut document, &model, &model.pages[0], 0)?;
+
+        // Fast path: one rewritten stream, no `Tm` regeneration, original font kept.
+        assert_eq!(content_ids.len(), 1);
+        let out = decode_content_ids(&document, &content_ids)?;
+        assert!(!out.operations.iter().any(|op| op.operator == "Tm"));
+
+        // Both TJ arrays survive with their kerning numbers; the edit landed on the
+        // first run and the second (unedited) run's operand is byte-identical.
+        let mut kerns = Vec::new();
+        let mut tj_strings: Vec<Vec<u8>> = Vec::new();
+        for op in out.operations.iter().filter(|op| op.operator == "TJ") {
+            let Some(Object::Array(arr)) = op.operands.first() else {
+                continue;
+            };
+            for item in arr {
+                match item {
+                    Object::String(bytes, _) => tj_strings.push(bytes.clone()),
+                    other => {
+                        if let Some(value) = number_as_f32(other) {
+                            kerns.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            kerns,
+            vec![-60.0, -40.0],
+            "both kerning adjustments must survive"
+        );
+        assert_eq!(
+            tj_strings,
+            vec![b"Jello".to_vec(), b"World".to_vec()],
+            "edit applied to first run; unedited run operand byte-identical"
+        );
+
+        // Both original `Td` positioning operators are carried through verbatim.
+        let td_positions: Vec<(f32, f32)> = out
+            .operations
+            .iter()
+            .filter(|op| op.operator == "Td")
+            .filter_map(|op| {
+                Some((
+                    number_as_f32(op.operands.first()?)?,
+                    number_as_f32(op.operands.get(1)?)?,
+                ))
+            })
+            .collect();
+        assert_eq!(td_positions, vec![(20.0, 60.0), (0.0, -20.0)]);
+
+        // No generated fallback font was injected — the original `F1` is reused.
+        let resources = resources.ok_or("missing resources")?;
+        let fonts = resources.as_dict()?.get(b"Font")?.as_dict()?;
+        assert!(fonts.has(b"F1"));
+        assert!(!fonts.iter().any(|(name, _)| name.starts_with(b"RustFont")));
+        Ok(())
+    }
+
+    /// Correctness floor — no partial rewrite. When an EARLIER show-text operator
+    /// encodes cleanly but a LATER one needs a Standard-14 fallback (a glyph the
+    /// font cannot represent), the whole page must defer: [`rewrite_text_operators`]
+    /// returns `None` and the mutation of the earlier operator on its local
+    /// `Content` is discarded, so the caller regenerates from the ORIGINAL streams
+    /// rather than emitting a half-rewritten stream. Mirrors Java aborting the token
+    /// rewrite (`return false`) the moment any segment fails to encode.
+    #[test]
+    fn rewrite_text_operators_defers_wholesale_on_a_later_unencodable_run() {
+        use super::{PdfJsonTextElement, rewrite_text_operators};
+        use lopdf::Document;
+
+        let document = Document::with_version("1.7");
+        let resources = simple_font_resources("Type1");
+        // Two Tj operators sharing font F1; the second element's replacement holds a
+        // CJK code point WinAnsi cannot represent, forcing a fallback.
+        let streams = vec![content_stream_model(b"BT /F1 12 Tf (aa) Tj (bb) Tj ET")];
+        let elements = vec![
+            PdfJsonTextElement {
+                text: Some("ok".to_owned()),
+                font_id: Some("F1".to_owned()),
+                char_codes: Some(vec![0, 0]),
+                ..PdfJsonTextElement::default()
+            },
+            PdfJsonTextElement {
+                text: Some("\u{4e2d}".to_owned()),
+                font_id: Some("F1".to_owned()),
+                char_codes: Some(vec![0, 0]),
+                ..PdfJsonTextElement::default()
+            },
+        ];
+        assert!(
+            rewrite_text_operators(&document, &resources, &streams, &elements).is_none(),
+            "a later unencodable run must abort the whole rewrite, not partially rewrite"
+        );
     }
 
     #[test]

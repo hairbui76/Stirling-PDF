@@ -34,6 +34,10 @@ pub(crate) fn routes(service: Arc<IntegrationConfigService>) -> Router {
             get(list_integrations).post(create_integration),
         )
         .route(
+            "/api/v1/integrations/capabilities",
+            get(integration_capabilities),
+        )
+        .route(
             "/api/v1/integrations/{id}",
             get(get_integration)
                 .put(update_integration)
@@ -205,6 +209,21 @@ async fn create_integration(
         Ok(integration) => Json(integration).into_response(),
         Err(error) => integration_error(error),
     }
+}
+
+/// Reports what the authenticated caller may set up so the portal UI offers the
+/// free-form "custom API" option only to those who can actually use it. Portal
+/// access is required (as for every integrations route); the answer is computed
+/// server-side because it is an authorization decision, not a presentation one.
+/// Mirrors Java's `IntegrationConfigController.capabilities`.
+async fn integration_capabilities(
+    Extension(service): Extension<Arc<IntegrationConfigService>>,
+    Extension(context): Extension<AuthContext>,
+) -> Response {
+    if let Err(error) = service.require_portal(&context) {
+        return integration_error(error);
+    }
+    Json(json!({"customApi": service.can_author_custom_api(&context)})).into_response()
 }
 
 async fn get_integration(

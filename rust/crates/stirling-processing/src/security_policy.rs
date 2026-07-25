@@ -128,6 +128,7 @@ pub fn endpoint_policy(method: &Method, path: &str) -> EndpointPolicy {
         || is_public_static(method, path)
         || is_public_auth(method, path)
         || is_public_invitation(method, path)
+        || is_public_webhook(method, path)
         || path.starts_with("/api/v1/mobile-scanner/")
     {
         return EndpointPolicy::Public;
@@ -223,6 +224,16 @@ fn is_public_invitation(method: &Method, path: &str) -> bool {
         || (method == Method::POST && path.starts_with("/api/v1/invite/accept/"))
 }
 
+/// The inbound webhook-source receiver is authenticated by an HMAC signature over
+/// its raw body rather than by a login session, so the endpoint boundary must let
+/// the request reach the handler unauthenticated. Mirrors Java's
+/// `RequestUriUtils.isStaticResource` allowlisting of `/api/v1/webhooks/`, but is
+/// deliberately narrowed to `POST` (the only verb `WebhookReceiverController`
+/// exposes) so no other method inherits the public exemption.
+fn is_public_webhook(method: &Method, path: &str) -> bool {
+    method == Method::POST && path.starts_with("/api/v1/webhooks/")
+}
+
 fn is_administrator_path(path: &str) -> bool {
     path.starts_with("/api/v1/admin/")
         || path == "/api/v1/admin"
@@ -285,8 +296,18 @@ mod tests {
             (Method::POST, "/api/v1/invite/accept/token"),
             (Method::GET, "/api/v1/mobile-scanner/files/id"),
             (Method::GET, "/api/v1/ui-data/footer-info"),
+            // The inbound webhook receiver authenticates by HMAC, not a session.
+            (Method::POST, "/api/v1/webhooks/receivertestid12"),
         ] {
             assert_eq!(endpoint_policy(&method, path), EndpointPolicy::Public);
+        }
+        // The webhook receiver is public only for POST; any other verb on the
+        // same prefix stays authenticated so nothing else inherits the exemption.
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert_eq!(
+                endpoint_policy(&method, "/api/v1/webhooks/receivertestid12"),
+                EndpointPolicy::Authenticated
+            );
         }
         // The OIDC login routes are public only on their intended verb: a GET on
         // the authorize route (or POST on the callback) is not part of the frozen

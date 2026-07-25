@@ -16,6 +16,7 @@ The following routes exist only inside the opt-in reviewed-security router and o
 - `GET /api/v1/policies/run/{runId}`
 - `GET /api/v1/policies/runs`
 - `GET /api/v1/policies/triggers`
+- `GET /api/v1/admin/settings/policies/implied-folder-roots` (ADMIN)
 - `GET|DELETE /api/v1/policies/{policyId}`
 - `POST /api/v1/policies/{policyId}/run`
 - `POST /api/v1/policies/{policyId}/trigger`
@@ -46,8 +47,16 @@ options and policy-output options are encrypted at rest and never returned in pl
 
 `editor` remains a virtual, non-mutable source and is pinned first in the source overview. Source
 deletion returns `409` while a visible policy references it. Policy ordering ignores unknown and
-cross-team IDs. Folder sources/outputs require a normalized path inside
-`policies.allowedFolderRoots` and always reject the Stirling config directory.
+cross-team IDs. Folder sources/outputs must resolve to a normalized absolute path that a fail-closed
+decision permits, matching the ordering of Java's `FolderAccessGuard.requirePermitted`: a path inside
+the Stirling config directory is always rejected; a path inside a Stirling-owned *implied* root — the
+local server-storage base path or a pipeline watched folder — is always permitted, even when
+`policies.allowedFolderRoots` is empty or absent; otherwise an empty allowlist rejects and a non-empty
+allowlist requires membership. The admin route `GET /api/v1/admin/settings/policies/implied-folder-roots`
+(above; `hasRole('ADMIN')`) exposes those implied roots as `{path, reason}` with `reason` one of
+`serverStorage`/`watchedFolder`, porting `FolderAccessSettingsController.impliedFolderRoots`. The
+server-storage root contributes only when the local storage provider is enabled with a non-blank base
+path (provider match is case-insensitive); blank watched-folder entries are skipped.
 
 S3 sources and outputs accept Java's legacy embedded options or a stored integration
 `connectionId`. Save-time resolution enforces type, enabled state, ownership/grants/default access,
@@ -58,7 +67,59 @@ The policy overview is derived from the caller's team-scoped policy and source r
 total/active/paused KPIs and case-insensitively sorted policy views with status,
 manual-or-configured trigger type, resolved source names, step count, output type, and owner.
 Trigger definitions are validated at write time: schedules enforce their type-specific fields,
-time, and IANA time zone; folder-watch policies must reference a folder source.
+time, and IANA time zone; folder-watch policies must reference a folder source; webhook policies
+must reference a webhook source (below).
+
+## Webhook sources and trigger
+
+A fourth input-source type `webhook` is secured-router-gated through the existing
+`/api/v1/sources` CRUD. Its stored options are a `webhookId` (`^[A-Za-z0-9_-]{16,128}$`) and a
+`signingSecret`, both **minted server-side with a CSPRNG on create** — never client-supplied —
+so credentials cannot be forged: the id is 18 random bytes as URL-safe base64-no-pad (24 chars)
+and the secret 32 bytes (43 chars), mirroring `WebhookIds.newWebhookId`/`newSigningSecret`.
+Regeneration follows Java's `WebhookInputSource.prepareOptionsForSave` (`!(!isCreate && hasId)`):
+mint a fresh pair on create, or on an update that arrives without a usable `webhookId`; a normal
+update keeps the stored pair. Validation (`WebhookConfig.from`) requires a non-blank `webhookId`
+matching the format, then a non-blank `signingSecret`, with byte-identical messages:
+`webhook config requires a 'webhookId' option`, `webhook config 'webhookId' has an invalid format`,
+`webhook config requires a 'signingSecret' option`. The regex doubles as the spool's traversal
+guard — `.`/`/`/`\`/`..` are outside the charset and rejected.
+
+Reveal-on-create returns the freshly minted `webhookId` **and** `signingSecret` in the clear
+exactly once; every later read masks `signingSecret` to `********` via the existing `secret`
+sensitive-key hint while `webhookId` stays plaintext (the receiver must be able to find it). The
+secret is encrypted at rest inside the existing encrypted `source_json` (the whole blob, option
+keys included, is inside the cipher). A client posting the `********` mask back on update
+preserves the stored secret through the recursive `merge_config` restore — the sentinel is never
+persisted.
+
+The matching automatic trigger type `webhook` is now advertised by `GET /api/v1/policies/triggers`
+(`requiresSource=true`, `supportedSourceTypes=["webhook"]`, mirroring `WebhookTrigger`). Write-time
+validation requires the policy to reference ≥1 team-accessible webhook source, else
+`webhook trigger requires at least one webhook input source`. `policy_references_webhook` matches a
+policy's stored source `webhookId` against a delivered id using the **raw source store with no team
+scope** (`WebhookTrigger.referencesWebhook` — a delivery is authenticated by its signed id/secret,
+not a caller's team). On a delivery, `fire_for_webhook` selects only **enabled** webhook policies
+(`findByTriggerTypeAndEnabledTrue`) referencing the id and runs each as a **LIGHT** sweep,
+logging-and-swallowing per-policy errors so one broken policy cannot fail the delivery response or
+block the others. Separately, a webhook reconcile safety-net loop runs every enabled webhook policy
+as a **FULL** sweep — an immediate startup catch-up run then every `watch_reconcile` interval —
+mirroring `WebhookTrigger.start`'s `scheduleAtFixedRate(safeReconcile, 0, reconcileSeconds)`.
+
+The public HMAC-authenticated receiver that accepts inbound deliveries and calls
+`fire_for_webhook` — `POST /api/v1/webhooks/{webhookId}`, the port's only new public route — is
+documented separately in `contracts/webhook-receiver.md`.
+
+**End-to-end (closed):** a webhook policy *run* now consumes the spooled delivery — `resolve_source`
+has a real `"webhook"` arm (the earlier `Unsupported("webhook")` gap is closed). It derives the
+per-webhook spool dir from the engine `install_root`, then runs the folder-consume lifecycle
+(`{snapshot=false, recursive=false, identity=stat}`): a missing/non-directory spool path is a no-op
+(not an error), the receiver's hidden `.part`/dotfile temps are skipped, each delivery is claimed
+through the ledger and settled via `finish_consumed` (delete on success once every sharing policy is
+Done, retain-and-retry on failure), and the pipeline filename is the display name (32-hex UUID prefix
+stripped). LIGHT consumes one delivery per dispatch; FULL reconciles and prunes vanished ledger rows
+(excluding `PROCESSING`). Mirrors Java `WebhookInputSource.resolve`/`completeConsumed`; the receiver
+is documented in `contracts/webhook-receiver.md`.
 
 The Java-compatible `policy_source_doc_counts` and `policy_source_doc_totals` tables back lifetime,
 rolling 24-hour/30-day, and 30-day daily-series reads. No synthetic totals are returned; missing
@@ -117,7 +178,8 @@ the queued run, so its status and outputs remain available through the ordinary 
 `POST /{policyId}/trigger` performs a manual `FULL` source sweep; every member of the owning team
 may invoke it even when the policy is disabled. `DELETE /{policyId}/processed-history` is limited
 to administrators and current team leaders. `GET /triggers` returns the exact supported automatic
-types, `folder-watch` and `schedule`.
+types, `folder-watch`, `schedule`, and `webhook` (the last requiring a webhook source — see
+"Webhook sources and trigger").
 
 The schedule task establishes a first-seen baseline and then submits at most the latest due wall
 clock occurrence, collapsing missed intervals. It supports minute/hour/day intervals plus

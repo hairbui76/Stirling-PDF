@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
+    purview::{PurviewConfigError, PurviewConnectionSettings},
     resource_access::{
         DefaultAccessPolicy, OwnerRef, OwnerScope, PrincipalType, ResourceAccessError,
         ResourceAccessService, ResourceType,
@@ -46,6 +47,8 @@ pub(crate) enum IntegrationType {
     S3,
     Mcp,
     Api,
+    /// Microsoft Purview Information Protection: sensitivity-label taxonomy via Graph.
+    Purview,
 }
 
 impl IntegrationType {
@@ -54,6 +57,7 @@ impl IntegrationType {
             Self::S3 => "S3",
             Self::Mcp => "MCP",
             Self::Api => "API",
+            Self::Purview => "PURVIEW",
         }
     }
 
@@ -62,6 +66,7 @@ impl IntegrationType {
             "S3" => Some(Self::S3),
             "MCP" => Some(Self::Mcp),
             "API" => Some(Self::Api),
+            "PURVIEW" => Some(Self::Purview),
             _ => None,
         }
     }
@@ -143,30 +148,54 @@ pub(crate) enum IntegrationFailure {
     Access(#[from] ResourceAccessError),
 }
 
+/// A rejected Purview connection payload surfaces as a client error, matching
+/// Java where `PurviewConnectionSettings.from` throws `IllegalArgumentException`
+/// and the save fails with a 400.
+impl From<PurviewConfigError> for IntegrationFailure {
+    fn from(error: PurviewConfigError) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct IntegrationConfigService {
     access: ResourceAccessService,
     policies_enabled: bool,
     allow_private_s3_endpoints: bool,
+    allow_custom_api_integrations: bool,
 }
 
 impl IntegrationConfigService {
+    // Each flag is a distinct Java-compatible policy toggle (portal default access
+    // width, policy classification, private S3 endpoints, custom-API authoring),
+    // not an accidental boolean-blindness cluster.
+    #[allow(clippy::fn_params_excessive_bools)]
     pub(crate) fn new(
         store: Arc<SecurityStore>,
         portal_default: DefaultAccessPolicy,
         deployment_wide_access: bool,
         policies_enabled: bool,
         allow_private_s3_endpoints: bool,
+        allow_custom_api_integrations: bool,
     ) -> Self {
         Self {
             access: ResourceAccessService::new(store, portal_default, deployment_wide_access),
             policies_enabled,
             allow_private_s3_endpoints,
+            allow_custom_api_integrations,
         }
     }
 
     pub(crate) fn access(&self) -> &ResourceAccessService {
         &self.access
+    }
+
+    /// Whether this caller may author free-form ("custom") API integrations, for
+    /// the UI to offer or hide the option. Mirrors Java's
+    /// `IntegrationConfigService.canAuthorCustomApi`: authoring is admin-only and
+    /// the operator can withdraw it entirely via `policies.allowCustomApiIntegrations`.
+    pub(crate) fn can_author_custom_api(&self, context: &AuthContext) -> bool {
+        custom_api_authoring_available(self.allow_custom_api_integrations, context)
     }
 
     pub(crate) fn require_portal(&self, context: &AuthContext) -> Result<(), IntegrationFailure> {
@@ -200,6 +229,12 @@ impl IntegrationConfigService {
                 "S3 connections can only be created by administrators or team owners".to_owned(),
             ));
         }
+        // A custom API integration names its own host, path and body, so it can
+        // point the server anywhere — authoring power gated to admins and
+        // withdrawable via `policies.allowCustomApiIntegrations`. Mirrors Java's
+        // `requireCustomApiAllowed`, keeping the enforced rule aligned with the
+        // capability reported by `can_author_custom_api`.
+        self.require_custom_api_allowed(integration_type, context)?;
         let (owner_user_id, owner_team_id) =
             self.assign_ownership(integration_type, scope, request.owner_team_id, context)?;
         let request_config = request.config.unwrap_or_default();
@@ -275,6 +310,10 @@ impl IntegrationConfigService {
             config.default_access = default_access;
         }
         if let Some(incoming) = request.config {
+            // Editing the config of a custom API integration is the same authoring
+            // power as creating one — it is where the base URL and body live — so
+            // it is gated identically, matching Java's `update`.
+            self.require_custom_api_allowed(config.integration_type, context)?;
             validate_config_depth(&Value::Object(incoming.clone()), 0)?;
             config.config = merge_config(&config.config, &incoming, 0);
             self.validate_config(config.integration_type, &config.config)?;
@@ -338,6 +377,41 @@ impl IntegrationConfigService {
         }
         validate_s3_config(&resolved, self.allow_private_s3_endpoints)?;
         Ok(resolved)
+    }
+
+    /// Dereferences a step's `connectionId` to the stored config of a connection of
+    /// the given type. Ported from Java `ApiConnectionResolver.resolveConfig`, used by
+    /// the Purview label steps to recover the tenant id.
+    ///
+    /// Every "you may not have this" outcome — no such row, the wrong integration
+    /// type, not permitted for this caller, or disabled — collapses into ONE opaque
+    /// error so a caller cannot probe which connection ids exist (anti-enumeration).
+    /// Java reports the disabled case with a distinct message; this port folds it into
+    /// the same opaque error, which leaks strictly less than Java. Unlike the Java
+    /// resolver, the caller's identity is passed explicitly rather than read from a
+    /// thread-local security context, so the `can_use` check always runs.
+    pub(crate) fn resolve_config(
+        &self,
+        id: i64,
+        integration_type: IntegrationType,
+        context: &AuthContext,
+    ) -> Result<Map<String, Value>, IntegrationFailure> {
+        let opaque = || {
+            IntegrationFailure::BadRequest(format!(
+                "unknown or inaccessible {} connection",
+                integration_type.as_str().to_ascii_lowercase()
+            ))
+        };
+        let connection = self
+            .access
+            .store()
+            .get_integration_config(id)?
+            .filter(|connection| connection.integration_type == integration_type)
+            .ok_or_else(opaque)?;
+        if !self.can_use(&connection, context)? || !connection.enabled {
+            return Err(opaque());
+        }
+        Ok(connection.config)
     }
 
     pub(crate) fn list(
@@ -510,6 +584,23 @@ impl IntegrationConfigService {
         })
     }
 
+    /// Enforces the custom-API authoring rule for `API`-type configs, matching
+    /// Java's `requireCustomApiAllowed`: non-API types are unaffected; API types
+    /// require the server flag to be on and the caller to be an administrator.
+    /// Vendor presets (S3/MCP) carry a fixed shape and are intentionally not
+    /// gated here.
+    fn require_custom_api_allowed(
+        &self,
+        integration_type: IntegrationType,
+        context: &AuthContext,
+    ) -> Result<(), IntegrationFailure> {
+        custom_api_allowed(
+            self.allow_custom_api_integrations,
+            integration_type,
+            context,
+        )
+    }
+
     fn validate_config(
         &self,
         integration_type: IntegrationType,
@@ -526,8 +617,50 @@ impl IntegrationConfigService {
         if self.policies_enabled && integration_type == IntegrationType::S3 {
             validate_s3_config(config, self.allow_private_s3_endpoints)?;
         }
+        // Purview connections are schema-validated on save regardless of the S3
+        // policy toggle, mirroring Java's always-registered `PurviewIntegrationValidator`.
+        // The parsed settings are only needed for their validation side effect here.
+        if integration_type == IntegrationType::Purview {
+            PurviewConnectionSettings::from(config)?;
+        }
         Ok(())
     }
+}
+
+/// Whether a caller may author custom API integrations: the server flag is on
+/// and the caller is an administrator. Mirrors Java's `canAuthorCustomApi`.
+fn custom_api_authoring_available(
+    allow_custom_api_integrations: bool,
+    context: &AuthContext,
+) -> bool {
+    allow_custom_api_integrations && ResourceAccessService::is_admin(context)
+}
+
+/// Fail-closed custom-API authoring gate shared by create and update. Non-API
+/// integration types pass unconditionally; API types require the server flag and
+/// administrator privileges. Mirrors Java's `requireCustomApiAllowed`, including
+/// its two distinct forbidden messages.
+fn custom_api_allowed(
+    allow_custom_api_integrations: bool,
+    integration_type: IntegrationType,
+    context: &AuthContext,
+) -> Result<(), IntegrationFailure> {
+    if integration_type != IntegrationType::Api {
+        return Ok(());
+    }
+    if !allow_custom_api_integrations {
+        return Err(IntegrationFailure::Forbidden(
+            "Custom API integrations are disabled on this server \
+             (policies.allowCustomApiIntegrations)"
+                .to_owned(),
+        ));
+    }
+    if !ResourceAccessService::is_admin(context) {
+        return Err(IntegrationFailure::Forbidden(
+            "Custom API integrations can only be created by administrators".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn owner_ref(config: &IntegrationConfig) -> Option<OwnerRef> {
@@ -645,6 +778,25 @@ fn connection_id(options: &Map<String, Value>) -> Result<Option<i64>, Integratio
     parsed.map(Some).ok_or_else(|| {
         IntegrationFailure::BadRequest(format!(
             "s3 'connectionId' is not a valid connection reference: {reference}"
+        ))
+    })
+}
+
+/// Parses a `connectionId` request parameter for a label/API step, where the value
+/// always arrives as a form-field string. Ported from Java
+/// `ApiConnectionResolver.connectionId`, folding its `null` return and the
+/// controller's follow-up `null` check into a single required-parameter error so
+/// blank and absent are indistinguishable to the caller.
+pub(crate) fn parse_connection_id_param(reference: &str) -> Result<i64, IntegrationFailure> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return Err(IntegrationFailure::BadRequest(
+            "'connectionId' is required".to_owned(),
+        ));
+    }
+    trimmed.parse::<i64>().map_err(|_| {
+        IntegrationFailure::BadRequest(format!(
+            "'connectionId' is not a valid connection reference: {reference}"
         ))
     })
 }
@@ -795,11 +947,83 @@ fn is_public_ip(address: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_config, merge_config, sanitize_config, validate_s3_config};
+    use super::{
+        IntegrationFailure, IntegrationType, custom_api_allowed, custom_api_authoring_available,
+        mask_config, merge_config, sanitize_config, validate_s3_config,
+    };
+    use crate::security::{AuthContext, AuthenticationSource};
     use serde_json::{Map, Value, json};
+    use std::collections::BTreeSet;
 
     fn object(value: &Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
+    }
+
+    fn context<const N: usize>(roles: [&str; N]) -> AuthContext {
+        AuthContext {
+            user_id: 1,
+            username: "user".to_owned(),
+            authentication_source: AuthenticationSource::AccessToken,
+            authentication_type: "web".to_owned(),
+            roles: roles
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            team_id: Some(1),
+            permissions: BTreeSet::new(),
+            external_subject: None,
+            force_password_change: false,
+            session_id: "session".to_owned(),
+            correlation_id: "request".to_owned(),
+        }
+    }
+
+    #[test]
+    fn custom_api_authoring_requires_flag_and_admin() {
+        let admin = context(["ROLE_ADMIN"]);
+        let user = context(["ROLE_USER"]);
+        // Both the server flag and the admin role are required.
+        assert!(custom_api_authoring_available(true, &admin));
+        assert!(!custom_api_authoring_available(false, &admin));
+        assert!(!custom_api_authoring_available(true, &user));
+        assert!(!custom_api_authoring_available(false, &user));
+    }
+
+    #[test]
+    fn custom_api_gate_only_applies_to_api_integrations() {
+        let user = context(["ROLE_USER"]);
+        // Vendor presets are never gated here, even with the flag off / non-admin.
+        assert!(custom_api_allowed(false, IntegrationType::S3, &user).is_ok());
+        assert!(custom_api_allowed(false, IntegrationType::Mcp, &user).is_ok());
+    }
+
+    #[test]
+    fn custom_api_gate_reports_disabled_before_checking_admin() {
+        // Flag-off is reported regardless of role, and the message names the
+        // controlling property, matching Java's ordering and text.
+        let admin = context(["ROLE_ADMIN"]);
+        assert!(matches!(
+            custom_api_allowed(false, IntegrationType::Api, &admin),
+            Err(IntegrationFailure::Forbidden(message))
+                if message.contains("disabled on this server")
+                    && message.contains("policies.allowCustomApiIntegrations")
+        ));
+    }
+
+    #[test]
+    fn custom_api_gate_refuses_non_admins_when_enabled() {
+        let user = context(["ROLE_USER"]);
+        assert!(matches!(
+            custom_api_allowed(true, IntegrationType::Api, &user),
+            Err(IntegrationFailure::Forbidden(message))
+                if message.contains("only be created by administrators")
+        ));
+    }
+
+    #[test]
+    fn custom_api_gate_permits_admins_when_enabled() {
+        let admin = context(["ROLE_ADMIN"]);
+        assert!(custom_api_allowed(true, IntegrationType::Api, &admin).is_ok());
     }
 
     #[test]
@@ -856,5 +1080,182 @@ mod tests {
                 .is_some_and(|error| error.to_string().contains("private or local"))
         );
         assert!(validate_s3_config(&private, true).is_ok());
+    }
+
+    // TESTER: the adversarial payoff — a POST create of an API-type integration
+    // must be refused SERVER-SIDE (through create(), not just the gate helper)
+    // whenever the flag is off OR the caller is not an admin, mirroring Java's
+    // create() calling requireCustomApiAllowed. Both refusals fire before any
+    // store write, so an in-memory store suffices.
+    #[test]
+    fn create_refuses_custom_api_server_side_without_flag_and_admin()
+    -> Result<(), IntegrationFailure> {
+        use super::{IntegrationConfigRequest, IntegrationConfigService};
+        use crate::resource_access::DefaultAccessPolicy;
+        use crate::security::SecurityStore;
+        use std::sync::Arc;
+
+        fn api_request() -> IntegrationConfigRequest {
+            IntegrationConfigRequest {
+                integration_type: Some(IntegrationType::Api),
+                name: Some("custom".to_owned()),
+                ..Default::default()
+            }
+        }
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+
+        // Flag OFF, admin caller: still refused — the operator withdrew the feature.
+        let disabled = IntegrationConfigService::new(
+            Arc::clone(&store),
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(
+            disabled.create(api_request(), &context(["ROLE_ADMIN"])),
+            Err(IntegrationFailure::Forbidden(message))
+                if message.contains("disabled on this server")
+        ));
+
+        // Flag ON, non-admin caller: refused — authoring is admin-only.
+        let enabled = IntegrationConfigService::new(
+            store,
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(
+            enabled.create(api_request(), &context(["ROLE_USER"])),
+            Err(IntegrationFailure::Forbidden(message))
+                if message.contains("only be created by administrators")
+        ));
+
+        // Flag ON, admin caller: the custom-API gate does not block (non-Forbidden
+        // beyond it — here it proceeds into ownership/config handling).
+        let allowed = IntegrationConfigService::new(
+            Arc::new(SecurityStore::in_memory()?),
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(!matches!(
+            allowed.create(api_request(), &context(["ROLE_ADMIN"])),
+            Err(IntegrationFailure::Forbidden(message)) if message.contains("Custom API")
+        ));
+        Ok(())
+    }
+
+    // TESTER: a Purview config's clientSecret must never reach a response body in
+    // clear text. The "secret" hint drives is_sensitive, so mask_config replaces it
+    // with the mask while the non-sensitive tenantId/clientId are echoed verbatim.
+    #[test]
+    fn mask_config_hides_purview_client_secret() {
+        let stored = object(&json!({
+            "tenantId": "cb46c030-1825-4e81-a295-151c039dbf02",
+            "clientId": "app-registration",
+            "clientSecret": "super-secret-value",
+        }));
+        let masked = mask_config(&stored, 0);
+        assert_eq!(
+            masked.get("clientSecret").and_then(Value::as_str),
+            Some("********")
+        );
+        assert_eq!(
+            masked.get("tenantId").and_then(Value::as_str),
+            Some("cb46c030-1825-4e81-a295-151c039dbf02")
+        );
+        assert_eq!(
+            masked.get("clientId").and_then(Value::as_str),
+            Some("app-registration")
+        );
+    }
+
+    #[test]
+    fn integration_type_purview_round_trips_through_the_database_encoding() {
+        assert_eq!(IntegrationType::Purview.as_str(), "PURVIEW");
+        assert_eq!(
+            IntegrationType::from_database("PURVIEW"),
+            Some(IntegrationType::Purview)
+        );
+        assert_eq!(IntegrationType::from_database("purview"), None);
+    }
+
+    // TESTER: Purview save-validation must fire SERVER-SIDE through create(), not
+    // only in the standalone parser — mirroring Java's PurviewIntegrationValidator
+    // running whenever a PURVIEW config is persisted. A malformed tenant id is
+    // refused before any store write; a well-formed connection is accepted.
+    #[test]
+    fn create_validates_purview_config_server_side() -> Result<(), IntegrationFailure> {
+        use super::{IntegrationConfigRequest, IntegrationConfigService};
+        use crate::resource_access::{DefaultAccessPolicy, OwnerScope};
+        use crate::security::SecurityStore;
+        use std::sync::Arc;
+
+        fn purview_request(scope: OwnerScope, config: Value) -> IntegrationConfigRequest {
+            let config = match config {
+                Value::Object(map) => Some(map),
+                _ => None,
+            };
+            IntegrationConfigRequest {
+                integration_type: Some(IntegrationType::Purview),
+                name: Some("tenant".to_owned()),
+                scope: Some(scope),
+                config,
+                ..Default::default()
+            }
+        }
+
+        let service = IntegrationConfigService::new(
+            Arc::new(SecurityStore::in_memory()?),
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            // policies disabled: Purview still validates (unlike the S3 gate).
+            false,
+            false,
+            false,
+        );
+        let admin = context(["ROLE_ADMIN"]);
+
+        // Missing tenant id: rejected as a client error before persisting.
+        assert!(matches!(
+            service.create(purview_request(OwnerScope::User, json!({})), &admin),
+            Err(IntegrationFailure::BadRequest(message)) if message.contains("tenantId")
+        ));
+
+        // Malformed tenant id: rejected as a GUID violation.
+        assert!(matches!(
+            service.create(
+                purview_request(OwnerScope::User, json!({ "tenantId": "not-a-guid" })),
+                &admin
+            ),
+            Err(IntegrationFailure::BadRequest(message)) if message.contains("must be a GUID")
+        ));
+
+        // Well-formed connection (no app registration): accepted and stored. Uses
+        // SERVER scope so the admin-owned row has null owners and the in-memory
+        // store's user foreign key is not exercised.
+        let created = service.create(
+            purview_request(
+                OwnerScope::Server,
+                json!({ "tenantId": "CB46C030-1825-4E81-A295-151C039DBF02" }),
+            ),
+            &admin,
+        )?;
+        assert_eq!(created.integration_type, IntegrationType::Purview);
+        // Save-validation is a pure side effect: the stored config is not
+        // rewritten, so the tenant id keeps its original casing (parity with Java,
+        // where lowercasing is a read-time concern in PurviewConnectionSettings).
+        assert_eq!(
+            created.config.get("tenantId").and_then(Value::as_str),
+            Some("CB46C030-1825-4E81-A295-151C039DBF02")
+        );
+        Ok(())
     }
 }

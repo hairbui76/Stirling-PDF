@@ -8,7 +8,7 @@ The opt-in reviewed Rust security router owns the Java-compatible resource-grant
 - `GET /api/v1/admin/access/grants/by-principal`
 - `DELETE /api/v1/admin/access/grants/{id}`
 
-It also owns `GET|POST /api/v1/integrations` and
+It also owns `GET|POST /api/v1/integrations`, `GET /api/v1/integrations/capabilities`, and
 `GET|PUT|DELETE /api/v1/integrations/{id}`. These routes are not exposed by the open router, and
 production secure-mode startup remains fail-closed pending the independent security review.
 
@@ -32,6 +32,15 @@ Creation preserves the current Java restrictions for USER/TEAM/SERVER ownership,
 checks, S3 personal ownership, and locked SERVER overrides. Update ignores type/scope/team changes.
 Locked configs block non-admin updates but, matching Java, do not block an otherwise authorized
 delete.
+
+Authoring a free-form (`API`-type) integration is additionally gated by `requireCustomApiAllowed`,
+matching Java: it requires an administrator **and** `policies.allowCustomApiIntegrations` (default
+`true`), enforced server-side on both `create` and `update` (editing an API config's `config` is the
+same authoring power — it holds the base URL and body). Vendor presets (`S3`/`MCP`) are never gated
+here. `GET /api/v1/integrations/capabilities` (portal access required) reports
+`{customApi: allowCustomApiIntegrations && isAdmin}` so the portal can show or hide the custom-API
+option, but the rule is enforced in the service, not merely hidden in that response. The flag-off
+refusal names `policies.allowCustomApiIntegrations`; a non-admin refusal is a distinct message.
 
 ## Secrets and persistence
 

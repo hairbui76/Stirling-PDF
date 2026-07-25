@@ -42,6 +42,41 @@ The image route accepts only Java-safe basename characters, rejects symlinks,
 and never resolves outside the shared directory. JPEG suffixes return `image/jpeg`;
 every other Java-compatible suffix uses the Java default `image/png` response type.
 
+## Portal UI-data projections (secured router)
+
+`proprietary_ui_data.rs` ports the non-mutating routes of Java `ProprietaryUIDataController`
+under `/api/v1/proprietary/ui-data`, as thin read projections over already-ported stores
+(`SecurityStore`) and a startup snapshot of server-owned configuration. No route re-parses
+settings or makes a UI decision.
+
+| Route | Gate | Rust response |
+| --- | --- | --- |
+| `GET .../login` | Public | `LoginData`: `enableLogin`, `ssoAutoLogin`, `loginMethod`, OAuth2 `providerList` (`/oauth2/authorization/{name}` → display name), `altLogin`, `firstTimeSetup`/`showDefaultCredentials`, `languages`, `defaultLocale`. |
+| `GET .../account` | Authenticated, non-demo | An `/auth/me` superset: the same `user`/`mfa` blocks plus account-page fields (`role`, masked `settings`, `changeCredsFlag`, `oAuth2Login`, `saml2Login`, `mfaEnabled`, `mfaRequired`). The TOTP secret is masked. |
+| `GET .../audit-dashboard` | `ROLE_ADMIN` + verified Enterprise | Audit config plus the `AuditLevel` listing (`OFF`/`BASIC`/`STANDARD`/`VERBOSE`), the fixed `AuditEventType` enum, `retentionDays`, and `pdfMetadataEnabled` (`captureFileHash \|\| capturePdfAuthor`). |
+| `GET .../teams` | `ROLE_ADMIN` | Teams (internal team excluded) with user counts, per-team last-activity, and team owners. |
+| `GET .../teams/{id}` | `ROLE_ADMIN` | One team's members, available users (excluding this team and the internal team), per-user last-activity, and owner user IDs. |
+
+`firstTimeSetup`/`showDefaultCredentials` are `true` when there are no real users (the internal
+API user excluded) or exactly one real user which is the default `admin` still on its first login.
+`retentionDays` is Java's raw unclamped `getRetentionDays()` (default `90`; `≤0` means retain
+indefinitely). Last-activity is emitted in epoch milliseconds.
+
+Deliberate divergences from the Java oracle:
+
+- **SAML2 is deferred**, so SAML2 provider entries are omitted from the login `providerList` and
+  `altLogin` is OAuth2-only. A SAML2-only configuration therefore yields `altLogin=false` here where
+  Java would return `true`; OAuth2 providers (generic + Google/GitHub/Keycloak) are unaffected.
+- An unknown `teams/{id}` returns `404` (Java accidentally `500`s from a bare `RuntimeException`);
+  the internal team returns `403`. The client's `getTeamDetails` does not distinguish the two, so
+  behavior is unchanged and the returned status is the semantically correct one.
+- "Last activity" derives from each session's `created_at`; the Rust session store records no
+  per-request `lastRequest`.
+
+Not ported (still deferred from this controller): `PortalApiKeysController`
+(`/proprietary/ui-data/infrastructure/api-keys`, needs API-key schema work) and the H2-only
+`ui-data/database` route.
+
 ## Cutover boundary
 
 `stirling-processing/build.rs` generates the response manifest from `rust/Cargo.lock`

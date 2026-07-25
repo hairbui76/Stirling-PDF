@@ -32,6 +32,7 @@ use crate::{
     },
     runtime_config::FileReadinessConfig,
     security::{AuthContext, SecurityError},
+    webhook_receiver::{display_name, is_valid_webhook_id, spool_dir},
 };
 
 #[derive(Debug, Serialize)]
@@ -57,6 +58,10 @@ pub(crate) struct PolicySourceRunner {
     ledger: Arc<ProcessedLedger>,
     readiness: FileReadinessConfig,
     s3: S3ConnectionPool,
+    // The engine install root; the per-webhook spool directory is derived from it
+    // (`<install_root>/policy-webhook-spool/<webhookId>`) so a webhook source can
+    // consume exactly what the public receiver spooled.
+    install_root: PathBuf,
 }
 
 impl PolicySourceRunner {
@@ -66,6 +71,7 @@ impl PolicySourceRunner {
         ledger: Arc<ProcessedLedger>,
         readiness: FileReadinessConfig,
         s3: S3ConnectionPool,
+        install_root: PathBuf,
     ) -> Self {
         Self {
             config,
@@ -73,6 +79,7 @@ impl PolicySourceRunner {
             ledger,
             readiness,
             s3,
+            install_root,
         }
     }
 
@@ -191,6 +198,33 @@ impl PolicySourceRunner {
             let config = S3Config::from_options(&options)?;
             let client = self.s3.client_for(&config)?;
             return resolve_s3(policy_id, client, config, sweep).await;
+        }
+        if source.source_type == "webhook" {
+            // A run-time webhook source always carries the id injected at save
+            // (see policy_config save_source). No AuthContext is needed: the spool
+            // dir derives from the signed id, not the caller's team — exactly as
+            // the folder arm needs no context for its directory. Mirrors
+            // WebhookConfig.from reading WEBHOOK_ID_OPTION: trim, reject blank, then
+            // enforce WebhookIds.isValidId (`^[A-Za-z0-9_-]{16,128}$`). Without the
+            // validity guard a malformed-but-contained id (e.g. one with a '.') that
+            // Java rejects would be silently accepted here on containment alone.
+            // (Java also requires a non-blank signingSecret at resolve; resolve never
+            // reads it, so that check is a documented, behaviourally-inert deviation.)
+            let webhook_id = source
+                .options
+                .get("webhookId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty() && is_valid_webhook_id(id))
+                .ok_or(SourceFailure::WebhookConfig)?;
+            return resolve_webhook(
+                policy_id,
+                &self.install_root,
+                webhook_id,
+                &self.readiness,
+                sweep,
+            )
+            .await;
         }
         Err(SourceFailure::Unsupported(source.source_type.clone()))
     }
@@ -402,13 +436,113 @@ async fn resolve_folder(
         if !claimed {
             continue;
         }
+        // The folder pipeline filename is the OS basename (pipeline_file's logic).
+        let filename = file.file_name().map_or_else(
+            || "file".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         units.push(consumed_input(
             policy_id,
             file,
+            filename,
             identity,
             gate,
             config.hash_identity,
             claimed_hash,
+            Arc::clone(&sweep.ledger),
+        ));
+    }
+    Ok(units)
+}
+
+/// Consumes the per-webhook spool directory. Structurally this is the folder
+/// non-snapshot consume path with fixed `{snapshot=false, recursive=false,
+/// identity=stat}`, a spool-derived directory, a no-op (not error) on a missing
+/// directory, and a display-name pipeline filename. Mirrors Java
+/// `WebhookInputSource.resolve` (which reuses the same `FolderIdentities` helpers).
+async fn resolve_webhook(
+    policy_id: &str,
+    install_root: &Path,
+    webhook_id: &str,
+    readiness: &FileReadinessConfig,
+    sweep: &mut PolicySweep,
+) -> Result<Vec<ResolvedInput>, SourceFailure> {
+    // Containment: an invalid id / traversal yields no dir. Mirrors
+    // WebhookSpool.dirFor's parent-equality guard.
+    let Some(dir) = spool_dir(install_root, webhook_id) else {
+        return Err(SourceFailure::WebhookConfig);
+    };
+    // Neither a missing spool dir NOR a non-directory path (a regular file or a
+    // symlink-to-file at the spool path) is an error — both are a NO-OP, the key
+    // divergence from resolve_folder, which errors when its directory is absent or
+    // is not a directory. Reporting an empty present set (rather than vetoing
+    // cleanup) lets a FULL sweep still prune stale ledger rows for deliveries
+    // already consumed and deleted. Mirrors WebhookInputSource.resolve:
+    // `if (!Files.isDirectory(dir)) { ctx.reportPresent(List.of()); return List.of(); }`
+    // — `Files.isDirectory` is false for BOTH a missing and a non-dir path, so both
+    // land on the same no-op branch here.
+    match fs::metadata(&dir).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            sweep.report_present(&[])?;
+            return Ok(Vec::new());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            sweep.report_present(&[])?;
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let canonical_dir = fs::canonicalize(&dir).await?;
+    // Non-recursive; hidden_name drops the receiver's `.{name}.part` temps AND any
+    // dotfile, matching WebhookInputSource.listFiles's regular-file + non-`.` filter.
+    let files = list_files(&dir, false).await?;
+    let identities = files
+        .iter()
+        .map(|file| folder_identity(&canonical_dir, &dir, file))
+        .collect::<Result<Vec<_>, _>>()?;
+    sweep.report_present(&identities)?;
+    let mut units = Vec::new();
+    for (file, identity) in files.into_iter().zip(identities) {
+        if !file_is_ready(&file, readiness).await {
+            continue;
+        }
+        let gate = match stat_gate(&file).await {
+            Ok(gate) => gate,
+            Err(error) => {
+                debug!(path = %file.display(), %error, "could not read webhook source version");
+                continue;
+            }
+        };
+        // Webhook identity is stat-only, so hash_path is ALWAYS None: a spool file
+        // is immutable once atomically renamed into place. Mirrors Java's
+        // `ctx.claim(identity, gate, null)`.
+        let (claimed, _) = match sweep.claim(&identity, &gate, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                debug!(path = %file.display(), %error, "could not claim webhook source file");
+                continue;
+            }
+        };
+        if !claimed {
+            continue;
+        }
+        // The pipeline filename is the DISPLAY name (32-hex prefix stripped) so a
+        // downstream step sees `invoice.pdf`, not `<32hex>-invoice.pdf`. Mirrors
+        // WebhookInputSource.fileResource overriding getFilename to displayName.
+        let filename = display_name(
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        );
+        units.push(consumed_input(
+            policy_id,
+            file,
+            filename,
+            identity,
+            gate,
+            false,
+            None,
             Arc::clone(&sweep.ledger),
         ));
     }
@@ -564,16 +698,23 @@ fn snapshot_input(file: PathBuf) -> ResolvedInput {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consumed_input(
     policy_id: &str,
     file: PathBuf,
+    filename: String,
     identity: String,
     gate: String,
     hash_identity: bool,
     claimed_hash: Option<String>,
     ledger: Arc<ProcessedLedger>,
 ) -> ResolvedInput {
-    let primary = vec![pipeline_file(file.clone())];
+    let primary = vec![PipelineFile {
+        filename,
+        path: file.clone(),
+        content_type: None,
+        origin: None,
+    }];
     let policy_id = policy_id.to_owned();
     let completion: CompletionCallback = Box::new(move |success| {
         Box::pin(async move {
@@ -791,18 +932,24 @@ enum SourceFailure {
     InvalidIdentity,
     #[error("folder input directory is not a directory: {0:?}")]
     NotDirectory(PathBuf),
+    #[error("webhook source has no valid 'webhookId'")]
+    WebhookConfig,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, path::Path, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use tempfile::{TempDir, tempdir};
     use tokio::fs;
 
     use super::{
-        FolderSourceConfig, PolicySweep, SweepKind, content_hash, folder_identity, resolve_folder,
-        stat_gate,
+        FolderSourceConfig, PolicySweep, ResolvedFiles, SourceFailure, SweepKind, content_hash,
+        folder_identity, resolve_folder, resolve_webhook, stat_gate,
     };
     use crate::{
         policy_ledger::{ProcessedFileStatus, ProcessedLedger},
@@ -988,6 +1135,311 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    // ---- webhook source: the folder-consume lifecycle over a spool directory ----
+
+    /// A valid webhook id (16-char lower bound of the `WebhookIds` alphabet).
+    const WEBHOOK_ID: &str = "receivertestid12";
+
+    /// The per-webhook spool directory the public receiver writes into and the
+    /// runner reads from (`<install_root>/policy-webhook-spool/<webhookId>`).
+    fn spool_directory(install_root: &Path, webhook_id: &str) -> PathBuf {
+        install_root.join("policy-webhook-spool").join(webhook_id)
+    }
+
+    /// A spool file name in the receiver's shape: 32 hex chars + `-` + display
+    /// name, so `display_name` strips the prefix back to `name`.
+    fn spool_name(name: &str) -> String {
+        format!("{}-{name}", "a".repeat(32))
+    }
+
+    /// Creates the spool directory and writes one delivery, returning its on-disk
+    /// path (as `resolve_webhook` will see it).
+    async fn spool_delivery(
+        install_root: &Path,
+        webhook_id: &str,
+        stored_name: &str,
+        body: &[u8],
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let dir = spool_directory(install_root, webhook_id);
+        fs::create_dir_all(&dir).await?;
+        let file = dir.join(stored_name);
+        fs::write(&file, body).await?;
+        Ok(file)
+    }
+
+    #[tokio::test]
+    async fn webhook_consume_reports_the_display_name_and_deletes_after_settlement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        let file = spool_delivery(
+            install_root.path(),
+            WEBHOOK_ID,
+            &spool_name("invoice.pdf"),
+            b"pdf",
+        )
+        .await?;
+        // A hidden `.part` temp staged alongside the delivery must be skipped.
+        fs::write(
+            spool_directory(install_root.path(), WEBHOOK_ID).join(".staging.part"),
+            b"partial",
+        )
+        .await?;
+
+        let mut sweep = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        let mut units = resolve_webhook(
+            "policy-a",
+            install_root.path(),
+            WEBHOOK_ID,
+            &readiness(),
+            &mut sweep,
+        )
+        .await?;
+        assert_eq!(units.len(), 1);
+        let unit = units.remove(0);
+        // The pipeline filename is the DISPLAY name, never the `<32hex>-` on-disk name.
+        match &unit.files {
+            ResolvedFiles::Ready(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].filename, "invoice.pdf");
+                assert_eq!(files[0].path, file);
+            }
+            ResolvedFiles::Deferred(_) => {
+                return Err("webhook input must be ready, not deferred".into());
+            }
+        }
+        assert!(file.exists());
+        (unit.completion)(true).await;
+        // Success deletes the delivery and records the ledger row DONE.
+        assert!(!file.exists());
+        let states = ledger.states_for("policy-a", &sweep.present_identities())?;
+        assert_eq!(
+            states.values().next().map(|state| state.status),
+            Some(ProcessedFileStatus::Done)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_empty_spool_dir_is_a_no_op_not_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        // The spool dir was never created. Unlike a missing FOLDER source (a hard
+        // error), a missing webhook spool dir resolves to zero units and does NOT
+        // veto cleanup, so a FULL sweep can still prune stale ledger rows.
+        let mut missing = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut missing,
+            )
+            .await?
+            .is_empty()
+        );
+        assert!(missing.cleanup_allowed());
+        assert!(missing.present_identities().is_empty());
+
+        // Contrast: a missing FOLDER source directory is a hard error.
+        let mut folder = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_folder(
+                "policy-a",
+                &config(&install_root.path().join("no-such-folder"), false, false),
+                &readiness(),
+                &mut folder,
+            )
+            .await
+            .is_err()
+        );
+
+        // An existing-but-empty spool dir is likewise a no-op.
+        fs::create_dir_all(spool_directory(install_root.path(), WEBHOOK_ID)).await?;
+        let mut empty = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut empty,
+            )
+            .await?
+            .is_empty()
+        );
+        assert!(empty.cleanup_allowed());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_directory_spool_path_is_a_no_op_not_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        // Plant a REGULAR FILE where the per-webhook spool directory would be. Java's
+        // `if (!Files.isDirectory(dir))` is false for a non-dir just as for a missing
+        // path, so this must be a no-op that still permits cleanup — NOT an error that
+        // vetoes it (which would stop a FULL sweep from pruning stale ledger rows).
+        let dir = spool_directory(install_root.path(), WEBHOOK_ID);
+        fs::create_dir_all(dir.parent().ok_or("spool dir has no parent")?).await?;
+        fs::write(&dir, b"not a directory").await?;
+        let mut sweep = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut sweep,
+            )
+            .await?
+            .is_empty()
+        );
+        assert!(sweep.cleanup_allowed());
+        assert!(sweep.present_identities().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lone_part_temp_is_skipped_and_left_untouched()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        let dir = spool_directory(install_root.path(), WEBHOOK_ID);
+        fs::create_dir_all(&dir).await?;
+        let temp = dir.join(".abc.part");
+        fs::write(&temp, b"partial").await?;
+        let mut sweep = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut sweep,
+            )
+            .await?
+            .is_empty()
+        );
+        // The hidden temp is neither claimed nor removed.
+        assert!(temp.exists());
+        assert!(sweep.present_identities().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_traversal_webhook_id_is_a_config_error_and_lists_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        for bad in ["..", "a/b", "../other"] {
+            let mut sweep = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+            let outcome = resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                bad,
+                &readiness(),
+                &mut sweep,
+            )
+            .await;
+            assert!(
+                matches!(outcome, Err(SourceFailure::WebhookConfig)),
+                "traversal id {bad:?} must be a WebhookConfig error"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_webhook_consume_is_parked_and_the_delivery_retained()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        let file = spool_delivery(
+            install_root.path(),
+            WEBHOOK_ID,
+            &spool_name("invoice.pdf"),
+            b"pdf",
+        )
+        .await?;
+        let mut first = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        let mut units = resolve_webhook(
+            "policy-a",
+            install_root.path(),
+            WEBHOOK_ID,
+            &readiness(),
+            &mut first,
+        )
+        .await?;
+        assert_eq!(units.len(), 1);
+        // A clean failure settles ERROR and RETAINS the file (delete only on success).
+        (units.remove(0).completion)(false).await;
+        assert!(file.exists());
+        // The spool file is immutable, so a re-claim on the unchanged stat gate is
+        // refused — the delivery is parked, never lost, never auto-retried.
+        let mut retry = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut retry,
+            )
+            .await?
+            .is_empty()
+        );
+        assert!(file.exists());
+        let states = ledger.states_for("policy-a", &retry.present_identities())?;
+        assert_eq!(
+            states.values().next().map(|state| state.status),
+            Some(ProcessedFileStatus::Error)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_light_claim_is_not_reprocessed_by_a_full_sweep()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (install_root, ledger) = harness()?;
+        let file = spool_delivery(
+            install_root.path(),
+            WEBHOOK_ID,
+            &spool_name("invoice.pdf"),
+            b"pdf",
+        )
+        .await?;
+        // A LIGHT per-delivery fire claims the delivery (PROCESSING) but never settles.
+        let mut light = PolicySweep::new("policy-a", SweepKind::Light, Arc::clone(&ledger));
+        let claimed = resolve_webhook(
+            "policy-a",
+            install_root.path(),
+            WEBHOOK_ID,
+            &readiness(),
+            &mut light,
+        )
+        .await?;
+        assert_eq!(claimed.len(), 1);
+        // LIGHT records no presence and never permits cleanup.
+        assert!(light.present_identities().is_empty());
+        assert!(!light.cleanup_allowed());
+        // A concurrent FULL reconcile observes the PROCESSING row and does not
+        // re-submit the in-flight delivery.
+        let mut full = PolicySweep::new("policy-a", SweepKind::Full, Arc::clone(&ledger));
+        assert!(
+            resolve_webhook(
+                "policy-a",
+                install_root.path(),
+                WEBHOOK_ID,
+                &readiness(),
+                &mut full,
+            )
+            .await?
+            .is_empty()
+        );
+        // The delivery is still on disk; dropping the LIGHT unit leaves it PROCESSING.
+        assert!(file.exists());
+        drop(claimed);
         Ok(())
     }
 }

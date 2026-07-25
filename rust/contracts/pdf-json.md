@@ -48,8 +48,18 @@ Deferred (returned empty/unset, documented gaps):
   the Java endpoint. The full-document endpoint exports root AcroForm fields.
 - no additional metadata fields
 
-**Parity gap:** date strings are passed through as the raw PDF `D:YYYYMMDD...` form;
-Java reformats via `PDDocumentInformation`. To be reconciled in a later phase.
+**Date/trapped parity (closed):** Info **and** annotation dates now round-trip through
+`pdf_date_to_iso_instant` / `iso_instant_to_pdf_date`. On read a `D:YYYYMMDD...` string
+becomes an ISO-8601 UTC instant (`YYYY-MM-DDTHH:MM:SSZ`) — mirroring PDFBox's GMT-seeded
+`DateConverter` (a missing designator is UTC; a `Z`/`±HH'mm'` offset is applied and
+normalized back to UTC; missing time fields default per the PDF date grammar). On write the
+instant is converted back to the PDF `D:...+00'00'` form; an unparseable value **omits the
+key** (matching Java's `parseInstant(...).ifPresent(...)`). The annotation overlay
+write-back also converts ISO→`D:` before setting `/CreationDate` and `/M`, so it never
+writes an invalid literal, and leaves the raw COS date in place on a conversion miss rather
+than clobbering it. `/Trapped` is read and written as a COS **Name** (Java `getNameAsString`
+/ `setTrapped`) — a Name or String is accepted on read, and only `True`/`False`/`Unknown`
+is written.
 
 ## `POST /api/v1/convert/text-editor/pdf` (Phase 2 — done, font-independent path)
 
@@ -115,13 +125,44 @@ metrics rather than the restored font's, so a font switch mid-line can shift
 positioning slightly. Both this endpoint and the cached partial-export path go
 through the same font-resolution code, so this applies equally to both.
 
-**Deferred (font subsystem, later phases):** token-level rewriting of `textElements`
-in place over an existing preserved source stream (Java's `rewriteTextOperators`
-fast path) — Rust's mixed-edit path always strips-and-regenerates rather than
-patching matched text tokens in place — plus Symbol/ZapfDingbats encodings,
-synthesizing new embedded/CID/Type3 fonts, and true glyph synthesis for characters
-representable by neither the restored font nor the Standard-14 fallback. The
-cached partial endpoint has the bounded regeneration
+**Token-preserving fast path (Java `rewriteTextOperators`).** Before that
+strip-and-regenerate step, a **text-only** mixed edit (non-empty `textElements`,
+no image edits) over a preserved stream first attempts a token-preserving in-place
+rewrite (`build_page_contents` → `rewrite_text_operators`). It decodes the page
+content stream, tracks the active font through `Tf`, and for each `Tj` (and each
+string element of a `TJ` array) consumes the matching edited `textElements` in show
+order and swaps **only** the string operand for the replacement re-encoded through
+that same font. Every other token — `Td`/`TD`/`Tm`/`T*`/`Tc`/`Tw`/`cm`, a `TJ`
+array's numeric kerning adjustments, and any vector operator — is carried through
+byte-for-byte, and an unedited run's string operand stays byte-identical. So a
+boundary-aligned `Tj`/`TJ` edit on a simple `Type1`/`TrueType`/`MMType1` font
+(text representable in its resolved simple/WinAnsi/Standard-14 encoding) now
+round-trips token-for-token instead of regenerating the page's layout.
+
+The fast path is deliberately strict and **defers to strip-and-regenerate**
+(returning nothing, leaving that path's output byte-for-byte unchanged) on any
+unsupported case: a `Type0`/`Type3` (or unresolvable) active font; a simple font
+that is not `Type1`/`TrueType`/`MMType1`; a replacement the font cannot represent
+losslessly (Java's "a Standard-14 fallback would be needed" case); an encode
+failure; a glyph-count/cursor mismatch; text in an invoked Form XObject (its
+elements stay in the cursor and force a leftover-defer); or an interior-kerned
+multi-string `TJ`. The rewrite mutates a local content clone, so **any** deferral
+re-decodes the *original* stream — there is never a partial rewrite. Two apparent
+gaps are confirmed parity, not Rust shortfalls: (a) Java's `TextRunAccumulator`
+merges same-baseline kerned glyphs into one run with no kerning-gap check, so an
+interior-kerning run defers in both implementations; and (b) Java's partial-export
+path (`determineRegenerateMode` with `forceRegenerate=true`) also always
+regenerates, so the cached `partial/{jobId}` path always regenerating is parity.
+This **partially closes** the headline byte-parity gap; still open are
+`Type0`/`Type3`, interior-kerning-run rewrite, true Type3 glyph synthesis, and
+byte-parity for those deferred classes.
+
+**Deferred (font subsystem, later phases):** token-preserving in-place rewriting
+for the classes the fast path above still defers (`Type0`/`Type3` fonts, an
+interior-kerned multi-string `TJ`, invoked-Form text), plus Symbol/ZapfDingbats
+encodings, synthesizing new embedded/CID/Type3 fonts, and true glyph synthesis for
+characters representable by neither the restored font nor the Standard-14 fallback.
+The cached partial endpoint has the bounded regeneration
 path described below.
 
 The `PdfJsonCosValue` ↔ lopdf `Object` bridge (`cos_value_to_object`,
@@ -187,7 +228,9 @@ plain `X` mark for the checked state — not a byte-match for Java's own checkbo
 glyph, but a real mark instead of nothing for headless consumers.
 
 Page annotations are also exported. The JSON includes subtype, contents, rectangle,
-appearance state, color, flags, name, subject, author, and PDF date strings. Full
+appearance state, color, flags, name, subject, author, and ISO-8601 creation/modification
+date instants (the raw PDF `D:...` dates are converted on read and back to `D:...+00'00'`
+on JSON→PDF; see the metadata section above). Full
 responses additionally carry an annotation COS projection; `lightweight=true`
 omits that raw projection but retains the structured annotation fields. JSON→PDF
 creates fresh non-widget annotation objects and attaches them to their page. Widget
@@ -238,10 +281,10 @@ in place; untouched pages and document-level graph objects survive.
 ## Remaining editor capability
 
 Glyph-accurate `textElements` extraction (including Type3 outline geometry and CMap collections
-not available through the configured Poppler data paths), token-level rewriting in the
-full-document rebuild path (mixed-stream editing itself is ported — see
-`/api/v1/convert/text-editor/pdf` above — but always strips-and-regenerates rather than
-patching matched text tokens in place like Java's `rewriteTextOperators`), font-program
+not available through the configured Poppler data paths), token-preserving in-place rewriting for
+the classes the full-document fast path still defers (`Type0`/`Type3`, interior-kerned multi-string
+`TJ`, invoked-Form text — boundary-aligned simple-font `Tj`/`TJ` edits are now rewritten in place,
+see `/api/v1/convert/text-editor/pdf` above), font-program
 round-trip, complex inline filter parameters, DCT DeviceN images with more than four JPEG source components,
 and external ICC conversion for DCT CMYK images, and rich
 non-widget-annotation appearance streams
@@ -332,7 +375,12 @@ Calibrated
 fixtures cover CalGray gamma, a CalRGB D65 matrix, direct raw/DCT conversion, and reversed DCT
 `/Decode`. A two-colorant fixture proves DeviceN sample ordering and bilinear interpolation across a
 2×2 table. A four-component Adobe CMYK DCT fixture proves native-plane preservation, reversed
-per-component `/Decode`, DeviceN tint evaluation, and channel-count mismatch rejection. HTTP tests
+per-component `/Decode`, DeviceN tint evaluation, and channel-count mismatch rejection.
+Token-rewrite unit and HTTP tests prove a text-only simple-font `Tj`/single-string `TJ` edit is
+rewritten in place — the original `Td`/`Tm` positioning and `TJ` kerning survive, unedited runs stay
+byte-identical, and no generated `RustFont` is injected — while the rewrite defers wholesale (never
+partially) for a `Type0`/`Type3` font, an unrepresentable replacement, a font/cursor mismatch, an
+interior-kerned multi-string `TJ`, or a later-run encode failure. HTTP tests
 drive the lazy cache through complete content-stream replacement, bounded
 text/image regeneration over retained vectors, explicit empty text/annotation clearing, incomplete
 resource/annotation preservation, metadata/XMP updates, untouched-page/form survival, and cache

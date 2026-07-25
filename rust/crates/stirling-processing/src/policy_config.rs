@@ -3,10 +3,12 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt as _;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -15,11 +17,22 @@ use crate::{
     integration_config::{IntegrationConfigService, IntegrationFailure, mask_config, merge_config},
     policy_ledger::ProcessedLedger,
     security::{AuthContext, SecurityError, SecurityStore},
+    storage::StorageConfig,
 };
 
 const EDITOR_ID: &str = "editor";
 const EDITOR_TYPE: &str = "editor";
+const WEBHOOK_TYPE: &str = "webhook";
 const MAX_POLICY_JSON_BYTES: usize = 1024 * 1024;
+
+/// Reason key for an implied root backed by the local server file-storage
+/// directory. Surfaced verbatim to the admin UI so it can label each root,
+/// matching Java's `FolderAccessGuard.IMPLIED_SERVER_STORAGE`.
+const IMPLIED_SERVER_STORAGE: &str = "serverStorage";
+
+/// Reason key for an implied root backed by a pipeline watched folder,
+/// matching Java's `FolderAccessGuard.IMPLIED_WATCHED_FOLDER`.
+const IMPLIED_WATCHED_FOLDER: &str = "watchedFolder";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,6 +192,24 @@ struct DetailRow {
     value: String,
 }
 
+/// A Stirling-owned directory that is always permitted for folder automations
+/// regardless of `policies.allowedFolderRoots`, plus the reason key the admin UI
+/// uses to label it. Mirrors Java's `FolderAccessGuard.ImpliedRoot`.
+#[derive(Clone, Debug)]
+pub(crate) struct ImpliedFolderRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) reason: &'static str,
+}
+
+/// Read-only projection of an [`ImpliedFolderRoot`] for the admin endpoint,
+/// mirroring Java's `FolderAccessSettingsController.ImpliedFolderRoot` record
+/// (`{path, reason}` with the absolute path rendered as a string).
+#[derive(Debug, Serialize)]
+pub(crate) struct ImpliedFolderRootView {
+    path: String,
+    reason: &'static str,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum PolicyFailure {
     #[error("{0}")]
@@ -199,6 +230,7 @@ pub(crate) struct PolicyConfigService {
     integrations: Arc<IntegrationConfigService>,
     allowed_folder_roots: Arc<Vec<PathBuf>>,
     protected_config_root: PathBuf,
+    implied_folder_roots: Arc<Vec<ImpliedFolderRoot>>,
 }
 
 impl PolicyConfigService {
@@ -207,6 +239,7 @@ impl PolicyConfigService {
         integrations: Arc<IntegrationConfigService>,
         allowed_folder_roots: Vec<PathBuf>,
         protected_config_root: &Path,
+        implied_folder_roots: Vec<ImpliedFolderRoot>,
     ) -> Self {
         Self {
             store,
@@ -218,7 +251,31 @@ impl PolicyConfigService {
                     .collect(),
             ),
             protected_config_root: normalize_path(protected_config_root),
+            implied_folder_roots: Arc::new(implied_folder_roots),
         }
+    }
+
+    /// Admin-only read of the Stirling-owned directories always permitted for
+    /// folder automations, with a reason key for each. Mirrors Java's
+    /// `FolderAccessSettingsController.impliedFolderRoots` (`@PreAuthorize
+    /// hasRole('ADMIN')`), which is read-only and never editable here.
+    pub(crate) fn list_implied_folder_roots(
+        &self,
+        context: &AuthContext,
+    ) -> Result<Vec<ImpliedFolderRootView>, PolicyFailure> {
+        if !context.has_role("ROLE_ADMIN") {
+            return Err(PolicyFailure::Forbidden(
+                "Administrator role required".to_owned(),
+            ));
+        }
+        Ok(self
+            .implied_folder_roots
+            .iter()
+            .map(|root| ImpliedFolderRootView {
+                path: root.path.display().to_string(),
+                reason: root.reason,
+            })
+            .collect())
     }
 
     pub(crate) fn source_overview(
@@ -372,6 +429,7 @@ impl PolicyConfigService {
             .then(|| self.store.get_policy_source(&incoming.id))
             .transpose()?
             .flatten();
+        let is_create = existing.is_none();
         if let Some(existing) = &existing {
             if !Self::can_access_team(existing.team_id, context) {
                 return Err(PolicyFailure::NotFound(format!(
@@ -387,10 +445,40 @@ impl PolicyConfigService {
             incoming.owner = Some(context.username.clone());
             incoming.team_id = context.team_id;
         }
+        // Mirror WebhookInputSource.prepareOptionsForSave: a webhook source keeps
+        // its client-supplied credentials only when updating an existing source
+        // that already carries a non-blank webhookId; otherwise (create, or an
+        // update with no id) mint a fresh id + signing secret server-side so
+        // credentials can never be forged by the client.
+        if incoming.source_type == WEBHOOK_TYPE {
+            let has_id = incoming
+                .options
+                .get("webhookId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            // Java's `!(!isCreate && hasId)`, i.e. regenerate on create, or on an
+            // update that arrived without a usable webhookId.
+            if is_create || !has_id {
+                incoming
+                    .options
+                    .insert("webhookId".to_owned(), Value::String(new_webhook_id()));
+                incoming.options.insert(
+                    "signingSecret".to_owned(),
+                    Value::String(new_signing_secret()),
+                );
+            }
+        }
         self.validate_source(&incoming, context)?;
         validate_serialized_size(&incoming)?;
         self.store.save_policy_source(&incoming)?;
-        Ok(mask_source(incoming))
+        // Reveal-on-create: a freshly created webhook source returns its plaintext
+        // signing secret exactly once so the operator can copy it; every other
+        // response (updates, and all non-webhook sources) masks secrets.
+        if is_create && incoming.source_type == WEBHOOK_TYPE {
+            Ok(incoming)
+        } else {
+            Ok(mask_source(incoming))
+        }
     }
 
     pub(crate) fn delete_source(
@@ -552,6 +640,56 @@ impl PolicyConfigService {
             }
         }
         Ok(directories)
+    }
+
+    /// Whether `policy` references a webhook input source whose stored
+    /// `webhookId` equals `webhook_id`. Mirrors Java's
+    /// `WebhookTrigger.referencesWebhook`: it consults the raw source store
+    /// (`sourceStore.get`) with **no** team filter, because a webhook delivery is
+    /// authenticated by its signed id/secret rather than by any caller's team.
+    #[allow(
+        dead_code,
+        reason = "invoked by the public webhook-receiver route port (staged)"
+    )]
+    pub(crate) fn policy_references_webhook(
+        &self,
+        policy: &PolicyDefinition,
+        webhook_id: &str,
+    ) -> Result<bool, PolicyFailure> {
+        for source_id in &policy.source_ids {
+            let Some(source) = self.store.get_policy_source(source_id)? else {
+                continue;
+            };
+            if source.source_type == WEBHOOK_TYPE
+                && source.options.get("webhookId").and_then(Value::as_str) == Some(webhook_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolves the single persisted webhook source whose decrypted
+    /// `webhookId` option equals `webhook_id`, scanning **every** source with no
+    /// team scope. Mirrors Java's `WebhookReceiverController.findWebhookSource`
+    /// (`sourceStore.all()` filtered by `type == "webhook"` and a raw string
+    /// equality on the stored `webhookId`), because an inbound webhook delivery is
+    /// authenticated by its signed id/secret rather than by any caller's team.
+    ///
+    /// The returned source carries its **decrypted** options (including
+    /// `signingSecret`); the receiver must never log them.
+    pub(crate) fn find_webhook_source(
+        &self,
+        webhook_id: &str,
+    ) -> Result<Option<PolicySource>, PolicyFailure> {
+        for source in self.store.list_all_policy_sources()? {
+            if source.source_type == WEBHOOK_TYPE
+                && source.options.get("webhookId").and_then(Value::as_str) == Some(webhook_id)
+            {
+                return Ok(Some(source));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn get_source_for_run(
@@ -733,6 +871,7 @@ impl PolicyConfigService {
                 self.validate_folder_options(&source.options)?;
                 validate_folder_identity(&source.options)
             }
+            WEBHOOK_TYPE => validate_webhook_options(&source.options),
             value => Err(PolicyFailure::BadRequest(format!(
                 "unknown source type: {value}"
             ))),
@@ -783,6 +922,20 @@ impl PolicyConfigService {
                         .to_owned(),
                 ))
             }
+            "webhook" => {
+                for source_id in &policy.source_ids {
+                    let source = self
+                        .store
+                        .get_policy_source(source_id)?
+                        .filter(|source| Self::can_access_team(source.team_id, context));
+                    if source.is_some_and(|source| source.source_type == WEBHOOK_TYPE) {
+                        return Ok(());
+                    }
+                }
+                Err(PolicyFailure::BadRequest(
+                    "webhook trigger requires at least one webhook input source".to_owned(),
+                ))
+            }
             value => Err(PolicyFailure::BadRequest(format!(
                 "unknown trigger type: {value}"
             ))),
@@ -802,27 +955,12 @@ impl PolicyConfigService {
                 PolicyFailure::BadRequest("folder config requires a 'directory' option".to_owned())
             })?;
         let directory = normalize_path(Path::new(directory));
-        if directory.starts_with(&self.protected_config_root) {
-            return Err(PolicyFailure::BadRequest(
-                "folder may not point inside a protected Stirling directory".to_owned(),
-            ));
-        }
-        if self.allowed_folder_roots.is_empty() {
-            return Err(PolicyFailure::BadRequest(
-                "folder access is disabled; set policies.allowedFolderRoots to permit it"
-                    .to_owned(),
-            ));
-        }
-        if !self
-            .allowed_folder_roots
-            .iter()
-            .any(|root| directory.starts_with(root))
-        {
-            return Err(PolicyFailure::BadRequest(format!(
-                "folder '{}' is outside the allowed folder roots",
-                directory.display()
-            )));
-        }
+        folder_access_decision(
+            &directory,
+            &self.protected_config_root,
+            &self.implied_folder_roots,
+            &self.allowed_folder_roots,
+        )?;
         Ok(directory)
     }
 
@@ -889,6 +1027,51 @@ fn validate_folder_identity(options: &Map<String, Value>) -> Result<(), PolicyFa
     Err(PolicyFailure::BadRequest(
         "folder input 'identity' must be 'stat' or 'hash'".to_owned(),
     ))
+}
+
+/// Validates a webhook input source's stored options, mirroring Java's
+/// `WebhookConfig.from` (via `WebhookInputSource.validate`): a non-blank
+/// `webhookId` matching `WebhookIds.VALID_ID`, then a non-blank `signingSecret`.
+/// Error messages are kept byte-for-byte identical for parity with the Java
+/// oracle.
+fn validate_webhook_options(options: &Map<String, Value>) -> Result<(), PolicyFailure> {
+    let webhook_id = options
+        .get("webhookId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            PolicyFailure::BadRequest("webhook config requires a 'webhookId' option".to_owned())
+        })?;
+    // Fail closed: a (theoretically impossible) regex-compile failure rejects
+    // every id rather than waving it through.
+    if !webhook_id_regex().is_some_and(|regex| regex.is_match(webhook_id)) {
+        return Err(PolicyFailure::BadRequest(
+            "webhook config 'webhookId' has an invalid format".to_owned(),
+        ));
+    }
+    options
+        .get("signingSecret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            PolicyFailure::BadRequest("webhook config requires a 'signingSecret' option".to_owned())
+        })?;
+    Ok(())
+}
+
+/// Compiled-once `webhookId` format check, mirroring Java's
+/// `WebhookIds.VALID_ID = Pattern.compile("^[A-Za-z0-9_-]{16,128}$")`. The char
+/// class excludes newlines and callers trim before matching, so `^`/`$` anchor
+/// the whole (single-line) value exactly as Java's `Matcher.matches()` does.
+/// Returns `None` only if the (constant) pattern fails to compile, which the
+/// caller treats as an invalid id — matching the crate's `.ok()` regex idiom.
+fn webhook_id_regex() -> Option<&'static Regex> {
+    static WEBHOOK_ID_REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    WEBHOOK_ID_REGEX
+        .get_or_init(|| Regex::new(r"^[A-Za-z0-9_-]{16,128}$").ok())
+        .as_ref()
 }
 
 fn validate_schedule_options(options: &Map<String, Value>) -> Result<(), PolicyFailure> {
@@ -1132,6 +1315,98 @@ fn new_uuid_v4() -> String {
     )
 }
 
+/// Mints a fresh webhook id: 18 CSPRNG bytes rendered as URL-safe base64 with no
+/// padding (24 characters), mirroring Java's `WebhookIds.newWebhookId`
+/// (`randomToken(18)` through a `Base64.getUrlEncoder().withoutPadding()`).
+fn new_webhook_id() -> String {
+    let mut bytes = [0_u8; 18];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Mints a fresh webhook signing secret: 32 CSPRNG bytes rendered as URL-safe
+/// base64 with no padding (43 characters), mirroring Java's
+/// `WebhookIds.newSigningSecret` (`randomToken(32)`).
+fn new_signing_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Builds the Stirling-owned "implied" folder roots always permitted for folder
+/// automations regardless of `policies.allowedFolderRoots`, so they work out of
+/// the box. Mirrors Java's `FolderAccessGuard.impliedRoots`: the local server
+/// file-storage directory (when that provider is enabled with a non-blank base
+/// path) followed by each pipeline watched-folder directory, all normalized to
+/// absolute paths.
+pub(crate) fn implied_folder_roots(
+    storage: &StorageConfig,
+    watched_folders: &[PathBuf],
+) -> Vec<ImpliedFolderRoot> {
+    let mut roots = Vec::new();
+    if storage.enabled
+        && storage.provider.trim().eq_ignore_ascii_case("local")
+        && !storage.base_path.as_os_str().is_empty()
+    {
+        roots.push(ImpliedFolderRoot {
+            path: normalize_path(&storage.base_path),
+            reason: IMPLIED_SERVER_STORAGE,
+        });
+    }
+    for folder in watched_folders {
+        if folder.as_os_str().is_empty() {
+            continue;
+        }
+        roots.push(ImpliedFolderRoot {
+            path: normalize_path(folder),
+            reason: IMPLIED_WATCHED_FOLDER,
+        });
+    }
+    roots
+}
+
+/// Fail-closed folder-access decision shared by save-time and run-time folder
+/// validation. Mirrors the ordering of Java's `FolderAccessGuard.requirePermitted`
+/// (protected-root rejection → implied-root allowance → allowlist), so a folder
+/// automation targeting a watched-folder or server-storage path is permitted even
+/// when it is absent from `policies.allowedFolderRoots`. The `directory` and all
+/// roots must already be normalized to absolute paths.
+fn folder_access_decision(
+    directory: &Path,
+    protected_config_root: &Path,
+    implied_folder_roots: &[ImpliedFolderRoot],
+    allowed_folder_roots: &[PathBuf],
+) -> Result<(), PolicyFailure> {
+    if directory.starts_with(protected_config_root) {
+        return Err(PolicyFailure::BadRequest(
+            "folder may not point inside a protected Stirling directory".to_owned(),
+        ));
+    }
+    // Stirling-owned implied roots are always permitted, even with no configured
+    // allowlist, so automations work against them out of the box.
+    if implied_folder_roots
+        .iter()
+        .any(|root| directory.starts_with(&root.path))
+    {
+        return Ok(());
+    }
+    if allowed_folder_roots.is_empty() {
+        return Err(PolicyFailure::BadRequest(
+            "folder access is disabled; set policies.allowedFolderRoots to permit it".to_owned(),
+        ));
+    }
+    if !allowed_folder_roots
+        .iter()
+        .any(|root| directory.starts_with(root))
+    {
+        return Err(PolicyFailure::BadRequest(format!(
+            "folder '{}' is outside the allowed folder roots",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1155,8 +1430,57 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_uuid_v4, normalize_path};
-    use std::path::Path;
+    use super::{
+        ImpliedFolderRoot, PolicyFailure, folder_access_decision, implied_folder_roots,
+        new_signing_secret, new_uuid_v4, new_webhook_id, normalize_path, validate_webhook_options,
+        webhook_id_regex,
+    };
+    use crate::storage::{StorageConfig, StorageSharingConfig};
+    use serde_json::{Map, Value};
+    use std::path::{Path, PathBuf};
+
+    fn webhook_options(
+        webhook_id: Option<&str>,
+        signing_secret: Option<&str>,
+    ) -> Map<String, Value> {
+        let mut options = Map::new();
+        if let Some(webhook_id) = webhook_id {
+            options.insert("webhookId".to_owned(), Value::String(webhook_id.to_owned()));
+        }
+        if let Some(signing_secret) = signing_secret {
+            options.insert(
+                "signingSecret".to_owned(),
+                Value::String(signing_secret.to_owned()),
+            );
+        }
+        options
+    }
+
+    fn storage(enabled: bool, provider: &str, base_path: &str) -> StorageConfig {
+        StorageConfig {
+            enabled,
+            provider: provider.to_owned(),
+            base_path: PathBuf::from(base_path),
+            database_path: PathBuf::from("/srv/security.db"),
+            sharing: StorageSharingConfig {
+                enabled: false,
+                link_enabled: false,
+                email_enabled: false,
+                link_expiration_days: 3,
+            },
+            max_file_bytes: None,
+            max_user_bytes: None,
+            max_total_bytes: None,
+            max_upload_bytes: 0,
+        }
+    }
+
+    fn implied(path: &str, reason: &'static str) -> ImpliedFolderRoot {
+        ImpliedFolderRoot {
+            path: normalize_path(Path::new(path)),
+            reason,
+        }
+    }
 
     #[test]
     fn ids_are_rfc_4122_version_four_shape() {
@@ -1167,8 +1491,788 @@ mod tests {
     }
 
     #[test]
+    fn minted_webhook_credentials_match_java_lengths_and_alphabet() {
+        // WebhookIds.newWebhookId -> randomToken(18) -> URL-safe base64 no-pad = 24 chars.
+        let id = new_webhook_id();
+        assert_eq!(id.len(), 24);
+        // WebhookIds.newSigningSecret -> randomToken(32) -> URL-safe base64 no-pad = 43 chars.
+        let secret = new_signing_secret();
+        assert_eq!(secret.len(), 43);
+        // URL-safe base64-no-pad alphabet only: A-Za-z0-9-_ and never '=' padding.
+        let url_safe = |value: &str| {
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        };
+        assert!(url_safe(&id), "webhook id used a non-url-safe char: {id}");
+        assert!(
+            url_safe(&secret),
+            "signing secret used a non-url-safe char: {secret}"
+        );
+        // A freshly minted id always satisfies the stored-config format check, and a
+        // minted id + secret validate cleanly (24 chars is inside the 16..=128 bound).
+        assert!(webhook_id_regex().is_some_and(|regex| regex.is_match(&id)));
+        assert!(validate_webhook_options(&webhook_options(Some(&id), Some(&secret))).is_ok());
+        // Two mints are distinct (CSPRNG, not a fixed value).
+        assert_ne!(new_webhook_id(), new_webhook_id());
+        assert_ne!(new_signing_secret(), new_signing_secret());
+    }
+
+    #[test]
+    fn webhook_validation_mirrors_java_message_order() {
+        // Missing webhookId -> first failure, exact Java message.
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(None, Some("secret-value"))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config requires a 'webhookId' option"
+        ));
+        // Whitespace-only webhookId is treated as absent (Java trims then null-checks).
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(Some("   "), Some("secret-value"))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config requires a 'webhookId' option"
+        ));
+        // A non-string webhookId cannot satisfy the string format and reads as absent.
+        let mut numeric = Map::new();
+        numeric.insert("webhookId".to_owned(), Value::from(1234));
+        numeric.insert("signingSecret".to_owned(), Value::String("s".to_owned()));
+        assert!(matches!(
+            validate_webhook_options(&numeric),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config requires a 'webhookId' option"
+        ));
+        // Present but below the 16-char minimum -> invalid format.
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(Some("short-id"), Some("secret-value"))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config 'webhookId' has an invalid format"
+        ));
+        // Right length but a disallowed character (space) -> invalid format.
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(Some("abcdefghij klmnop"), Some("s"))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config 'webhookId' has an invalid format"
+        ));
+        // Valid id, but missing signingSecret -> third failure, exact Java message.
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(Some("abcdefghijklmnop"), None)),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config requires a 'signingSecret' option"
+        ));
+        // Valid id, but whitespace-only signingSecret is treated as absent.
+        assert!(matches!(
+            validate_webhook_options(&webhook_options(Some("abcdefghijklmnop"), Some("  "))),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config requires a 'signingSecret' option"
+        ));
+        // Fully valid: 16-char id + non-blank secret.
+        assert!(
+            validate_webhook_options(&webhook_options(Some("abcdefghijklmnop"), Some("s"))).is_ok()
+        );
+    }
+
+    #[test]
+    fn webhook_id_format_enforces_length_bounds_and_charset() {
+        let matches = |value: &str| webhook_id_regex().is_some_and(|regex| regex.is_match(value));
+        // Length bounds: 16 and 128 inclusive; 15 and 129 rejected.
+        assert!(matches(&"a".repeat(16)));
+        assert!(matches(&"a".repeat(128)));
+        assert!(!matches(&"a".repeat(15)));
+        assert!(!matches(&"a".repeat(129)));
+        // Full permitted charset (A-Za-z0-9_-) accepted.
+        assert!(matches("AZaz09_-AZaz09_-"));
+        // A disallowed char anywhere is rejected even at a valid length.
+        assert!(!matches("abcdefghijklmno."));
+        // Anchored end-to-end: an otherwise-valid token with a trailing newline
+        // must not match (guards against `$`'s before-final-newline behaviour).
+        assert!(!matches("abcdefghijklmnop\n"));
+    }
+
+    #[test]
     fn lexical_path_normalization_removes_dot_segments() {
         let normalized = normalize_path(Path::new("/srv/inbox/../outbox/./file"));
         assert_eq!(normalized, Path::new("/srv/outbox/file"));
+    }
+
+    #[test]
+    fn implied_roots_add_local_server_storage_and_every_watched_folder() {
+        let watched = vec![
+            PathBuf::from("/srv/watched/one"),
+            PathBuf::from("/srv/watched/../watched/two/."),
+        ];
+        let roots = implied_folder_roots(&storage(true, "local", "/srv/store/./data"), &watched);
+        assert_eq!(roots.len(), 3);
+        // Server storage is first and normalized to an absolute path.
+        assert_eq!(roots[0].path, Path::new("/srv/store/data"));
+        assert_eq!(roots[0].reason, "serverStorage");
+        assert_eq!(roots[1].path, Path::new("/srv/watched/one"));
+        assert_eq!(roots[1].reason, "watchedFolder");
+        // Lexical `..`/`.` segments in a watched folder are normalized too.
+        assert_eq!(roots[2].path, Path::new("/srv/watched/two"));
+        assert_eq!(roots[2].reason, "watchedFolder");
+    }
+
+    #[test]
+    fn implied_roots_skip_server_storage_unless_enabled_and_local() {
+        // Disabled storage contributes no server-storage root.
+        assert!(implied_folder_roots(&storage(false, "local", "/srv/store"), &[]).is_empty());
+        // A non-local provider (e.g. S3) contributes no server-storage root.
+        assert!(implied_folder_roots(&storage(true, "s3", "/srv/store"), &[]).is_empty());
+        // A blank base path contributes no server-storage root.
+        assert!(implied_folder_roots(&storage(true, "local", ""), &[]).is_empty());
+        // Provider matching is case-insensitive, matching Java's equalsIgnoreCase.
+        let roots = implied_folder_roots(&storage(true, "LOCAL", "/srv/store"), &[]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].reason, "serverStorage");
+    }
+
+    #[test]
+    fn implied_roots_skip_blank_watched_folders() {
+        let watched = vec![PathBuf::new(), PathBuf::from("/srv/watched")];
+        let roots = implied_folder_roots(&storage(false, "local", ""), &watched);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, Path::new("/srv/watched"));
+    }
+
+    #[test]
+    fn folder_decision_rejects_paths_inside_the_protected_config_root() {
+        assert!(matches!(
+            folder_access_decision(
+                Path::new("/srv/configs/secrets"),
+                Path::new("/srv/configs"),
+                &[implied("/srv/store", "serverStorage")],
+                &[PathBuf::from("/srv/configs")],
+            ),
+            Err(PolicyFailure::BadRequest(message)) if message.contains("protected")
+        ));
+    }
+
+    #[test]
+    fn folder_decision_permits_implied_roots_even_with_no_allowlist() {
+        // Watched-folder path is permitted despite an empty allowlist (the paired
+        // parity fix: previously this returned "folder access is disabled").
+        assert!(
+            folder_access_decision(
+                Path::new("/srv/watched/inbox/report.pdf"),
+                Path::new("/srv/configs"),
+                &[implied("/srv/watched", "watchedFolder")],
+                &[],
+            )
+            .is_ok()
+        );
+        // A server-storage subtree is likewise permitted.
+        assert!(
+            folder_access_decision(
+                Path::new("/srv/store/user/1"),
+                Path::new("/srv/configs"),
+                &[implied("/srv/store", "serverStorage")],
+                &[],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn folder_decision_reports_disabled_access_when_nothing_permits_it() {
+        assert!(matches!(
+            folder_access_decision(
+                Path::new("/srv/elsewhere"),
+                Path::new("/srv/configs"),
+                &[implied("/srv/watched", "watchedFolder")],
+                &[],
+            ),
+            Err(PolicyFailure::BadRequest(message)) if message.contains("folder access is disabled")
+        ));
+    }
+
+    #[test]
+    fn folder_decision_enforces_the_configured_allowlist() {
+        let allowed = [PathBuf::from("/srv/allowed")];
+        // Outside every allowed root and every implied root.
+        assert!(matches!(
+            folder_access_decision(
+                Path::new("/srv/other/file"),
+                Path::new("/srv/configs"),
+                &[],
+                &allowed,
+            ),
+            Err(PolicyFailure::BadRequest(message)) if message.contains("outside the allowed folder roots")
+        ));
+        // Inside an allowed root is permitted.
+        assert!(
+            folder_access_decision(
+                Path::new("/srv/allowed/sub"),
+                Path::new("/srv/configs"),
+                &[],
+                &allowed,
+            )
+            .is_ok()
+        );
+    }
+
+    // TESTER: parity coverage for the endpoint method (not just the free fn) —
+    // FolderAccessSettingsController.impliedFolderRoots is @PreAuthorize
+    // hasRole('ADMIN') and projects each ImpliedRoot to {path, reason} with an
+    // absolute path string.
+    #[test]
+    fn implied_roots_endpoint_is_admin_only_and_projects_path_and_reason()
+    -> Result<(), PolicyFailure> {
+        use super::PolicyConfigService;
+        use crate::integration_config::IntegrationConfigService;
+        use crate::resource_access::DefaultAccessPolicy;
+        use crate::security::{AuthContext, AuthenticationSource, SecurityStore};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        fn ctx<const N: usize>(roles: [&str; N]) -> AuthContext {
+            AuthContext {
+                user_id: 1,
+                username: "user".to_owned(),
+                authentication_source: AuthenticationSource::AccessToken,
+                authentication_type: "web".to_owned(),
+                roles: roles
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>(),
+                team_id: Some(1),
+                permissions: BTreeSet::new(),
+                external_subject: None,
+                force_password_change: false,
+                session_id: "session".to_owned(),
+                correlation_id: "request".to_owned(),
+            }
+        }
+
+        let store = Arc::new(SecurityStore::in_memory()?);
+        let integrations = Arc::new(IntegrationConfigService::new(
+            Arc::clone(&store),
+            DefaultAccessPolicy::ExplicitOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        let service = PolicyConfigService::new(
+            store,
+            integrations,
+            Vec::new(),
+            Path::new("/srv/configs"),
+            vec![
+                implied("/srv/store", "serverStorage"),
+                implied("/srv/watched", "watchedFolder"),
+            ],
+        );
+
+        // Non-admin is refused (maps to HTTP 403 via policy_error).
+        assert!(matches!(
+            service.list_implied_folder_roots(&ctx(["ROLE_USER"])),
+            Err(PolicyFailure::Forbidden(_))
+        ));
+
+        // Admin sees each implied root projected as {path, reason}, absolute,
+        // in insertion order (server storage first, then watched folders).
+        let view = service.list_implied_folder_roots(&ctx(["ROLE_ADMIN"]))?;
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0].path, "/srv/store");
+        assert_eq!(view[0].reason, "serverStorage");
+        assert!(Path::new(&view[0].path).is_absolute());
+        assert_eq!(view[1].path, "/srv/watched");
+        assert_eq!(view[1].reason, "watchedFolder");
+        assert!(Path::new(&view[1].path).is_absolute());
+        Ok(())
+    }
+
+    // ---- TESTER: service-level webhook save/get round-trip parity ----
+    // These cover SourceController.save's ordering (resolveOwnership ->
+    // withStoredSecrets(merge) -> withPreparedOptions(mint/regen) -> validate ->
+    // save -> revealOnCreate) plus SecretMasker mask/restore, which the free-fn
+    // tests above cannot reach.
+
+    fn webhook_admin_context() -> crate::security::AuthContext {
+        crate::security::AuthContext {
+            user_id: 1,
+            username: "admin".to_owned(),
+            authentication_source: crate::security::AuthenticationSource::AccessToken,
+            authentication_type: "web".to_owned(),
+            roles: ["ROLE_ADMIN"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>(),
+            team_id: Some(1),
+            permissions: std::collections::BTreeSet::new(),
+            external_subject: None,
+            force_password_change: false,
+            session_id: "session".to_owned(),
+            correlation_id: "request".to_owned(),
+        }
+    }
+
+    fn webhook_service(
+        store: std::sync::Arc<crate::security::SecurityStore>,
+    ) -> super::PolicyConfigService {
+        let integrations =
+            std::sync::Arc::new(crate::integration_config::IntegrationConfigService::new(
+                std::sync::Arc::clone(&store),
+                crate::resource_access::DefaultAccessPolicy::ExplicitOnly,
+                false,
+                false,
+                false,
+                false,
+            ));
+        super::PolicyConfigService::new(
+            store,
+            integrations,
+            Vec::new(),
+            Path::new("/srv/configs"),
+            Vec::new(),
+        )
+    }
+
+    fn webhook_source_input(id: &str, options: Map<String, Value>) -> super::PolicySource {
+        super::PolicySource {
+            id: id.to_owned(),
+            name: "Inbound hook".to_owned(),
+            source_type: "webhook".to_owned(),
+            options,
+            enabled: true,
+            owner: None,
+            team_id: None,
+        }
+    }
+
+    fn option_str(source: &super::PolicySource, key: &str) -> Option<String> {
+        source
+            .options
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    fn masked_options(webhook_id: &str) -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("webhookId".to_owned(), Value::String(webhook_id.to_owned()));
+        options.insert(
+            "signingSecret".to_owned(),
+            Value::String("********".to_owned()),
+        );
+        options
+    }
+
+    #[test]
+    fn webhook_create_reveals_pair_get_masks_secret_and_merge_preserves_it()
+    -> Result<(), PolicyFailure> {
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        // Create: the server mints the pair and the response reveals BOTH in the
+        // clear exactly once (revealOnCreate), never the mask.
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let (Some(real_id), Some(real_secret)) = (
+            option_str(&created, "webhookId"),
+            option_str(&created, "signingSecret"),
+        ) else {
+            return Err(PolicyFailure::BadRequest(
+                "create dropped webhook credentials".to_owned(),
+            ));
+        };
+        assert_ne!(
+            real_secret, "********",
+            "create must reveal the real signing secret"
+        );
+        assert_eq!(real_id.len(), 24);
+        assert_eq!(real_secret.len(), 43);
+        assert!(
+            validate_webhook_options(&webhook_options(Some(&real_id), Some(&real_secret))).is_ok()
+        );
+        let source_id = created.id.clone();
+
+        // An immediate get masks the signingSecret but keeps the webhookId plaintext.
+        let fetched = service.get_source(&source_id, &ctx)?;
+        assert_eq!(
+            option_str(&fetched, "webhookId").as_deref(),
+            Some(real_id.as_str())
+        );
+        assert_eq!(
+            option_str(&fetched, "signingSecret").as_deref(),
+            Some("********")
+        );
+
+        // The persisted (decrypted) secret is the real one — the mask was a view.
+        let persisted = service.get_source_for_run(&source_id, &ctx)?;
+        assert_eq!(
+            option_str(&persisted, "signingSecret").as_deref(),
+            Some(real_secret.as_str())
+        );
+
+        // ADVERSARIAL: an update that posts the MASK back with the real webhookId
+        // must preserve the stored secret via merge_config and never persist the
+        // sentinel. Response for an update is masked (reveal only on create).
+        let mut update = webhook_source_input(&source_id, masked_options(&real_id));
+        update.name = "Renamed hook".to_owned();
+        let updated = service.save_source(update, &ctx)?;
+        assert_eq!(
+            option_str(&updated, "signingSecret").as_deref(),
+            Some("********")
+        );
+        assert_eq!(
+            option_str(&updated, "webhookId").as_deref(),
+            Some(real_id.as_str())
+        );
+        let after = service.get_source_for_run(&source_id, &ctx)?;
+        assert_eq!(
+            option_str(&after, "signingSecret").as_deref(),
+            Some(real_secret.as_str())
+        );
+        assert_eq!(after.name, "Renamed hook");
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_update_without_id_regenerates_pair_but_normal_update_keeps_it()
+    -> Result<(), PolicyFailure> {
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let source_id = created.id.clone();
+        let first = service.get_source_for_run(&source_id, &ctx)?;
+        let (Some(id1), Some(secret1)) = (
+            option_str(&first, "webhookId"),
+            option_str(&first, "signingSecret"),
+        ) else {
+            return Err(PolicyFailure::BadRequest("missing initial pair".to_owned()));
+        };
+
+        // Update carrying NO webhookId (only a masked secret) => regenerate a fresh
+        // pair server-side (prepareOptionsForSave with hasId == false).
+        let mut opts = Map::new();
+        opts.insert(
+            "signingSecret".to_owned(),
+            Value::String("********".to_owned()),
+        );
+        service.save_source(webhook_source_input(&source_id, opts), &ctx)?;
+        let regen = service.get_source_for_run(&source_id, &ctx)?;
+        let (Some(id2), Some(secret2)) = (
+            option_str(&regen, "webhookId"),
+            option_str(&regen, "signingSecret"),
+        ) else {
+            return Err(PolicyFailure::BadRequest(
+                "regen dropped the pair".to_owned(),
+            ));
+        };
+        assert_ne!(id1, id2, "no-id update must mint a fresh webhookId");
+        assert_ne!(
+            secret1, secret2,
+            "no-id update must mint a fresh signingSecret"
+        );
+        assert!(validate_webhook_options(&webhook_options(Some(&id2), Some(&secret2))).is_ok());
+
+        // Normal update WITH the current id + masked secret keeps the pair intact.
+        service.save_source(webhook_source_input(&source_id, masked_options(&id2)), &ctx)?;
+        let kept = service.get_source_for_run(&source_id, &ctx)?;
+        assert_eq!(
+            option_str(&kept, "webhookId").as_deref(),
+            Some(id2.as_str())
+        );
+        assert_eq!(
+            option_str(&kept, "signingSecret").as_deref(),
+            Some(secret2.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_rejects_directory_traversal_characters_in_webhook_id() -> Result<(), PolicyFailure> {
+        // The regex is the spool's traversal guard: '.', '/', '\' are outside
+        // [A-Za-z0-9_-] and must be rejected with the exact invalid-format message.
+        for bad in [
+            "abcdefghij.klmnop",
+            "abcdefghij/klmnop",
+            "abcdefghij\\klmnop",
+            "../../secrets/xx",
+        ] {
+            assert!(
+                matches!(
+                    validate_webhook_options(&webhook_options(Some(bad), Some("secret"))),
+                    Err(PolicyFailure::BadRequest(message))
+                        if message == "webhook config 'webhookId' has an invalid format"
+                ),
+                "expected {bad} rejected as invalid format"
+            );
+        }
+
+        // End-to-end: an UPDATE that supplies a present-but-malicious webhookId is
+        // NOT regenerated (hasId is true) and must be rejected by validate_source
+        // before anything is persisted.
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let source_id = created.id.clone();
+        let mut opts = Map::new();
+        opts.insert(
+            "webhookId".to_owned(),
+            Value::String("../../secrets/xx".to_owned()),
+        );
+        opts.insert(
+            "signingSecret".to_owned(),
+            Value::String("real-secret".to_owned()),
+        );
+        assert!(matches!(
+            service.save_source(webhook_source_input(&source_id, opts), &ctx),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook config 'webhookId' has an invalid format"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_signing_secret_is_encrypted_at_rest_never_plaintext()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("security.db");
+        let store = std::sync::Arc::new(crate::security::SecurityStore::open_protected(
+            &database,
+            crate::security_crypto::ProtectedSecretCipher::random(),
+        )?);
+        let service = webhook_service(std::sync::Arc::clone(&store));
+        let ctx = webhook_admin_context();
+
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let source_id = created.id.clone();
+        let Some(real_secret) = option_str(&created, "signingSecret") else {
+            return Err("create dropped signingSecret".into());
+        };
+
+        // The raw on-disk column must NOT contain the plaintext secret nor even the
+        // option keys — the whole source_json is inside the encrypted blob.
+        let raw = rusqlite::Connection::open(&database)?;
+        let stored: String = raw.query_row(
+            "SELECT source_json FROM policy_sources WHERE id = ?1",
+            [&source_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !stored.contains(&real_secret),
+            "signing secret leaked to disk in plaintext"
+        );
+        assert!(
+            !stored.contains("signingSecret"),
+            "option keys leaked to disk in plaintext"
+        );
+
+        // ...yet it round-trips back to the real secret through the cipher.
+        let persisted = service.get_source_for_run(&source_id, &ctx)?;
+        assert_eq!(
+            option_str(&persisted, "signingSecret").as_deref(),
+            Some(real_secret.as_str())
+        );
+        Ok(())
+    }
+
+    // ---- TESTER (WB): webhook TRIGGER validation + delivery reference matching ----
+    // Parity target: WebhookTrigger.validate (requires a webhook source) and
+    // WebhookTrigger.referencesWebhook / fireForWebhook's policy selection
+    // (findByTriggerType(TYPE) + referencesWebhook by stored webhookId).
+
+    fn webhook_policy_input(source_ids: Vec<String>, enabled: bool) -> super::PolicyDefinition {
+        super::PolicyDefinition {
+            id: String::new(),
+            name: "Inbound pipeline".to_owned(),
+            owner: None,
+            enabled,
+            trigger: Some(super::TriggerConfig {
+                trigger_type: "webhook".to_owned(),
+                options: Map::new(),
+            }),
+            source_ids,
+            steps: Vec::new(),
+            output: super::OutputSpec::default(),
+            team_id: None,
+        }
+    }
+
+    #[test]
+    fn webhook_trigger_requires_a_webhook_input_source() -> Result<(), PolicyFailure> {
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        // No input sources at all: the webhook arm finds nothing to accept and
+        // rejects with the exact Java message (WebhookTrigger.validate).
+        assert!(matches!(
+            service.save_policy(webhook_policy_input(Vec::new(), true), &ctx),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook trigger requires at least one webhook input source"
+        ));
+
+        // A webhook input source flips the same policy to valid (success arm).
+        let source = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let saved =
+            service.save_policy(webhook_policy_input(vec![source.id.clone()], true), &ctx)?;
+        assert_eq!(saved.source_ids, vec![source.id]);
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_trigger_rejects_a_source_from_another_team() -> Result<(), PolicyFailure> {
+        // validate_trigger filters candidate sources through can_access_team, so a
+        // webhook source owned by a different team cannot satisfy the requirement.
+        // Exercised directly (save_policy's own source-ownership pre-check would
+        // otherwise reject the foreign source before the trigger arm is reached).
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(std::sync::Arc::clone(&store));
+        let ctx = webhook_admin_context();
+        let source = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+
+        // Re-persist the same source under a foreign team directly in the store.
+        let mut foreign = store
+            .get_policy_source(&source.id)?
+            .ok_or_else(|| PolicyFailure::BadRequest("source vanished".to_owned()))?;
+        foreign.team_id = Some(999);
+        store.save_policy_source(&foreign)?;
+
+        let policy = webhook_policy_input(vec![source.id], true);
+        assert!(matches!(
+            service.validate_trigger(&policy, &ctx),
+            Err(PolicyFailure::BadRequest(message))
+                if message == "webhook trigger requires at least one webhook input source"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn policy_references_webhook_matches_only_the_delivered_id() -> Result<(), PolicyFailure> {
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let real_id = option_str(&created, "webhookId")
+            .ok_or_else(|| PolicyFailure::BadRequest("create dropped webhookId".to_owned()))?;
+        let policy =
+            service.save_policy(webhook_policy_input(vec![created.id.clone()], true), &ctx)?;
+
+        // The delivered id matches (no team filter — a delivery is authenticated by
+        // its signed id, mirroring referencesWebhook via sourceStore.get).
+        assert!(service.policy_references_webhook(&policy, &real_id)?);
+        // A different id never matches (ignoresADeliveryForAnUnknownWebhookId).
+        assert!(!service.policy_references_webhook(&policy, "whkZ-unknown-000000")?);
+        // A dangling source id references nothing rather than erroring.
+        let dangling = webhook_policy_input(vec!["no-such-source".to_owned()], true);
+        assert!(!service.policy_references_webhook(&dangling, &real_id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn find_webhook_source_scans_all_sources_and_returns_the_decrypted_secret()
+    -> Result<(), PolicyFailure> {
+        // Parity with WebhookReceiverController.findWebhookSource: scan every
+        // persisted source (no team filter), match type == "webhook" and the raw
+        // stored webhookId, and hand back DECRYPTED options so the receiver can
+        // read signingSecret. A disabled source is still resolvable — the receiver
+        // itself decides how to treat `enabled`.
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        // A non-webhook decoy plus the real webhook source.
+        let created = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let real_id = option_str(&created, "webhookId")
+            .ok_or_else(|| PolicyFailure::BadRequest("create dropped webhookId".to_owned()))?;
+        let real_secret = option_str(&created, "signingSecret")
+            .ok_or_else(|| PolicyFailure::BadRequest("create dropped secret".to_owned()))?;
+
+        let found = service
+            .find_webhook_source(&real_id)?
+            .ok_or_else(|| PolicyFailure::NotFound("webhook source not found".to_owned()))?;
+        assert_eq!(found.source_type, "webhook");
+        assert_eq!(
+            option_str(&found, "webhookId").as_deref(),
+            Some(real_id.as_str())
+        );
+        // The DECRYPTED secret is returned (never the "********" get-mask).
+        assert_eq!(
+            option_str(&found, "signingSecret").as_deref(),
+            Some(real_secret.as_str())
+        );
+
+        // An unknown id resolves to nothing rather than erroring.
+        assert!(
+            service
+                .find_webhook_source("whkZ-unknown-000000")?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn policies_for_trigger_returns_only_enabled_webhook_policies() -> Result<(), PolicyFailure> {
+        // fireForWebhook / the reconcile loop iterate policies_for_trigger("webhook"),
+        // which must be enabled-only (findByTriggerTypeAndEnabledTrue) and exclude
+        // other trigger types.
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        let source = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let enabled =
+            service.save_policy(webhook_policy_input(vec![source.id.clone()], true), &ctx)?;
+        // A disabled webhook policy still validates but must not be fired.
+        service.save_policy(webhook_policy_input(vec![source.id], false), &ctx)?;
+
+        let fired = service.policies_for_trigger("webhook")?;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].id, enabled.id);
+        // A non-webhook trigger type returns none of them.
+        assert!(service.policies_for_trigger("schedule")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn every_enabled_policy_sharing_a_webhook_id_is_selected_and_matches()
+    -> Result<(), PolicyFailure> {
+        // Models fire_for_webhook's fan-out: it dispatches EVERY enabled webhook
+        // policy that referencesWebhook(id). Two enabled policies bound to the same
+        // webhook source must BOTH be selected (policies_for_trigger, enabled-only)
+        // AND both reference-match the delivered id, while a disabled third policy on
+        // the identical webhook is silently dropped (never fired). Parity with
+        // WebhookTrigger.fireForWebhook over findByTriggerTypeAndEnabledTrue.
+        let store = std::sync::Arc::new(crate::security::SecurityStore::in_memory()?);
+        let service = webhook_service(store);
+        let ctx = webhook_admin_context();
+
+        let source = service.save_source(webhook_source_input("", Map::new()), &ctx)?;
+        let real_id = option_str(&source, "webhookId")
+            .ok_or_else(|| PolicyFailure::BadRequest("create dropped webhookId".to_owned()))?;
+
+        let first =
+            service.save_policy(webhook_policy_input(vec![source.id.clone()], true), &ctx)?;
+        let second =
+            service.save_policy(webhook_policy_input(vec![source.id.clone()], true), &ctx)?;
+        // A disabled sibling on the SAME webhook id: enabled-only selection excludes it
+        // even though it would reference-match, so it can never be dispatched.
+        let disabled = service.save_policy(webhook_policy_input(vec![source.id], false), &ctx)?;
+
+        let selected = service.policies_for_trigger("webhook")?;
+        let selected_ids = selected
+            .iter()
+            .map(|policy| policy.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(selected.len(), 2, "only the two enabled policies are fired");
+        assert!(selected_ids.contains(&first.id));
+        assert!(selected_ids.contains(&second.id));
+        assert!(
+            !selected_ids.contains(&disabled.id),
+            "disabled webhook policy must never be selected for dispatch"
+        );
+        // Both selected policies reference-match the delivered id, so fire_for_webhook
+        // would dispatch each of them (no team scope — raw source-store lookup).
+        for policy in &selected {
+            assert!(service.policy_references_webhook(policy, &real_id)?);
+        }
+        Ok(())
     }
 }

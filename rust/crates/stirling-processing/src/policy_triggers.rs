@@ -24,6 +24,7 @@ use crate::{
 
 const SCHEDULE_TRIGGER: &str = "schedule";
 const FOLDER_WATCH_TRIGGER: &str = "folder-watch";
+const WEBHOOK_TRIGGER: &str = "webhook";
 
 #[derive(Clone, Default)]
 pub(crate) struct PolicyChangeNotifier {
@@ -67,8 +68,13 @@ impl PolicyTriggerRuntime {
 
     pub(crate) async fn run_forever(self) {
         let schedule = self.clone();
-        let folder_watch = self;
-        tokio::join!(schedule.run_schedule_loop(), folder_watch.run_folder_loop());
+        let folder_watch = self.clone();
+        let webhook = self;
+        tokio::join!(
+            schedule.run_schedule_loop(),
+            folder_watch.run_folder_loop(),
+            webhook.run_webhook_loop(),
+        );
     }
 
     async fn run_schedule_loop(self) {
@@ -310,6 +316,75 @@ impl PolicyTriggerRuntime {
         }
     }
 
+    async fn run_webhook_loop(self) {
+        // Immediate startup catch-up sweep, mirroring run_folder_loop and Java's
+        // WebhookTrigger.start (scheduleAtFixedRate(safeReconcile, 0, reconcileSeconds)
+        // fires its first FULL reconcile at t=0). Without this the first reconcile
+        // would be deferred a whole watch_reconcile interval, defeating its purpose.
+        self.run_all_webhook_policies().await;
+        let mut reconcile = interval_at(
+            Instant::now() + self.settings.watch_reconcile,
+            self.settings.watch_reconcile,
+        );
+        reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        info!(
+            seconds = self.settings.watch_reconcile.as_secs(),
+            "policy webhook trigger started"
+        );
+        loop {
+            reconcile.tick().await;
+            self.run_all_webhook_policies().await;
+        }
+    }
+
+    async fn run_all_webhook_policies(&self) {
+        let policies = match self.config.policies_for_trigger(WEBHOOK_TRIGGER) {
+            Ok(policies) => policies,
+            Err(failure) => {
+                warn!(%failure, "could not list webhook policies for reconciliation");
+                return;
+            }
+        };
+        for policy in policies {
+            if let Err(failure) = self.dispatch(&policy, SweepKind::Full).await {
+                warn!(policy_id = %policy.id, %failure, "webhook reconcile run failed");
+            }
+        }
+    }
+
+    /// Fires every enabled webhook-triggered policy that references the delivered
+    /// `webhook_id`, mirroring Java's `WebhookTrigger.fireForWebhook`
+    /// (`findByTriggerType` → `referencesWebhook` → light run). Every per-policy
+    /// error is logged and swallowed so a single broken policy can never fail the
+    /// caller's webhook-delivery response nor block the other policies.
+    #[allow(
+        dead_code,
+        reason = "invoked by the public webhook-receiver route port (staged)"
+    )]
+    pub(crate) async fn fire_for_webhook(&self, webhook_id: &str) {
+        let policies = match self.config.policies_for_trigger(WEBHOOK_TRIGGER) {
+            Ok(policies) => policies,
+            Err(failure) => {
+                warn!(%failure, "could not list webhook policies for delivery");
+                return;
+            }
+        };
+        for policy in policies {
+            match self.config.policy_references_webhook(&policy, webhook_id) {
+                Ok(true) => {
+                    debug!(policy_id = %policy.id, policy_name = %policy.name, "webhook policy saw a delivery");
+                    if let Err(failure) = self.dispatch(&policy, SweepKind::Light).await {
+                        warn!(policy_id = %policy.id, %failure, "webhook policy run failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(failure) => {
+                    warn!(policy_id = %policy.id, %failure, "could not evaluate webhook policy references");
+                }
+            }
+        }
+    }
+
     async fn dispatch(
         &self,
         policy: &PolicyDefinition,
@@ -344,6 +419,11 @@ pub(crate) fn trigger_metadata() -> Vec<TriggerInfo> {
             trigger_type: SCHEDULE_TRIGGER,
             requires_source: false,
             supported_source_types: Vec::new(),
+        },
+        TriggerInfo {
+            trigger_type: WEBHOOK_TRIGGER,
+            requires_source: true,
+            supported_source_types: vec!["webhook"],
         },
     ]
 }
@@ -670,7 +750,21 @@ enum TriggerFailure {
 mod tests {
     use jiff::Timestamp;
 
-    use super::{EveryUnit, Schedule, ScheduleConfig};
+    use super::{EveryUnit, Schedule, ScheduleConfig, WEBHOOK_TRIGGER, trigger_metadata};
+
+    #[test]
+    fn trigger_metadata_advertises_the_webhook_trigger() -> Result<(), Box<dyn std::error::Error>> {
+        // Surfaced verbatim on GET /api/v1/policies/triggers; parity with
+        // WebhookTrigger.requiresSource()/supportedSourceTypes() (Set.of("webhook")).
+        let metadata = trigger_metadata();
+        let webhook = metadata
+            .iter()
+            .find(|info| info.trigger_type == WEBHOOK_TRIGGER)
+            .ok_or("webhook trigger must be advertised")?;
+        assert!(webhook.requires_source);
+        assert_eq!(webhook.supported_source_types, vec!["webhook"]);
+        Ok(())
+    }
 
     fn millis(value: &str) -> Result<i64, Box<dyn std::error::Error>> {
         Ok(value.parse::<Timestamp>()?.as_millisecond())
