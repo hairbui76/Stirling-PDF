@@ -111,6 +111,7 @@ mod policy_triggers;
 mod portal_api_keys;
 mod portal_audit;
 mod process_executor;
+mod proprietary_external_api;
 mod proprietary_ui_data;
 mod purview;
 mod purview_http;

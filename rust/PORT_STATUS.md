@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **754 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **826 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -336,9 +336,16 @@ auto-rename/auto-split, plus:
 - `settings/update-enable-analytics` and `general/send-email` now honor `?async=true` (added to the
   async-job allowlist), matching Java's `@AutoJobPostMapping`. With these plus `admin-settings`, a
   systematic route cross-check finds no remaining bounded parity gap in the OSS-core + proprietary
-  `controller/api` route surface; what remains is the standing deferred-external set (SaaS/cloud, SAML2,
-  external-api/Consigno), upstream-blocked items (P-521 signing, Windows-cert async), the H2-only
-  `ui-data/database`, and unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity).
+  `controller/api` route surface. What remains: the standing deferred-external set (SaaS/cloud, SAML2),
+  upstream-blocked items (P-521 signing, Windows-cert async), the H2-only `ui-data/database`, and
+  unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
+  blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
+  of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
+  as a bounded staircase — slice 1 (pure request-construction + config primitives:
+  `proprietary_external_api.rs`) is landed and oracle-verified; slices 2–4 (document context/body
+  assembly, the SSRF-safe outbound caller + auth/token-login cache reusing the OIDC resolve-and-pin, and
+  response/verdict/result-URL/zip handling + route wiring) remain, and will cover ConsignO via the
+  generic `bodyTemplate`. See `contracts/resource-access-integrations.md`.
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
   Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
   app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the
