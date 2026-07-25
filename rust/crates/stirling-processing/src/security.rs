@@ -71,7 +71,7 @@ const SESSION_ID_PREFIX: &str = "spdf_sid_";
 const INVITE_TOKEN_PREFIX: &str = "spdf_inv_";
 const DEFAULT_TEAM_NAME: &str = "Default";
 pub(crate) const INTERNAL_TEAM_NAME: &str = "Internal";
-const INTERNAL_API_USERNAME: &str = "STIRLING-PDF-BACKEND-API-USER";
+pub(crate) const INTERNAL_API_USERNAME: &str = "STIRLING-PDF-BACKEND-API-USER";
 const MAX_TEAM_NAME_BYTES: usize = 100;
 const MAX_EXTERNAL_ISSUER_BYTES: usize = 2_048;
 const MAX_EXTERNAL_SUBJECT_BYTES: usize = 128;
@@ -2325,6 +2325,98 @@ impl SecurityStore {
         statement
             .query_map([team_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Returns the distinct usernames that currently hold a live session,
+    /// mirroring Java `SessionRepository.findActivePrincipalsSince(cutoff)`
+    /// (`expired = false AND lastRequest > cutoff`). The Rust session store
+    /// records no per-request `lastRequest` and no `expired` flag, so a session
+    /// is "live" when it is neither revoked nor past its refresh window at
+    /// `now` (`revoked_at IS NULL AND refresh_expires_at > now`) — the refresh
+    /// expiry is the Rust equivalent of Java's inactivity timeout. The `now`
+    /// argument is the cutoff the expiry must still exceed. See
+    /// [`Self::latest_session_activity_per_team`] for the shared `lastRequest`
+    /// parity note.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn active_principals_since(&self, now: i64) -> Result<Vec<String>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT u.username
+             FROM security_sessions s
+             JOIN security_users u ON u.user_id = s.user_id
+             WHERE s.revoked_at IS NULL AND s.refresh_expires_at > ?1
+             ORDER BY u.username COLLATE NOCASE",
+        )?;
+        statement
+            .query_map([now], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Returns `(username, latest_activity)` for every principal that has ever
+    /// held a session — the most recent session `created_at` (unix seconds) per
+    /// user. Mirrors Java `SessionRepository.findLatestRequestPerPrincipal`
+    /// (`MAX(lastRequest) GROUP BY principalName`); the Rust store records no
+    /// per-request `lastRequest`, so the latest session creation time stands in.
+    /// Users who have never held a session are absent (the admin projection
+    /// defaults them to epoch 0). No revoked/expired filter is applied, matching
+    /// the Java query, which aggregates over every session row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn latest_request_per_principal(&self) -> Result<Vec<(String, i64)>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT u.username, MAX(s.created_at)
+             FROM security_sessions s
+             JOIN security_users u ON u.user_id = s.user_id
+             GROUP BY u.user_id, u.username
+             ORDER BY u.username COLLATE NOCASE",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SecurityError::from)
+    }
+
+    /// Returns `(user_id, created_at, initial_setup_completed)` for every user,
+    /// supplying the two `security_users` columns the admin-settings roster
+    /// needs on top of [`Self::list_users`]: the account creation time and the
+    /// first-run marker. `created_at` is formatted as an ISO-8601 local
+    /// date-time string (`YYYY-MM-DDTHH:MM:SS`, UTC) to match the Jackson
+    /// serialization of Java `User.createdAt` (a `LocalDateTime`) the client
+    /// consumes; the admin projection maps `initial_setup_completed = 0` onto
+    /// Java's `isFirstLogin`. There is no `updated_at` column, so Java's
+    /// `updatedAt` has no analogue here (a documented divergence).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent state cannot be read.
+    pub fn admin_roster_lifecycle(&self) -> Result<Vec<(i64, String, bool)>, SecurityError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT user_id,
+                    strftime('%Y-%m-%dT%H:%M:%S', created_at, 'unixepoch'),
+                    initial_setup_completed
+             FROM security_users
+             ORDER BY user_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(SecurityError::from)
@@ -8243,6 +8335,109 @@ mod proprietary_ui_data_store_tests {
         )?;
         let after = store.latest_session_by_team(team_id)?;
         assert_eq!(after[0].1, Some(5_000));
+        Ok(())
+    }
+
+    #[test]
+    fn active_principals_reflect_live_non_revoked_sessions() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let admin = store.authenticate_password("admin", "admin-test-password", 1_000, "login")?;
+
+        // No sessions yet: nobody is active.
+        assert!(store.active_principals_since(1_000)?.is_empty());
+
+        // Issue a session at t=1_000 with the default (30-day refresh) window.
+        store.issue_session(
+            &admin,
+            1_000,
+            super::DEFAULT_ACCESS_TTL,
+            super::DEFAULT_REFRESH_TTL,
+        )?;
+
+        // Within the refresh window the principal is live even long after the
+        // 1-hour access token would have lapsed.
+        let one_day_later = 1_000 + 24 * 60 * 60;
+        assert_eq!(
+            store.active_principals_since(one_day_later)?,
+            vec!["admin".to_owned()]
+        );
+
+        // Past the refresh expiry the session is no longer live.
+        let refresh_expiry = 1_000 + i64::try_from(super::DEFAULT_REFRESH_TTL.as_secs())?;
+        assert!(
+            store
+                .active_principals_since(refresh_expiry + 1)?
+                .is_empty()
+        );
+
+        // A revoked session never counts as active, even inside its window.
+        store.revoke_user_sessions(admin.user_id, one_day_later)?;
+        assert!(store.active_principals_since(one_day_later)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn latest_request_per_principal_reports_max_session_creation() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let admin = store.authenticate_password("admin", "admin-test-password", 1_000, "login")?;
+
+        // No sessions → no principals reported (caller defaults them to 0).
+        assert!(store.latest_request_per_principal()?.is_empty());
+
+        // Two sessions: the newer creation time wins, even once it is revoked
+        // (the aggregate ignores revocation, matching the Java query).
+        store.issue_session(
+            &admin,
+            2_000,
+            super::DEFAULT_ACCESS_TTL,
+            super::DEFAULT_REFRESH_TTL,
+        )?;
+        store.issue_session(
+            &admin,
+            9_000,
+            super::DEFAULT_ACCESS_TTL,
+            super::DEFAULT_REFRESH_TTL,
+        )?;
+        store.revoke_user_sessions(admin.user_id, 10_000)?;
+        assert_eq!(
+            store.latest_request_per_principal()?,
+            vec![("admin".to_owned(), 9_000)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_roster_lifecycle_exposes_creation_and_setup_marker() -> TestResult {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "admin-test-password")?);
+        let admin_id = store
+            .list_users(0)?
+            .into_iter()
+            .find(|user| user.username == "admin")
+            .map(|user| user.id)
+            .ok_or("admin present")?;
+
+        let lifecycle = store.admin_roster_lifecycle()?;
+        let (_, created_at, initial_setup) = lifecycle
+            .into_iter()
+            .find(|(id, _, _)| *id == admin_id)
+            .ok_or("admin lifecycle row")?;
+        // A fresh admin has not completed initial setup (Java `isFirstLogin`).
+        assert!(!initial_setup);
+        // created_at is an ISO-8601 local date-time (no timezone/offset suffix).
+        assert_eq!(created_at.len(), "2026-07-25T12:34:56".len());
+        assert_eq!(created_at.as_bytes()[10], b'T');
+
+        // Completing setup flips the marker the projection reads.
+        store.complete_initial_setup(admin_id)?;
+        let updated = store.admin_roster_lifecycle()?;
+        let (_, _, setup_after) = updated
+            .into_iter()
+            .find(|(id, _, _)| *id == admin_id)
+            .ok_or("admin lifecycle row after setup")?;
+        assert!(setup_after);
         Ok(())
     }
 }
