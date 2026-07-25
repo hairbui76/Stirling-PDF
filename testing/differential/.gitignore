@@ -1,0 +1,7 @@
+# Generated multi-page fixtures (reproduced on demand from Ghostscript).
+_generated/
+# Python bytecode cache.
+__pycache__/
+*.pyc
+# Stirling backend watched-folder tree, if a backend is ever started from here.
+pipeline/
