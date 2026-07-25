@@ -97,6 +97,16 @@ const MAX_AUDIT_FORM_VALUE_CHARS: usize = 2_048;
 const REDACTED_AUDIT_FORM_VALUE: &str = "[REDACTED]";
 const MAX_AUDIT_POLICY_LABEL_CHARS: usize = 200;
 const MAX_AUDIT_POLICY_STEPS: usize = 50;
+// Portal personal API-key bounds, mirroring Java `ApiKeyManagementService` /
+// `ApiKeyHasher`.
+/// Non-secret leading fragment kept for display (Java `DISPLAY_PREFIX_LENGTH`).
+const API_KEY_DISPLAY_PREFIX_LEN: usize = 11;
+/// Caps active keys per user so key creation can't multiply rate-limit budget
+/// (Java `MAX_ACTIVE_KEYS_PER_USER`).
+const MAX_ACTIVE_API_KEYS_PER_USER: i64 = 50;
+/// Rolling window (days) for the portal "usage this month" figure
+/// (Java `MONTH_WINDOW_DAYS`).
+const API_KEY_MONTH_WINDOW_DAYS: i64 = 30;
 
 pub const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -152,6 +162,22 @@ pub struct SecurityTeam {
     pub id: i64,
     pub name: String,
     pub member_count: i64,
+}
+
+/// One personal API key as the portal Infrastructure → API Keys tab lists it.
+/// Never carries the secret; the plaintext is returned exactly once at creation.
+/// Usage figures are aggregated from `security_api_key_daily_usage`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiKeyRecord {
+    pub key_id: String,
+    pub name: String,
+    pub prefix: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub usage_today: i64,
+    pub usage_month: i64,
+    pub usage_total: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -765,6 +791,8 @@ pub enum SecurityError {
     TeamNotFound,
     #[error("security state conflicts with an existing record")]
     Conflict,
+    #[error("active API key limit reached")]
+    TooManyApiKeys,
     #[error("security user limit reached (allowed: {max_allowed}, available: {available_slots})")]
     UserLimitReached {
         max_allowed: i64,
@@ -2953,11 +2981,20 @@ impl SecurityStore {
     ) -> Result<Zeroizing<String>, SecurityError> {
         let token = random_secret(API_KEY_PREFIX);
         let key_id = random_secret("akid_");
+        let prefix = display_prefix(&token);
         let connection = self.lock()?;
         connection.execute(
-            "INSERT INTO security_api_keys (key_id, user_id, key_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![key_id.as_str(), user_id, token_digest(&token), now],
+            "INSERT INTO security_api_keys
+                 (key_id, user_id, key_hash, created_at, name, prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key_id.as_str(),
+                user_id,
+                token_digest(&token),
+                now,
+                "Default key",
+                prefix.as_str(),
+            ],
         )?;
         Ok(token)
     }
@@ -2998,6 +3035,7 @@ impl SecurityStore {
     ) -> Result<Zeroizing<String>, SecurityError> {
         let token = random_secret(API_KEY_PREFIX);
         let key_id = random_secret("akid_");
+        let prefix = display_prefix(&token);
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let user = find_user_by_id(&transaction, user_id)?.ok_or(SecurityError::UserNotFound)?;
@@ -3010,9 +3048,17 @@ impl SecurityStore {
             params![now, user_id],
         )?;
         transaction.execute(
-            "INSERT INTO security_api_keys (key_id, user_id, key_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![key_id.as_str(), user_id, token_digest(&token), now],
+            "INSERT INTO security_api_keys
+                 (key_id, user_id, key_hash, created_at, name, prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key_id.as_str(),
+                user_id,
+                token_digest(&token),
+                now,
+                "Default key",
+                prefix.as_str(),
+            ],
         )?;
         transaction.commit()?;
         Ok(token)
@@ -3050,6 +3096,9 @@ impl SecurityStore {
         let user = find_user_by_id(&connection, key.1)?
             .filter(|user| user.enabled)
             .ok_or(SecurityError::InvalidToken)?;
+        // Best-effort per-key usage accounting; a write failure here must never
+        // fail authentication (mirrors Java's async `ApiKeyUsageRecorder`).
+        record_api_key_usage(&connection, &key.0);
         context_for_user(
             &connection,
             &user,
@@ -3057,6 +3106,144 @@ impl SecurityStore {
             key.0,
             correlation_id,
         )
+    }
+
+    /// Lists the personal API keys the caller owns, newest first, with usage
+    /// aggregated from `security_api_key_daily_usage` in a single grouped query
+    /// (no per-key round trips). `today_epoch_day` is the UTC epoch day the
+    /// "today" and rolling-30-day windows are measured against.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when persistent state is unavailable.
+    pub fn list_api_keys(
+        &self,
+        user_id: i64,
+        today_epoch_day: i64,
+    ) -> Result<Vec<ApiKeyRecord>, SecurityError> {
+        let month_start = today_epoch_day.saturating_sub(API_KEY_MONTH_WINDOW_DAYS - 1);
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT k.key_id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at,
+                    COALESCE(SUM(CASE WHEN u.epoch_day = ?2 THEN u.count END), 0),
+                    COALESCE(SUM(CASE WHEN u.epoch_day >= ?3 THEN u.count END), 0),
+                    COALESCE(SUM(u.count), 0)
+             FROM security_api_keys k
+             LEFT JOIN security_api_key_daily_usage u ON u.key_id = k.key_id
+             WHERE k.user_id = ?1
+             GROUP BY k.key_id
+             ORDER BY k.created_at DESC, k.key_id DESC",
+        )?;
+        let records = statement
+            .query_map(params![user_id, today_epoch_day, month_start], |row| {
+                Ok(ApiKeyRecord {
+                    key_id: row.get(0)?,
+                    name: row.get(1)?,
+                    prefix: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_used_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                    usage_today: row.get(6)?,
+                    usage_month: row.get(7)?,
+                    usage_total: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Creates a named personal API key and returns its record plus the plaintext
+    /// secret exactly once. Only the digest, name and non-secret prefix are
+    /// persisted. Enforces the per-user active-key cap atomically so concurrent
+    /// creates cannot exceed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::TooManyApiKeys`] when the caller already owns the
+    /// maximum number of active keys, or a storage error when persistence is
+    /// unavailable.
+    pub fn create_named_api_key(
+        &self,
+        user_id: i64,
+        name: &str,
+        now: i64,
+    ) -> Result<(ApiKeyRecord, Zeroizing<String>), SecurityError> {
+        let token = random_secret(API_KEY_PREFIX);
+        let key_id = random_secret("akid_");
+        let prefix = display_prefix(&token);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active_owned: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM security_api_keys
+             WHERE user_id = ?1 AND revoked_at IS NULL",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        if active_owned >= MAX_ACTIVE_API_KEYS_PER_USER {
+            return Err(SecurityError::TooManyApiKeys);
+        }
+        transaction.execute(
+            "INSERT INTO security_api_keys
+                 (key_id, user_id, key_hash, created_at, name, prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key_id.as_str(),
+                user_id,
+                token_digest(&token),
+                now,
+                name,
+                prefix.as_str(),
+            ],
+        )?;
+        transaction.commit()?;
+        let record = ApiKeyRecord {
+            key_id: key_id.as_str().to_owned(),
+            name: name.to_owned(),
+            prefix,
+            created_at: now,
+            last_used_at: None,
+            revoked_at: None,
+            usage_today: 0,
+            usage_month: 0,
+            usage_total: 0,
+        };
+        Ok((record, token))
+    }
+
+    /// Soft-revokes a personal key the caller owns, returning whether a key was
+    /// found. An unknown key or a key owned by another user returns `Ok(false)`
+    /// (never distinguished, so a caller cannot probe other users' key ids); a
+    /// key the caller owns is stamped revoked idempotently and returns
+    /// `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when persistence is unavailable.
+    pub fn revoke_api_key(
+        &self,
+        user_id: i64,
+        key_id: &str,
+        now: i64,
+    ) -> Result<bool, SecurityError> {
+        let connection = self.lock()?;
+        let owner: Option<i64> = connection
+            .query_row(
+                "SELECT user_id FROM security_api_keys WHERE key_id = ?1",
+                [key_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Unknown or cross-user: report not-found without leaking existence.
+        if owner != Some(user_id) {
+            return Ok(false);
+        }
+        // Idempotent: re-revoking an already-revoked key keeps its first stamp.
+        connection.execute(
+            "UPDATE security_api_keys SET revoked_at = COALESCE(revoked_at, ?1)
+             WHERE key_id = ?2",
+            params![now, key_id],
+        )?;
+        Ok(true)
     }
 
     /// Persists a bounded event without any credential or token value.
@@ -5439,6 +5626,7 @@ fn initialize_connection(connection: &Connection) -> Result<(), SecurityError> {
     initialize_resource_access_schema(connection)?;
     initialize_user_security_schema(connection)?;
     migrate_audit_event_details(connection)?;
+    migrate_api_key_details(connection)?;
     migrate_force_password_change(connection)?;
     migrate_initial_setup_completed(connection)?;
     initialize_external_identity_schema(connection)?;
@@ -5845,6 +6033,48 @@ fn migrate_audit_event_details(connection: &Connection) -> Result<(), SecurityEr
              ON security_audit_events(event_type, source, created_at);
          CREATE INDEX IF NOT EXISTS security_audit_source_timestamp_principal_idx
              ON security_audit_events(source, created_at, principal);",
+    )?;
+    Ok(())
+}
+
+/// Adds the portal personal-API-key columns and the daily-usage table to an
+/// existing `security_api_keys` schema. Idempotent and column-guarded so it is
+/// safe on both fresh and previously-migrated databases: named keys carry a
+/// display `name`, a non-secret `prefix`, and a nullable `last_used_at`, and
+/// per-key request counts accumulate in `security_api_key_daily_usage`.
+fn migrate_api_key_details(connection: &Connection) -> Result<(), SecurityError> {
+    let columns = connection
+        .prepare("SELECT name FROM pragma_table_info('security_api_keys')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !columns.contains("name") {
+        connection.execute_batch(
+            "ALTER TABLE security_api_keys
+                 ADD COLUMN name TEXT NOT NULL DEFAULT 'Default key';",
+        )?;
+    }
+    if !columns.contains("prefix") {
+        connection.execute_batch(
+            "ALTER TABLE security_api_keys
+                 ADD COLUMN prefix TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !columns.contains("last_used_at") {
+        connection.execute_batch(
+            "ALTER TABLE security_api_keys
+                 ADD COLUMN last_used_at INTEGER;",
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS security_api_keys_owner_idx
+             ON security_api_keys(user_id, revoked_at);
+         CREATE TABLE IF NOT EXISTS security_api_key_daily_usage (
+             key_id TEXT NOT NULL
+                 REFERENCES security_api_keys(key_id) ON DELETE CASCADE,
+             epoch_day INTEGER NOT NULL,
+             count INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (key_id, epoch_day)
+         );",
     )?;
     Ok(())
 }
@@ -6344,6 +6574,35 @@ fn token_digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+/// Non-secret leading fragment of a raw key shown in listings (mirrors Java
+/// `ApiKeyHasher.displayPrefix`): the first [`API_KEY_DISPLAY_PREFIX_LEN`]
+/// characters, or the whole value when shorter. Character-based so it never
+/// splits a UTF-8 boundary.
+fn display_prefix(token: &str) -> String {
+    token.chars().take(API_KEY_DISPLAY_PREFIX_LEN).collect()
+}
+
+/// Best-effort per-key usage accounting for a successful API-key authentication:
+/// bumps today's tally (UTC epoch day, matching `list_api_keys`) and stamps
+/// last-used. Every error is swallowed so a usage-write failure can never fail
+/// or roll back authentication, mirroring Java's async `ApiKeyUsageRecorder`.
+fn record_api_key_usage(connection: &Connection, key_id: &str) {
+    if let Err(error) = connection.execute(
+        "INSERT INTO security_api_key_daily_usage (key_id, epoch_day, count)
+         VALUES (?1, CAST(unixepoch() / 86400 AS INTEGER), 1)
+         ON CONFLICT(key_id, epoch_day) DO UPDATE SET count = count + 1",
+        params![key_id],
+    ) {
+        tracing::debug!(%error, "failed to record API key usage");
+    }
+    if let Err(error) = connection.execute(
+        "UPDATE security_api_keys SET last_used_at = unixepoch() WHERE key_id = ?1",
+        params![key_id],
+    ) {
+        tracing::debug!(%error, "failed to stamp API key last-used");
+    }
+}
+
 /// Builds a fresh batch of [`RECOVERY_CODE_COUNT`] recovery codes paired with
 /// their persisted digests, de-duplicating digests within the batch so every
 /// INSERT can rely on the UNIQUE constraint. The plaintext codes never leave
@@ -6819,6 +7078,146 @@ mod tests {
         assert!(persisted.iter().all(|digest| digest.len() == 32));
         assert!(persisted.iter().all(|digest| digest != first.as_bytes()));
         assert!(persisted.iter().all(|digest| digest != second.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
+    fn lists_named_api_keys_with_usage_windows() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        let user_id = store.create_local_user(
+            "api-usage@example.test",
+            "test-only-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        // The store persists the name verbatim (the HTTP layer owns trimming);
+        // the prefix is the non-secret leading fragment of the raw key.
+        let (record, secret) = store.create_named_api_key(user_id, "Prod", 1_000)?;
+        assert_eq!(record.name, "Prod");
+        assert_eq!(record.prefix.chars().count(), 11);
+        assert!(secret.starts_with(record.prefix.as_str()));
+        assert_eq!(
+            (record.usage_today, record.usage_month, record.usage_total),
+            (0, 0, 0)
+        );
+
+        // Seed usage across three epoch days: today, 15 days ago (inside the
+        // rolling 30-day window), and 40 days ago (outside the month, in total).
+        let today = 20_000_i64;
+        {
+            let connection = store.lock()?;
+            connection.execute(
+                "INSERT INTO security_api_key_daily_usage (key_id, epoch_day, count)
+                 VALUES (?1, ?2, 5), (?1, ?3, 3), (?1, ?4, 7)",
+                rusqlite::params![record.key_id, today, today - 15, today - 40],
+            )?;
+        }
+
+        let keys = store.list_api_keys(user_id, today)?;
+        assert_eq!(keys.len(), 1);
+        let key = &keys[0];
+        assert_eq!(key.usage_today, 5);
+        // Rolling 30-day window (epoch_day >= today - 29): 5 (today) + 3 = 8.
+        assert_eq!(key.usage_month, 8);
+        // Lifetime: 5 + 3 + 7 = 15.
+        assert_eq!(key.usage_total, 15);
+        assert!(key.last_used_at.is_none());
+        assert!(key.revoked_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn month_window_boundary_is_inclusive_of_29_days_ago() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Guards the off-by-one in the rolling 30-day window: the oldest day
+        // still counted for "usage this month" is `today - 29`; `today - 30`
+        // falls just outside it but still counts toward the lifetime total
+        // (parity with Java `sumSinceByIds(ids, today - (MONTH_WINDOW_DAYS - 1))`).
+        let store = SecurityStore::in_memory()?;
+        let user_id = store.create_local_user(
+            "api-boundary@example.test",
+            "test-only-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        let (record, _secret) = store.create_named_api_key(user_id, "boundary", 1_000)?;
+        let today = 50_000_i64;
+        {
+            let connection = store.lock()?;
+            connection.execute(
+                "INSERT INTO security_api_key_daily_usage (key_id, epoch_day, count)
+                 VALUES (?1, ?2, 2), (?1, ?3, 4)",
+                rusqlite::params![record.key_id, today - 29, today - 30],
+            )?;
+        }
+        let keys = store.list_api_keys(user_id, today)?;
+        let key = &keys[0];
+        // Only the `today - 29` row (2) is inside the month window.
+        assert_eq!(key.usage_month, 2);
+        // Both rows count toward the lifetime total.
+        assert_eq!(key.usage_total, 6);
+        assert_eq!(key.usage_today, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn create_named_api_key_enforces_active_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        let user_id = store.create_local_user(
+            "api-cap@example.test",
+            "test-only-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        for index in 0..50 {
+            store.create_named_api_key(user_id, &format!("k{index}"), 1_000)?;
+        }
+        assert!(matches!(
+            store.create_named_api_key(user_id, "one too many", 1_000),
+            Err(SecurityError::TooManyApiKeys)
+        ));
+        // Revoking one frees a slot; the freed key lists as revoked, not gone.
+        let victim = store.list_api_keys(user_id, 100)?[0].key_id.clone();
+        assert!(store.revoke_api_key(user_id, &victim, 2_000)?);
+        assert!(
+            store
+                .create_named_api_key(user_id, "now fits", 1_000)
+                .is_ok()
+        );
+        let revoked = store
+            .list_api_keys(user_id, 100)?
+            .into_iter()
+            .find(|key| key.key_id == victim)
+            .ok_or("revoked key still listed")?;
+        assert!(revoked.revoked_at.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn revoke_api_key_is_owner_scoped_and_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        let owner = store.create_local_user(
+            "api-owner@example.test",
+            "test-only-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        let attacker = store.create_local_user(
+            "api-attacker@example.test",
+            "test-only-password",
+            ["ROLE_USER"],
+            None,
+        )?;
+        let (record, _secret) = store.create_named_api_key(owner, "owned", 1_000)?;
+        // Unknown id and cross-user id both report not-found (never revoke).
+        assert!(!store.revoke_api_key(owner, "akid_missing", 2_000)?);
+        assert!(!store.revoke_api_key(attacker, &record.key_id, 2_000)?);
+        assert!(store.list_api_keys(owner, 100)?[0].revoked_at.is_none());
+        // First revoke succeeds and stamps the time; a second is idempotent and
+        // keeps the first stamp.
+        assert!(store.revoke_api_key(owner, &record.key_id, 2_000)?);
+        assert!(store.revoke_api_key(owner, &record.key_id, 9_000)?);
+        assert_eq!(store.list_api_keys(owner, 100)?[0].revoked_at, Some(2_000));
         Ok(())
     }
 
