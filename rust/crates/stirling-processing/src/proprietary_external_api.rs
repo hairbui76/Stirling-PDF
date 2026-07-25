@@ -1653,7 +1653,8 @@ fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
 
 /// Strip an IPv4-mapped-IPv6 wrapper so the compare sees the bare IPv4 address
 /// (mirrors the oracle's `normalise`, minus the zone id which `IpAddr` never
-/// carries here).
+/// carries here). Used for the deny message's display; the *detection* in
+/// [`is_cloud_metadata`] additionally unwraps every other embedding form.
 fn normalise_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
@@ -1661,8 +1662,85 @@ fn normalise_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Every IPv4 address `address` embeds through a standardized IPv4-in-IPv6
+/// notation, in the SAME set of forms
+/// [`oidc_discovery::ip_addr_is_reserved`] unwraps: IPv4-mapped,
+/// IPv4-compatible, NAT64 well-known + local-use, 6to4, Teredo (server and
+/// obfuscated client), and ISATAP. See `oidc_discovery` for the per-form RFC
+/// citations and byte layouts — those extractors are private to that module and
+/// this track must not widen another module's surface, so the layouts are
+/// reproduced here. Keeping the two in lockstep is what makes the cloud-metadata
+/// deny as comprehensive as the reserved-range check: e.g. `169.254.169.254`
+/// encoded as the NAT64 AAAA `64:ff9b::a9fe:a9fe` must be caught even when the
+/// operator has opted into private endpoints (which skips the reserved check).
+fn embedded_ipv4_forms(address: Ipv6Addr) -> Vec<Ipv4Addr> {
+    let octets = address.octets();
+    let mut forms = Vec::new();
+
+    // IPv4-mapped (`::ffff:a.b.c.d`, RFC 4291) — stdlib recognises this one.
+    if let Some(v4) = address.to_ipv4_mapped() {
+        forms.push(v4);
+    }
+    // IPv4-compatible (`::a.b.c.d`, RFC 4291 2.5.5.1): high 96 bits all zero.
+    if octets[..12] == [0; 12] {
+        forms.push(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // NAT64 Well-Known Prefix (`64:ff9b::/96`, RFC 6052): IPv4 in the low 32 bits.
+    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        forms.push(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // NAT64 Local-Use Prefix (`64:ff9b:1::/48`, RFC 8215): IPv4 straddles the
+    // reserved "u" octet at index 8 (high bits at 6-7, low bits at 9-10).
+    if octets[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
+        forms.push(Ipv4Addr::new(octets[6], octets[7], octets[9], octets[10]));
+    }
+    // 6to4 (`2002::/16`, RFC 3056): IPv4 in octets 2-5.
+    if octets[..2] == [0x20, 0x02] {
+        forms.push(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]));
+    }
+    // Teredo (`2001::/32`, RFC 4380): plain server IPv4 in octets 4-7 and the
+    // bitwise-inverted ("obfuscated") client IPv4 in octets 12-15.
+    if octets[..4] == [0x20, 0x01, 0x00, 0x00] {
+        forms.push(Ipv4Addr::new(octets[4], octets[5], octets[6], octets[7]));
+        forms.push(Ipv4Addr::new(
+            !octets[12],
+            !octets[13],
+            !octets[14],
+            !octets[15],
+        ));
+    }
+    // ISATAP (RFC 5214): the `5e-fe` marker at octets 10-11, IPv4 in octets
+    // 12-15; the 64-bit network prefix (octets 0-7) is unconstrained.
+    if octets[10..12] == [0x5e, 0xfe] {
+        forms.push(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    forms
+}
+
+/// True when `ip` is — or embeds, through any standardized IPv4-in-IPv6
+/// notation ([`embedded_ipv4_forms`]) — one of the [`CLOUD_METADATA_IPS`]. This
+/// deny is meant to be unconditional (it runs even under the private opt-in), so
+/// it cannot rely on the reserved-range check to catch the embedded forms.
 fn is_cloud_metadata(ip: IpAddr) -> bool {
-    CLOUD_METADATA_IPS.contains(&normalise_ip(ip))
+    // Direct hit: a bare IPv4 metadata address, the IPv6 metadata literal, or an
+    // IPv4-mapped wrapper thereof.
+    if CLOUD_METADATA_IPS.contains(&normalise_ip(ip)) {
+        return true;
+    }
+    // Otherwise, any other embedding of a metadata IPv4 is equally a hit.
+    match ip {
+        IpAddr::V6(v6) => embedded_ipv4_forms(v6)
+            .into_iter()
+            .any(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
+        IpAddr::V4(_) => false,
+    }
 }
 
 /// The base-host gate run at dispatch time (oracle
@@ -1679,12 +1757,16 @@ fn require_public_host(
 
 /// Resolve `url`'s host, vet every resolved address, and return them pinned.
 ///
-/// `deny_metadata` gates the unconditional cloud-metadata block (on for the base
-/// host, off for result URLs — matching the oracles: `ApiIntegrationValidator`
-/// has the explicit metadata deny, `ResultUrls` relies on the reserved-range
-/// rejection alone). The reserved-range rejection is always gated by
-/// `allow_private`. Every vetted address is pinned so the socket cannot re-resolve
-/// to a different address after the check.
+/// `deny_metadata` gates the unconditional cloud-metadata block. It is `true`
+/// for BOTH the base host and result URLs so a metadata IP (in any embedding
+/// form — see [`is_cloud_metadata`]) is rejected even under the private opt-in,
+/// which skips the reserved-range rejection. The base host mirrors the Java
+/// `ApiIntegrationValidator` metadata deny; applying it to result URLs is
+/// deliberately stricter than the `ResultUrls` oracle (which relies on the
+/// reserved-range rejection alone, leaving metadata reachable under the opt-in).
+/// The reserved-range rejection is always gated by `allow_private`. Every vetted
+/// address is pinned so the socket cannot re-resolve to a different address after
+/// the check.
 fn resolve_and_pin(
     url: &Url,
     allow_private: bool,
@@ -2338,10 +2420,13 @@ impl ResultUrls {
                  there."
             )));
         }
-        // Even an allowlisted name must not resolve somewhere internal. No metadata
-        // deny here (matching ResultUrls): the reserved-range rejection covers the
-        // metadata IPs unless the operator opted into private endpoints.
-        let pinned = resolve_and_pin(&url, allow_private, RESULT_URL_SETTING, false, resolve)?;
+        // Even an allowlisted name must not resolve somewhere internal. The
+        // cloud-metadata deny is applied here too (`deny_metadata = true`): it
+        // must hold even when the operator opted into private endpoints, which
+        // skips the reserved-range rejection the metadata IPs would otherwise
+        // fall under. (This is stricter than the Java `ResultUrls` oracle, whose
+        // reserved-only path leaves metadata reachable under the opt-in.)
+        let pinned = resolve_and_pin(&url, allow_private, RESULT_URL_SETTING, true, resolve)?;
         Ok(ValidatedResultUrl { url, pinned })
     }
 
@@ -5173,7 +5258,8 @@ mod slice3_tests {
     use super::{
         ApiConnectionSettings, ApiResponse, ApiTokenLogin, ExternalApiCallRequest,
         ExternalApiCallResult, ExternalApiCaller, ExternalApiError, OutboundBody, ResultFiles,
-        ResultUrls, RunFacts, SendParts, require_public_host, resolve_host, send, token_cache_key,
+        ResultUrls, RunFacts, SendParts, is_cloud_metadata, require_public_host, resolve_host,
+        send, token_cache_key,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -5725,6 +5811,101 @@ mod slice3_tests {
         };
         assert_err_contains(
             require_public_host(&base, false, &resolve),
+            "metadata service",
+        );
+        Ok(())
+    }
+
+    /// Every standardized IPv4-in-IPv6 embedding of `v4`, in the same forms
+    /// [`super::embedded_ipv4_forms`] unwraps. This is the inverse of that
+    /// helper, so a metadata IPv4 hidden in any of them must be detected.
+    fn ipv6_embeddings_of(v4: Ipv4Addr) -> Vec<(&'static str, Ipv6Addr)> {
+        let [a, b, c, d] = v4.octets();
+        let hi = u16::from_be_bytes([a, b]);
+        let lo = u16::from_be_bytes([c, d]);
+        // Teredo stores the client IPv4 bitwise-inverted.
+        let cli_hi = u16::from_be_bytes([!a, !b]);
+        let cli_lo = u16::from_be_bytes([!c, !d]);
+        vec![
+            ("ipv4-mapped", v4.to_ipv6_mapped()),
+            ("ipv4-compatible", Ipv6Addr::new(0, 0, 0, 0, 0, 0, hi, lo)),
+            (
+                "nat64-well-known",
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, hi, lo),
+            ),
+            (
+                "nat64-local-use",
+                // 64:ff9b:1::/48 with the IPv4 straddling the reserved "u" octet.
+                Ipv6Addr::from([
+                    0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, a, b, 0x00, c, d, 0, 0, 0, 0, 0,
+                ]),
+            ),
+            ("6to4", Ipv6Addr::new(0x2002, hi, lo, 0, 0, 0, 0, 0)),
+            (
+                "teredo-server",
+                Ipv6Addr::new(0x2001, 0, hi, lo, 0, 0, 0, 0),
+            ),
+            (
+                "teredo-client",
+                Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, cli_hi, cli_lo),
+            ),
+            (
+                // Arbitrary public /64 prefix; only the 5e-fe marker + IPv4 matter.
+                "isatap",
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0x5efe, hi, lo),
+            ),
+        ]
+    }
+
+    #[test]
+    fn metadata_deny_unwraps_every_ipv4_in_ipv6_embedding_form() {
+        // The finding: the deny previously unwrapped only the IPv4-MAPPED form, so
+        // a metadata IP encoded as e.g. a NAT64 AAAA slipped through. Each metadata
+        // address must now be caught in EVERY standardized embedding form.
+        for v4 in [
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(169, 254, 169, 253),
+            Ipv4Addr::new(169, 254, 169, 250),
+        ] {
+            assert!(is_cloud_metadata(IpAddr::V4(v4)), "bare {v4}");
+            for (form, v6) in ipv6_embeddings_of(v4) {
+                assert!(
+                    is_cloud_metadata(IpAddr::V6(v6)),
+                    "metadata {v4} embedded as {form} ({v6}) escaped the deny",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_deny_does_not_over_block_a_public_ipv4_embedded_in_ipv6() {
+        // The unwrapping must be precise: a PUBLIC IPv4 in the same embeddings is
+        // not the metadata service, so the deny must not fire on it.
+        let public = Ipv4Addr::new(1, 1, 1, 1);
+        assert!(!is_cloud_metadata(IpAddr::V4(public)));
+        for (form, v6) in ipv6_embeddings_of(public) {
+            assert!(
+                !is_cloud_metadata(IpAddr::V6(v6)),
+                "public {public} embedded as {form} ({v6}) was wrongly flagged as metadata",
+            );
+        }
+    }
+
+    #[test]
+    fn gate_blocks_a_nat64_embedded_metadata_ip_under_the_private_opt_in() -> TestResult {
+        // The exact finding scenario on an IPv6-only + DNS64/NAT64 host: the AAAA
+        // 64:ff9b::a9fe:a9fe encodes 169.254.169.254. Under the private opt-in the
+        // reserved-range vet is skipped, so only the (now comprehensive) metadata
+        // deny stands between the caller and the metadata service.
+        let base = Url::parse("http://metadata-nat64.example/latest/meta-data/")?;
+        let nat64 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe)),
+            80,
+        );
+        let resolve =
+            move |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> { Ok(vec![nat64]) };
+        assert_err_contains(
+            require_public_host(&base, true, &resolve),
             "metadata service",
         );
         Ok(())
@@ -6449,8 +6630,8 @@ mod slice3_tests {
         let metadata = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
             Ok(vec![addr("169.254.169.254", 80)])
         };
-        // No metadata opt-out here: the reserved-range rejection covers it (message
-        // "private/link-local", matching the oracle's ResultUrls path).
+        // The metadata deny now runs for result URLs too (and before the
+        // reserved-range rejection), so the message names the metadata service.
         assert_err_contains(
             ResultUrls::validate_with_resolver(
                 &settings,
@@ -6458,7 +6639,7 @@ mod slice3_tests {
                 false,
                 &metadata,
             ),
-            "private/link-local",
+            "metadata service",
         );
 
         let loopback = |_host: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
@@ -7168,7 +7349,7 @@ mod slice3_tests {
     #[test]
     fn result_urls_block_an_allowlisted_host_that_resolves_internal() -> TestResult {
         // An allowlisted name whose DNS points at the metadata service is still
-        // blocked: the reserved-range vet runs on the RESOLVED address.
+        // blocked: the metadata deny runs on the RESOLVED address.
         let settings = settings_with(
             "https://api.vendor.example/v1",
             &[("resultUrlHosts", json!(["cdn.vendor.example"]))],
@@ -7183,7 +7364,52 @@ mod slice3_tests {
                 false,
                 &resolve,
             ),
-            "private/link-local",
+            "metadata service",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_url_metadata_deny_holds_even_under_the_private_opt_in() -> TestResult {
+        // The finding, half (b): result URLs previously passed `deny_metadata =
+        // false`, so under the private opt-in (which ALSO skips the reserved-range
+        // vet) an allowlisted name resolving to the metadata service was accepted.
+        // The deny must now fire on the resolved address regardless of the opt-in.
+        let settings = settings_with(
+            "https://api.vendor.example/v1",
+            &[("resultUrlHosts", json!(["cdn.vendor.example"]))],
+        )?;
+
+        // Plain IPv4 metadata address, opt-in ON (`allow_private = true`).
+        let plain = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("169.254.169.254", 443)])
+        };
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "https://cdn.vendor.example/result.pdf",
+                true,
+                &plain,
+            ),
+            "metadata service",
+        );
+
+        // NAT64 AAAA encoding 169.254.169.254 — the embedded form half (a) unwraps,
+        // exercised through the result-URL path under the opt-in.
+        let nat64 = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe)),
+                443,
+            )])
+        };
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "https://cdn.vendor.example/result.pdf",
+                true,
+                &nat64,
+            ),
+            "metadata service",
         );
         Ok(())
     }
