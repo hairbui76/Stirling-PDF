@@ -97,7 +97,7 @@ For local testing, you should generally be testing the full 'Security' version o
 
 ### Verify Setup
 
-Run `task install` to install all project dependencies (frontend npm packages, engine Python packages). Gradle manages its own dependencies automatically. Then run `task check` to verify everything builds and passes.
+Run `task install` to install all project dependencies (frontend npm packages and Rust packages). Gradle manages its own dependencies automatically. Then run `task check` to verify everything builds and passes. The retired Python AI implementation is available separately through `task engine:legacy:install` when compatibility-oracle work requires it.
 
 ## 4. Stirling 2.0 Development Workflow
 
@@ -109,7 +109,9 @@ The fastest way to start developing:
 2. **Or start services individually** in separate terminals:
    - `task backend:dev` — Spring Boot on localhost:8080
    - `task frontend:dev` — Vite on localhost:5173
-   - `task engine:dev` — FastAPI on localhost:5001
+   - `task engine:dev` — Rust AI engine on localhost:5001
+
+The Python compatibility oracle is not started by the normal development flow. Run `task engine:legacy:dev` explicitly when comparing behavior.
 
 Run `task --list` to see all available commands.
 

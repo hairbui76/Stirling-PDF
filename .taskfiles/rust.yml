@@ -1,0 +1,102 @@
+version: '3'
+
+tasks:
+  clean:deps:
+    desc: "Clean Rust dependency build artifacts"
+    run: once
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -Command "Remove-Item -LiteralPath target/debug/deps -Recurse -Force -ErrorAction SilentlyContinue"{{else}}rm -rf -- target/debug/deps{{end}}'
+
+  pdfium:install:
+    desc: "Install the pinned PDFium runtime"
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -File scripts/install-pdfium.ps1{{else}}bash scripts/install-pdfium.sh{{end}}'
+
+  install:
+    desc: "Fetch Rust dependencies"
+    deps:
+      - pdfium:install
+    cmds:
+      - cargo fetch --locked
+
+  run:
+    desc: "Run the Rust processing service"
+    deps:
+      - clean:deps
+      - pdfium:install
+    vars:
+      HOST: '{{.HOST | default "127.0.0.1"}}'
+      PORT: '{{.PORT | default "8080"}}'
+      AIENGINE_URL: '{{.AIENGINE_URL | default "http://localhost:5001"}}'
+      AIENGINE_ENABLED: '{{.AIENGINE_ENABLED | default "false"}}'
+      AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS | default "120"}}'
+      SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN | default "false"}}'
+      POLICIES_ENABLED: '{{.POLICIES_ENABLED | default "false"}}'
+    env:
+      STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+      STIRLING_HOST: '{{.HOST}}'
+      STIRLING_PORT: '{{.PORT}}'
+      STIRLING_PROCESSING_PORT: '{{.PORT}}'
+      AIENGINE_URL: '{{.AIENGINE_URL}}'
+      AIENGINE_ENABLED: '{{.AIENGINE_ENABLED}}'
+      AIENGINE_TIMEOUTSECONDS: '{{.AIENGINE_TIMEOUTSECONDS}}'
+      SECURITY_ENABLELOGIN: '{{.SECURITY_ENABLELOGIN}}'
+      POLICIES_ENABLED: '{{.POLICIES_ENABLED}}'
+    cmds:
+      - cargo run -p stirling-processing --locked
+
+  ai-engine:run:
+    desc: "Run the Rust AI engine"
+    deps: [clean:deps]
+    cmds:
+      - cargo run -p stirling-ai-engine --bin stirling-ai-engine
+
+  ai-engine:migrate:
+    desc: "Migrate legacy AI-engine document data to Rust storage"
+    deps: [clean:deps]
+    cmds:
+      - cargo run -p stirling-ai-engine --bin migrate-sqlite-vec -- {{.CLI_ARGS}}
+
+  build:
+    desc: "Build Rust components"
+    deps: [clean:deps]
+    cmds:
+      - cargo build --workspace --locked
+
+  test:
+    desc: "Run Rust tests"
+    deps:
+      - clean:deps
+      - pdfium:install
+    env:
+      STIRLING_PDFIUM_LIBRARY_PATH: '{{.ROOT_DIR}}/rust/.pdfium/current'
+    cmds:
+      - cargo test --workspace --locked
+
+  lint:
+    desc: "Run Rust linting"
+    deps: [clean:deps]
+    cmds:
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  format:
+    desc: "Auto-fix Rust formatting"
+    cmds:
+      - cargo fmt
+
+  format:check:
+    desc: "Check Rust formatting"
+    cmds:
+      - cargo fmt --check
+
+  check:
+    desc: "Run the Rust quality gate"
+    cmds:
+      - task: format:check
+      - task: lint
+      - task: test
+
+  clean:
+    desc: "Clean Rust build artifacts"
+    cmds:
+      - cargo clean

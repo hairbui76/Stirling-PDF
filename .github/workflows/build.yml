@@ -44,6 +44,7 @@ jobs:
       dockerfiles: ${{ steps.changes.outputs.dockerfiles }}
       tauri: ${{ steps.changes.outputs.tauri }}
       engine: ${{ steps.changes.outputs.engine }}
+      rust-processing: ${{ steps.changes.outputs.rust-processing }}
       generated-models: ${{ steps.changes.outputs.generated-models }}
       proprietary: ${{ steps.changes.outputs.proprietary }}
     steps:
@@ -180,6 +181,14 @@ jobs:
     uses: ./.github/workflows/ai-engine.yml
     secrets: inherit
 
+  rust-processing:
+    if: needs.files-changed.outputs.rust-processing == 'true'
+    needs: [files-changed]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust-processing.yml
+    secrets: inherit
+
   # The generated frontend types and engine tool models are both derived from
   # the Java OpenAPI spec. This job regenerates and diffs them; it boots the
   # backend, so it is gated on the narrow generated-models filter (spec source,
@@ -251,6 +260,7 @@ jobs:
       - test-build-docker-images
       - tauri-build
       - ai-engine
+      - rust-processing
       - generated-models
       - pre-commit
       - dependency-review
@@ -277,6 +287,7 @@ jobs:
             test-build-docker-images=${{ needs.test-build-docker-images.result }}
             tauri-build=${{ needs.tauri-build.result }}
             ai-engine=${{ needs.ai-engine.result }}
+            rust-processing=${{ needs.rust-processing.result }}
             generated-models=${{ needs.generated-models.result }}
             pre-commit=${{ needs.pre-commit.result }}
             dependency-review=${{ needs.dependency-review.result }}

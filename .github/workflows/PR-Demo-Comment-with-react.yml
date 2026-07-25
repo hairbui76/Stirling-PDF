@@ -255,11 +255,22 @@ jobs:
             PROTOTYPES_BUILD=${{ needs.check-comment.outputs.enable_prototypes }}
           platforms: linux/amd64
 
-      - name: Build and push engine image
-        if: needs.check-comment.outputs.enable_prototypes == 'true'
+      - name: Build and push engine image (Depot)
+        if: env.USE_DEPOT == 'true' && needs.check-comment.outputs.enable_prototypes == 'true'
+        uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.16.0
+        with:
+          project: ${{ vars.DEPOT_PROJECT_ID }}
+          context: .
+          file: ./engine/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/test:engine-pr-${{ needs.check-comment.outputs.pr_number }}
+          platforms: linux/amd64
+
+      - name: Build and push engine image (Docker fork fallback)
+        if: env.USE_DEPOT != 'true' && needs.check-comment.outputs.enable_prototypes == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: ./engine
+          context: .
           file: ./engine/Dockerfile
           push: true
           cache-from: type=gha,scope=stirling-pdf-engine

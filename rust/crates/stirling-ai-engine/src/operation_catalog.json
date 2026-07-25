@@ -1,0 +1,2676 @@
+{
+  "/api/v1/convert/cbr/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "optimizeForEbook": {
+        "default": false,
+        "description": "Optimize the output PDF for ebook reading using Ghostscript",
+        "type": "boolean"
+      }
+    },
+    "title": "CbrToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/cbz/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "optimizeForEbook": {
+        "default": false,
+        "description": "Optimize the output PDF for ebook reading using Ghostscript",
+        "type": "boolean"
+      }
+    },
+    "title": "CbzToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/ebook/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "embedAllFonts": {
+        "default": false,
+        "description": "Embed all fonts from the eBook into the generated PDF",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      },
+      "includePageNumbers": {
+        "default": false,
+        "description": "Add page numbers to the generated PDF",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      },
+      "includeTableOfContents": {
+        "default": false,
+        "description": "Add a generated table of contents to the resulting PDF",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      },
+      "optimizeForEbook": {
+        "default": false,
+        "description": "Optimize the PDF for eBook reading (smaller file size, better rendering on eInk devices)",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      }
+    },
+    "title": "EbookToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/eml/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "downloadHtml": {
+        "anyOf": [
+          {
+            "description": "Download HTML intermediate file instead of PDF",
+            "example": false,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "includeAllRecipients": {
+        "anyOf": [
+          {
+            "description": "Include CC and BCC recipients in header (if available)",
+            "example": true,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "includeAttachments": {
+        "anyOf": [
+          {
+            "description": "Include email attachments in the PDF output",
+            "example": false,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "maxAttachmentSizeMb": {
+        "anyOf": [
+          {
+            "description": "Maximum attachment size in MB to include (default 10MB, range: 1-100)",
+            "example": 10,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "EmlToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/file/pdf": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "FileToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/html/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "zoom": {
+        "default": 1,
+        "description": "Zoom level for displaying the website. Default is '1'.",
+        "type": "number"
+      }
+    },
+    "title": "HtmlToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/img/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "autoRotate": {
+        "default": false,
+        "description": "Whether to automatically rotate the images to better fit the PDF page",
+        "type": "boolean"
+      },
+      "colorType": {
+        "default": "color",
+        "description": "The color type of the output image(s)",
+        "enum": [
+          "color",
+          "greyscale",
+          "blackwhite"
+        ],
+        "type": "string"
+      },
+      "fitOption": {
+        "default": "fillPage",
+        "description": "Option to determine how the image will fit onto the page",
+        "enum": [
+          "fillPage",
+          "fitDocumentToImage",
+          "maintainAspectRatio"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "ImgToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/markdown/pdf": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "MarkdownToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/cbr": {
+    "additionalProperties": false,
+    "properties": {
+      "dpi": {
+        "description": "The DPI (Dots Per Inch) for rendering PDF pages as images",
+        "example": 150,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "dpi"
+    ],
+    "title": "PdfToCbrParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/cbz": {
+    "additionalProperties": false,
+    "properties": {
+      "dpi": {
+        "description": "The DPI (Dots Per Inch) for rendering PDF pages as images",
+        "example": 150,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "dpi"
+    ],
+    "title": "PdfToCbzParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/csv": {
+    "additionalProperties": false,
+    "properties": {
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      }
+    },
+    "title": "PdfToCsvParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/epub": {
+    "additionalProperties": false,
+    "properties": {
+      "detectChapters": {
+        "default": true,
+        "description": "Detect headings that look like chapters and insert EPUB page breaks.",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      },
+      "outputFormat": {
+        "default": "EPUB",
+        "description": "Choose the output format for the ebook.",
+        "enum": [
+          "EPUB",
+          "AZW3",
+          "EPUB",
+          "AZW3"
+        ],
+        "type": "string"
+      },
+      "targetDevice": {
+        "default": "TABLET_PHONE_IMAGES",
+        "description": "Choose an output profile optimized for the reader device.",
+        "enum": [
+          "TABLET_PHONE_IMAGES",
+          "KINDLE_EINK_TEXT",
+          "TABLET_PHONE_IMAGES",
+          "KINDLE_EINK_TEXT"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "PdfToEpubParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/html": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "PdfToHtmlParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/img": {
+    "additionalProperties": false,
+    "properties": {
+      "colorType": {
+        "default": "color",
+        "description": "The color type of the output image(s)",
+        "enum": [
+          "color",
+          "greyscale",
+          "blackwhite"
+        ],
+        "type": "string"
+      },
+      "dpi": {
+        "default": 300,
+        "description": "The DPI (dots per inch) for the output image(s)",
+        "type": "integer"
+      },
+      "imageFormat": {
+        "default": "png",
+        "description": "The output image format",
+        "enum": [
+          "png",
+          "jpeg",
+          "jpg",
+          "gif",
+          "webp"
+        ],
+        "type": "string"
+      },
+      "includeAnnotations": {
+        "default": false,
+        "description": "Include annotations such as comments in the output image(s)",
+        "type": "boolean"
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      },
+      "singleOrMultiple": {
+        "default": "multiple",
+        "description": "Choose between a single image containing all pages or separate images for each page",
+        "enum": [
+          "single",
+          "multiple"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "PdfToImgParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/markdown": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "PdfToMarkdownParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/pdfa": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "description": "The output format type (PDF/A or PDF/X)",
+        "enum": [
+          "pdfa",
+          "pdfa-1",
+          "pdfa-2",
+          "pdfa-2b",
+          "pdfa-3",
+          "pdfa-3b",
+          "pdfx"
+        ],
+        "type": "string"
+      },
+      "strict": {
+        "anyOf": [
+          {
+            "description": "If true, the conversion will fail if the output is not perfectly compliant",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "required": [
+      "outputFormat"
+    ],
+    "title": "PdfToPdfaParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/presentation": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "description": "The output Presentation format",
+        "enum": [
+          "ppt",
+          "pptx",
+          "odp"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "outputFormat"
+    ],
+    "title": "PdfToPresentationParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/text": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "description": "The output Text or RTF format",
+        "enum": [
+          "rtf",
+          "txt"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "outputFormat"
+    ],
+    "title": "PdfToTextParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/vector": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "default": "eps",
+        "description": "Target vector format extension",
+        "enum": [
+          "eps",
+          "ps",
+          "pcl",
+          "xps"
+        ],
+        "type": "string"
+      },
+      "prepress": {
+        "default": false,
+        "description": "Apply Ghostscript prepress settings",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      }
+    },
+    "title": "PdfToVectorParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/word": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "description": "The output Word document format",
+        "enum": [
+          "doc",
+          "docx",
+          "odt"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "outputFormat"
+    ],
+    "title": "PdfToWordParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/xlsx": {
+    "additionalProperties": false,
+    "properties": {
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      }
+    },
+    "title": "PdfToXlsxParams",
+    "type": "object"
+  },
+  "/api/v1/convert/pdf/xml": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "PdfToXmlParams",
+    "type": "object"
+  },
+  "/api/v1/convert/svg/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "combineIntoSinglePdf": {
+        "default": false,
+        "description": "Whether to combine all SVG files into a single PDF (each SVG as a separate page) or create separate PDF files for each SVG.",
+        "type": "boolean"
+      }
+    },
+    "title": "SvgToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/url/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "urlInput": {
+        "description": "The input URL to be converted to a PDF file",
+        "type": "string"
+      }
+    },
+    "required": [
+      "urlInput"
+    ],
+    "title": "UrlToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/convert/vector/pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "outputFormat": {
+        "default": "eps",
+        "description": "Target vector format extension",
+        "enum": [
+          "eps",
+          "ps",
+          "pcl",
+          "xps"
+        ],
+        "type": "string"
+      },
+      "prepress": {
+        "default": false,
+        "description": "Apply Ghostscript prepress settings",
+        "enum": [
+          true,
+          false
+        ],
+        "type": "boolean"
+      }
+    },
+    "title": "VectorToPdfParams",
+    "type": "object"
+  },
+  "/api/v1/general/booklet-imposition": {
+    "additionalProperties": false,
+    "properties": {
+      "addBorder": {
+        "anyOf": [
+          {
+            "description": "Boolean for if you wish to add border around the pages",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "addGutter": {
+        "anyOf": [
+          {
+            "description": "Add gutter margin (inner margin for binding)",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "doubleSided": {
+        "anyOf": [
+          {
+            "description": "Generate both front and back sides (double-sided printing)",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "duplexPass": {
+        "default": "BOTH",
+        "description": "For manual duplex: which pass to generate",
+        "enum": [
+          "BOTH",
+          "FIRST",
+          "SECOND"
+        ],
+        "type": "string"
+      },
+      "flipOnShortEdge": {
+        "anyOf": [
+          {
+            "description": "Flip back sides for short-edge duplex printing (default is long-edge)",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "gutterSize": {
+        "default": 12,
+        "description": "Gutter margin size in points (used when addGutter is true)",
+        "type": "number"
+      },
+      "pagesPerSheet": {
+        "default": 2,
+        "description": "The number of pages per side for booklet printing (always 2 for proper booklet).",
+        "enum": [
+          2
+        ],
+        "type": "integer"
+      },
+      "spineLocation": {
+        "default": "LEFT",
+        "description": "The spine location for the booklet.",
+        "enum": [
+          "LEFT",
+          "RIGHT"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "BookletImpositionParams",
+    "type": "object"
+  },
+  "/api/v1/general/crop": {
+    "additionalProperties": false,
+    "properties": {
+      "autoCrop": {
+        "anyOf": [
+          {
+            "description": "Enable auto-crop to detect and remove white space",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "height": {
+        "anyOf": [
+          {
+            "description": "The height of the crop area",
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "removeDataOutsideCrop": {
+        "anyOf": [
+          {
+            "description": "Whether to remove text outside the crop area (keeps images)",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "width": {
+        "anyOf": [
+          {
+            "description": "The width of the crop area",
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "x": {
+        "anyOf": [
+          {
+            "description": "The x-coordinate of the top-left corner of the crop area",
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "y": {
+        "anyOf": [
+          {
+            "description": "The y-coordinate of the top-left corner of the crop area",
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "CropParams",
+    "type": "object"
+  },
+  "/api/v1/general/edit-table-of-contents": {
+    "additionalProperties": false,
+    "properties": {
+      "bookmarkData": {
+        "anyOf": [
+          {
+            "description": "Bookmark structure in JSON format",
+            "example": "[{\\\"title\\\":\\\"Chapter 1\\\",\\\"pageNumber\\\":1,\\\"children\\\":[{\\\"title\\\":\\\"Section 1.1\\\",\\\"pageNumber\\\":2}]}]",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "replaceExisting": {
+        "anyOf": [
+          {
+            "description": "Whether to replace existing bookmarks or append to them",
+            "example": true,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "EditTableOfContentsParams",
+    "type": "object"
+  },
+  "/api/v1/general/edit-text": {
+    "$defs": {
+      "EditTextOperation": {
+        "additionalProperties": false,
+        "description": "Ordered list of find/replace operations. Each replaces every occurrence on the selected pages, in order; later operations see the result of earlier ones (so 'foo'->'foos' then 'foos'->'bars' turns 'foo' into 'bars').",
+        "properties": {
+          "find": {
+            "description": "The literal text to find.",
+            "type": "string"
+          },
+          "replace": {
+            "description": "The replacement text. May be empty to delete the matched text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "find",
+          "replace"
+        ],
+        "title": "EditTextOperation",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "edits": {
+        "description": "Ordered list of find/replace operations. Each replaces every occurrence on the selected pages, in order; later operations see the result of earlier ones (so 'foo'->'foos' then 'foos'->'bars' turns 'foo' into 'bars').",
+        "items": {
+          "$ref": "#/$defs/EditTextOperation"
+        },
+        "type": "array"
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      },
+      "wholeWordSearch": {
+        "default": false,
+        "description": "Whether matches must be whole words (boundaries determined by non-word characters)",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "edits"
+    ],
+    "title": "EditTextParams",
+    "type": "object"
+  },
+  "/api/v1/general/merge-pdfs": {
+    "additionalProperties": false,
+    "properties": {
+      "clientFileIds": {
+        "anyOf": [
+          {
+            "description": "JSON array of client-provided IDs for each uploaded file (same order as fileInput)",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "fileOrder": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "generateToc": {
+        "default": false,
+        "description": "Flag indicating whether to generate a table of contents for the merged PDF. If true, a table of contents will be created using the input filenames as chapter names.",
+        "type": "boolean"
+      },
+      "removeCertSign": {
+        "default": true,
+        "description": "Flag indicating whether to remove certification signatures from the merged PDF. If true, all certification signatures will be removed from the final merged document.",
+        "type": "boolean"
+      },
+      "sortType": {
+        "default": "orderProvided",
+        "description": "The type of sorting to be applied on the input files before merging.",
+        "enum": [
+          "orderProvided",
+          "byFileName",
+          "byDateModified",
+          "byDateCreated",
+          "byPDFTitle"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "MergePdfsParams",
+    "type": "object"
+  },
+  "/api/v1/general/multi-page-layout": {
+    "additionalProperties": false,
+    "properties": {
+      "addBorder": {
+        "anyOf": [
+          {
+            "description": "Boolean for if you wish to add border around the pages",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "arrangement": {
+        "default": "BY_ROWS",
+        "description": "The arrangement of pages on the sheet: BY_ROWS fills pages row by row, while BY_COLUMNS fills pages column by column.",
+        "enum": [
+          "BY_ROWS",
+          "BY_COLUMNS"
+        ],
+        "type": "string"
+      },
+      "borderWidth": {
+        "default": 1,
+        "description": "Border width (in points) to apply around each page when merging",
+        "example": 2,
+        "minimum": 0,
+        "type": "number"
+      },
+      "bottomMargin": {
+        "default": 0,
+        "description": "Bottom margin (in points) to apply to the output pages when merging",
+        "example": 200,
+        "minimum": 0,
+        "type": "number"
+      },
+      "cols": {
+        "default": 2,
+        "description": "Number of columns",
+        "example": 2,
+        "maximum": 300,
+        "minimum": 1,
+        "type": "number"
+      },
+      "innerMargin": {
+        "default": 0,
+        "description": "Inner margin (in points) to apply around each page when merging",
+        "example": 200,
+        "minimum": 0,
+        "type": "number"
+      },
+      "leftMargin": {
+        "default": 0,
+        "description": "Left margin (in points) to apply to the output pages when merging",
+        "example": 200,
+        "minimum": 0,
+        "type": "number"
+      },
+      "mode": {
+        "default": "DEFAULT",
+        "description": "Input mode: DEFAULT uses pagesPerSheet; CUSTOM uses explicit cols x rows.",
+        "enum": [
+          "DEFAULT",
+          "CUSTOM"
+        ],
+        "type": "string"
+      },
+      "orientation": {
+        "default": "PORTRAIT",
+        "description": "The orientation of the output PDF pages",
+        "enum": [
+          "PORTRAIT",
+          "LANDSCAPE"
+        ],
+        "type": "string"
+      },
+      "pagesPerSheet": {
+        "anyOf": [
+          {
+            "description": "The number of pages to fit onto a single sheet in the output PDF.",
+            "enum": [
+              2,
+              4,
+              9,
+              16
+            ],
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "readingDirection": {
+        "default": "LTR",
+        "description": "The direction in which pages are arranged on the sheet: LTR (left-to-right) or RTL (right-to-left).",
+        "enum": [
+          "LTR",
+          "RTL"
+        ],
+        "type": "string"
+      },
+      "rightMargin": {
+        "default": 0,
+        "description": "Right margin (in points) to apply to the output pages when merging",
+        "example": 200,
+        "minimum": 0,
+        "type": "number"
+      },
+      "rows": {
+        "default": 1,
+        "description": "Number of rows",
+        "example": 3,
+        "maximum": 300,
+        "minimum": 1,
+        "type": "number"
+      },
+      "topMargin": {
+        "default": 0,
+        "description": "Top margin (in points) to apply to the output pages when merging",
+        "example": 200,
+        "minimum": 0,
+        "type": "number"
+      }
+    },
+    "title": "MultiPageLayoutParams",
+    "type": "object"
+  },
+  "/api/v1/general/pdf-to-single-page": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "PdfToSinglePageParams",
+    "type": "object"
+  },
+  "/api/v1/general/rearrange-pages": {
+    "additionalProperties": false,
+    "properties": {
+      "customMode": {
+        "anyOf": [
+          {
+            "description": "The custom mode for page rearrangement. Valid values are:\nCUSTOM: Uses order defined in PageNums DUPLICATE: Duplicate pages n times (if Page order defined as 4, then duplicates each page 4 times)REVERSE_ORDER: Reverses the order of all pages.\nDUPLEX_SORT: Sorts pages as if all fronts were scanned then all backs in reverse (1, n, 2, n-1, ...). BOOKLET_SORT: Arranges pages for booklet printing (last, first, second, second last, ...).\nODD_EVEN_SPLIT: Splits and arranges pages into odd and even numbered pages.\nREMOVE_FIRST: Removes the first page.\nREMOVE_LAST: Removes the last page.\nREMOVE_FIRST_AND_LAST: Removes both the first and the last pages.\n",
+            "enum": [
+              "CUSTOM",
+              "REVERSE_ORDER",
+              "DUPLEX_SORT",
+              "BOOKLET_SORT",
+              "SIDE_STITCH_BOOKLET_SORT",
+              "ODD_EVEN_SPLIT",
+              "REMOVE_FIRST",
+              "REMOVE_LAST",
+              "REMOVE_FIRST_AND_LAST",
+              "DUPLICATE"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      }
+    },
+    "title": "RearrangePagesParams",
+    "type": "object"
+  },
+  "/api/v1/general/remove-image-pdf": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "RemoveImagePdfParams",
+    "type": "object"
+  },
+  "/api/v1/general/remove-pages": {
+    "additionalProperties": false,
+    "properties": {
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      }
+    },
+    "title": "RemovePagesParams",
+    "type": "object"
+  },
+  "/api/v1/general/rotate-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "angle": {
+        "description": "The clockwise angle by which to rotate all pages in the PDF file. Must be a multiple of 90.",
+        "enum": [
+          0,
+          90,
+          180,
+          270
+        ],
+        "type": "integer"
+      }
+    },
+    "required": [
+      "angle"
+    ],
+    "title": "RotatePdfParams",
+    "type": "object"
+  },
+  "/api/v1/general/scale-pages": {
+    "additionalProperties": false,
+    "properties": {
+      "orientation": {
+        "default": "PORTRAIT",
+        "description": "Orientation to apply to the target page size. Ignored when pageSize is KEEP.",
+        "enum": [
+          "PORTRAIT",
+          "LANDSCAPE"
+        ],
+        "type": "string"
+      },
+      "pageSize": {
+        "description": "The scale of pages in the output PDF. Acceptable values are A0-A6, LETTER, LEGAL, KEEP.",
+        "enum": [
+          "A0",
+          "A1",
+          "A2",
+          "A3",
+          "A4",
+          "A5",
+          "A6",
+          "LETTER",
+          "LEGAL",
+          "KEEP"
+        ],
+        "type": "string"
+      },
+      "scaleFactor": {
+        "default": 1,
+        "description": "The scale of the content on the pages of the output PDF. Acceptable values are floats.",
+        "minimum": 0,
+        "type": "number"
+      }
+    },
+    "required": [
+      "pageSize"
+    ],
+    "title": "ScalePagesParams",
+    "type": "object"
+  },
+  "/api/v1/general/split-by-size-or-count": {
+    "additionalProperties": false,
+    "properties": {
+      "splitType": {
+        "default": 0,
+        "description": "Determines the type of split: 0 for size, 1 for page count, 2 for document count",
+        "type": "integer"
+      },
+      "splitValue": {
+        "default": "10MB",
+        "description": "Value for split: size in MB (e.g., '10MB') or number of pages (e.g., '5')",
+        "type": "string"
+      }
+    },
+    "title": "SplitBySizeOrCountParams",
+    "type": "object"
+  },
+  "/api/v1/general/split-for-poster-print": {
+    "additionalProperties": false,
+    "properties": {
+      "pageSize": {
+        "description": "Target page size for output chunks (e.g., 'A4', 'Letter', 'A3')",
+        "enum": [
+          "A4",
+          "Letter",
+          "A3",
+          "A5",
+          "Legal",
+          "Tabloid"
+        ],
+        "type": "string"
+      },
+      "rightToLeft": {
+        "default": false,
+        "description": "Split right-to-left instead of left-to-right",
+        "type": "boolean"
+      },
+      "xFactor": {
+        "default": 2,
+        "description": "Horizontal decimation factor (how many columns to split into)",
+        "maximum": 10,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "yFactor": {
+        "default": 2,
+        "description": "Vertical decimation factor (how many rows to split into)",
+        "maximum": 10,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "pageSize"
+    ],
+    "title": "SplitForPosterPrintParams",
+    "type": "object"
+  },
+  "/api/v1/general/split-pages": {
+    "additionalProperties": false,
+    "properties": {
+      "pageNumbers": {
+        "default": "all",
+        "description": "Split points - page numbers after which the PDF will be cut. For example, `\"2\"` produces two documents (pages 1-2 and pages 3+); `\"2,5\"` produces three (pages 1-2, 3-5, 6+). Supports ranges (e.g. `\"1,3,5-9\"` splits after pages 1, 3, 5, 6, 7, 8, 9, yielding 8 documents), `\"all\"` (split after every page), or functions like `\"2n+1\"`, `\"3n\"`, `\"6n-5\"`.",
+        "type": "string"
+      }
+    },
+    "title": "SplitPagesParams",
+    "type": "object"
+  },
+  "/api/v1/general/split-pdf-by-chapters": {
+    "additionalProperties": false,
+    "properties": {
+      "allowDuplicates": {
+        "default": false,
+        "description": "Whether to allow duplicates or not",
+        "type": "boolean"
+      },
+      "bookmarkLevel": {
+        "default": 0,
+        "description": "Maximum bookmark level required",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "includeMetadata": {
+        "default": false,
+        "description": "Whether to include Metadata or not",
+        "type": "boolean"
+      }
+    },
+    "title": "SplitPdfByChaptersParams",
+    "type": "object"
+  },
+  "/api/v1/general/split-pdf-by-sections": {
+    "additionalProperties": false,
+    "properties": {
+      "horizontalDivisions": {
+        "default": 0,
+        "description": "Number of horizontal divisions for each PDF page",
+        "maximum": 50,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "merge": {
+        "default": false,
+        "description": "Merge the split documents into a single PDF",
+        "type": "boolean"
+      },
+      "pageNumbers": {
+        "default": "SPLIT_ALL",
+        "description": "Pages to be split by section",
+        "type": "string"
+      },
+      "splitMode": {
+        "anyOf": [
+          {
+            "description": "Modes for page split. Valid values are:\nSPLIT_ALL_EXCEPT_FIRST_AND_LAST: Splits all except the first and the last pages.\nSPLIT_ALL_EXCEPT_FIRST: Splits all except the first page.\nSPLIT_ALL_EXCEPT_LAST: Splits all except the last page.\nSPLIT_ALL: Splits all pages.\nCUSTOM: Custom split.\n",
+            "enum": [
+              "CUSTOM",
+              "SPLIT_ALL_EXCEPT_FIRST_AND_LAST",
+              "SPLIT_ALL_EXCEPT_FIRST",
+              "SPLIT_ALL_EXCEPT_LAST",
+              "SPLIT_ALL"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "verticalDivisions": {
+        "default": 1,
+        "description": "Number of vertical divisions for each PDF page",
+        "maximum": 50,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "title": "SplitPdfBySectionsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/add-comments": {
+    "additionalProperties": false,
+    "properties": {
+      "comments": {
+        "description": "JSON array of comment specs. Each element has: {pageIndex, x, y, width, height, text, author?, subject?}. Coordinates are PDF user-space with origin at the page's bottom-left.",
+        "example": "[{\"pageIndex\":0,\"x\":72,\"y\":720,\"width\":20,\"height\":20,\"text\":\"Check this paragraph\",\"author\":\"Reviewer\",\"subject\":\"Unclear wording\"}]",
+        "type": "string"
+      }
+    },
+    "required": [
+      "comments"
+    ],
+    "title": "AddCommentsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/add-page-numbers": {
+    "additionalProperties": false,
+    "properties": {
+      "customMargin": {
+        "default": "medium",
+        "description": "Custom margin: small/medium/large/x-large",
+        "enum": [
+          "small",
+          "medium",
+          "large",
+          "x-large"
+        ],
+        "type": "string"
+      },
+      "customText": {
+        "default": "{n}",
+        "description": "Custom text pattern. Available variables: {n}=current page number, {total}=total pages, {filename}=original filename",
+        "example": "Page {n} of {total}",
+        "type": "string"
+      },
+      "fontColor": {
+        "default": "#000000",
+        "description": "Hex colour for page numbers (e.g. #FF0000)",
+        "example": "#000000",
+        "type": "string"
+      },
+      "fontSize": {
+        "default": 12,
+        "description": "Font size for page numbers",
+        "minimum": 1,
+        "type": "number"
+      },
+      "fontType": {
+        "description": "Font type for page numbers",
+        "enum": [
+          "helvetica",
+          "courier",
+          "times"
+        ],
+        "type": "string"
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      },
+      "pagesToNumber": {
+        "default": "all",
+        "description": "Which pages to number (e.g. '1,3-5,7' or 'all')",
+        "type": "string"
+      },
+      "position": {
+        "description": "Position: 1-9 representing positions on the page (1=top-left, 2=top-center, 3=top-right, 4=middle-left, 5=middle-center, 6=middle-right, 7=bottom-left, 8=bottom-center, 9=bottom-right)",
+        "enum": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "type": "integer"
+      },
+      "startingNumber": {
+        "default": 1,
+        "description": "Starting number for page numbering",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "zeroPad": {
+        "default": 0,
+        "description": "Zero-padding width for page numbers (Bates Stamping). Set to 0 to disable padding",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "fontType",
+      "position"
+    ],
+    "title": "AddPageNumbersParams",
+    "type": "object"
+  },
+  "/api/v1/misc/add-stamp": {
+    "additionalProperties": false,
+    "properties": {
+      "alphabet": {
+        "default": "roman",
+        "description": "The selected alphabet of the stamp text",
+        "enum": [
+          "roman",
+          "arabic",
+          "japanese",
+          "korean",
+          "chinese",
+          "thai"
+        ],
+        "type": "string"
+      },
+      "customColor": {
+        "default": "#d3d3d3",
+        "description": "The color of the stamp text",
+        "type": "string"
+      },
+      "customMargin": {
+        "default": "medium",
+        "description": "Specifies the margin size for the stamp.",
+        "enum": [
+          "small",
+          "medium",
+          "large",
+          "x-large"
+        ],
+        "type": "string"
+      },
+      "fontSize": {
+        "default": 40,
+        "description": "The font size of the stamp text and image in points.",
+        "type": "number"
+      },
+      "opacity": {
+        "default": 0.5,
+        "description": "The opacity of the stamp (0.0 - 1.0)",
+        "type": "number"
+      },
+      "overrideX": {
+        "default": -1,
+        "description": "Override X coordinate for stamp placement. If set, it will override the position-based calculation. Negative value means no override.",
+        "type": "number"
+      },
+      "overrideY": {
+        "default": -1,
+        "description": "Override Y coordinate for stamp placement. If set, it will override the position-based calculation. Negative value means no override.",
+        "type": "number"
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      },
+      "position": {
+        "default": 8,
+        "description": "Position for stamp placement based on a 1-9 grid (1: bottom-left, 2: bottom-center, 3: bottom-right, 4: middle-left, 5: middle-center, 6: middle-right, 7: top-left, 8: top-center, 9: top-right)",
+        "enum": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "type": "integer"
+      },
+      "rotation": {
+        "default": 0,
+        "description": "The rotation of the stamp in degrees",
+        "type": "number"
+      },
+      "stampText": {
+        "default": "Stirling Software",
+        "description": "The stamp text",
+        "type": "string"
+      },
+      "stampType": {
+        "description": "The stamp type (text or image)",
+        "enum": [
+          "text",
+          "image"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "stampType"
+    ],
+    "title": "AddStampParams",
+    "type": "object"
+  },
+  "/api/v1/misc/auto-rename": {
+    "additionalProperties": false,
+    "properties": {
+      "useFirstTextAsFallback": {
+        "default": false,
+        "description": "Flag indicating whether to use the first text as a fallback if no suitable title is found. Defaults to false.",
+        "type": "boolean"
+      }
+    },
+    "title": "AutoRenameParams",
+    "type": "object"
+  },
+  "/api/v1/misc/auto-split-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "duplexMode": {
+        "default": false,
+        "description": "Flag indicating if the duplex mode is active, where the page after the divider also gets removed.",
+        "type": "boolean"
+      }
+    },
+    "title": "AutoSplitPdfParams",
+    "type": "object"
+  },
+  "/api/v1/misc/compress-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "expectedOutputSize": {
+        "default": "25KB",
+        "description": "The expected output size, e.g. '100MB', '25KB', etc.",
+        "type": "string"
+      },
+      "grayscale": {
+        "default": false,
+        "description": "Whether to convert the PDF to grayscale. Default is false.",
+        "type": "boolean"
+      },
+      "lineArt": {
+        "default": false,
+        "description": "Whether to convert images to high-contrast line art using ImageMagick. Default is false.",
+        "type": "boolean"
+      },
+      "lineArtEdgeLevel": {
+        "default": 1,
+        "description": "Edge detection strength to use for line art conversion (1-3). This maps to ImageMagick's -edge radius.",
+        "enum": [
+          1,
+          2,
+          3
+        ],
+        "type": "integer"
+      },
+      "lineArtThreshold": {
+        "default": 55,
+        "description": "Threshold to use for line art conversion (0-100).",
+        "type": "number"
+      },
+      "linearize": {
+        "default": false,
+        "description": "Whether to linearize the PDF for faster web viewing. Default is false.",
+        "type": "boolean"
+      },
+      "normalize": {
+        "default": false,
+        "description": "Whether to normalize the PDF content for better compatibility. Default is false.",
+        "type": "boolean"
+      },
+      "optimizeLevel": {
+        "description": "The level of optimization to apply to the PDF file. Higher values indicate greater compression but may reduce quality.",
+        "enum": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "type": "integer"
+      }
+    },
+    "required": [
+      "optimizeLevel"
+    ],
+    "title": "CompressPdfParams",
+    "type": "object"
+  },
+  "/api/v1/misc/delete-attachment": {
+    "additionalProperties": false,
+    "properties": {
+      "attachmentName": {
+        "description": "The name of the attachment to delete",
+        "type": "string"
+      }
+    },
+    "required": [
+      "attachmentName"
+    ],
+    "title": "DeleteAttachmentParams",
+    "type": "object"
+  },
+  "/api/v1/misc/extract-attachments": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "ExtractAttachmentsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/extract-image-scans": {
+    "additionalProperties": false,
+    "properties": {
+      "angleThreshold": {
+        "default": 5,
+        "description": "The angle threshold for the image scan extraction",
+        "type": "integer"
+      },
+      "borderSize": {
+        "default": 1,
+        "description": "The border size for the image scan extraction",
+        "type": "integer"
+      },
+      "minArea": {
+        "default": 8000,
+        "description": "The minimum area for the image scan extraction",
+        "type": "integer"
+      },
+      "minContourArea": {
+        "default": 500,
+        "description": "The minimum contour area for the image scan extraction",
+        "type": "integer"
+      },
+      "tolerance": {
+        "default": 20,
+        "description": "The tolerance for the image scan extraction",
+        "type": "integer"
+      }
+    },
+    "title": "ExtractImageScansParams",
+    "type": "object"
+  },
+  "/api/v1/misc/extract-images": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "default": "png",
+        "description": "The output image format e.g., 'png', 'jpeg', or 'gif'",
+        "enum": [
+          "png",
+          "jpeg",
+          "gif"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "ExtractImagesParams",
+    "type": "object"
+  },
+  "/api/v1/misc/flatten": {
+    "additionalProperties": false,
+    "properties": {
+      "flattenOnlyForms": {
+        "default": false,
+        "description": "True to flatten only the forms, false to flatten full PDF (Convert page to image)",
+        "type": "boolean"
+      },
+      "renderDpi": {
+        "anyOf": [
+          {
+            "description": "Optional DPI for page rendering when flattening the full document.",
+            "minimum": 72,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "FlattenParams",
+    "type": "object"
+  },
+  "/api/v1/misc/ocr-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "clean": {
+        "anyOf": [
+          {
+            "description": "Clean the input file if set to true",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "cleanFinal": {
+        "anyOf": [
+          {
+            "description": "Clean the final output if set to true",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "deskew": {
+        "anyOf": [
+          {
+            "description": "Deskew the input file if set to true",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "languages": {
+        "default": [
+          "eng"
+        ],
+        "description": "List of languages to use in OCR processing, e.g., 'eng', 'deu'",
+        "items": {
+          "description": "List of languages to use in OCR processing, e.g., 'eng', 'deu'",
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "ocrRenderType": {
+        "default": "hocr",
+        "description": "Specify the OCR render type, either 'hocr' or 'sandwich'",
+        "enum": [
+          "hocr",
+          "sandwich"
+        ],
+        "type": "string"
+      },
+      "ocrType": {
+        "description": "Specify the OCR type, e.g., 'skip-text', 'force-ocr', or 'Normal'",
+        "enum": [
+          "skip-text",
+          "force-ocr",
+          "Normal"
+        ],
+        "type": "string"
+      },
+      "removeImagesAfter": {
+        "anyOf": [
+          {
+            "description": "Remove images from the output PDF if set to true",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "sidecar": {
+        "anyOf": [
+          {
+            "description": "Include OCR text in a sidecar text file if set to true",
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "required": [
+      "ocrType"
+    ],
+    "title": "OcrPdfParams",
+    "type": "object"
+  },
+  "/api/v1/misc/remove-blanks": {
+    "additionalProperties": false,
+    "properties": {
+      "threshold": {
+        "default": 10,
+        "description": "The threshold value to determine blank pages",
+        "maximum": 255,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "whitePercent": {
+        "default": 99.9,
+        "description": "The percentage of white color on a page to consider it as blank",
+        "maximum": 100,
+        "minimum": 0.1,
+        "type": "number"
+      }
+    },
+    "title": "RemoveBlanksParams",
+    "type": "object"
+  },
+  "/api/v1/misc/rename-attachment": {
+    "additionalProperties": false,
+    "properties": {
+      "attachmentName": {
+        "description": "The current name of the attachment to rename",
+        "type": "string"
+      },
+      "newName": {
+        "description": "The new name for the attachment",
+        "type": "string"
+      }
+    },
+    "required": [
+      "attachmentName",
+      "newName"
+    ],
+    "title": "RenameAttachmentParams",
+    "type": "object"
+  },
+  "/api/v1/misc/repair": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "RepairParams",
+    "type": "object"
+  },
+  "/api/v1/misc/replace-invert-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "backGroundColor": {
+        "anyOf": [
+          {
+            "description": "If CUSTOM_COLOR option selected, then pick the custom color for background. Expected color value should be 24bit decimal value of a color",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "highContrastColorCombination": {
+        "default": "WHITE_TEXT_ON_BLACK",
+        "description": "If HIGH_CONTRAST_COLOR option selected, then pick the default color option for text and background.",
+        "enum": [
+          "WHITE_TEXT_ON_BLACK",
+          "BLACK_TEXT_ON_WHITE",
+          "YELLOW_TEXT_ON_BLACK",
+          "GREEN_TEXT_ON_BLACK",
+          "WHITE_TEXT_ON_BLACK",
+          "BLACK_TEXT_ON_WHITE",
+          "YELLOW_TEXT_ON_BLACK",
+          "GREEN_TEXT_ON_BLACK"
+        ],
+        "type": "string"
+      },
+      "replaceAndInvertOption": {
+        "default": "HIGH_CONTRAST_COLOR",
+        "description": "Replace and Invert color options of a pdf.",
+        "enum": [
+          "HIGH_CONTRAST_COLOR",
+          "CUSTOM_COLOR",
+          "FULL_INVERSION",
+          "COLOR_SPACE_CONVERSION",
+          "HIGH_CONTRAST_COLOR",
+          "CUSTOM_COLOR",
+          "FULL_INVERSION",
+          "COLOR_SPACE_CONVERSION"
+        ],
+        "type": "string"
+      },
+      "textColor": {
+        "anyOf": [
+          {
+            "description": "If CUSTOM_COLOR option selected, then pick the custom color for text. Expected color value should be 24bit decimal value of a color",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "ReplaceInvertPdfParams",
+    "type": "object"
+  },
+  "/api/v1/misc/scanner-effect": {
+    "additionalProperties": false,
+    "properties": {
+      "advancedEnabled": {
+        "anyOf": [
+          {
+            "description": "Whether advanced settings are enabled",
+            "example": false,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "blur": {
+        "anyOf": [
+          {
+            "description": "Blur amount (0 = none, higher = more blur)",
+            "example": 1.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "border": {
+        "anyOf": [
+          {
+            "description": "Border thickness in pixels",
+            "example": 20,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "brightness": {
+        "anyOf": [
+          {
+            "description": "Brightness multiplier (1.0 = no change)",
+            "example": 1.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "colorspace": {
+        "anyOf": [
+          {
+            "description": "Colorspace for output image",
+            "enum": [
+              "grayscale",
+              "color"
+            ],
+            "example": "grayscale",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "contrast": {
+        "anyOf": [
+          {
+            "description": "Contrast multiplier (1.0 = no change)",
+            "example": 1.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "noise": {
+        "anyOf": [
+          {
+            "description": "Noise amount (0 = none, higher = more noise)",
+            "example": 8.0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "quality": {
+        "description": "Scan quality preset",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "example": "high",
+        "type": "string"
+      },
+      "resolution": {
+        "anyOf": [
+          {
+            "description": "Rendering resolution in DPI",
+            "example": 300,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "rotate": {
+        "anyOf": [
+          {
+            "description": "Base rotation in degrees",
+            "example": 0,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "rotateVariance": {
+        "anyOf": [
+          {
+            "description": "Random rotation variance in degrees",
+            "example": 2,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "rotation": {
+        "description": "Rotation preset",
+        "enum": [
+          "none",
+          "slight",
+          "moderate",
+          "severe"
+        ],
+        "example": "none",
+        "type": "string"
+      },
+      "rotationValue": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "yellowish": {
+        "anyOf": [
+          {
+            "description": "Simulate yellowed paper",
+            "example": false,
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "required": [
+      "quality",
+      "rotation"
+    ],
+    "title": "ScannerEffectParams",
+    "type": "object"
+  },
+  "/api/v1/misc/unlock-pdf-forms": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "UnlockPdfFormsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/update-metadata": {
+    "additionalProperties": false,
+    "properties": {
+      "allRequestParams": {
+        "anyOf": [
+          {
+            "additionalProperties": {
+              "description": "Map list of key and value of custom parameters. Note these must start with customKey and customValue if they are non-standard",
+              "type": "string"
+            },
+            "description": "Map list of key and value of custom parameters. Note these must start with customKey and customValue if they are non-standard",
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "author": {
+        "default": "author",
+        "description": "The author of the document",
+        "type": "string"
+      },
+      "creationDate": {
+        "default": "2023/10/01 12:00:00",
+        "description": "The creation date of the document (format: yyyy/MM/dd HH:mm:ss)",
+        "pattern": "yyyy/MM/dd HH:mm:ss",
+        "type": "string"
+      },
+      "creator": {
+        "default": "creator",
+        "description": "The creator of the document",
+        "type": "string"
+      },
+      "deleteAll": {
+        "default": false,
+        "description": "Delete all metadata if set to true",
+        "type": "boolean"
+      },
+      "keywords": {
+        "default": "keywords",
+        "description": "The keywords for the document",
+        "type": "string"
+      },
+      "modificationDate": {
+        "default": "2023/10/01 12:00:00",
+        "description": "The modification date of the document (format: yyyy/MM/dd HH:mm:ss)",
+        "pattern": "yyyy/MM/dd HH:mm:ss",
+        "type": "string"
+      },
+      "producer": {
+        "default": "producer",
+        "description": "The producer of the document",
+        "type": "string"
+      },
+      "subject": {
+        "default": "subject",
+        "description": "The subject of the document",
+        "type": "string"
+      },
+      "title": {
+        "default": "title",
+        "description": "The title of the document",
+        "type": "string"
+      },
+      "trapped": {
+        "default": "False",
+        "description": "The trapped status of the document",
+        "enum": [
+          "True",
+          "False",
+          "Unknown"
+        ],
+        "type": "string"
+      }
+    },
+    "title": "UpdateMetadataParams",
+    "type": "object"
+  },
+  "/api/v1/security/add-password": {
+    "additionalProperties": false,
+    "properties": {
+      "keyLength": {
+        "default": 256,
+        "description": "The length of the encryption key",
+        "enum": [
+          40,
+          128,
+          256
+        ],
+        "type": "integer"
+      },
+      "ownerPassword": {
+        "anyOf": [
+          {
+            "description": "The owner password to be added to the PDF file (Restricts what can be done with the document once it is opened)",
+            "format": "password",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "password": {
+        "anyOf": [
+          {
+            "description": "The password to be added to the PDF file (Restricts the opening of the document itself.)",
+            "format": "password",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "preventAssembly": {
+        "default": false,
+        "description": "Whether document assembly is prevented",
+        "type": "boolean"
+      },
+      "preventExtractContent": {
+        "default": false,
+        "description": "Whether content extraction is prevented",
+        "type": "boolean"
+      },
+      "preventExtractForAccessibility": {
+        "default": false,
+        "description": "Whether content extraction for accessibility is prevented",
+        "type": "boolean"
+      },
+      "preventFillInForm": {
+        "default": false,
+        "description": "Whether form filling is prevented",
+        "type": "boolean"
+      },
+      "preventModify": {
+        "default": false,
+        "description": "Whether document modification is prevented",
+        "type": "boolean"
+      },
+      "preventModifyAnnotations": {
+        "default": false,
+        "description": "Whether modification of annotations is prevented",
+        "type": "boolean"
+      },
+      "preventPrinting": {
+        "default": false,
+        "description": "Whether printing of the document is prevented",
+        "type": "boolean"
+      },
+      "preventPrintingFaithful": {
+        "default": false,
+        "description": "Whether faithful printing is prevented",
+        "type": "boolean"
+      }
+    },
+    "title": "AddPasswordParams",
+    "type": "object"
+  },
+  "/api/v1/security/add-watermark": {
+    "additionalProperties": false,
+    "properties": {
+      "alphabet": {
+        "default": "roman",
+        "description": "The selected alphabet",
+        "enum": [
+          "roman",
+          "arabic",
+          "japanese",
+          "korean",
+          "chinese",
+          "thai"
+        ],
+        "type": "string"
+      },
+      "convertPdfToImage": {
+        "default": false,
+        "description": "Convert the redacted PDF to an image",
+        "type": "boolean"
+      },
+      "customColor": {
+        "default": "#d3d3d3",
+        "description": "The color for watermark",
+        "type": "string"
+      },
+      "fontSize": {
+        "default": 30,
+        "description": "The font size of the watermark text",
+        "minimum": 1.0,
+        "type": "number"
+      },
+      "heightSpacer": {
+        "default": 50,
+        "description": "The height spacer between watermark elements",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "opacity": {
+        "default": 0.5,
+        "description": "The opacity of the watermark (0.0 - 1.0)",
+        "type": "number"
+      },
+      "rotation": {
+        "default": 0,
+        "description": "The rotation of the watermark in degrees",
+        "type": "number"
+      },
+      "watermarkText": {
+        "default": "Stirling Software",
+        "description": "The watermark text",
+        "type": "string"
+      },
+      "watermarkType": {
+        "description": "The watermark type (text or image)",
+        "enum": [
+          "text",
+          "image"
+        ],
+        "type": "string"
+      },
+      "widthSpacer": {
+        "default": 50,
+        "description": "The width spacer between watermark elements",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "watermarkType"
+    ],
+    "title": "AddWatermarkParams",
+    "type": "object"
+  },
+  "/api/v1/security/auto-redact": {
+    "additionalProperties": false,
+    "properties": {
+      "convertPdfToImage": {
+        "default": false,
+        "description": "Convert the redacted PDF to an image",
+        "type": "boolean"
+      },
+      "customPadding": {
+        "description": "Custom padding for redaction",
+        "type": "number"
+      },
+      "listOfText": {
+        "default": "text,text2",
+        "description": "List of text to redact from the PDF",
+        "type": "string"
+      },
+      "redactColor": {
+        "default": "#000000",
+        "description": "The color for redaction",
+        "type": "string"
+      },
+      "useRegex": {
+        "default": false,
+        "description": "Whether to use regex for the listOfText",
+        "type": "boolean"
+      },
+      "wholeWordSearch": {
+        "default": false,
+        "description": "Whether to use whole word search",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "customPadding"
+    ],
+    "title": "AutoRedactParams",
+    "type": "object"
+  },
+  "/api/v1/security/redact": {
+    "$defs": {
+      "RedactionArea": {
+        "additionalProperties": false,
+        "description": "A list of areas that should be redacted",
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "description": "The color used to redact the specified area.",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "height": {
+            "anyOf": [
+              {
+                "description": "The height of the area to be redacted.",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "page": {
+            "anyOf": [
+              {
+                "description": "The page on which the area should be redacted.",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "width": {
+            "anyOf": [
+              {
+                "description": "The width of the area to be redacted.",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "x": {
+            "anyOf": [
+              {
+                "description": "The left edge point of the area to be redacted.",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "y": {
+            "anyOf": [
+              {
+                "description": "The top edge point of the area to be redacted.",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "RedactionArea",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "convertPdfToImage": {
+        "default": false,
+        "description": "Convert the redacted PDF to an image",
+        "type": "boolean"
+      },
+      "pageNumbers": {
+        "default": "all",
+        "description": "The pages to select, Supports ranges (e.g., '1,3,5-9'), or 'all' or functions in the format 'an+b' where 'a' is the multiplier of the page number 'n', and 'b' is a constant (e.g., '2n+1', '3n', '6n-5')",
+        "type": "string"
+      },
+      "pageRedactionColor": {
+        "default": "#000000",
+        "description": "The color used to fully redact certain pages",
+        "type": "string"
+      },
+      "redactions": {
+        "description": "A list of areas that should be redacted",
+        "items": {
+          "$ref": "#/$defs/RedactionArea"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "redactions"
+    ],
+    "title": "RedactParams",
+    "type": "object"
+  },
+  "/api/v1/security/redact-execute": {
+    "$defs": {
+      "ImageBox": {
+        "additionalProperties": false,
+        "description": "Rectangular areas to black out, each defined by a page number and bounding box coordinates.",
+        "properties": {
+          "pageIndex": {
+            "description": "0-indexed page number (first page = 0).",
+            "type": "integer"
+          },
+          "x1": {
+            "description": "Left x coordinate of the redaction rectangle in PDF user-space points.",
+            "type": "number"
+          },
+          "x2": {
+            "description": "Right x coordinate of the redaction rectangle in PDF user-space points.",
+            "type": "number"
+          },
+          "y1": {
+            "description": "Top y coordinate of the redaction rectangle in PDF user-space points.",
+            "type": "number"
+          },
+          "y2": {
+            "description": "Bottom y coordinate of the redaction rectangle in PDF user-space points.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "pageIndex",
+          "x1",
+          "x2",
+          "y1",
+          "y2"
+        ],
+        "title": "ImageBox",
+        "type": "object"
+      },
+      "RedactStyle": {
+        "additionalProperties": false,
+        "description": "Redaction style options",
+        "properties": {
+          "color": {
+            "default": "#000000",
+            "description": "Hex redaction box color",
+            "type": "string"
+          },
+          "convertToImage": {
+            "default": false,
+            "description": "Rasterize output to prevent text extraction",
+            "type": "boolean"
+          },
+          "padding": {
+            "default": 0,
+            "description": "Extra padding around each box in points",
+            "type": "number"
+          },
+          "strategy": {
+            "default": "AUTO",
+            "description": "Execution strategy hint for the redaction pipeline",
+            "enum": [
+              "AUTO",
+              "OVERLAY_ONLY",
+              "IMAGE_FINALIZE"
+            ],
+            "type": "string"
+          }
+        },
+        "title": "RedactStyle",
+        "type": "object"
+      },
+      "TextRange": {
+        "additionalProperties": false,
+        "description": "Text ranges to redact by specifying a start and end anchor phrase. All content between the two phrases (inclusive) is redacted. Anchors work best when short and unique. They must appear verbatim in the document.",
+        "properties": {
+          "endString": {
+            "description": "A short, distinctive phrase (5–15 words) that marks where redaction ends (inclusive). Must appear verbatim in the document. Shorter phrases match more reliably.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "startString": {
+            "description": "A short, distinctive phrase (5–15 words) that marks where redaction begins (inclusive). Must appear verbatim in the document — e.g. a section heading or a unique sentence fragment.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "endString",
+          "startString"
+        ],
+        "title": "TextRange",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "imageBoxes": {
+        "anyOf": [
+          {
+            "description": "Rectangular areas to black out, each defined by a page number and bounding box coordinates.",
+            "items": {
+              "$ref": "#/$defs/ImageBox"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "ranges": {
+        "anyOf": [
+          {
+            "description": "Text ranges to redact by specifying a start and end anchor phrase. All content between the two phrases (inclusive) is redacted. Anchors work best when short and unique. They must appear verbatim in the document.",
+            "items": {
+              "$ref": "#/$defs/TextRange"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "redactImagePages": {
+        "anyOf": [
+          {
+            "description": "1-indexed page numbers to redact all detected images from. Pass an empty list to redact images from every page. Omit or pass null to skip image redaction entirely.",
+            "items": {
+              "description": "1-indexed page numbers to redact all detected images from. Pass an empty list to redact images from every page. Omit or pass null to skip image redaction entirely.",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "regexPatterns": {
+        "anyOf": [
+          {
+            "description": "Regex patterns to match and redact. Each match anywhere in the document is blacked out. Uses Java/PCRE regex syntax. Well-suited for strings that follow known patterns, like phone numbers, email addresses, national ID numbers, or dates (which can appear with different separators, optional country codes, etc.). For fixed known strings such as names, use textValues instead.",
+            "items": {
+              "description": "Regex patterns to match and redact. Each match anywhere in the document is blacked out. Uses Java/PCRE regex syntax. Well-suited for strings that follow known patterns, like phone numbers, email addresses, national ID numbers, or dates (which can appear with different separators, optional country codes, etc.). For fixed known strings such as names, use textValues instead.",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "style": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/RedactStyle"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "textValues": {
+        "anyOf": [
+          {
+            "description": "Exact strings to find and black out. One entry per phrase to redact. Best for known names, identifiers, and specific text found in the document.",
+            "items": {
+              "description": "Exact strings to find and black out. One entry per phrase to redact. Best for known names, identifiers, and specific text found in the document.",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "wipePages": {
+        "anyOf": [
+          {
+            "description": "1-indexed page numbers to wipe entirely (all content removed from those pages).",
+            "items": {
+              "description": "1-indexed page numbers to wipe entirely (all content removed from those pages).",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "RedactExecuteParams",
+    "type": "object"
+  },
+  "/api/v1/security/remove-cert-sign": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "RemoveCertSignParams",
+    "type": "object"
+  },
+  "/api/v1/security/remove-password": {
+    "additionalProperties": false,
+    "properties": {
+      "password": {
+        "anyOf": [
+          {
+            "description": "The password of the PDF file",
+            "format": "password",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "RemovePasswordParams",
+    "type": "object"
+  },
+  "/api/v1/security/sanitize-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "removeEmbeddedFiles": {
+        "default": true,
+        "description": "Remove embedded files from the PDF",
+        "type": "boolean"
+      },
+      "removeFonts": {
+        "default": false,
+        "description": "Remove fonts from the PDF",
+        "type": "boolean"
+      },
+      "removeJavaScript": {
+        "default": true,
+        "description": "Remove JavaScript actions from the PDF",
+        "type": "boolean"
+      },
+      "removeLinks": {
+        "default": false,
+        "description": "Remove links from the PDF",
+        "type": "boolean"
+      },
+      "removeMetadata": {
+        "default": false,
+        "description": "Remove document info metadata from the PDF",
+        "type": "boolean"
+      },
+      "removeXmpMetadata": {
+        "default": false,
+        "description": "Remove XMP metadata from the PDF",
+        "type": "boolean"
+      }
+    },
+    "title": "SanitizePdfParams",
+    "type": "object"
+  },
+  "/api/v1/security/timestamp-pdf": {
+    "additionalProperties": false,
+    "properties": {
+      "tsaUrl": {
+        "default": "http://timestamp.digicert.com",
+        "description": "URL of the RFC 3161 Time Stamp Authority (TSA) server. Must be one of the built-in presets (DigiCert, Sectigo, SSL.com, FreeTSA, MeSign) or an admin-configured URL in settings.yml (security.timestamp.customTsaUrls). If omitted, the server default is used.",
+        "type": "string"
+      }
+    },
+    "title": "TimestampPdfParams",
+    "type": "object"
+  }
+}
