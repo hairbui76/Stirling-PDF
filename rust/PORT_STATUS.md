@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **716 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **736 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -320,9 +320,11 @@ auto-rename/auto-split, plus:
   so the login `altLogin` flag is OAuth2-only — a documented divergence for a SAML2-only config; OAuth2
   providers are unaffected. Two minor divergences: an unknown `teams/{id}` returns `404` (Java accidentally
   `500`s) and "last activity" derives from session `created_at` (the Rust store has no per-request
-  `lastRequest`). Only `PortalApiKeysController` (`/proprietary/ui-data/infrastructure/api-keys`, needs
-  schema work) and the H2-only `ui-data/database` route remain deferred from this controller. See
-  `contracts/ui-data.md`.
+  `lastRequest`). `PortalApiKeysController` (`/proprietary/ui-data/infrastructure/api-keys`, GET/POST/DELETE)
+  is now ported — digest-only personal API-key list/create/revoke with a per-user active cap (50 → 429),
+  the secret returned once, cross-owner access `404`, and best-effort usage/last-used recorded on key auth;
+  authenticated non-anonymous callers only (no admin/Enterprise/demo gate). Only the H2-only
+  `ui-data/database` route remains deferred from this controller. See `contracts/ui-data.md`.
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
   Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
   app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the
@@ -330,8 +332,11 @@ auto-rename/auto-split, plus:
   only the same tenant's labels, refusing a protected/`ENCRYPT` label) and returns the re-saved PDF;
   read returns the PDF byte-for-byte unchanged plus an `X-Stirling-Tool-Report` JSON report. A step's
   `connectionId` resolves to the `PURVIEW` connection through one opaque anti-enumeration error.
+  That same confused-deputy guard now also runs at policy **save** and ad-hoc-run time (Java
+  `IntegrationStepValidator`): a policy whose step references an inaccessible / wrong-type / disabled
+  Purview connection is rejected with `400`, fail-closed for any other `/api/v1/integration/*` op.
   Secured-router-gated (mounts only in the opt-in secured runtime). Ports Java `PurviewLabelController`,
-  `ApiConnectionResolver`, `PdfSensitivityLabels`, and `AiToolResponseHeaders`. See
+  `ApiConnectionResolver`, `PdfSensitivityLabels`, `IntegrationStepValidator`, and `AiToolResponseHeaders`. See
   `contracts/purview.md`.
 
 ## Remaining (not yet ported)
