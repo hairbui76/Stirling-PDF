@@ -44,7 +44,7 @@ lettre = { version = "0.11.22", default-features = false, features = ["builder",
 pdfium-render = { version = "0.9.3", default-features = false, features = ["image_latest", "pdfium_7543", "thread_safe"] }
 p12-keystore = "0.3.1"
 p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "pem", "pkcs8"] }
-p384 = { version = "0.14.0", default-features = false, features = ["arithmetic", "pem", "pkcs8"] }
+p384 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdsa", "pem", "pkcs8"] }
 p521 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdsa", "pem", "pkcs8"] }
 pem = "3.0.6"
 pkcs8 = { version = "0.11.0", features = ["3des", "des-insecure", "encryption", "getrandom", "pem", "sha1-insecure"] }

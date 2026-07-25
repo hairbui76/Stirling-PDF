@@ -24,7 +24,7 @@ use cryptographic_message_syntax::{
 use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
 use p521::ecdsa::signature::Signer as _;
 use pkcs8::{DecodePrivateKey, EncryptedPrivateKeyInfoRef, SecretDocument};
-use sha2::{Digest as _, Sha512};
+use sha2::{Digest as _, Sha384, Sha512};
 use thiserror::Error;
 use x509_certificate::{
     CapturedX509Certificate, DigestAlgorithm, InMemorySigningKeyPair, Sign,
@@ -33,6 +33,16 @@ use x509_certificate::{
     rfc5652::{Attribute, AttributeValue},
 };
 use zeroize::Zeroizing;
+
+/// DER content octets for the `ecdsa-with-SHA384` signature algorithm OID
+/// (1.2.840.10045.4.3.3), the natural pairing for a P-384/secp384r1 key. The
+/// `cryptographic-message-syntax` `SignerBuilder` *can* express this signature
+/// algorithm, but it hardcodes a SHA-256 message digest regardless of curve, so
+/// a P-384 key would be signed as `ecdsa-with-SHA384` over a SHA-256 content
+/// digest — a curve-inconsistent pairing strict CMS verifiers (OpenSSL, Adobe)
+/// reject. The P-384 CMS path therefore builds a curve-consistent
+/// `SignerInfo` (SHA-384 digest + this signature algorithm) directly.
+const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 
 /// DER content octets for the `ecdsa-with-SHA512` signature algorithm OID
 /// (1.2.840.10045.4.3.4). This pairing is not expressible via
@@ -177,71 +187,132 @@ pub struct PemSigningKey {
 
 /// The parsed private key behind a [`PemSigningKey`].
 ///
-/// P-256/P-384/RSA/Ed25519 keys sign through the
-/// `cryptographic-message-syntax` + `x509-certificate` CMS backend. P-521
-/// (secp521r1) keys sign through a dedicated pure-Rust `p521` path because that
-/// backend's CMS signer implements only secp256r1/secp384r1; everything else is
-/// left on the original, unchanged path.
+/// P-256/RSA/Ed25519 keys sign through the `cryptographic-message-syntax` +
+/// `x509-certificate` CMS backend, which emits a SHA-256 message digest — the
+/// curve-consistent pairing for P-256 (`ecdsa-with-SHA256`). P-384 (secp384r1)
+/// and P-521 (secp521r1) keys sign through a dedicated pure-Rust path because
+/// that backend would emit a curve-inconsistent digest for them: it hardcodes
+/// SHA-256 regardless of curve (wrong for P-384's `ecdsa-with-SHA384`), and its
+/// `x509_certificate::SignatureAlgorithm` EC variants stop at SHA-384 so it
+/// cannot express P-521's `ecdsa-with-SHA512` at all. The pure-Rust path emits a
+/// curve-consistent digest (SHA-384 for P-384, SHA-512 for P-521); everything
+/// else is left on the original, unchanged path.
 enum SigningKeyMaterial {
     X509(InMemorySigningKeyPair),
     // Boxed to keep the enum small: `InMemorySigningKeyPair` boxes its key
-    // internally, whereas `p521::ecdsa::SigningKey` embeds the scalar and point.
-    P521(Box<P521SigningKey>),
+    // internally, whereas `p384`/`p521` signing keys embed the scalar and point.
+    PureEc(Box<EcSigningKey>),
 }
 
 impl SigningKeyMaterial {
     /// Whether this key's public half matches the signing certificate.
     ///
-    /// The X.509 backend compares raw `SubjectPublicKeyInfo` bytes. The P-521
-    /// path parses the certificate's SEC1 point (accepting either compressed or
-    /// uncompressed form) and compares curve points, so an equivalent key still
-    /// matches regardless of point encoding.
+    /// The X.509 backend compares raw `SubjectPublicKeyInfo` bytes. The pure-Rust
+    /// EC path parses the certificate's SEC1 point (accepting either compressed
+    /// or uncompressed form) and compares curve points, so an equivalent key
+    /// still matches regardless of point encoding.
     fn matches_certificate(&self, signing_certificate: &CapturedX509Certificate) -> bool {
         match self {
             Self::X509(key) => key.public_key_data() == signing_certificate.public_key_data(),
-            Self::P521(key) => {
-                p521::PublicKey::from_sec1_bytes(&signing_certificate.public_key_data())
-                    .is_ok_and(|certificate_public_key| certificate_public_key == key.public_key())
-            }
+            Self::PureEc(key) => key.matches_certificate(signing_certificate),
         }
     }
 }
 
-/// A P-521 (secp521r1) ECDSA signing key.
+/// A pure-Rust NIST-curve ECDSA signing key for the curves whose
+/// curve-consistent digest the `cryptographic-message-syntax` +
+/// `x509-certificate` CMS backend cannot emit: P-384 (secp384r1, SHA-384) and
+/// P-521 (secp521r1, SHA-512).
 ///
-/// Signs with SHA-512 — the natural digest pairing for P-521 — using
-/// deterministic RFC 6979 nonces, producing DER-encoded ECDSA signatures for
-/// CMS. The secret scalar stays inside `p521::ecdsa::SigningKey`, which zeroizes
-/// on drop; it is never exposed, serialized, or logged.
-struct P521SigningKey {
-    signing_key: p521::ecdsa::SigningKey,
+/// Each variant signs with its natural digest pairing — SHA-384 for P-384,
+/// SHA-512 for P-521 — using deterministic RFC 6979 nonces, producing
+/// DER-encoded ECDSA signatures for CMS. The secret scalar stays inside the
+/// `p384`/`p521` `SigningKey`, which zeroizes on drop; it is never exposed,
+/// serialized, or logged.
+enum EcSigningKey {
+    P384(p384::ecdsa::SigningKey),
+    P521(p521::ecdsa::SigningKey),
 }
 
-impl P521SigningKey {
-    /// Parses a PKCS#8 DER key iff it is a genuine P-521 key.
+impl EcSigningKey {
+    /// Parses a PKCS#8 DER key iff it is a genuine P-384 or P-521 key.
     ///
-    /// Returns `None` for every other curve/algorithm — a P-256/P-384/RSA/
-    /// Ed25519 key fails this parse — so callers use it as the P-521
-    /// discriminator before falling back to the X.509 backend.
+    /// Returns `None` for every other curve/algorithm — a P-256/RSA/Ed25519 key
+    /// fails both curve parses (each validates the named-curve OID) — so callers
+    /// use it as the discriminator that keeps P-256 (SHA-256, already
+    /// consistent) and RSA on the unchanged X.509 backend.
     fn from_pkcs8_der(pkcs8_der: &[u8]) -> Option<Self> {
-        let secret_key = p521::SecretKey::from_pkcs8_der(pkcs8_der).ok()?;
-        let signing_key = p521::ecdsa::SigningKey::from(&secret_key);
-        drop(secret_key);
-        Some(Self { signing_key })
+        if let Ok(secret_key) = p384::SecretKey::from_pkcs8_der(pkcs8_der) {
+            let signing_key = p384::ecdsa::SigningKey::from(&secret_key);
+            drop(secret_key);
+            return Some(Self::P384(signing_key));
+        }
+        if let Ok(secret_key) = p521::SecretKey::from_pkcs8_der(pkcs8_der) {
+            let signing_key = p521::ecdsa::SigningKey::from(&secret_key);
+            drop(secret_key);
+            return Some(Self::P521(signing_key));
+        }
+        None
     }
 
-    /// The public key corresponding to this signing key.
-    fn public_key(&self) -> p521::PublicKey {
-        self.signing_key.verifying_key().into()
+    /// Whether the certificate's SEC1 public point matches this signing key.
+    fn matches_certificate(&self, signing_certificate: &CapturedX509Certificate) -> bool {
+        let certificate_spki = signing_certificate.public_key_data();
+        match self {
+            Self::P384(signing_key) => p384::PublicKey::from_sec1_bytes(&certificate_spki)
+                .is_ok_and(|certificate_public_key| {
+                    certificate_public_key == signing_key.verifying_key().into()
+                }),
+            Self::P521(signing_key) => p521::PublicKey::from_sec1_bytes(&certificate_spki)
+                .is_ok_and(|certificate_public_key| {
+                    certificate_public_key == signing_key.verifying_key().into()
+                }),
+        }
     }
 
-    /// ECDSA-P521 signature over `SHA-512(message)`, DER-encoded.
+    /// DER-encoded ECDSA signature over the curve's digest of `message`
+    /// (SHA-384 for P-384, SHA-512 for P-521).
     fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
-        let signature: p521::ecdsa::DerSignature = self
-            .signing_key
-            .try_sign(message)
-            .map_err(|_| SigningKeyError::ProviderFailure)?;
-        Ok(signature.as_bytes().to_vec())
+        match self {
+            Self::P384(signing_key) => {
+                let signature: p384::ecdsa::DerSignature = signing_key
+                    .try_sign(message)
+                    .map_err(|_| SigningKeyError::ProviderFailure)?;
+                Ok(signature.as_bytes().to_vec())
+            }
+            Self::P521(signing_key) => {
+                let signature: p521::ecdsa::DerSignature = signing_key
+                    .try_sign(message)
+                    .map_err(|_| SigningKeyError::ProviderFailure)?;
+                Ok(signature.as_bytes().to_vec())
+            }
+        }
+    }
+
+    /// The CMS `digestAlgorithm` this curve pairs with: SHA-384 for P-384,
+    /// SHA-512 for P-521.
+    fn digest_algorithm(&self) -> DigestAlgorithm {
+        match self {
+            Self::P384(_) => DigestAlgorithm::Sha384,
+            Self::P521(_) => DigestAlgorithm::Sha512,
+        }
+    }
+
+    /// DER content octets of the CMS `signatureAlgorithm` OID this curve pairs
+    /// with: `ecdsa-with-SHA384` for P-384, `ecdsa-with-SHA512` for P-521.
+    fn signature_algorithm_oid(&self) -> &'static [u8] {
+        match self {
+            Self::P384(_) => OID_ECDSA_WITH_SHA384,
+            Self::P521(_) => OID_ECDSA_WITH_SHA512,
+        }
+    }
+
+    /// The curve's digest over `content`, for the CMS `messageDigest` attribute.
+    fn message_digest(&self, content: &[u8]) -> Vec<u8> {
+        match self {
+            Self::P384(_) => Sha384::digest(content).to_vec(),
+            Self::P521(_) => Sha512::digest(content).to_vec(),
+        }
     }
 }
 
@@ -356,14 +427,14 @@ impl PemSigningKey {
     ) -> Result<Self, SigningKeyError> {
         // Every entry form (traditional EC PEM, encrypted PKCS#8, direct PKCS#8
         // PEM, and PKCS#12/JKS archives) reaches this function as PKCS#8 DER.
-        // A genuine P-521 key parses only through the `p521` path and is signed
-        // there; a P-256/P-384 key fails that parse and falls through to the
-        // unchanged `x509-certificate` backend (which also serves RSA/Ed25519).
-        let material = if let Some(p521_key) =
-            P521SigningKey::from_pkcs8_der(private_key.as_bytes())
-        {
+        // A genuine P-384 or P-521 key parses only through the pure-Rust EC path
+        // and is signed there with its curve-consistent digest; a P-256 key
+        // fails that parse and falls through to the unchanged `x509-certificate`
+        // backend (which emits the consistent SHA-256 for P-256, and also serves
+        // RSA/Ed25519).
+        let material = if let Some(ec_key) = EcSigningKey::from_pkcs8_der(private_key.as_bytes()) {
             drop(private_key);
-            SigningKeyMaterial::P521(Box::new(p521_key))
+            SigningKeyMaterial::PureEc(Box::new(ec_key))
         } else {
             let parsed_private_key = InMemorySigningKeyPair::from_pkcs8_der(private_key.as_bytes());
             drop(private_key);
@@ -422,8 +493,8 @@ impl PemSigningKey {
                     .build_der()
                     .map_err(|_| SigningKeyError::CmsGeneration)
             }
-            SigningKeyMaterial::P521(private_key) => {
-                build_p521_detached_cms(private_key, &self.certificates, signed_pdf_bytes)
+            SigningKeyMaterial::PureEc(private_key) => {
+                build_ec_detached_cms(private_key, &self.certificates, signed_pdf_bytes)
             }
         }
     }
@@ -528,26 +599,31 @@ impl SigningKey for PemSigningKey {
                     .map_err(|_| SigningKeyError::ProviderFailure)?;
                 signature
             }
-            SigningKeyMaterial::P521(private_key) => private_key.sign_der(signed_attributes_der)?,
+            SigningKeyMaterial::PureEc(private_key) => {
+                private_key.sign_der(signed_attributes_der)?
+            }
         };
         Signature::new(signature)
     }
 }
 
-/// Builds a detached CMS `SignedData` (DER) for a P-521 signing key.
+/// Builds a detached CMS `SignedData` (DER) for a pure-Rust EC signing key
+/// (P-384 or P-521).
 ///
 /// The `cryptographic-message-syntax` `SignerBuilder` hardcodes a SHA-256 digest
-/// and derives the signature algorithm from `x509_certificate::SignatureAlgorithm`,
-/// whose EC variants stop at SHA-384 — so it cannot express the SHA-512 digest
-/// and `ecdsa-with-SHA512` signature algorithm P-521 requires. This assembles the
+/// regardless of curve and derives the signature algorithm from
+/// `x509_certificate::SignatureAlgorithm`, whose EC variants stop at SHA-384 — so
+/// it cannot express the curve-consistent digest these curves require (SHA-384
+/// with `ecdsa-with-SHA384` for P-384; SHA-512 with `ecdsa-with-SHA512` for
+/// P-521, which it cannot express at all). This assembles the
 /// `SignerInfo`/`SignedData` from the crate's own RFC 5652 ASN.1 types instead,
 /// mirroring the builder's structure exactly (external content, `id-signedData`
 /// eContentType, the content-type/message-digest/signing-time signed attributes,
 /// DER-sorted, `IssuerAndSerialNumber` signer id) so the output verifies through
-/// the same code path as the P-256/P-384 signatures. Only the digest, the
-/// signature algorithm, and the signing curve differ.
-fn build_p521_detached_cms(
-    private_key: &P521SigningKey,
+/// the same code path as the P-256 signatures. Only the digest, the signature
+/// algorithm, and the signing curve differ — all sourced from `private_key`.
+fn build_ec_detached_cms(
+    private_key: &EcSigningKey,
     certificates: &[CapturedX509Certificate],
     signed_pdf_bytes: &[u8],
 ) -> Result<Vec<u8>, SigningKeyError> {
@@ -555,18 +631,20 @@ fn build_p521_detached_cms(
         .first()
         .ok_or(SigningKeyError::EmptyCertificateChain)?;
 
-    // digestAlgorithm = SHA-512 (2.16.840.1.101.3.4.2.3), parameters absent.
-    let digest_algorithm: AlgorithmIdentifier = DigestAlgorithm::Sha512.into();
-    // signatureAlgorithm = ecdsa-with-SHA512 (1.2.840.10045.4.3.4), parameters absent.
+    // digestAlgorithm = SHA-384 (P-384) / SHA-512 (P-521), parameters absent.
+    let digest_algorithm: AlgorithmIdentifier = private_key.digest_algorithm().into();
+    // signatureAlgorithm = ecdsa-with-SHA384 / ecdsa-with-SHA512, parameters absent.
     let signature_algorithm = AlgorithmIdentifier {
-        algorithm: Oid(Bytes::copy_from_slice(OID_ECDSA_WITH_SHA512)),
+        algorithm: Oid(Bytes::copy_from_slice(
+            private_key.signature_algorithm_oid(),
+        )),
         parameters: None,
     };
 
-    // messageDigest = SHA-512 over the externally-signed content (the covered
-    // PDF byte range). This is the detached/external signature form: the content
-    // is digested but not embedded.
-    let message_digest = Sha512::digest(signed_pdf_bytes);
+    // messageDigest = the curve's digest over the externally-signed content (the
+    // covered PDF byte range). This is the detached/external signature form: the
+    // content is digested but not embedded.
+    let message_digest = private_key.message_digest(signed_pdf_bytes);
 
     let content_type_oid = Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref()));
     let mut signed_attributes = SignedAttributes::default();
@@ -615,7 +693,8 @@ fn build_p521_detached_cms(
 
     // The signed content is the DER of the signed attributes, re-tagged from
     // `IMPLICIT [0]` to `EXPLICIT SET OF` per RFC 5652 §5.4. `sign_der` then
-    // ECDSA-signs `SHA-512` of that content.
+    // ECDSA-signs the curve's digest (SHA-384 for P-384, SHA-512 for P-521) of
+    // that content.
     let signed_content = signer_info
         .signed_attributes_digested_content()
         .map_err(|_| SigningKeyError::CmsGeneration)?
@@ -1067,6 +1146,204 @@ amwXixTh3YlrdOneww==\n\
             .err(),
             Some(SigningKeyError::CertificateKeyMismatch)
         );
+        Ok(())
+    }
+
+    /// Independently verifies a P-384 detached CMS the way a strict external
+    /// verifier (OpenSSL, Adobe) would: it decodes the low-level RFC 5652 ASN.1
+    /// and asserts the `SignerInfo` is curve-consistent — SHA-384 digest
+    /// (2.16.840.1.101.3.4.2.2) *and* `ecdsa-with-SHA384` signature
+    /// (1.2.840.10045.4.3.3) — the pairing the pre-fix SHA-256 digest broke. It
+    /// then re-checks the SHA-384 messageDigest binding and verifies the ECDSA
+    /// signature over the signed attributes with the `p384` crate directly.
+    fn assert_p384_detached_cms_verifies(
+        cms: &[u8],
+        signed_pdf_bytes: &[u8],
+        signing_certificate: &CapturedX509Certificate,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use cryptographic_message_syntax::asn1::rfc5652::SignedData as Asn1SignedData;
+        use p384::ecdsa::{Signature as EcdsaSignature, VerifyingKey, signature::Verifier};
+        use sha2::{Digest as _, Sha384};
+
+        // digestAlgorithm = SHA-384 (2.16.840.1.101.3.4.2.2).
+        const OID_SHA384: &[u8] = &[96, 134, 72, 1, 101, 3, 4, 2, 2];
+
+        let expected_digest = Sha384::digest(signed_pdf_bytes);
+        // The signed messageDigest attribute must carry SHA-384(content),
+        // encoded as an OCTET STRING (tag 0x04, length 0x30 = 48 bytes).
+        let mut expected_message_digest = vec![0x04u8, 0x30u8];
+        expected_message_digest.extend_from_slice(expected_digest.as_slice());
+        assert!(
+            cms.windows(expected_message_digest.len())
+                .any(|window| window == expected_message_digest),
+            "CMS must bind SHA-384 of the signed content via the messageDigest attribute"
+        );
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(&signing_certificate.public_key_data())?;
+
+        let signed_data = Asn1SignedData::decode_ber(cms)?;
+        assert!(
+            !signed_data.signer_infos.is_empty(),
+            "at least one SignerInfo"
+        );
+        for signer_info in signed_data.signer_infos.iter() {
+            assert_eq!(
+                signer_info.digest_algorithm.algorithm.as_ref(),
+                OID_SHA384,
+                "digestAlgorithm must be SHA-384"
+            );
+            assert_eq!(
+                signer_info.signature_algorithm.algorithm.as_ref(),
+                super::OID_ECDSA_WITH_SHA384,
+                "signatureAlgorithm must be ecdsa-with-SHA384"
+            );
+            let signed_content = signer_info
+                .signed_attributes_digested_content()?
+                .ok_or("signed attributes present")?;
+            let signature = EcdsaSignature::from_der(signer_info.signature.to_bytes().as_ref())?;
+            verifying_key.verify(&signed_content, &signature)?;
+        }
+        Ok(())
+    }
+
+    /// A P-384 (secp384r1) key must produce a curve-consistent detached CMS:
+    /// SHA-384 digest paired with `ecdsa-with-SHA384`. The pre-fix path routed
+    /// P-384 through the backend `SignerBuilder`, which hardcodes a SHA-256
+    /// digest — a mismatch strict verifiers reject. The key + `ecdsa-with-SHA384`
+    /// self-signed certificate come from the same ring-backed test helper the
+    /// P-256 cases use, so no fixed fixture is embedded.
+    #[test]
+    #[allow(deprecated)]
+    fn pem_provider_signs_p384_pkcs8_key_and_generates_verifiable_cms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (certificate, key) =
+            self_signed_ecdsa_key_pair(Some(x509_certificate::EcdsaCurve::Secp384r1));
+        let signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(private_key_pem(&key)?.into_bytes()),
+            certificate.encode_pem().as_bytes(),
+        )?;
+        assert_eq!(signer.source(), SigningKeySource::UploadedPem);
+
+        let signed_pdf_bytes = b"p384-pkcs8-pdf-byte-range";
+        let cms = signer.detached_cms_der(signed_pdf_bytes)?;
+        assert_p384_detached_cms_verifies(&cms, signed_pdf_bytes, &certificate)
+    }
+
+    /// The traditional (SEC1) EC PEM entry form for a P-384 key must reach the
+    /// same curve-consistent pure-Rust path after the legacy PEM -> PKCS#8
+    /// conversion.
+    #[test]
+    #[allow(deprecated)]
+    fn pem_provider_signs_traditional_p384_ec_pem() -> Result<(), Box<dyn std::error::Error>> {
+        let (certificate, key) =
+            self_signed_ecdsa_key_pair(Some(x509_certificate::EcdsaCurve::Secp384r1));
+        let private_key = key.private_key_data().ok_or("key")?;
+        let ec_key = p384::SecretKey::from_pkcs8_der(private_key.as_slice())?;
+        let traditional_pem = pem_document("EC PRIVATE KEY", ec_key.to_sec1_der()?.as_ref());
+
+        let signer = PemSigningKey::from_pem(
+            SigningSecret::new(traditional_pem.into_bytes()),
+            None,
+            certificate.encode_pem().as_bytes(),
+        )?;
+
+        let signed_pdf_bytes = b"p384-traditional-pdf-byte-range";
+        let cms = signer.detached_cms_der(signed_pdf_bytes)?;
+        assert_p384_detached_cms_verifies(&cms, signed_pdf_bytes, &certificate)
+    }
+
+    /// The `SigningKey::sign` trait path (detached signature over caller-supplied
+    /// attribute bytes) must also route a P-384 key through the pure-Rust signer
+    /// and produce a DER ECDSA-P384/SHA-384 signature that verifies.
+    #[test]
+    #[allow(deprecated)]
+    fn p384_signing_key_trait_sign_produces_verifiable_signature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use p384::ecdsa::{Signature as EcdsaSignature, VerifyingKey, signature::Verifier};
+
+        let (certificate, key) =
+            self_signed_ecdsa_key_pair(Some(x509_certificate::EcdsaCurve::Secp384r1));
+        let mut signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(private_key_pem(&key)?.into_bytes()),
+            certificate.encode_pem().as_bytes(),
+        )?;
+        let attributes = b"arbitrary-signed-attributes-der";
+        let signature = signer.sign(attributes)?;
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(&certificate.public_key_data())?;
+        let parsed = EcdsaSignature::from_der(signature.as_bytes())?;
+        verifying_key.verify(attributes, &parsed)?;
+        Ok(())
+    }
+
+    /// A P-384 key whose public half does not match the certificate is rejected
+    /// with the same `CertificateKeyMismatch` used by every other curve.
+    #[test]
+    #[allow(deprecated)]
+    fn p384_provider_rejects_mismatched_certificate() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, key) = self_signed_ecdsa_key_pair(Some(x509_certificate::EcdsaCurve::Secp384r1));
+        let (other_certificate, _) =
+            self_signed_ecdsa_key_pair(Some(x509_certificate::EcdsaCurve::Secp384r1));
+        assert_eq!(
+            PemSigningKey::from_pkcs8_pem(
+                SigningSecret::new(private_key_pem(&key)?.into_bytes()),
+                other_certificate.encode_pem().as_bytes(),
+            )
+            .err(),
+            Some(SigningKeyError::CertificateKeyMismatch)
+        );
+        Ok(())
+    }
+
+    /// Regression guard: a P-256 (secp256r1) key must stay on the unchanged X.509
+    /// backend, whose SHA-256 digest is already curve-consistent for P-256. The
+    /// `SignerInfo` must carry SHA-256 (2.16.840.1.101.3.4.2.1) paired with
+    /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2), and still verify through the
+    /// high-level `cryptographic-message-syntax` verifier. The P-384/P-521 fix
+    /// must not perturb this.
+    #[test]
+    #[allow(deprecated)]
+    fn pem_provider_p256_stays_sha256_consistent() -> Result<(), Box<dyn std::error::Error>> {
+        use cryptographic_message_syntax::asn1::rfc5652::SignedData as Asn1SignedData;
+
+        // digestAlgorithm = SHA-256 (2.16.840.1.101.3.4.2.1);
+        // signatureAlgorithm = ecdsa-with-SHA256 (1.2.840.10045.4.3.2).
+        const OID_SHA256: &[u8] = &[96, 134, 72, 1, 101, 3, 4, 2, 1];
+        const OID_ECDSA_WITH_SHA256: &[u8] = &[42, 134, 72, 206, 61, 4, 3, 2];
+
+        let (certificate, key) = self_signed_ecdsa_key_pair(None);
+        let signer = PemSigningKey::from_pkcs8_pem(
+            SigningSecret::new(private_key_pem(&key)?.into_bytes()),
+            certificate.encode_pem().as_bytes(),
+        )?;
+        let signed_pdf_bytes = b"p256-pdf-byte-range";
+        let cms = signer.detached_cms_der(signed_pdf_bytes)?;
+
+        let signed_data = Asn1SignedData::decode_ber(&cms)?;
+        assert!(
+            !signed_data.signer_infos.is_empty(),
+            "at least one SignerInfo"
+        );
+        for signer_info in signed_data.signer_infos.iter() {
+            assert_eq!(
+                signer_info.digest_algorithm.algorithm.as_ref(),
+                OID_SHA256,
+                "P-256 digestAlgorithm must stay SHA-256"
+            );
+            assert_eq!(
+                signer_info.signature_algorithm.algorithm.as_ref(),
+                OID_ECDSA_WITH_SHA256,
+                "P-256 signatureAlgorithm must be ecdsa-with-SHA256"
+            );
+        }
+
+        // And it still verifies through the crate's own high-level verifier,
+        // which resolves `ecdsa-with-SHA256` fine.
+        let high_level = SignedData::parse_ber(&cms)?;
+        for cms_signer in high_level.signers() {
+            cms_signer.verify_message_digest_with_content(signed_pdf_bytes)?;
+            cms_signer.verify_signature_with_signed_data(&high_level)?;
+        }
         Ok(())
     }
 

@@ -3616,6 +3616,7 @@ dependencies = [
  "fiat-crypto 0.3.0",
  "primefield",
  "primeorder 0.14.0",
+ "sha2 0.11.0",
 ]
 
 [[package]]
