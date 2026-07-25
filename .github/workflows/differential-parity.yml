@@ -86,12 +86,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends ghostscript
           gs --version
 
+      # Java FIRST: the Gradle build generates app/common/src/main/resources/version.properties
+      # (task `writeVersion`, build.gradle), which the Rust crate include_str!s at compile time
+      # (runtime_metrics.rs). That file is gitignored, so on a fresh runner Rust cannot compile
+      # until Gradle has produced it.
+      - name: Build Java backend (bootJar, also generates version.properties)
+        run: ./gradlew :stirling-pdf:bootJar
+
       - name: Build Rust backend
         working-directory: rust
         run: cargo build -p stirling-processing --locked
-
-      - name: Build Java backend (bootJar)
-        run: ./gradlew :stirling-pdf:bootJar
 
       - name: Start both backends and run the differential diff
         shell: bash
