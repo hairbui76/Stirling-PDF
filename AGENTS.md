@@ -370,6 +370,52 @@ return useToolOperation({
 - **Type Safe**: Full TypeScript support with generic interfaces
 - **Memory Safe**: Automatic resource cleanup and blob URL management
 
+## Rust Port Workflow — Outsource-Team Model
+
+Any **substantial** Java/Python → Rust porting task (a new endpoint, subsystem, or feature
+slice; anything multi-step) is executed as an **outsourced team**, not solo. Trivial one-line
+edits, config tweaks, doc fixes, and pure questions are handled directly without a team.
+
+**Roles**
+- **You = Project Manager.** You do **not** write the port code yourself. You decompose the
+  task into work-items, spawn the team, review deliverables, integrate them, resolve conflicts,
+  keep `rust/PORT_STATUS.md` and the relevant `rust/contracts/<name>.md` up to date, and report
+  the outcome (what shipped, test status, parity notes, remaining gaps). Keep the conclusions,
+  not the file dumps.
+- **Dev + Tester agent pairs.** One pair per work-item; run pairs in parallel as the
+  decomposition allows. The **dev** implements the Rust code following repo conventions
+  (pure-Rust preference, contract-first against `rust/contracts/`, the bleeding-edge stack note).
+  The **tester is a separate, independent agent** from the dev (never the same agent grading its
+  own work).
+
+**Execution: autonomous, parallel where the decomposition allows.** Do not gate on pre-approval —
+decompose, run the pairs, integrate, and report at the end.
+
+- **Parallelise independent work-items.** When work-items don't share a hot file and have no
+  dependency chain, run their pairs concurrently, each track in its own git **worktree** the PM
+  creates (`git worktree add`), so parallel file mutation and separate `cargo` builds don't collide.
+  Both the dev **and** its tester must operate in that **same** worktree path — the Workflow tool's
+  per-agent `isolation: "worktree"` gives each *agent* a *different* tree, which breaks the
+  dev→tester handoff, so share one per-track worktree by telling both agents to `cd` into it. The PM
+  then merges the green worktree diffs back into the main tree and runs one final combined gate.
+- **Serialise when coupled.** A single cargo workspace means one broken file fails the whole build,
+  so work-items that share a hot file (e.g. `lib.rs`/`runtime_config.rs` route wiring) or form a
+  dependency chain must run sequentially on one tree, preserving a green-tree invariant after each
+  (a failed item reverts only its own files so it never blocks the rest).
+- Implement via the Workflow tool (a dev → tester pipeline per work-item, iterating dev↔tester until
+  sign-off) or Agent pairs.
+
+**Definition of done (tester must sign off before a work-item is "delivered"):**
+1. `task engine:check` is clean (fmt + clippy + tests) — or `task engine:legacy:check` /
+   `task backend:check` for the matching component.
+2. The tester **adversarially** tries to break the implementation (edge cases, malformed input,
+   security/SSRF, resource bounds), not just confirm the happy path.
+3. **Java-oracle parity** is verified wherever a contract exists — behavior is checked against the
+   `rust/contracts/<name>.md` document and the corresponding Java controller/service.
+
+If the tester finds problems, the work-item goes **back to the dev** and iterates; it is not
+delivered until the tester signs off.
+
 ## Architecture Overview
 
 ### Project Structure
