@@ -74,8 +74,14 @@ usage labels; grants/config are removed only after references are gone. See `pol
 ## Explicit remaining boundary
 
 MCP remains a storage placeholder, matching its current Java integration-config behavior. The
-`external-api-call` step (the `API` integration type) is being ported as a bounded staircase: **slices 1–2
-are landed**. Slice 2 adds `DocumentContext::build` (the templating namespace — base facts filename/
+`external-api-call` step (the `API` integration type) is being ported as a bounded staircase: **slices 1–3
+are landed**. Slice 3 adds the SSRF-safe outbound caller: redirect never followed, a 64 MiB bounded
+response read, per-connection timeout, credential-free error messages, the NONE/BEARER/BASIC/HEADER/
+TOKEN_LOGIN auth application, and a login-once token cache (TTL, per-credential key, 401→evict→retry-once).
+Its base-host gate reuses the OIDC `resolve_to_addrs` pin + `ip_addr_is_reserved` (anti-DNS-rebinding) and
+enforces an **unconditional cloud-metadata deny** (169.254.169.254/.253/.250, `fd00:ec2::254`) that runs
+*before* the new `policies.allowPrivateApiEndpoints` opt-in (default `false`) — so the metadata endpoints
+stay blocked even when private endpoints are allowed. Slice 2 adds `DocumentContext::build` (the templating namespace — base facts filename/
 extension/contentType/sizeBytes/sha256/base64 + run facts + best-effort PDF Info metadata + `classification.*`
 + `sensitivityLabel.*`, every PDF/label field omit-not-fatal on a non-PDF/unparseable input) and `buildBody`
 (the four outbound body modes: multipart with templated fields, json, raw binary, and `bodyTemplate` via

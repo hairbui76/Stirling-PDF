@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **848 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **889 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -341,13 +341,17 @@ auto-rename/auto-split, plus:
   unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
   blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
   of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
-  as a bounded staircase — slices 1–2 are landed and oracle-verified (`proprietary_external_api.rs`):
+  as a bounded staircase — slices 1–3 are landed and oracle-verified (`proprietary_external_api.rs`):
   slice 1 = pure request-construction + config primitives; slice 2 = the `DocumentContext` namespace
   (base/run facts + best-effort PDF Info metadata + classification + sensitivity-label, omit-not-fatal on
-  non-PDF) and the four `buildBody` modes (multipart / json / binary / bodyTemplate). Slices 3–4 (the
-  SSRF-safe outbound caller + auth/token-login cache reusing the OIDC resolve-and-pin, and
-  response/verdict/result-URL/zip handling + route wiring) remain, and will cover ConsignO via the
-  generic `bodyTemplate`. See `contracts/resource-access-integrations.md`.
+  non-PDF) and the four `buildBody` modes (multipart / json / binary / bodyTemplate); slice 3 = the
+  SSRF-safe outbound caller (redirect=NEVER, 64 MiB bounded read, credential-free errors) with
+  NONE/BEARER/BASIC/HEADER/TOKEN_LOGIN auth and a login-once token cache (401→evict→retry-once),
+  reusing the OIDC `resolve_to_addrs` pin + `ip_addr_is_reserved`, gated by an **unconditional
+  cloud-metadata deny** (169.254.169.254/.253/.250, `fd00:ec2::254`) that runs before the new
+  `policies.allowPrivateApiEndpoints` opt-in (default false). Slice 4 (response/verdict/result-URL/zip
+  handling + policy-step route wiring — which closes the fail-closed step and covers ConsignO via the
+  generic `bodyTemplate`) remains. See `contracts/resource-access-integrations.md`.
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
   Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
   app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the

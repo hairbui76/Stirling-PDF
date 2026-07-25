@@ -37,9 +37,12 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::OnceLock,
+    io::Read as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use base64::{
@@ -49,11 +52,15 @@ use base64::{
 use lopdf::Document;
 use rand::RngExt as _;
 use regex::Regex;
+use reqwest::{Method, blocking::Client, header::CONTENT_TYPE, redirect::Policy};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use crate::purview::{AssignmentMethod, PdfSensitivityLabels};
+use crate::{
+    oidc_discovery::ip_addr_is_reserved,
+    purview::{AssignmentMethod, PdfSensitivityLabels},
+};
 
 // ---------------------------------------------------------------------------
 // Error type — every Java IllegalArgumentException maps here. Display carries
@@ -433,15 +440,43 @@ impl fmt::Display for ApiAuthType {
     }
 }
 
-/// Placeholder for the token-login sub-config.
+/// How a `TOKEN_LOGIN` connection turns credentials into a short-lived token.
+/// (oracle `ApiTokenLogin`.)
 ///
-/// TODO(slice 3): port `ApiTokenLogin.from(Map<String,Object>)` with full
-/// validation (`loginPath`; exactly one of `tokenResponseHeader` /
-/// `tokenResponseJsonPath`; `tokenHeaderName`; TTL) and `tokenCacheKey()`.
-/// Slice 1 records only that `TOKEN_LOGIN` was selected; the sub-config is
-/// **not** validated here.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct ApiTokenLogin;
+/// The two axes that vary between vendors are *where* the token comes back
+/// (`token_response_header` **or** `token_response_json_path` — exactly one) and
+/// *how* it is then presented (`token_header_name` + optional prefix). Parsed and
+/// validated by [`ApiTokenLogin::from_options`] (slice 3).
+///
+/// `login_body` / `login_headers` carry the credentials, so [`fmt::Debug`] never
+/// prints them (mirrors Java `toString`).
+#[derive(Clone)]
+pub(crate) struct ApiTokenLogin {
+    login_path: String,
+    /// The JSON object sent to `login_path`; may embed the password.
+    login_body: Value,
+    /// Headers sent on the login call; may embed a client secret.
+    login_headers: BTreeMap<String, String>,
+    /// Exactly one of these two is `Some` (enforced at parse time).
+    token_response_header: Option<String>,
+    token_response_json_path: Option<String>,
+    /// The header the token is presented under on authenticated calls.
+    token_header_name: String,
+    /// Already carries its trailing space when non-empty (Java stores it so),
+    /// so the sent value is simply `token_prefix + token`.
+    token_prefix: String,
+    token_ttl_seconds: i32,
+}
+
+impl fmt::Debug for ApiTokenLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ApiTokenLogin[loginPath={}, tokenTtlSeconds={}]",
+            self.login_path, self.token_ttl_seconds
+        )
+    }
+}
 
 const BASE_URL_OPTION: &str = "baseUrl";
 const AUTH_TYPE_OPTION: &str = "authType";
@@ -540,7 +575,8 @@ impl ApiConnectionSettings {
                     "api config authType 'BASIC' requires a 'password'",
                 )?;
             }
-            // Validation of the TOKEN_LOGIN sub-config is deferred (slice 3).
+            // The TOKEN_LOGIN sub-config is validated by ApiTokenLogin::from_options
+            // below (matching Java's `/* validated by ApiTokenLogin.from below */`).
             ApiAuthType::TokenLogin | ApiAuthType::None => {}
         }
 
@@ -548,9 +584,7 @@ impl ApiConnectionSettings {
         // matches: headers, then token-login, then result hosts, then timeout.
         let headers = parse_headers(options.get(HEADERS_OPTION))?;
         let token_login = if auth_type == ApiAuthType::TokenLogin {
-            // TODO(slice 3): ApiTokenLogin::from_options(options) — validates the
-            // login sub-config. Slice 1 records selection only.
-            Some(ApiTokenLogin)
+            Some(ApiTokenLogin::from_options(options)?)
         } else {
             None
         };
@@ -1314,6 +1348,1019 @@ fn templated_body(
         content_type: APPLICATION_JSON.to_owned(),
         bytes,
     })
+}
+
+// ===========================================================================
+// (h) Slice 3 — the SSRF-safe outbound caller, per-authType credential headers,
+//     and the TOKEN_LOGIN login-once token cache. Mirrors the Java oracles
+//     `ExternalApiCaller`, `ApiTokenCache`, `ApiTokenLogin`, `ApiIntegrationValidator`
+//     (the base-host gate) and `ResultUrls` (the result-fetch host allowlist).
+// ===========================================================================
+
+// ---- ApiTokenLogin: parse + token extraction (oracle ApiTokenLogin) --------
+
+const LOGIN_PATH_OPTION: &str = "loginPath";
+const LOGIN_BODY_OPTION: &str = "loginBody";
+const LOGIN_HEADERS_OPTION: &str = "loginHeaders";
+const TOKEN_RESPONSE_HEADER_OPTION: &str = "tokenResponseHeader";
+const TOKEN_RESPONSE_JSON_PATH_OPTION: &str = "tokenResponseJsonPath";
+const TOKEN_HEADER_NAME_OPTION: &str = "tokenHeaderName";
+const TOKEN_PREFIX_OPTION: &str = "tokenPrefix";
+const TOKEN_TTL_SECONDS_OPTION: &str = "tokenTtlSeconds";
+
+/// Conservative default (oracle `ApiTokenLogin.DEFAULT_TOKEN_TTL_SECONDS`):
+/// cache for 25 min against a token good for ~30, so a slow call finishes on a
+/// token still valid when it started.
+const DEFAULT_TOKEN_TTL_SECONDS: i32 = 1500;
+const MAX_TOKEN_TTL_SECONDS: i32 = 86400;
+
+impl ApiTokenLogin {
+    /// Ports Java `ApiTokenLogin.from(Map<String,Object>)`. Validation order (and
+    /// so error precedence) matches the oracle: loginPath, exactly-one-of the two
+    /// token-location options, tokenHeaderName presence + grammar, the response
+    /// header's grammar, then loginBody / loginHeaders / TTL.
+    fn from_options(options: &BTreeMap<String, Value>) -> Result<Self, ExternalApiError> {
+        let login_path = trimmed(options.get(LOGIN_PATH_OPTION)).ok_or_else(|| {
+            invalid("api config authType 'TOKEN_LOGIN' requires a 'loginPath', e.g. /auth/login")
+        })?;
+
+        let response_header = trimmed(options.get(TOKEN_RESPONSE_HEADER_OPTION));
+        let response_json_path = trimmed(options.get(TOKEN_RESPONSE_JSON_PATH_OPTION));
+        // Exactly one: both-absent and both-present are equally rejected.
+        if response_header.is_none() == response_json_path.is_none() {
+            return Err(invalid(
+                "api config authType 'TOKEN_LOGIN' needs exactly one of 'tokenResponseHeader' \
+                 (e.g. X-Auth-Token) or 'tokenResponseJsonPath' (e.g. access_token) to say where \
+                 the token comes back",
+            ));
+        }
+
+        let token_header_name =
+            trimmed(options.get(TOKEN_HEADER_NAME_OPTION)).ok_or_else(|| {
+                invalid(
+                    "api config authType 'TOKEN_LOGIN' requires a 'tokenHeaderName' saying which \
+                 header carries the token back, e.g. X-Auth-Token or Authorization",
+                )
+            })?;
+        if !ExternalApiHeaders::is_valid_name(&token_header_name) {
+            return Err(invalid(format!(
+                "api config 'tokenHeaderName' is not a valid HTTP header name: {token_header_name}"
+            )));
+        }
+        if let Some(header) = response_header.as_deref()
+            && !ExternalApiHeaders::is_valid_name(header)
+        {
+            return Err(invalid(format!(
+                "api config 'tokenResponseHeader' is not a valid HTTP header name: {header}"
+            )));
+        }
+
+        let login_body = nested_object(options.get(LOGIN_BODY_OPTION), LOGIN_BODY_OPTION)?;
+        let login_headers = parse_login_headers(options.get(LOGIN_HEADERS_OPTION))?;
+        // Stored already carrying its trailing space, so the sent value is just
+        // `prefix + token` (oracle stores it the same way).
+        let token_prefix = trimmed(options.get(TOKEN_PREFIX_OPTION))
+            .map(|prefix| format!("{prefix} "))
+            .unwrap_or_default();
+        let token_ttl_seconds = parse_token_ttl(options.get(TOKEN_TTL_SECONDS_OPTION))?;
+
+        Ok(Self {
+            login_path,
+            login_body,
+            login_headers,
+            token_response_header: response_header,
+            token_response_json_path: response_json_path,
+            token_header_name,
+            token_prefix,
+            token_ttl_seconds,
+        })
+    }
+
+    /// Pull the token out of a login response — from the configured response
+    /// header, or by walking the configured dotted JSON path. Credential-free
+    /// failure messages (they name the config field, never the response body).
+    fn extract_token(&self, response: &ApiResponse) -> Result<String, ExternalApiError> {
+        if let Some(header_name) = &self.token_response_header {
+            return match response.header(header_name) {
+                Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
+                _ => Err(invalid(format!(
+                    "Login succeeded but returned no '{header_name}' response header"
+                ))),
+            };
+        }
+        // Exactly one of the two is set; this is the JSON-path branch.
+        let Some(path) = self.token_response_json_path.as_deref() else {
+            return Err(invalid(
+                "Login succeeded but no token location was configured",
+            ));
+        };
+        let body = response.body_as_json();
+        let mut node = body.as_ref();
+        for segment in json_path_segments(path) {
+            node = node.and_then(|value| value.get(segment));
+        }
+        match node.and_then(scalar_token) {
+            Some(token) => Ok(token),
+            None => Err(invalid(format!(
+                "Login succeeded but its body had no token at '{path}'"
+            ))),
+        }
+    }
+
+    /// The header to send on an authenticated call: `(tokenHeaderName, prefix + token)`.
+    fn auth_header(&self, token: &str) -> (String, String) {
+        (
+            self.token_header_name.clone(),
+            format!("{}{token}", self.token_prefix),
+        )
+    }
+}
+
+/// Java `nestedObject`: `null` → empty object; a non-object → error; else the
+/// object itself. Kept as a JSON [`Value`] so the login body serialises verbatim.
+fn nested_object(value: Option<&Value>, option: &str) -> Result<Value, ExternalApiError> {
+    match value {
+        None | Some(Value::Null) => Ok(Value::Object(Map::new())),
+        Some(Value::Object(map)) => Ok(Value::Object(map.clone())),
+        Some(_) => Err(invalid(format!("api config '{option}' must be an object"))),
+    }
+}
+
+/// The login call's headers. Unlike the connection's static `headers`, these are
+/// **not** screened against the reserved set (a login legitimately sets
+/// `X-Client-Secret`, and some flows post to `Authorization`): only name grammar
+/// and value grammar are enforced. (oracle `ApiTokenLogin.loginHeaders`)
+fn parse_login_headers(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, String>, ExternalApiError> {
+    let raw = match value {
+        None | Some(Value::Null) => return Ok(BTreeMap::new()),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err(invalid("api config 'loginHeaders' must be an object")),
+    };
+    let mut out = BTreeMap::new();
+    for (name, entry) in raw {
+        if !ExternalApiHeaders::is_valid_name(name) {
+            return Err(invalid(format!(
+                "api config 'loginHeaders' has an invalid header name: {name}"
+            )));
+        }
+        let header_value = match entry {
+            Value::Null => None,
+            other => Some(java_to_string(other)),
+        };
+        match header_value {
+            Some(value) if ExternalApiHeaders::is_valid_value(&value) => {
+                out.insert(name.clone(), value);
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "api config 'loginHeaders' has an invalid value for '{name}'"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_token_ttl(value: Option<&Value>) -> Result<i32, ExternalApiError> {
+    let text = match value {
+        None | Some(Value::Null) => return Ok(DEFAULT_TOKEN_TTL_SECONDS),
+        Some(other) => java_to_string(other),
+    };
+    let seconds: i32 = text
+        .trim()
+        .parse()
+        .map_err(|_| invalid("api config 'tokenTtlSeconds' must be a number"))?;
+    if !(1..=MAX_TOKEN_TTL_SECONDS).contains(&seconds) {
+        return Err(invalid(format!(
+            "api config 'tokenTtlSeconds' must be between 1 and {MAX_TOKEN_TTL_SECONDS}"
+        )));
+    }
+    Ok(seconds)
+}
+
+/// Java `String.split("\\.")` with the default limit drops trailing empties.
+fn json_path_segments(path: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = path.split('.').collect();
+    while segments.last() == Some(&"") {
+        segments.pop();
+    }
+    segments
+}
+
+/// A JSON *value* node (Jackson `isValueNode()` && not blank): a non-blank
+/// string, or a number/boolean rendered as text. An object/array/null is not a
+/// token.
+fn scalar_token(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+// ---- ApiResponse (oracle ExternalApiCaller.Response) -----------------------
+
+/// What the external API sent back. Header lookup is case-insensitive; the body
+/// is the bytes read under the response-size cap.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiResponse {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
+impl ApiResponse {
+    /// A response header by name, case-insensitively; `None` when absent.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub(crate) fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub(crate) fn is_json(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("json"))
+    }
+
+    pub(crate) fn body_as_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    fn body_as_json(&self) -> Option<Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+}
+
+// ---- SSRF gate: resolve, vet, pin (oracle ApiIntegrationValidator / S3Clients) ----
+
+/// Cap on a response read into memory (oracle `ExternalApiCaller.MAX_RESPONSE_BYTES`):
+/// 64 MiB. Enforced as a bounded read — the advertised `Content-Length` is
+/// rejected up front, and the body itself is never buffered past the cap.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-connection TCP-connect timeout (oracle `ExternalApiCaller.CONNECT_TIMEOUT`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded so many connections cannot grow the token cache without limit
+/// (oracle `ApiTokenCache.MAX_ENTRIES`).
+const MAX_TOKEN_CACHE_ENTRIES: usize = 500;
+
+const BASE_HOST_SETTING: &str = "API connection base URL";
+const RESULT_URL_SETTING: &str = "API result URL";
+const PRIVATE_OPT_IN_HINT: &str =
+    "set policies.allowPrivateApiEndpoints=true to opt in (e.g. for an on-prem integration).";
+
+/// AWS/GCP/Azure, Oracle and IBM metadata addresses (oracle
+/// `ApiIntegrationValidator.CLOUD_METADATA_IPS`).
+///
+/// The Java oracle compares these as textual `String.startsWith` prefixes, which
+/// cannot match the IPv6 entry once `InetAddress.getHostAddress()` expands it to
+/// `fd00:ec2:0:0:0:0:0:254`. Here they are parsed `IpAddr`s compared for equality
+/// (after unwrapping an IPv4-mapped form), so `fd00:ec2::254` is actually
+/// blocked — a deliberate, strictly-safer divergence from the oracle.
+const CLOUD_METADATA_IPS: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 253)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 250)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+];
+
+/// A hostname resolved to the exact addresses to connect to, pinned so DNS
+/// cannot be re-pointed between the vet and the connect (anti-rebinding/TOCTOU).
+struct PinnedHost {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+/// A resolver injection seam: production uses [`resolve_host`]; tests drive the
+/// gate deterministically without real DNS.
+type HostResolver<'a> = &'a dyn Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>;
+
+/// Production host resolution via the platform resolver. An IP-literal host
+/// round-trips through this unchanged.
+fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    (host, port).to_socket_addrs().map(Iterator::collect)
+}
+
+/// Strip an IPv4-mapped-IPv6 wrapper so the compare sees the bare IPv4 address
+/// (mirrors the oracle's `normalise`, minus the zone id which `IpAddr` never
+/// carries here).
+fn normalise_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+fn is_cloud_metadata(ip: IpAddr) -> bool {
+    CLOUD_METADATA_IPS.contains(&normalise_ip(ip))
+}
+
+/// The base-host gate run at dispatch time (oracle
+/// `ApiIntegrationValidator.requirePublicHost`): the cloud-metadata deny is
+/// UNCONDITIONAL and runs first; the private/reserved rejection is then skipped
+/// only when the operator has opted into private endpoints.
+fn require_public_host(
+    base: &Url,
+    allow_private: bool,
+    resolve: HostResolver<'_>,
+) -> Result<PinnedHost, ExternalApiError> {
+    resolve_and_pin(base, allow_private, BASE_HOST_SETTING, true, resolve)
+}
+
+/// Resolve `url`'s host, vet every resolved address, and return them pinned.
+///
+/// `deny_metadata` gates the unconditional cloud-metadata block (on for the base
+/// host, off for result URLs — matching the oracles: `ApiIntegrationValidator`
+/// has the explicit metadata deny, `ResultUrls` relies on the reserved-range
+/// rejection alone). The reserved-range rejection is always gated by
+/// `allow_private`. Every vetted address is pinned so the socket cannot re-resolve
+/// to a different address after the check.
+fn resolve_and_pin(
+    url: &Url,
+    allow_private: bool,
+    setting_name: &str,
+    deny_metadata: bool,
+    resolve: HostResolver<'_>,
+) -> Result<PinnedHost, ExternalApiError> {
+    let host = match url.host_str() {
+        Some(host) if !host.is_empty() => host,
+        _ => {
+            return Err(invalid(format!(
+                "{setting_name} must include a host: {url}"
+            )));
+        }
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| invalid(format!("{setting_name} must include a host: {url}")))?;
+
+    let addrs = resolve(host, port)
+        .map_err(|_| invalid(format!("Unable to resolve {setting_name} host '{host}'")))?;
+    if addrs.is_empty() {
+        return Err(invalid(format!(
+            "Unable to resolve {setting_name} host '{host}'"
+        )));
+    }
+
+    if deny_metadata && let Some(addr) = addrs.iter().find(|addr| is_cloud_metadata(addr.ip())) {
+        return Err(invalid(format!(
+            "{setting_name} host '{host}' resolves to the cloud metadata service ({}), which is \
+             never a valid integration target.",
+            normalise_ip(addr.ip())
+        )));
+    }
+
+    if !allow_private && let Some(addr) = addrs.iter().find(|addr| ip_addr_is_reserved(addr.ip())) {
+        return Err(invalid(format!(
+            "{setting_name} host '{host}' resolves to private/link-local address {}; \
+             {PRIVATE_OPT_IN_HINT}",
+            addr.ip()
+        )));
+    }
+
+    Ok(PinnedHost {
+        host: host.to_owned(),
+        addrs,
+    })
+}
+
+// ---- The low-level pinned send (oracle ExternalApiCaller.send) --------------
+
+/// One outbound request's parameters, gathered so [`send`] stays a two-argument
+/// function rather than a positional pile.
+struct SendParts<'a> {
+    method: &'a str,
+    url: &'a Url,
+    /// Set only for body-bearing verbs; `None` on a GET.
+    content_type: Option<&'a str>,
+    body: Option<&'a [u8]>,
+    headers: &'a [(String, String)],
+    timeout_seconds: i32,
+    max_response_bytes: u64,
+}
+
+/// Send one request to the pinned host and read the response under the cap.
+///
+/// The client follows NO redirects (a 3xx could re-target a host the base URL
+/// never authorised, undoing the gate) and pins the vetted addresses. Every error
+/// message is credential-free: it names only the scheme/host/path, never the
+/// token, the basic-auth pair, or a query string an operator may have put in the
+/// path.
+fn send(pinned: &PinnedHost, parts: &SendParts<'_>) -> Result<ApiResponse, ExternalApiError> {
+    let method = Method::from_bytes(parts.method.as_bytes())
+        .map_err(|_| invalid("api step has an unsupported HTTP method"))?;
+    let timeout = Duration::from_secs(u64::try_from(parts.timeout_seconds).unwrap_or(60));
+
+    let client = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirect(Policy::none())
+        // Pin the vetted addresses; reqwest keys this on the host name, and an
+        // IP-literal host bypasses resolution and connects to the literal (already
+        // vetted) directly.
+        .resolve_to_addrs(&pinned.host, &pinned.addrs)
+        .build()
+        .map_err(|_| invalid(format!("Failed to call {}", safe_target(parts.url))))?;
+
+    let mut request = client.request(method, parts.url.clone());
+    if let Some(content_type) = parts.content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+    for (name, value) in parts.headers {
+        request = request.header(name, value);
+    }
+    if let Some(body) = parts.body {
+        request = request.body(body.to_vec());
+    }
+    let response = request
+        .send()
+        .map_err(|_| invalid(format!("Failed to call {}", safe_target(parts.url))))?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let headers = collect_headers(response.headers());
+    // Reject an over-large body before reading it, then read under a hard cap so
+    // a response omitting Content-Length cannot buffer past the limit either.
+    if response
+        .content_length()
+        .is_some_and(|length| length > parts.max_response_bytes)
+    {
+        return Err(oversized(parts.url, parts.max_response_bytes));
+    }
+    let mut body = Vec::new();
+    response
+        .take(parts.max_response_bytes + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| invalid(format!("Failed to call {}", safe_target(parts.url))))?;
+    if body.len() as u64 > parts.max_response_bytes {
+        return Err(oversized(parts.url, parts.max_response_bytes));
+    }
+    Ok(ApiResponse {
+        status,
+        content_type,
+        body,
+        headers,
+    })
+}
+
+fn oversized(url: &Url, cap: u64) -> ExternalApiError {
+    invalid(format!(
+        "Response from {} exceeds the {cap} byte limit",
+        safe_target(url)
+    ))
+}
+
+/// Response headers as owned pairs, joining duplicate names with `, ` (oracle
+/// `String.join(", ", values)`).
+fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in headers {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name.as_str()))
+        {
+            existing.1.push_str(", ");
+            existing.1.push_str(value);
+        } else {
+            out.push((name.as_str().to_owned(), value.to_owned()));
+        }
+    }
+    out
+}
+
+/// Scheme, host and path only (oracle `safeTarget`): a query string could carry a
+/// token an operator put there, and user-info is never echoed.
+fn safe_target(url: &Url) -> String {
+    let mut out = String::new();
+    out.push_str(url.scheme());
+    out.push_str("://");
+    if let Some(host) = url.host_str() {
+        out.push_str(host);
+    }
+    if let Some(port) = url.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push_str(url.path());
+    out
+}
+
+// ---- Token cache (oracle ApiTokenCache) ------------------------------------
+
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+/// Login-once cache of `TOKEN_LOGIN` tokens, keyed on the connection's login
+/// identity (credentials included) so editing a password stops reusing the token
+/// bought with the old one. Each entry expires on its connection's stated TTL;
+/// reading never extends it.
+struct TokenCache {
+    entries: HashMap<String, CachedToken>,
+}
+
+impl TokenCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// A live token for `key`, dropping it if it has expired (reading does not
+    /// extend the vendor's clock).
+    fn get(&mut self, key: &str) -> Option<String> {
+        match self.entries.get(key) {
+            Some(entry) if entry.expires_at > Instant::now() => Some(entry.token.clone()),
+            Some(_) => {
+                self.entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(&mut self, key: String, token: String, ttl_seconds: i32) {
+        self.purge_expired();
+        if self.entries.len() >= MAX_TOKEN_CACHE_ENTRIES && !self.entries.contains_key(&key) {
+            // Bounded like Caffeine's maximumSize: evict the soonest-to-expire.
+            if let Some(evict) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(existing, _)| existing.clone())
+            {
+                self.entries.remove(&evict);
+            }
+        }
+        let ttl = Duration::from_secs(u64::try_from(ttl_seconds).unwrap_or(1).max(1));
+        self.entries.insert(
+            key,
+            CachedToken {
+                token,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+
+    fn invalidate(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    fn purge_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.expires_at > now);
+    }
+}
+
+/// Identity of a connection's login for cache purposes, INCLUDING the credentials
+/// (login body + headers), hashed so the plaintext secret is never kept as a map
+/// key. (oracle `ApiConnectionSettings.tokenCacheKey` + the TTL suffix)
+fn token_cache_key(settings: &ApiConnectionSettings, login: &ApiTokenLogin) -> String {
+    let body = serde_json::to_string(&login.login_body).unwrap_or_default();
+    let headers = serde_json::to_string(&login.login_headers).unwrap_or_default();
+    let material = format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{body}\u{0}{headers}",
+        settings.base_url,
+        login.login_path,
+        login.token_header_name,
+        login.token_prefix,
+        login.token_response_header.as_deref().unwrap_or_default(),
+        login
+            .token_response_json_path
+            .as_deref()
+            .unwrap_or_default(),
+        login.token_ttl_seconds,
+    );
+    sha256_hex(material.as_bytes())
+}
+
+// ---- ExternalApiCaller (oracle ExternalApiCaller) --------------------------
+
+/// Performs the outbound call for an `API` connection, and caches `TOKEN_LOGIN`
+/// tokens. `allow_private_endpoints` mirrors the operator property
+/// `policies.allowPrivateApiEndpoints` the base-host gate consults.
+pub(crate) struct ExternalApiCaller {
+    allow_private_endpoints: bool,
+    tokens: Mutex<TokenCache>,
+}
+
+impl ExternalApiCaller {
+    pub(crate) fn new(allow_private_endpoints: bool) -> Self {
+        Self {
+            allow_private_endpoints,
+            tokens: Mutex::new(TokenCache::new()),
+        }
+    }
+
+    /// POST a document to `path` under the base URL as multipart/form-data.
+    #[allow(clippy::too_many_arguments)] // Faithful to the oracle's postFile signature.
+    pub(crate) fn post_file(
+        &self,
+        settings: &ApiConnectionSettings,
+        path: &str,
+        file_field_name: &str,
+        filename: &str,
+        file_content_type: &str,
+        content: &[u8],
+        fields: &BTreeMap<String, String>,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        self.post_file_with_resolver(
+            settings,
+            path,
+            file_field_name,
+            filename,
+            file_content_type,
+            content,
+            fields,
+            &resolve_host,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn post_file_with_resolver(
+        &self,
+        settings: &ApiConnectionSettings,
+        path: &str,
+        file_field_name: &str,
+        filename: &str,
+        file_content_type: &str,
+        content: &[u8],
+        fields: &BTreeMap<String, String>,
+        resolve: HostResolver<'_>,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        let mut multipart = MultipartBody::new();
+        multipart.add_fields(fields)?;
+        multipart.add_file(file_field_name, filename, file_content_type, content)?;
+        let body = OutboundBody {
+            content_type: multipart.content_type(),
+            bytes: multipart.build(),
+        };
+        self.dispatch_with_resolver(settings, "POST", path, &body, &BTreeMap::new(), resolve)
+    }
+
+    /// Send `body` to `path` under the base URL with `method` (POST/PUT/PATCH).
+    pub(crate) fn dispatch(
+        &self,
+        settings: &ApiConnectionSettings,
+        method: &str,
+        path: &str,
+        body: &OutboundBody,
+        extra_headers: &BTreeMap<String, String>,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        self.dispatch_with_resolver(settings, method, path, body, extra_headers, &resolve_host)
+    }
+
+    fn dispatch_with_resolver(
+        &self,
+        settings: &ApiConnectionSettings,
+        method: &str,
+        path: &str,
+        body: &OutboundBody,
+        extra_headers: &BTreeMap<String, String>,
+        resolve: HostResolver<'_>,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        let base = settings.base_uri()?;
+        // Resolve the step path first (an invalid path errors before the host is
+        // dialled), then re-vet the host at dispatch time and pin it.
+        let target = ExternalApiPaths::resolve(&base, path)?;
+        let pinned = require_public_host(&base, self.allow_private_endpoints, resolve)?;
+
+        let response = self.attempt(settings, method, &target, body, extra_headers, &pinned)?;
+        if response.status == 401 && settings.auth_type == ApiAuthType::TokenLogin {
+            // The cached token was rejected — expired early or revoked. One fresh
+            // login and one retry; a second 401 means the credentials are wrong.
+            self.invalidate_token(settings);
+            return self.attempt(settings, method, &target, body, extra_headers, &pinned);
+        }
+        Ok(response)
+    }
+
+    /// GET `path` under the base URL (credentials applied; no 401 re-auth retry —
+    /// that is `dispatch`'s alone, mirroring the oracle).
+    pub(crate) fn get(
+        &self,
+        settings: &ApiConnectionSettings,
+        path: &str,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        self.get_with_resolver(settings, path, &resolve_host)
+    }
+
+    fn get_with_resolver(
+        &self,
+        settings: &ApiConnectionSettings,
+        path: &str,
+        resolve: HostResolver<'_>,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        let base = settings.base_uri()?;
+        let target = ExternalApiPaths::resolve(&base, path)?;
+        let pinned = require_public_host(&base, self.allow_private_endpoints, resolve)?;
+        let headers = self.request_headers(settings, &pinned)?;
+        send(
+            &pinned,
+            &SendParts {
+                method: "GET",
+                url: &target,
+                content_type: None,
+                body: None,
+                headers: &headers,
+                timeout_seconds: settings.timeout_seconds,
+                max_response_bytes: MAX_RESPONSE_BYTES,
+            },
+        )
+    }
+
+    /// GET a validated result URL. No credentials are sent — a result URL usually
+    /// lives on a third-party host (a presigned link), and forwarding the token
+    /// there would leak it. The only way to obtain a [`ValidatedResultUrl`] is
+    /// [`ResultUrls::validate`], which is where the host allowlist lives.
+    // A method (not an associated fn) to mirror the oracle's instance API and
+    // keep call sites reading `caller.get_result(...)`; it needs no cache state.
+    #[allow(clippy::unused_self)]
+    pub(crate) fn get_result(
+        &self,
+        settings: &ApiConnectionSettings,
+        target: &ValidatedResultUrl,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        send(
+            &target.pinned,
+            &SendParts {
+                method: "GET",
+                url: &target.url,
+                content_type: None,
+                body: None,
+                headers: &[],
+                timeout_seconds: settings.timeout_seconds,
+                max_response_bytes: MAX_RESPONSE_BYTES,
+            },
+        )
+    }
+
+    fn attempt(
+        &self,
+        settings: &ApiConnectionSettings,
+        method: &str,
+        target: &Url,
+        body: &OutboundBody,
+        extra_headers: &BTreeMap<String, String>,
+        pinned: &PinnedHost,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        let mut headers = self.request_headers(settings, pinned)?;
+        // Step headers last so a step can add to a connection default; reserved
+        // names (incl. the auth header) were rejected before we got here.
+        for (name, value) in extra_headers {
+            headers.push((name.clone(), value.clone()));
+        }
+        send(
+            pinned,
+            &SendParts {
+                method,
+                url: target,
+                content_type: Some(&body.content_type),
+                body: Some(&body.bytes),
+                headers: &headers,
+                timeout_seconds: settings.timeout_seconds,
+                max_response_bytes: MAX_RESPONSE_BYTES,
+            },
+        )
+    }
+
+    /// The connection's static headers plus the credential header for its
+    /// `authType` (oracle `applyHeaders`).
+    fn request_headers(
+        &self,
+        settings: &ApiConnectionSettings,
+        pinned: &PinnedHost,
+    ) -> Result<Vec<(String, String)>, ExternalApiError> {
+        let mut out: Vec<(String, String)> = settings
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        match settings.auth_type {
+            ApiAuthType::None => {}
+            ApiAuthType::Bearer => {
+                let token = settings.token.as_deref().unwrap_or_default();
+                out.push(("Authorization".to_owned(), format!("Bearer {token}")));
+            }
+            ApiAuthType::Header => {
+                let name = settings.header_name.clone().unwrap_or_default();
+                let token = settings.token.as_deref().unwrap_or_default();
+                let value = match settings.header_prefix.as_deref() {
+                    Some(prefix) => format!("{prefix} {token}"),
+                    None => token.to_owned(),
+                };
+                out.push((name, value));
+            }
+            ApiAuthType::Basic => {
+                let user = settings.username.as_deref().unwrap_or_default();
+                let pass = settings.password.as_deref().unwrap_or_default();
+                let encoded = STANDARD.encode(format!("{user}:{pass}"));
+                out.push(("Authorization".to_owned(), format!("Basic {encoded}")));
+            }
+            ApiAuthType::TokenLogin => {
+                out.push(self.auth_header(settings, pinned)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn auth_header(
+        &self,
+        settings: &ApiConnectionSettings,
+        pinned: &PinnedHost,
+    ) -> Result<(String, String), ExternalApiError> {
+        let login = settings.token_login.as_ref().ok_or_else(|| {
+            invalid("api config authType 'TOKEN_LOGIN' requires a token-login sub-config")
+        })?;
+        let token = self.token(settings, login, pinned)?;
+        Ok(login.auth_header(&token))
+    }
+
+    fn token(
+        &self,
+        settings: &ApiConnectionSettings,
+        login: &ApiTokenLogin,
+        pinned: &PinnedHost,
+    ) -> Result<String, ExternalApiError> {
+        let key = token_cache_key(settings, login);
+        if let Some(token) = self.cache_get(&key)? {
+            return Ok(token);
+        }
+        let token = Self::login(settings, login, pinned)?;
+        self.cache_put(key, &token, login.token_ttl_seconds)?;
+        Ok(token)
+    }
+
+    fn login(
+        settings: &ApiConnectionSettings,
+        login: &ApiTokenLogin,
+        pinned: &PinnedHost,
+    ) -> Result<String, ExternalApiError> {
+        let base = settings.base_uri()?;
+        let target = ExternalApiPaths::resolve(&base, &login.login_path)?;
+        let body = serde_json::to_vec(&login.login_body)
+            .map_err(|_| invalid("api step failed to serialize the login body"))?;
+        let headers: Vec<(String, String)> = login
+            .login_headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let response = send(
+            pinned,
+            &SendParts {
+                method: "POST",
+                url: &target,
+                content_type: Some(APPLICATION_JSON),
+                body: Some(&body),
+                headers: &headers,
+                timeout_seconds: settings.timeout_seconds,
+                max_response_bytes: MAX_RESPONSE_BYTES,
+            },
+        )?;
+        if !response.is_success() {
+            // Deliberately does not echo the body: a login failure can repeat the
+            // credentials back, and this message reaches the run log.
+            let host = base.host_str().unwrap_or_default();
+            return Err(invalid(format!(
+                "Login to {host}{} returned HTTP {}",
+                login.login_path, response.status
+            )));
+        }
+        login.extract_token(&response)
+    }
+
+    fn cache_get(&self, key: &str) -> Result<Option<String>, ExternalApiError> {
+        let mut cache = self
+            .tokens
+            .lock()
+            .map_err(|_| invalid("api token cache is unavailable"))?;
+        Ok(cache.get(key))
+    }
+
+    fn cache_put(&self, key: String, token: &str, ttl: i32) -> Result<(), ExternalApiError> {
+        let mut cache = self
+            .tokens
+            .lock()
+            .map_err(|_| invalid("api token cache is unavailable"))?;
+        cache.put(key, token.to_owned(), ttl);
+        Ok(())
+    }
+
+    fn invalidate_token(&self, settings: &ApiConnectionSettings) {
+        if let Some(login) = settings.token_login.as_ref()
+            && let Ok(mut cache) = self.tokens.lock()
+        {
+            cache.invalidate(&token_cache_key(settings, login));
+        }
+    }
+}
+
+// ---- ResultUrls: the result-fetch host allowlist (oracle ResultUrls) -------
+
+/// A result URL that has passed [`ResultUrls::validate`] — the only way to obtain
+/// one, so [`ExternalApiCaller::get_result`] cannot be called with something
+/// unchecked. Carries the pinned addresses vetted during validation.
+pub(crate) struct ValidatedResultUrl {
+    url: Url,
+    pinned: PinnedHost,
+}
+
+pub(crate) struct ResultUrls;
+
+impl ResultUrls {
+    /// Validate a result URL the API asked us to fetch. Unlike a step `path`
+    /// (operator-written), this URL is chosen by the remote service at run time,
+    /// so it is checked against an operator-declared host allowlist and then
+    /// resolved/vetted like any other target.
+    pub(crate) fn validate(
+        settings: &ApiConnectionSettings,
+        url: &str,
+        allow_private: bool,
+    ) -> Result<ValidatedResultUrl, ExternalApiError> {
+        Self::validate_with_resolver(settings, url, allow_private, &resolve_host)
+    }
+
+    fn validate_with_resolver(
+        settings: &ApiConnectionSettings,
+        url_str: &str,
+        allow_private: bool,
+        resolve: HostResolver<'_>,
+    ) -> Result<ValidatedResultUrl, ExternalApiError> {
+        let url = Url::parse(url_str.trim()).map_err(|_| {
+            invalid(format!(
+                "The API returned a result URL that is not a valid URL: {url_str}"
+            ))
+        })?;
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            // file:, gopher:, jar: and friends turn a URL fetch into a local read.
+            return Err(invalid(format!(
+                "The API returned a result URL that is not http(s): {url_str}"
+            )));
+        }
+        let host = match url.host_str() {
+            Some(host) if !host.is_empty() => host.to_owned(),
+            _ => {
+                return Err(invalid(format!(
+                    "The API returned a result URL with no host: {url_str}"
+                )));
+            }
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            // Credentials in a URL are the classic way to make one host look like
+            // another.
+            return Err(invalid(
+                "The API returned a result URL carrying credentials, which is not accepted",
+            ));
+        }
+        if !Self::is_allowed_host(settings, &host) {
+            return Err(invalid(format!(
+                "The API returned a result URL on '{host}', which this connection does not allow. \
+                 Add it to the connection's 'resultUrlHosts' if results are meant to come from \
+                 there."
+            )));
+        }
+        // Even an allowlisted name must not resolve somewhere internal. No metadata
+        // deny here (matching ResultUrls): the reserved-range rejection covers the
+        // metadata IPs unless the operator opted into private endpoints.
+        let pinned = resolve_and_pin(&url, allow_private, RESULT_URL_SETTING, false, resolve)?;
+        Ok(ValidatedResultUrl { url, pinned })
+    }
+
+    /// The connection's own host is implicitly allowed; anything else must be
+    /// declared. A subdomain of a declared host matches, but a bare suffix does
+    /// not (`evilvendor.com` is not admitted by `vendor.com`).
+    pub(crate) fn is_allowed_host(settings: &ApiConnectionSettings, host: &str) -> bool {
+        let candidate = host.to_lowercase();
+        if let Ok(base) = settings.base_uri()
+            && base
+                .host_str()
+                .is_some_and(|base_host| base_host.eq_ignore_ascii_case(&candidate))
+        {
+            return true;
+        }
+        settings.result_url_hosts.iter().any(|entry| {
+            let allowed = entry.to_lowercase();
+            candidate == allowed || candidate.ends_with(&format!(".{allowed}"))
+        })
+    }
 }
 
 // ===========================================================================
@@ -2197,12 +3244,24 @@ mod tests {
     }
 
     #[test]
-    fn settings_token_login_selection_defers_sub_parse() -> Result<(), Box<dyn std::error::Error>> {
-        // Slice 1: TOKEN_LOGIN is accepted (validation deferred to slice 3) and
-        // records a placeholder token-login; other auth types leave it None.
+    fn settings_token_login_validates_its_sub_config() -> Result<(), Box<dyn std::error::Error>> {
+        // Slice 3: TOKEN_LOGIN no longer defers — the sub-config is validated
+        // (loginPath is required), matching Java `ApiTokenLogin.from`.
+        assert_err_contains(
+            ApiConnectionSettings::from_options(&options(&[
+                ("baseUrl", json!("https://api.example.com")),
+                ("authType", json!("TOKEN_LOGIN")),
+            ])),
+            "requires a 'loginPath'",
+        );
+
+        // A fully-specified TOKEN_LOGIN parses and records the sub-config.
         let settings = ApiConnectionSettings::from_options(&options(&[
             ("baseUrl", json!("https://api.example.com")),
             ("authType", json!("TOKEN_LOGIN")),
+            ("loginPath", json!("/auth/login")),
+            ("tokenResponseHeader", json!("X-Auth-Token")),
+            ("tokenHeaderName", json!("X-Auth-Token")),
         ]))?;
         assert_eq!(settings.auth_type, ApiAuthType::TokenLogin);
         assert!(settings.token_login.is_some());
@@ -3240,6 +4299,1354 @@ mod slice2_tests {
         // still lacks the injected keys.
         assert!(context.pointer("/document/safeFilename").is_none());
         assert!(context.pointer("/document/resolvedContentType").is_none());
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Slice 3 tests — the SSRF-safe caller, credential headers, and TOKEN_LOGIN
+// cache, driven against a real loopback mock HTTP server through real reqwest
+// (the model proven in mcp.rs / oidc_live_token.rs). No external network. No
+// `unwrap`/`expect` (both denied in this crate): errors surface via `?`,
+// `let … else { panic! }`, or `assert_err_contains`.
+// ===========================================================================
+#[cfg(test)]
+mod slice3_tests {
+    use std::{
+        collections::BTreeMap,
+        io::{Read as _, Write as _},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::Duration,
+    };
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
+    use url::Url;
+
+    use super::{
+        ApiConnectionSettings, ApiResponse, ApiTokenLogin, ExternalApiCaller, ExternalApiError,
+        OutboundBody, ResultUrls, SendParts, require_public_host, resolve_host, send,
+        token_cache_key,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    /// The request headers a capturing mock recorded (kept simple for clippy).
+    type CapturedHeaders = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// No `unwrap`/`expect`: assert an error whose message contains `needle`.
+    fn assert_err_contains<T>(result: Result<T, ExternalApiError>, needle: &str) {
+        match result {
+            Ok(_) => panic!("expected an error containing {needle:?}, got Ok"),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(needle),
+                    "message {message:?} did not contain {needle:?}"
+                );
+            }
+        }
+    }
+
+    fn options(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    fn settings_with(
+        base_url: &str,
+        extra: &[(&str, Value)],
+    ) -> Result<ApiConnectionSettings, ExternalApiError> {
+        let mut pairs: Vec<(&str, Value)> = vec![("baseUrl", json!(base_url))];
+        pairs.extend_from_slice(extra);
+        ApiConnectionSettings::from_options(&options(&pairs))
+    }
+
+    fn json_body() -> OutboundBody {
+        OutboundBody {
+            content_type: "application/json".to_owned(),
+            bytes: b"{}".to_vec(),
+        }
+    }
+
+    fn addr(literal: &str, port: u16) -> SocketAddr {
+        let ip = literal
+            .parse::<IpAddr>()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        SocketAddr::new(ip, port)
+    }
+
+    fn loopback_resolver() -> impl Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>> {
+        |_host: &str, port: u16| Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)])
+    }
+
+    // ---------------------------------------------------------------------
+    // A minimal, routable loopback HTTP/1.1 mock. Serves connections until
+    // dropped; each is handed to the test's handler closure.
+    // ---------------------------------------------------------------------
+
+    struct MockRequest {
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl MockRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn body_text(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+    }
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        omit_content_length: bool,
+    }
+
+    impl MockResponse {
+        fn json(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+                body: body.as_bytes().to_vec(),
+                omit_content_length: false,
+            }
+        }
+
+        fn with_header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_owned(), value.to_owned()));
+            self
+        }
+    }
+
+    type Handler = Arc<dyn Fn(&MockRequest) -> MockResponse + Send + Sync>;
+
+    struct MockServer {
+        base_url: String,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn start(handler: Handler) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let address = listener.local_addr()?;
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&shutdown);
+            let handle = thread::spawn(move || serve_loop(&listener, &flag, &handler));
+            Ok(Self {
+                base_url: format!("http://{address}"),
+                shutdown,
+                handle: Some(handle),
+            })
+        }
+
+        fn port(&self) -> Option<u16> {
+            self.base_url
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn serve_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &Handler) {
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = handle_connection(stream, handler);
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn handle_connection(mut stream: TcpStream, handler: &Handler) -> std::io::Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut buffer = Vec::new();
+        let mut header_end: Option<usize> = None;
+        let mut content_length = 0_usize;
+        loop {
+            if header_end.is_none()
+                && let Some(position) = find_subsequence(&buffer, b"\r\n\r\n")
+            {
+                header_end = Some(position + 4);
+                let head = String::from_utf8_lossy(&buffer[..position]);
+                content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+            }
+            if let Some(start) = header_end
+                && buffer.len() >= start + content_length
+            {
+                break;
+            }
+            let mut chunk = [0_u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
+                _ => break,
+            }
+        }
+        let request = parse_request(&buffer, header_end.unwrap_or(buffer.len()), content_length);
+        let response = handler(&request);
+        write_response(&mut stream, &response)
+    }
+
+    fn parse_request(buffer: &[u8], header_end: usize, content_length: usize) -> MockRequest {
+        let head = String::from_utf8_lossy(&buffer[..header_end.min(buffer.len())]);
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let headers = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_owned(), value.trim().to_owned()))
+            })
+            .collect();
+        let body_start = header_end.min(buffer.len());
+        let body_end = (body_start + content_length).min(buffer.len());
+        MockRequest {
+            path,
+            headers,
+            body: buffer[body_start..body_end].to_vec(),
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, response: &MockResponse) -> std::io::Result<()> {
+        let reason = match response.status {
+            200 => "OK",
+            201 => "Created",
+            302 => "Found",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Status",
+        };
+        let mut head = format!("HTTP/1.1 {} {reason}\r\n", response.status);
+        for (name, value) in &response.headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        if !response.omit_content_length {
+            head.push_str("Content-Length: ");
+            head.push_str(&response.body.len().to_string());
+            head.push_str("\r\n");
+        }
+        head.push_str("Connection: close\r\n\r\n");
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(&response.body)?;
+        stream.flush()
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    // ---- credential-header wire tests (oracle ExternalApiCallerAuthHeaderTest) ----
+
+    fn header_capturing_server() -> std::io::Result<(MockServer, CapturedHeaders)> {
+        let seen: CapturedHeaders = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let handler: Handler = Arc::new(move |request: &MockRequest| {
+            if let Ok(mut guard) = sink.lock() {
+                *guard = request.headers.clone();
+            }
+            MockResponse::json(200, "{\"ok\":true}")
+        });
+        Ok((MockServer::start(handler)?, seen))
+    }
+
+    fn header_value(seen: &CapturedHeaders, name: &str) -> Option<String> {
+        let Ok(guard) = seen.lock() else {
+            return None;
+        };
+        guard
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    fn send_ingest(
+        caller: &ExternalApiCaller,
+        settings: &ApiConnectionSettings,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        caller.dispatch(settings, "POST", "/ingest", &json_body(), &BTreeMap::new())
+    }
+
+    #[test]
+    fn bearer_auth_puts_a_bearer_header_on_the_wire() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true); // loopback is reserved; opt in
+        // A stray headerPrefix must not touch BEARER (mirrors the oracle).
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("BEARER")),
+                ("headerPrefix", json!("API-Key")),
+                ("token", json!("sk-secret")),
+            ],
+        )?;
+        assert!(send_ingest(&caller, &settings)?.is_success());
+        assert_eq!(
+            header_value(&seen, "authorization").as_deref(),
+            Some("Bearer sk-secret")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn header_auth_with_prefix_sends_scheme_and_token() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("HEADER")),
+                ("headerName", json!("Authorization")),
+                ("headerPrefix", json!("API-Key")),
+                ("token", json!("pd-secret")),
+            ],
+        )?;
+        assert!(send_ingest(&caller, &settings)?.is_success());
+        assert_eq!(
+            header_value(&seen, "authorization").as_deref(),
+            Some("API-Key pd-secret")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn header_auth_without_prefix_sends_the_bare_token() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("HEADER")),
+                ("headerName", json!("x-api-key")),
+                ("token", json!("sk-ant-secret")),
+            ],
+        )?;
+        assert!(send_ingest(&caller, &settings)?.is_success());
+        // No scheme invented; and no Authorization header conjured.
+        assert_eq!(
+            header_value(&seen, "x-api-key").as_deref(),
+            Some("sk-ant-secret")
+        );
+        assert_eq!(header_value(&seen, "authorization"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn basic_auth_sends_base64_of_user_colon_pass() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("BASIC")),
+                ("username", json!("alice")),
+                ("password", json!("s3cret")),
+            ],
+        )?;
+        assert!(send_ingest(&caller, &settings)?.is_success());
+        let expected = format!("Basic {}", STANDARD.encode("alice:s3cret"));
+        assert_eq!(
+            header_value(&seen, "authorization").as_deref(),
+            Some(expected.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn none_auth_sends_no_credentials_but_keeps_static_headers() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[("headers", json!({"X-Custom": "custom-value"}))],
+        )?;
+        assert!(send_ingest(&caller, &settings)?.is_success());
+        assert_eq!(header_value(&seen, "authorization"), None);
+        assert_eq!(
+            header_value(&seen, "x-custom").as_deref(),
+            Some("custom-value")
+        );
+        Ok(())
+    }
+
+    // ---- redirect and response-size bounds (oracle ExternalApiCaller) -------
+
+    #[test]
+    fn a_redirect_is_not_followed() -> TestResult {
+        let handler: Handler = Arc::new(|_request: &MockRequest| {
+            MockResponse::json(302, "{}").with_header("Location", "http://evil.example/steal")
+        });
+        let server = MockServer::start(handler)?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let response = caller.dispatch(&settings, "POST", "/go", &json_body(), &BTreeMap::new())?;
+        // The 3xx is surfaced, not chased to the attacker's host.
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.header("location"),
+            Some("http://evil.example/steal")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_oversized_response_is_rejected_via_its_content_length() -> TestResult {
+        let handler: Handler =
+            Arc::new(|_request: &MockRequest| MockResponse::json(200, "0123456789ABCDEF"));
+        let server = MockServer::start(handler)?;
+        let pinned = require_public_host(&Url::parse(&server.base_url)?, true, &resolve_host)?;
+        let target = Url::parse(&format!("{}/big", server.base_url))?;
+        // A tiny cap stands in for MAX_RESPONSE_BYTES; the advertised length is
+        // rejected before the body is read.
+        let result = send(
+            &pinned,
+            &SendParts {
+                method: "GET",
+                url: &target,
+                content_type: None,
+                body: None,
+                headers: &[],
+                timeout_seconds: 5,
+                max_response_bytes: 8,
+            },
+        );
+        assert_err_contains(result, "exceeds the 8 byte limit");
+        Ok(())
+    }
+
+    #[test]
+    fn an_oversized_response_without_content_length_is_capped_during_read() -> TestResult {
+        let handler: Handler = Arc::new(|_request: &MockRequest| MockResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: b"0123456789ABCDEF".to_vec(),
+            omit_content_length: true,
+        });
+        let server = MockServer::start(handler)?;
+        let pinned = require_public_host(&Url::parse(&server.base_url)?, true, &resolve_host)?;
+        let target = Url::parse(&format!("{}/big", server.base_url))?;
+        // No Content-Length: the bounded read (take cap+1) still refuses to buffer
+        // past the cap.
+        let result = send(
+            &pinned,
+            &SendParts {
+                method: "GET",
+                url: &target,
+                content_type: None,
+                body: None,
+                headers: &[],
+                timeout_seconds: 5,
+                max_response_bytes: 8,
+            },
+        );
+        assert_err_contains(result, "exceeds the 8 byte limit");
+        Ok(())
+    }
+
+    // ---- the SSRF base-host gate (oracle ApiIntegrationValidator) -----------
+
+    #[test]
+    fn gate_accepts_an_ordinary_public_host() -> TestResult {
+        let base = Url::parse("https://api.example.com/v1")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("1.1.1.1", 443)])
+        };
+        let pinned = require_public_host(&base, false, &resolve)?;
+        assert_eq!(pinned.addrs, vec![addr("1.1.1.1", 443)]);
+        Ok(())
+    }
+
+    #[test]
+    fn gate_rejects_a_private_host_by_default() -> TestResult {
+        let base = Url::parse("http://internal.example/x")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("10.0.0.5", 80)])
+        };
+        assert_err_contains(
+            require_public_host(&base, false, &resolve),
+            "private/link-local",
+        );
+        assert_err_contains(
+            require_public_host(&base, false, &resolve),
+            "allowPrivateApiEndpoints",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gate_allows_a_private_host_when_opted_in() -> TestResult {
+        let base = Url::parse("http://10.10.0.20:8080/api")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("10.10.0.20", 8080)])
+        };
+        let pinned = require_public_host(&base, true, &resolve)?;
+        assert_eq!(pinned.host, "10.10.0.20");
+        Ok(())
+    }
+
+    #[test]
+    fn gate_blocks_cloud_metadata_even_with_the_private_opt_in() -> TestResult {
+        for literal in ["169.254.169.254", "169.254.169.253", "169.254.169.250"] {
+            let base = Url::parse("http://metadata.example/latest/meta-data/")?;
+            let resolve = move |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+                Ok(vec![addr(literal, 80)])
+            };
+            // The opt-in allows RFC1918, but the metadata endpoint stays blocked.
+            assert_err_contains(
+                require_public_host(&base, true, &resolve),
+                "metadata service",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gate_blocks_the_ipv6_metadata_address_the_oracle_string_compare_missed() -> TestResult {
+        // Java's `String.startsWith` cannot match fd00:ec2::254 once expanded to
+        // its full form; the parsed-IpAddr compare here blocks it, opt-in or not.
+        let base = Url::parse("http://metadata6.example/latest")?;
+        let metadata6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+            80,
+        );
+        let resolve = move |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![metadata6])
+        };
+        assert_err_contains(
+            require_public_host(&base, true, &resolve),
+            "metadata service",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gate_reports_metadata_before_the_generic_private_message() -> TestResult {
+        // 169.254/16 is also link-local, but the unconditional metadata deny wins
+        // (and runs before the opt-in), so the message names the metadata service.
+        let base = Url::parse("http://metadata.example/x")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("169.254.169.254", 80)])
+        };
+        assert_err_contains(
+            require_public_host(&base, false, &resolve),
+            "metadata service",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gate_rejects_an_unresolvable_host() -> TestResult {
+        let base = Url::parse("https://nope.example/x")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Err(std::io::Error::other("nxdomain"))
+        };
+        assert_err_contains(
+            require_public_host(&base, false, &resolve),
+            "Unable to resolve",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gate_rejects_when_only_one_of_several_addresses_is_private() -> TestResult {
+        // A multi-address name is rejected if ANY resolved address is reserved.
+        let base = Url::parse("https://dual.example/x")?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("1.1.1.1", 443), addr("10.0.0.5", 443)])
+        };
+        assert_err_contains(
+            require_public_host(&base, false, &resolve),
+            "private/link-local",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_pins_the_vetted_address_so_a_named_host_reaches_it() -> TestResult {
+        // Proves resolve_to_addrs is actually wired: the base host is a NAME (not a
+        // loopback literal), vetted to 127.0.0.1 and pinned, so reqwest connects
+        // there rather than re-resolving.
+        let (server, seen) = header_capturing_server()?;
+        let Some(port) = server.port() else {
+            panic!("mock server had no port");
+        };
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &format!("http://api.internal.test:{port}"),
+            &[("authType", json!("BEARER")), ("token", json!("tok"))],
+        )?;
+        let resolve = loopback_resolver();
+        let response = caller.dispatch_with_resolver(
+            &settings,
+            "POST",
+            "/ingest",
+            &json_body(),
+            &BTreeMap::new(),
+            &resolve,
+        )?;
+        assert!(response.is_success());
+        assert_eq!(
+            header_value(&seen, "authorization").as_deref(),
+            Some("Bearer tok")
+        );
+        Ok(())
+    }
+
+    // ---- TOKEN_LOGIN end-to-end (oracle ExternalApiCallerTokenLoginTest) ----
+
+    struct ConsignoState {
+        logins: usize,
+        issued_token: String,
+        reject_token: bool,
+        last_call_token: Option<String>,
+        workflow_body: Option<String>,
+    }
+
+    impl ConsignoState {
+        fn shared(token: &str) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                logins: 0,
+                issued_token: token.to_owned(),
+                reject_token: false,
+                last_call_token: None,
+                workflow_body: None,
+            }))
+        }
+    }
+
+    fn consigno_server(state: Arc<Mutex<ConsignoState>>) -> std::io::Result<MockServer> {
+        let handler: Handler = Arc::new(move |request: &MockRequest| {
+            let path = request.path.split('?').next().unwrap_or_default();
+            match path {
+                "/api/v1/auth/login" => {
+                    let body = request.body_text();
+                    let client_id = request.header("X-Client-Id").map(str::to_owned);
+                    let client_secret = request.header("X-Client-Secret").map(str::to_owned);
+                    let Ok(mut guard) = state.lock() else {
+                        return MockResponse::json(500, "{}");
+                    };
+                    guard.logins += 1; // count every attempt, like the oracle
+                    if client_id.as_deref() != Some("client-abc")
+                        || client_secret.as_deref() != Some("client-xyz")
+                        || !body.contains("\"password\":\"s3cr3t\"")
+                        || !body.contains("\"tenantId\":\"acme\"")
+                    {
+                        return MockResponse::json(401, "{}");
+                    }
+                    let token = guard.issued_token.clone();
+                    MockResponse::json(200, "{\"msg\":\"ok\"}").with_header("X-Auth-Token", &token)
+                }
+                "/api/v1/documents" => {
+                    let token = request.header("X-Auth-Token").map(str::to_owned);
+                    let Ok(mut guard) = state.lock() else {
+                        return MockResponse::json(500, "{}");
+                    };
+                    guard.last_call_token = token.clone();
+                    if guard.reject_token || token.as_deref() != Some(guard.issued_token.as_str()) {
+                        return MockResponse::json(401, "{\"msg\":\"expired\"}");
+                    }
+                    MockResponse::json(
+                        201,
+                        "{\"response\":{\"metadata\":{\"documentId\":\"doc-9\"}}}",
+                    )
+                }
+                "/api/v1/workflows" => {
+                    let token = request.header("X-Auth-Token").map(str::to_owned);
+                    let body = request.body_text();
+                    let Ok(mut guard) = state.lock() else {
+                        return MockResponse::json(500, "{}");
+                    };
+                    if token.as_deref() != Some(guard.issued_token.as_str()) {
+                        return MockResponse::json(401, "{\"msg\":\"expired\"}");
+                    }
+                    guard.workflow_body = Some(body);
+                    MockResponse::json(201, "{\"response\":{\"id\":\"wf-7\",\"status\":1}}")
+                }
+                _ => MockResponse::json(404, "{}"),
+            }
+        });
+        MockServer::start(handler)
+    }
+
+    fn consigno_settings(base_url: &str) -> Result<ApiConnectionSettings, ExternalApiError> {
+        ApiConnectionSettings::from_options(&options(&[
+            ("baseUrl", json!(base_url)),
+            ("authType", json!("TOKEN_LOGIN")),
+            ("loginPath", json!("/auth/login")),
+            (
+                "loginBody",
+                json!({"username": "api@acme.test", "password": "s3cr3t", "tenantId": "acme"}),
+            ),
+            (
+                "loginHeaders",
+                json!({"X-Client-Id": "client-abc", "X-Client-Secret": "client-xyz"}),
+            ),
+            ("tokenResponseHeader", json!("X-Auth-Token")),
+            ("tokenHeaderName", json!("X-Auth-Token")),
+        ]))
+    }
+
+    fn upload(
+        caller: &ExternalApiCaller,
+        settings: &ApiConnectionSettings,
+    ) -> Result<ApiResponse, ExternalApiError> {
+        caller.post_file(
+            settings,
+            "/documents",
+            "file",
+            "contract.pdf",
+            "application/pdf",
+            b"%PDF-1.7",
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn logs_in_and_sends_the_token_from_the_response_header() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = consigno_settings(&format!("{}/api/v1", server.base_url))?;
+
+        let response = upload(&caller, &settings)?;
+        assert_eq!(response.status, 201);
+        assert!(response.body_as_text().contains("doc-9"));
+
+        let Ok(guard) = state.lock() else {
+            panic!("state poisoned");
+        };
+        assert_eq!(guard.logins, 1);
+        assert_eq!(guard.last_call_token.as_deref(), Some("token-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn reuses_the_token_across_calls_rather_than_logging_in_per_document() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+
+        // Fresh settings each call (as a stateless per-document step would build),
+        // so token reuse must come from the cache, not from a shared settings object.
+        for _ in 0..3 {
+            let settings = consigno_settings(&format!("{}/api/v1", server.base_url))?;
+            assert_eq!(upload(&caller, &settings)?.status, 201);
+        }
+
+        let Ok(guard) = state.lock() else {
+            panic!("state poisoned");
+        };
+        // A three-document policy must not perform three logins.
+        assert_eq!(guard.logins, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn re_authenticates_once_when_the_token_is_rejected() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = consigno_settings(&format!("{}/api/v1", server.base_url))?;
+
+        assert_eq!(upload(&caller, &settings)?.status, 201);
+        // The vendor expires the token early and issues a new one.
+        {
+            let Ok(mut guard) = state.lock() else {
+                panic!("state poisoned");
+            };
+            guard.issued_token = "token-2".to_owned();
+        }
+        assert_eq!(upload(&caller, &settings)?.status, 201);
+
+        let Ok(guard) = state.lock() else {
+            panic!("state poisoned");
+        };
+        assert_eq!(guard.logins, 2);
+        assert_eq!(guard.last_call_token.as_deref(), Some("token-2"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_persistent_401_surfaces_rather_than_looping_forever() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        {
+            let Ok(mut guard) = state.lock() else {
+                panic!("state poisoned");
+            };
+            guard.reject_token = true;
+        }
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = consigno_settings(&format!("{}/api/v1", server.base_url))?;
+
+        let response = upload(&caller, &settings)?;
+        assert_eq!(response.status, 401);
+
+        let Ok(guard) = state.lock() else {
+            panic!("state poisoned");
+        };
+        // The initial login plus exactly one re-auth, then give up.
+        assert_eq!(guard.logins, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn bad_credentials_fail_the_step_without_echoing_them() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = ApiConnectionSettings::from_options(&options(&[
+            ("baseUrl", json!(format!("{}/api/v1", server.base_url))),
+            ("authType", json!("TOKEN_LOGIN")),
+            ("loginPath", json!("/auth/login")),
+            (
+                "loginBody",
+                json!({"username": "api@acme.test", "password": "wrong"}),
+            ),
+            (
+                "loginHeaders",
+                json!({"X-Client-Id": "client-abc", "X-Client-Secret": "nope"}),
+            ),
+            ("tokenResponseHeader", json!("X-Auth-Token")),
+            ("tokenHeaderName", json!("X-Auth-Token")),
+        ]))?;
+
+        match upload(&caller, &settings) {
+            Ok(_) => panic!("expected the bad-credential login to fail the step"),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(message.contains("returned HTTP 401"), "message: {message}");
+                // The password must never ride out onward in the run log.
+                assert!(
+                    !message.contains("wrong"),
+                    "message leaked a credential: {message}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn submits_a_consigno_workflow_end_to_end_with_the_document_inline() -> TestResult {
+        let state = ConsignoState::shared("token-1");
+        let server = consigno_server(Arc::clone(&state))?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = consigno_settings(&format!("{}/api/v1", server.base_url))?;
+
+        let pdf = b"%PDF-1.7 contract";
+        let workflow = json!({
+            "name": "contract.pdf",
+            "status": 1,
+            "documents": [{"name": "contract.pdf", "data": STANDARD.encode(pdf)}],
+            "actions": [{"mode": "remote", "signer": {"type": "certifio"}}],
+        });
+        let body = OutboundBody {
+            content_type: "application/json".to_owned(),
+            bytes: serde_json::to_vec(&workflow)?,
+        };
+        let response = caller.dispatch(&settings, "POST", "/workflows", &body, &BTreeMap::new())?;
+        assert_eq!(response.status, 201);
+        let returned: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            returned.pointer("/response/id").and_then(Value::as_str),
+            Some("wf-7")
+        );
+
+        let Ok(guard) = state.lock() else {
+            panic!("state poisoned");
+        };
+        assert_eq!(guard.logins, 1);
+        let received: Value = serde_json::from_str(guard.workflow_body.as_deref().unwrap_or("{}"))?;
+        let arrived = received
+            .pointer("/documents/0/data")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(STANDARD.decode(arrived).unwrap_or_default(), pdf);
+        Ok(())
+    }
+
+    // ---- TOKEN_LOGIN with the token in a JSON body path (OAuth2 shape) ------
+
+    #[test]
+    fn token_login_reads_a_json_path_and_presents_it_with_a_prefix() -> TestResult {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let handler: Handler = Arc::new(move |request: &MockRequest| match request.path.as_str() {
+            "/oauth/token" => {
+                MockResponse::json(200, "{\"access_token\":\"jwt-xyz\",\"expires_in\":3600}")
+            }
+            "/resource" => {
+                if let Ok(mut guard) = sink.lock() {
+                    *guard = request.headers.clone();
+                }
+                let authorized = request.header("Authorization") == Some("Bearer jwt-xyz");
+                if authorized {
+                    MockResponse::json(200, "{\"ok\":true}")
+                } else {
+                    MockResponse::json(401, "{}")
+                }
+            }
+            _ => MockResponse::json(404, "{}"),
+        });
+        let server = MockServer::start(handler)?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("TOKEN_LOGIN")),
+                ("loginPath", json!("/oauth/token")),
+                ("tokenResponseJsonPath", json!("access_token")),
+                ("tokenHeaderName", json!("Authorization")),
+                ("tokenPrefix", json!("Bearer")),
+            ],
+        )?;
+        let response = caller.dispatch(
+            &settings,
+            "POST",
+            "/resource",
+            &json_body(),
+            &BTreeMap::new(),
+        )?;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            header_value(&seen, "authorization").as_deref(),
+            Some("Bearer jwt-xyz")
+        );
+        Ok(())
+    }
+
+    // ---- ApiTokenLogin: parsing + token extraction (oracle ApiTokenLogin) ---
+
+    fn login_from(pairs: &[(&str, Value)]) -> Result<ApiTokenLogin, ExternalApiError> {
+        ApiTokenLogin::from_options(&options(pairs))
+    }
+
+    fn response_of(status: u16, headers: &[(&str, &str)], body: &str) -> ApiResponse {
+        ApiResponse {
+            status,
+            content_type: headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| (*value).to_owned()),
+            body: body.as_bytes().to_vec(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn header_login() -> Result<ApiTokenLogin, ExternalApiError> {
+        login_from(&[
+            ("loginPath", json!("/auth/login")),
+            ("tokenResponseHeader", json!("X-Auth-Token")),
+            ("tokenHeaderName", json!("X-Auth-Token")),
+        ])
+    }
+
+    #[test]
+    fn token_login_requires_a_login_path() {
+        assert_err_contains(
+            login_from(&[
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+            ]),
+            "requires a 'loginPath'",
+        );
+    }
+
+    #[test]
+    fn token_login_needs_exactly_one_token_location() {
+        // Neither.
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+            ]),
+            "exactly one of",
+        );
+        // Both.
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenResponseJsonPath", json!("access_token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+            ]),
+            "exactly one of",
+        );
+    }
+
+    #[test]
+    fn token_login_requires_and_validates_the_token_header_name() {
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+            ]),
+            "requires a 'tokenHeaderName'",
+        );
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("bad name")),
+            ]),
+            "'tokenHeaderName' is not a valid HTTP header name",
+        );
+    }
+
+    #[test]
+    fn token_login_validates_the_response_header_grammar() {
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("bad header")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+            ]),
+            "'tokenResponseHeader' is not a valid HTTP header name",
+        );
+    }
+
+    #[test]
+    fn token_login_login_body_must_be_an_object() {
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+                ("loginBody", json!("not-an-object")),
+            ]),
+            "'loginBody' must be an object",
+        );
+    }
+
+    #[test]
+    fn token_login_rejects_bad_login_header_name_and_value() {
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+                ("loginHeaders", json!({"bad name": "v"})),
+            ]),
+            "'loginHeaders' has an invalid header name",
+        );
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+                ("loginHeaders", json!({"X-Client-Secret": "line\nbreak"})),
+            ]),
+            "'loginHeaders' has an invalid value for 'X-Client-Secret'",
+        );
+    }
+
+    #[test]
+    fn token_login_ttl_must_be_a_number_in_range() {
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+                ("tokenTtlSeconds", json!("soon")),
+            ]),
+            "'tokenTtlSeconds' must be a number",
+        );
+        assert_err_contains(
+            login_from(&[
+                ("loginPath", json!("/auth/login")),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+                ("tokenTtlSeconds", json!(0)),
+            ]),
+            "'tokenTtlSeconds' must be between 1 and 86400",
+        );
+    }
+
+    #[test]
+    fn extract_token_from_a_response_header() -> TestResult {
+        let login = header_login()?;
+        let response = response_of(200, &[("X-Auth-Token", "tok-99")], "{}");
+        assert_eq!(login.extract_token(&response)?, "tok-99");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_token_missing_header_is_an_error() -> TestResult {
+        let login = header_login()?;
+        let response = response_of(200, &[("Content-Type", "application/json")], "{}");
+        assert_err_contains(
+            login.extract_token(&response),
+            "returned no 'X-Auth-Token' response header",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extract_token_walks_a_nested_json_path() -> TestResult {
+        let login = login_from(&[
+            ("loginPath", json!("/auth/login")),
+            ("tokenResponseJsonPath", json!("data.token")),
+            ("tokenHeaderName", json!("Authorization")),
+        ])?;
+        let response = response_of(
+            200,
+            &[("Content-Type", "application/json")],
+            "{\"data\":{\"token\":\"nested-tok\"}}",
+        );
+        assert_eq!(login.extract_token(&response)?, "nested-tok");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_token_missing_json_value_is_an_error() -> TestResult {
+        let login = login_from(&[
+            ("loginPath", json!("/auth/login")),
+            ("tokenResponseJsonPath", json!("access_token")),
+            ("tokenHeaderName", json!("Authorization")),
+        ])?;
+        // Present but an object (not a scalar) → no token.
+        let response = response_of(
+            200,
+            &[("Content-Type", "application/json")],
+            "{\"access_token\":{\"nested\":1}}",
+        );
+        assert_err_contains(login.extract_token(&response), "no token at 'access_token'");
+        Ok(())
+    }
+
+    #[test]
+    fn auth_header_applies_the_prefix_then_the_bare_form() -> TestResult {
+        let prefixed = login_from(&[
+            ("loginPath", json!("/oauth/token")),
+            ("tokenResponseJsonPath", json!("access_token")),
+            ("tokenHeaderName", json!("Authorization")),
+            ("tokenPrefix", json!("Bearer")),
+        ])?;
+        assert_eq!(
+            prefixed.auth_header("t"),
+            ("Authorization".to_owned(), "Bearer t".to_owned())
+        );
+
+        let bare = header_login()?;
+        assert_eq!(
+            bare.auth_header("t"),
+            ("X-Auth-Token".to_owned(), "t".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn token_cache_key_changes_with_the_credentials_but_is_stable_per_config() -> TestResult {
+        let build = |password: &str| -> Result<ApiConnectionSettings, ExternalApiError> {
+            ApiConnectionSettings::from_options(&options(&[
+                ("baseUrl", json!("https://api.example.com")),
+                ("authType", json!("TOKEN_LOGIN")),
+                ("loginPath", json!("/auth/login")),
+                ("loginBody", json!({"username": "u", "password": password})),
+                ("tokenResponseHeader", json!("X-Auth-Token")),
+                ("tokenHeaderName", json!("X-Auth-Token")),
+            ]))
+        };
+        let one = build("one")?;
+        let one_again = build("one")?;
+        let two = build("two")?;
+        let (Some(login_one), Some(login_one_again), Some(login_two)) = (
+            one.token_login.as_ref(),
+            one_again.token_login.as_ref(),
+            two.token_login.as_ref(),
+        ) else {
+            panic!("token-login sub-config missing");
+        };
+
+        // Same config → same key (so a per-document step reuses the cached token).
+        assert_eq!(
+            token_cache_key(&one, login_one),
+            token_cache_key(&one_again, login_one_again)
+        );
+        // Editing the password → different key (evicts the token bought with the old one).
+        assert_ne!(
+            token_cache_key(&one, login_one),
+            token_cache_key(&two, login_two)
+        );
+        Ok(())
+    }
+
+    // ---- ResultUrls: the result-fetch host allowlist (oracle ResultUrls) ----
+
+    fn vendor_connection(
+        result_hosts: Option<Value>,
+    ) -> Result<ApiConnectionSettings, ExternalApiError> {
+        let mut pairs = vec![("baseUrl", json!("https://api.vendor.example/v1"))];
+        if let Some(hosts) = result_hosts {
+            pairs.push(("resultUrlHosts", hosts));
+        }
+        ApiConnectionSettings::from_options(&options(&pairs))
+    }
+
+    #[test]
+    fn result_host_allowlist_matches_own_declared_and_subdomains() -> TestResult {
+        let own = vendor_connection(None)?;
+        assert!(ResultUrls::is_allowed_host(&own, "api.vendor.example"));
+
+        let declared = vendor_connection(Some(json!(["cdn.vendor.example"])))?;
+        assert!(ResultUrls::is_allowed_host(&declared, "cdn.vendor.example"));
+
+        let parent = vendor_connection(Some(json!(["vendor.example"])))?;
+        assert!(ResultUrls::is_allowed_host(
+            &parent,
+            "files.eu.vendor.example"
+        ));
+
+        let mixed_case = vendor_connection(Some(json!(["CDN.Vendor.Example"])))?;
+        assert!(ResultUrls::is_allowed_host(
+            &mixed_case,
+            "cdn.vendor.example"
+        ));
+
+        // A bare suffix must NOT match: evilvendor.example is not vendor.example.
+        assert!(!ResultUrls::is_allowed_host(&parent, "evilvendor.example"));
+        Ok(())
+    }
+
+    #[test]
+    fn result_url_refuses_undeclared_hosts_and_dangerous_shapes() -> TestResult {
+        let settings = vendor_connection(Some(json!(["cdn.vendor.example"])))?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("1.1.1.1", 443)])
+        };
+
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "https://evil.example/x.pdf",
+                false,
+                &resolve,
+            ),
+            "does not allow",
+        );
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(&settings, "file:///etc/passwd", false, &resolve),
+            "is not http(s)",
+        );
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "https://user:pw@cdn.vendor.example/x.pdf",
+                false,
+                &resolve,
+            ),
+            "credentials",
+        );
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(&settings, "not a url", false, &resolve),
+            "is not a valid URL",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_url_refuses_internal_addresses_even_when_declared() -> TestResult {
+        let settings = vendor_connection(Some(json!(["169.254.169.254", "localhost"])))?;
+        let metadata = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("169.254.169.254", 80)])
+        };
+        // No metadata opt-out here: the reserved-range rejection covers it (message
+        // "private/link-local", matching the oracle's ResultUrls path).
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "http://169.254.169.254/latest/meta-data/iam/",
+                false,
+                &metadata,
+            ),
+            "private/link-local",
+        );
+
+        let loopback = |_host: &str, port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)])
+        };
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "http://localhost:8080/admin",
+                false,
+                &loopback,
+            ),
+            "private/link-local",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_result_fetches_a_validated_url_without_forwarding_credentials() -> TestResult {
+        let (server, seen) = header_capturing_server()?;
+        let caller = ExternalApiCaller::new(true);
+        // A BEARER connection whose token must NOT leak to the result host.
+        let settings = ApiConnectionSettings::from_options(&options(&[
+            ("baseUrl", json!("https://api.vendor.example/v1")),
+            ("authType", json!("BEARER")),
+            ("token", json!("do-not-leak")),
+            ("resultUrlHosts", json!(["127.0.0.1"])),
+        ]))?;
+        // The result URL's port is the mock's; the resolver pins it to loopback.
+        let url = format!("{}/files/signed.pdf", server.base_url);
+        let resolve = loopback_resolver();
+        let validated = ResultUrls::validate_with_resolver(&settings, &url, true, &resolve)?;
+
+        let response = caller.get_result(&settings, &validated)?;
+        assert!(response.is_success());
+        // The connection's credentials were deliberately not sent to the CDN host.
+        assert_eq!(header_value(&seen, "authorization"), None);
         Ok(())
     }
 }

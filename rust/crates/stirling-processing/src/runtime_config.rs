@@ -794,6 +794,30 @@ impl RuntimeConfig {
         })
     }
 
+    /// Whether an external-API connection's base URL (and any result URL it
+    /// returns) may resolve to a private/reserved address, mirroring Java's
+    /// operator property `policies.allowPrivateApiEndpoints` (default `false`)
+    /// that `ApiIntegrationValidator`/`ResultUrls` consult.
+    ///
+    /// Off by default so a self-hosted deployment cannot be steered at RFC1918 or
+    /// an internal gateway without an explicit opt-in; the cloud-metadata service
+    /// stays blocked at the base-host gate regardless of this flag. Both the
+    /// underscored and Spring relaxed-binding compact environment aliases are
+    /// honoured, matching [`Self::policies_allow_private_s3_endpoints`].
+    // Consumed once the external-API caller (`proprietary_external_api`) is
+    // mounted into a secured route; the flag exists now so wiring can read it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn policies_allow_private_api_endpoints(&self) -> bool {
+        env_bool("POLICIES_ALLOW_PRIVATE_API_ENDPOINTS").unwrap_or_else(|| {
+            self.boolean(
+                &["policies", "allowPrivateApiEndpoints"],
+                "POLICIES_ALLOWPRIVATEAPIENDPOINTS",
+                false,
+            )
+        })
+    }
+
     /// Returns whether administrators may author free-form ("custom") API
     /// integrations, mirroring Java's `policies.allowCustomApiIntegrations`
     /// (default `true`) that `IntegrationConfigService`/`IntegrationConfigController`
