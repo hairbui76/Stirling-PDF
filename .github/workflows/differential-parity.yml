@@ -108,10 +108,15 @@ jobs:
           echo $! > rust.pid
 
           # --- start the Java backend (open mode, security off) ---
+          # The jar is compiled by JDK 25 (class file v69), but the runner image's default
+          # `java` on PATH is JDK 17 (v61) — invoking it plainly dies with
+          # UnsupportedClassVersionError. Use the JDK 25 that setup-java installed.
+          JAVA_BIN="${JAVA_HOME_25_X64:-$JAVA_HOME}/bin/java"
+          echo "Java runtime: $JAVA_BIN"; "$JAVA_BIN" -version
           JAR="$(ls app/core/build/libs/*.jar | grep -v -- '-plain' | head -1)"
           echo "Java bootJar: $JAR"
           SERVER_PORT=8080 SECURITY_ENABLELOGIN=false \
-            java -jar "$JAR" > java-backend.log 2>&1 &
+            "$JAVA_BIN" -jar "$JAR" > java-backend.log 2>&1 &
           echo $! > java.pid
 
           wait_ready() {
