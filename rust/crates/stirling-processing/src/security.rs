@@ -2840,12 +2840,31 @@ impl SecurityStore {
     ) -> Result<AuthContext, SecurityError> {
         let normalized = normalize_username(username)?;
         validate_password(password)?;
-        let connection = self.lock()?;
-        let Some(user) = find_user(&connection, &normalized.normalized)? else {
+        // Read the stored hash and lockout state under a brief lock, then
+        // RELEASE it before any bcrypt work. A bcrypt verify/hash costs tens of
+        // milliseconds; holding the single global connection mutex across it
+        // serialises every authentication request, so a login flood collapses
+        // the whole service to a few requests/second (DoS). Every bcrypt call
+        // below therefore runs OFF-lock.
+        let (user, locked) = {
+            let connection = self.lock()?;
+            let user = find_user(&connection, &normalized.normalized)?;
+            let locked = if user.is_some() {
+                login_is_locked(&connection, &normalized.normalized, now)?
+            } else {
+                false
+            };
+            (user, locked)
+        };
+
+        // Timing equalisation: unknown, locked, and non-web accounts still pay
+        // exactly one bcrypt hash so response timing never reveals which case
+        // occurred (enumeration resistance). This runs with no lock held.
+        let Some(user) = user else {
             fake_password_work(password, self.bcrypt_cost)?;
             return Err(SecurityError::InvalidCredentials);
         };
-        if login_is_locked(&connection, &normalized.normalized, now)? {
+        if locked {
             fake_password_work(password, self.bcrypt_cost)?;
             return Err(SecurityError::AccountLocked);
         }
@@ -2853,8 +2872,17 @@ impl SecurityStore {
             fake_password_work(password, self.bcrypt_cost)?;
             return Err(SecurityError::InvalidCredentials);
         }
-        if !verify(password, &user.password_hash)? {
-            let locked = record_login_failure(&connection, &normalized.normalized, now)?;
+        let password_ok = verify(password, &user.password_hash)?;
+
+        // Re-acquire the lock only to record the outcome. An Immediate
+        // transaction serialises the failure-count update so concurrent
+        // attempts cannot race the lockout threshold, matching the previous
+        // single-lock atomicity without holding the mutex across bcrypt.
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !password_ok {
+            let locked = record_login_failure(&transaction, &normalized.normalized, now)?;
+            transaction.commit()?;
             return if locked {
                 Err(SecurityError::AccountLocked)
             } else {
@@ -2862,21 +2890,25 @@ impl SecurityStore {
             };
         }
         if !user.enabled {
+            // Correct password but disabled account: no state change, so the
+            // Immediate transaction rolls back on drop (matches prior behavior).
             return Err(SecurityError::AccountDisabled);
         }
         if clear_failures {
-            connection.execute(
+            transaction.execute(
                 "DELETE FROM security_login_attempts WHERE username_norm = ?1",
                 [&normalized.normalized],
             )?;
         }
-        context_for_user(
-            &connection,
+        let context = context_for_user(
+            &transaction,
             &user,
             AuthenticationSource::Password,
             String::new(),
             correlation_id,
-        )
+        )?;
+        transaction.commit()?;
+        Ok(context)
     }
 
     /// Persists a new opaque access/refresh pair for an authenticated user.
@@ -4894,11 +4926,16 @@ impl SecurityStore {
 
     #[cfg(test)]
     pub(crate) fn in_memory() -> Result<Self, SecurityError> {
+        Self::in_memory_with_cost(4)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_cost(bcrypt_cost: u32) -> Result<Self, SecurityError> {
         let connection = Connection::open_in_memory()?;
         initialize_connection(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
-            bcrypt_cost: 4,
+            bcrypt_cost,
             secret_cipher: Some(ProtectedSecretCipher::random()),
             license_state: RwLock::new(None),
         })
@@ -8191,6 +8228,128 @@ mod tests {
             store.delete_team(team_id),
             Err(SecurityError::TeamNotEmpty)
         ));
+        Ok(())
+    }
+
+    // FINDING #1 (DoS): bcrypt must run OUTSIDE the global connection mutex.
+    // The stored hash + lockout state are read under a brief lock, the lock is
+    // released, verify()/fake_password_work() run off-lock, then an Immediate
+    // transaction re-acquires only to record the outcome atomically.
+    #[test]
+    fn off_lock_refactor_preserves_failure_recording_and_reset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SecurityStore::in_memory()?;
+        assert!(store.bootstrap_admin("admin", "correct horse battery staple")?);
+
+        // Four wrong attempts accrue but stay below the lockout threshold (5).
+        for attempt in 0..4 {
+            assert!(matches!(
+                store.authenticate_password("admin", "nope", 1_000 + attempt, "fail"),
+                Err(SecurityError::InvalidCredentials)
+            ));
+        }
+        // A correct password still authenticates and clears the counter, proving
+        // the re-acquired transaction commits the success-path reset.
+        store.authenticate_password("admin", "correct horse battery staple", 1_010, "ok")?;
+        // So four further failures again fall one short of locking...
+        for attempt in 0..4 {
+            assert!(matches!(
+                store.authenticate_password("admin", "nope", 1_020 + attempt, "fail"),
+                Err(SecurityError::InvalidCredentials)
+            ));
+        }
+        // ...and the fifth consecutive failure trips the lockout, showing the
+        // off-lock failure recording is still atomic and correctly counted.
+        assert!(matches!(
+            store.authenticate_password("admin", "nope", 1_030, "fail"),
+            Err(SecurityError::AccountLocked)
+        ));
+        // A correct password is refused while locked (fake work, no bypass).
+        assert!(matches!(
+            store.authenticate_password("admin", "correct horse battery staple", 1_031, "locked"),
+            Err(SecurityError::AccountLocked)
+        ));
+        // Unknown users get the identical generic rejection (no enumeration).
+        assert!(matches!(
+            store.authenticate_password("ghost", "whatever", 1_040, "unknown"),
+            Err(SecurityError::InvalidCredentials)
+        ));
+        Ok(())
+    }
+
+    // FINDING #1 (DoS): structural proof that bcrypt is not serialised by the
+    // connection mutex. N authentications launched concurrently must finish
+    // meaningfully faster than the same N run back-to-back; that is only
+    // possible if the (expensive) bcrypt verify runs while the lock is free.
+    #[test]
+    fn password_authentication_runs_bcrypt_off_the_connection_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Instant;
+
+        // Number of authentications timed serially and then concurrently.
+        const N: usize = 6;
+
+        // Parallelism is only observable with more than one core: CPU-bound
+        // bcrypt cannot overlap on a single core regardless of locking, so the
+        // timing assertion would be meaningless there.
+        let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        if cores < 2 {
+            return Ok(());
+        }
+
+        // Cost tuned so one verify is comfortably measurable (tens of ms) while
+        // the whole test stays well under a second.
+        let store = Arc::new(SecurityStore::in_memory_with_cost(9)?);
+        assert!(store.bootstrap_admin("admin", "correct horse battery staple")?);
+
+        let password = "correct horse battery staple";
+
+        // Warm caches/JIT of the hashing path so neither measurement below eats
+        // a one-off cold-start cost.
+        store.authenticate_password("admin", password, 500, "warm")?;
+
+        // Serial baseline: N authentications back-to-back = N bcrypts in series.
+        // The timestamp is constant: every attempt uses the correct password, so
+        // it only ever clears an (empty) failure counter.
+        let serial_start = Instant::now();
+        for _ in 0..N {
+            store.authenticate_password("admin", password, 1_000, "serial")?;
+        }
+        let serial = serial_start.elapsed();
+
+        // Same N authentications launched simultaneously. Under the old
+        // under-lock behavior every verify would serialise on the mutex and the
+        // wall time would match `serial`; off-lock they overlap across cores.
+        let barrier = Arc::new(Barrier::new(N));
+        let concurrent_start = Instant::now();
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .authenticate_password("admin", password, 2_000, "flood")
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().map_err(|_| "auth thread panicked")??;
+        }
+        let concurrent = concurrent_start.elapsed();
+
+        // Overlap must pull concurrent wall time well below the serial baseline.
+        // 0.7 leaves generous headroom for scheduler noise while still failing
+        // the old behavior, where concurrent ~= serial.
+        let budget = serial.mul_f64(0.7);
+        assert!(
+            concurrent < budget,
+            "concurrent auth {concurrent:?} not sub-linear vs serial {serial:?} \
+             (budget {budget:?}); bcrypt appears to run under the connection lock",
+        );
         Ok(())
     }
 }
