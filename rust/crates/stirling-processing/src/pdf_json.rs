@@ -7175,7 +7175,7 @@ pub(crate) fn iso_instant_to_pdf_date(value: &str) -> Option<String> {
     ))
 }
 
-fn extract_metadata(document: &Document) -> PdfJsonMetadata {
+pub(crate) fn extract_metadata(document: &Document) -> PdfJsonMetadata {
     let info = document
         .trailer
         .get(b"Info")

@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **826 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **848 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -341,9 +341,11 @@ auto-rename/auto-split, plus:
   unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
   blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
   of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
-  as a bounded staircase — slice 1 (pure request-construction + config primitives:
-  `proprietary_external_api.rs`) is landed and oracle-verified; slices 2–4 (document context/body
-  assembly, the SSRF-safe outbound caller + auth/token-login cache reusing the OIDC resolve-and-pin, and
+  as a bounded staircase — slices 1–2 are landed and oracle-verified (`proprietary_external_api.rs`):
+  slice 1 = pure request-construction + config primitives; slice 2 = the `DocumentContext` namespace
+  (base/run facts + best-effort PDF Info metadata + classification + sensitivity-label, omit-not-fatal on
+  non-PDF) and the four `buildBody` modes (multipart / json / binary / bodyTemplate). Slices 3–4 (the
+  SSRF-safe outbound caller + auth/token-login cache reusing the OIDC resolve-and-pin, and
   response/verdict/result-URL/zip handling + route wiring) remain, and will cover ConsignO via the
   generic `bodyTemplate`. See `contracts/resource-access-integrations.md`.
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline

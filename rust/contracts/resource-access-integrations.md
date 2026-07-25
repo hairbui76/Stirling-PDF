@@ -74,8 +74,13 @@ usage labels; grants/config are removed only after references are gone. See `pol
 ## Explicit remaining boundary
 
 MCP remains a storage placeholder, matching its current Java integration-config behavior. The
-`external-api-call` step (the `API` integration type) is being ported as a bounded staircase: **slice 1
-is landed** — the pure, network-free request-construction primitives (`proprietary_external_api.rs`),
+`external-api-call` step (the `API` integration type) is being ported as a bounded staircase: **slices 1–2
+are landed**. Slice 2 adds `DocumentContext::build` (the templating namespace — base facts filename/
+extension/contentType/sizeBytes/sha256/base64 + run facts + best-effort PDF Info metadata + `classification.*`
++ `sensitivityLabel.*`, every PDF/label field omit-not-fatal on a non-PDF/unparseable input) and `buildBody`
+(the four outbound body modes: multipart with templated fields, json, raw binary, and `bodyTemplate` via
+`resolveTree` with `document.base64`/`safeFilename`/`resolvedContentType` injected). Slice 1 is
+the pure, network-free request-construction primitives (`proprietary_external_api.rs`),
 each a 1:1 port of its Java oracle: `ExternalApiPaths::resolve` (SSRF path anchor — relative-only,
 same-origin, under-base-path, `%2e`/fragment/control-char rejection), `Placeholders` (dotted `{{a.b}}`
 templating with URL-path escaping and unknown→error), `ApiConnectionSettings::from` (base-URL/authType/

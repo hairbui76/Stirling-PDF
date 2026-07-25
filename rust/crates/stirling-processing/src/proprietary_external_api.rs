@@ -42,11 +42,18 @@ use std::{
     sync::OnceLock,
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use lopdf::Document;
 use rand::RngExt as _;
 use regex::Regex;
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use url::Url;
+
+use crate::purview::{AssignmentMethod, PdfSensitivityLabels};
 
 // ---------------------------------------------------------------------------
 // Error type — every Java IllegalArgumentException maps here. Display carries
@@ -890,6 +897,423 @@ impl Default for MultipartBody {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// (f) DocumentContext — the `{{...}}` namespace: everything Stirling already
+//     knows about the document and the run, as one JSON object.
+//     (oracle DocumentContext.java)
+// ---------------------------------------------------------------------------
+
+/// The Info-dictionary custom-metadata key the classifier writes its verdict
+/// under. Verbatim from Java `PdfMetadataService.CLASSIFICATION_KEY`.
+const CLASSIFICATION_KEY: &[u8] = b"StirlingPDFClassification";
+
+/// Lower-case hex, matching Java `HexFormat.of().formatHex(...)`.
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+/// The run facts a step already holds: which policy sent the document, the run
+/// id, and when. Java reads `policyName`/`runId` from request headers and stamps
+/// `Instant.now().toString()`; here the timestamp is supplied so the context is
+/// deterministic and testable. All three are recorded even when absent (as JSON
+/// `null`), so `{{run.policyName}}` resolves to empty rather than erroring.
+pub(crate) struct RunFacts<'a> {
+    pub(crate) policy_name: Option<&'a str>,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) timestamp: &'a str,
+}
+
+/// Builds the placeholder namespace. (oracle `DocumentContext`)
+pub(crate) struct DocumentContext;
+
+impl DocumentContext {
+    /// Everything known about the document and run, as one JSON object.
+    ///
+    /// Base facts are always present: `filename`, `extension`, `contentType`,
+    /// `sizeBytes`, `sha256`, `base64`. PDF facts (`pageCount`, `encrypted`, the
+    /// Info metadata, `classification.*`, `sensitivityLabel.*`) are best-effort —
+    /// a non-PDF or an unparseable one simply omits them, never fails.
+    ///
+    /// A parsed PDF sets every Info field (`title`…`modified`) even when the
+    /// value is absent, as JSON `null` — matching Java's unconditional
+    /// `document.put(...)`. So `{{document.title}}` on a parsed PDF resolves to
+    /// empty, while on a non-PDF the key is missing and the placeholder errors.
+    pub(crate) fn build(
+        file_bytes: &[u8],
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        run: &RunFacts<'_>,
+    ) -> Value {
+        let mut document = Map::new();
+        document.insert("filename".to_owned(), opt_string(filename));
+        document.insert(
+            "extension".to_owned(),
+            opt_string(extension_of(filename).as_deref()),
+        );
+        document.insert("contentType".to_owned(), opt_string(content_type));
+        document.insert("sizeBytes".to_owned(), Value::from(file_bytes.len()));
+        document.insert("sha256".to_owned(), Value::String(sha256_hex(file_bytes)));
+        // The bytes themselves, for steps that carry the document inside a JSON
+        // body (an attachment field, a signing payload) rather than as multipart.
+        document.insert(
+            "base64".to_owned(),
+            Value::String(STANDARD.encode(file_bytes)),
+        );
+
+        // PDF facts and the two top-level namespaces are best-effort.
+        let mut classification: Option<Value> = None;
+        let mut sensitivity_label: Option<Value> = None;
+        if looks_like_pdf(file_bytes) {
+            add_pdf_facts(
+                &mut document,
+                &mut classification,
+                &mut sensitivity_label,
+                file_bytes,
+            );
+        }
+
+        let mut root = Map::new();
+        root.insert("document".to_owned(), Value::Object(document));
+        if let Some(classification) = classification {
+            root.insert("classification".to_owned(), classification);
+        }
+        if let Some(sensitivity_label) = sensitivity_label {
+            root.insert("sensitivityLabel".to_owned(), sensitivity_label);
+        }
+
+        let mut run_node = Map::new();
+        run_node.insert("policyName".to_owned(), opt_string(run.policy_name));
+        run_node.insert("runId".to_owned(), opt_string(run.run_id));
+        run_node.insert(
+            "timestamp".to_owned(),
+            Value::String(run.timestamp.to_owned()),
+        );
+        root.insert("run".to_owned(), Value::Object(run_node));
+
+        Value::Object(root)
+    }
+}
+
+/// PDF-only facts. A document we cannot parse still gets the base facts; a parse
+/// failure here is swallowed, matching Java's `catch (IOException | RuntimeException)`.
+fn add_pdf_facts(
+    document: &mut Map<String, Value>,
+    classification: &mut Option<Value>,
+    sensitivity_label: &mut Option<Value>,
+    content: &[u8],
+) {
+    let Ok(pdf) = Document::load_mem(content) else {
+        // An encrypted or malformed PDF is a normal thing to send to an external
+        // API; the extra facts are a convenience, not a precondition.
+        return;
+    };
+
+    document.insert("pageCount".to_owned(), Value::from(pdf.get_pages().len()));
+    document.insert(
+        "encrypted".to_owned(),
+        Value::Bool(pdf.encryption_state.is_some()),
+    );
+
+    // Reuse the pdf_json Info extraction (title…producer + ISO created/modified),
+    // which mirrors PDFBox's `PDDocumentInformation` getters and date formatting.
+    let info = crate::pdf_json::extract_metadata(&pdf);
+    document.insert("title".to_owned(), opt_string(info.title.as_deref()));
+    document.insert("author".to_owned(), opt_string(info.author.as_deref()));
+    document.insert("subject".to_owned(), opt_string(info.subject.as_deref()));
+    document.insert("keywords".to_owned(), opt_string(info.keywords.as_deref()));
+    document.insert("creator".to_owned(), opt_string(info.creator.as_deref()));
+    document.insert("producer".to_owned(), opt_string(info.producer.as_deref()));
+    document.insert(
+        "created".to_owned(),
+        opt_string(info.creation_date.as_deref()),
+    );
+    document.insert(
+        "modified".to_owned(),
+        opt_string(info.modification_date.as_deref()),
+    );
+
+    add_classification(classification, &pdf);
+    add_sensitivity_label(sensitivity_label, &pdf);
+}
+
+/// The classifier policy's verdict, so a call-out can act on it without
+/// re-classifying. JSON when it parses, otherwise the raw text (written by
+/// another tool, still recognisable to the receiver).
+fn add_classification(out: &mut Option<Value>, pdf: &Document) {
+    let Some(raw) = crate::pdf_metadata::document_info_text(pdf, CLASSIFICATION_KEY)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    *out = Some(match serde_json::from_str::<Value>(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => Value::String(raw),
+    });
+}
+
+/// The Purview label already on the document, if any (the first found).
+fn add_sensitivity_label(out: &mut Option<Value>, pdf: &Document) {
+    let labels = PdfSensitivityLabels::read_all(pdf);
+    let Some(label) = labels.into_iter().next() else {
+        return;
+    };
+    let mut node = Map::new();
+    node.insert(
+        "labelId".to_owned(),
+        Value::String(label.label_id().to_owned()),
+    );
+    node.insert("name".to_owned(), opt_string(label.name()));
+    node.insert(
+        "siteId".to_owned(),
+        Value::String(label.site_id().to_owned()),
+    );
+    node.insert(
+        "method".to_owned(),
+        match label.method() {
+            // Java writes the enum *name* (STANDARD / PRIVILEGED), not the
+            // mixed-case wire form.
+            Some(method) => Value::String(assignment_method_name(method).to_owned()),
+            None => Value::Null,
+        },
+    );
+    node.insert("protected".to_owned(), Value::Bool(label.is_protected()));
+    *out = Some(Value::Object(node));
+}
+
+/// The enum name Java's `AssignmentMethod.name()` yields.
+fn assignment_method_name(method: AssignmentMethod) -> &'static str {
+    match method {
+        AssignmentMethod::Standard => "STANDARD",
+        AssignmentMethod::Privileged => "PRIVILEGED",
+    }
+}
+
+/// A present value renders as a JSON string; an absent one as JSON `null`, so a
+/// documented-but-empty field resolves to empty rather than being missing.
+fn opt_string(value: Option<&str>) -> Value {
+    match value {
+        Some(text) => Value::String(text.to_owned()),
+        None => Value::Null,
+    }
+}
+
+/// Cheap magic-byte check so a non-PDF never pays for a parse attempt. Matches
+/// Java's `length > 4 && bytes 0..4 == "%PDF"`.
+fn looks_like_pdf(content: &[u8]) -> bool {
+    content.len() > 4 && &content[0..4] == b"%PDF"
+}
+
+/// Lower-case SHA-256 hex of the exact bytes the API will receive — the field
+/// external systems most often key on (dedupe, chain-of-custody).
+fn sha256_hex(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX_LOWER[usize::from(byte >> 4)] as char);
+        out.push(HEX_LOWER[usize::from(byte & 0x0F)] as char);
+    }
+    out
+}
+
+/// The lower-cased extension, or `None` when the name has no dot or ends in one.
+/// Java `extensionOf`: `lastIndexOf('.')`, reject `< 0` or trailing dot.
+fn extension_of(filename: Option<&str>) -> Option<String> {
+    let filename = filename?;
+    let dot = filename.rfind('.')?;
+    if dot == filename.len() - 1 {
+        return None;
+    }
+    Some(filename[dot + 1..].to_lowercase())
+}
+
+// ---------------------------------------------------------------------------
+// (g) buildBody — assemble the outbound body from the resolved fields, context
+//     and file. (oracle ExternalApiCallController.buildBody / templatedBody)
+// ---------------------------------------------------------------------------
+
+/// A JSON media type, matching Java's `MediaType.APPLICATION_JSON_VALUE`.
+const APPLICATION_JSON: &str = "application/json";
+
+/// Field (multipart) and property (json) the auto-populated context rides under.
+/// Verbatim from Java `ExternalApiCallController.CONTEXT_FIELD`.
+const CONTEXT_FIELD: &str = "stirlingContext";
+
+pub(crate) const BODY_MULTIPART: &str = "multipart";
+pub(crate) const BODY_JSON: &str = "json";
+pub(crate) const BODY_BINARY: &str = "binary";
+
+/// The assembled outbound body: the content type to send and the raw bytes.
+/// (Java's `ExternalApiCaller.Body`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutboundBody {
+    pub(crate) content_type: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// The inputs [`build_body`] needs, gathered so the entry point stays a single
+/// argument. `fields` are already placeholder-resolved by the caller; `filename`
+/// / `content_type` are the safe/resolved forms the caller settled on.
+pub(crate) struct BodyRequest<'a> {
+    /// Already normalised to `multipart` | `json` | `binary`.
+    pub(crate) body_mode: &'a str,
+    /// A JSON template that, when set (non-blank), takes precedence over
+    /// `body_mode` and carries an arbitrary vendor payload.
+    pub(crate) body_template: Option<&'a str>,
+    pub(crate) include_file: bool,
+    pub(crate) include_context: bool,
+    pub(crate) file_field_name: &'a str,
+    pub(crate) filename: &'a str,
+    pub(crate) content_type: &'a str,
+    pub(crate) content: &'a [u8],
+    pub(crate) fields: &'a BTreeMap<String, String>,
+}
+
+/// Assemble the outbound body. (oracle `ExternalApiCallController.buildBody`)
+///
+/// - `multipart` — the file plus form fields (what most upload APIs expect);
+///   `includeFile=false` sends the fields only (a notify-style call-out).
+/// - `json` — a JSON object of the fields, with the context optionally merged in
+///   and the file base64'd under `content`.
+/// - `binary` — the raw bytes as the body; fields have nowhere to go, so they are
+///   refused rather than dropped, and `includeFile=false` would send nothing.
+///
+/// A non-blank `bodyTemplate` overrides all three: the template is resolved
+/// against a deep copy of the context that also carries the file.
+pub(crate) fn build_body(
+    request: &BodyRequest<'_>,
+    context: &Value,
+) -> Result<OutboundBody, ExternalApiError> {
+    if let Some(template) = request
+        .body_template
+        .filter(|template| !template.trim().is_empty())
+    {
+        return templated_body(
+            template,
+            context,
+            request.filename,
+            request.content_type,
+            request.content,
+        );
+    }
+
+    match request.body_mode {
+        BODY_BINARY => {
+            if !request.fields.is_empty() {
+                return Err(invalid(
+                    "bodyMode 'binary' sends only the document, so 'fields' cannot be sent; use \
+                     'headers' instead, or bodyMode 'multipart'.",
+                ));
+            }
+            if !request.include_file {
+                return Err(invalid(
+                    "bodyMode 'binary' with includeFile=false would send an empty body",
+                ));
+            }
+            Ok(OutboundBody {
+                content_type: request.content_type.to_owned(),
+                bytes: request.content.to_vec(),
+            })
+        }
+        BODY_JSON => {
+            let mut json = Map::new();
+            for (name, value) in request.fields {
+                json.insert(name.clone(), Value::String(value.clone()));
+            }
+            if request.include_context
+                && let Value::Object(map) = context
+            {
+                // Java `json.setAll(context)`: later inserts win over an earlier
+                // field of the same name.
+                for (name, value) in map {
+                    json.insert(name.clone(), value.clone());
+                }
+            }
+            if request.include_file {
+                json.insert(
+                    "filename".to_owned(),
+                    Value::String(request.filename.to_owned()),
+                );
+                json.insert(
+                    "contentType".to_owned(),
+                    Value::String(request.content_type.to_owned()),
+                );
+                json.insert(
+                    "content".to_owned(),
+                    Value::String(STANDARD.encode(request.content)),
+                );
+            }
+            let bytes = serde_json::to_vec(&Value::Object(json))
+                .map_err(|_| invalid("api step failed to serialize the JSON body"))?;
+            Ok(OutboundBody {
+                content_type: APPLICATION_JSON.to_owned(),
+                bytes,
+            })
+        }
+        // multipart (default).
+        _ => {
+            let mut all = request.fields.clone();
+            if request.include_context {
+                let serialized = serde_json::to_string(context)
+                    .map_err(|_| invalid("api step failed to serialize the context"))?;
+                all.insert(CONTEXT_FIELD.to_owned(), serialized);
+            }
+            let mut body = MultipartBody::new();
+            body.add_fields(&all)?;
+            if request.include_file {
+                body.add_file(
+                    request.file_field_name,
+                    request.filename,
+                    request.content_type,
+                    request.content,
+                )?;
+            }
+            Ok(OutboundBody {
+                content_type: body.content_type(),
+                bytes: body.build(),
+            })
+        }
+    }
+}
+
+/// A caller-shaped JSON body: the template is resolved against the context so an
+/// arbitrary vendor payload can be expressed as config. `{{document.base64}}`
+/// carries the file itself. (oracle `ExternalApiCallController.templatedBody`)
+///
+/// The file is injected into a *deep copy* of the context — `stirlingContext`
+/// must not silently grow by a whole document.
+// `content` (the bytes) and `context` (the namespace) are the oracle's own
+// parameter names; kept for a faithful port despite the similar-names lint.
+#[allow(clippy::similar_names)]
+fn templated_body(
+    body_template: &str,
+    context: &Value,
+    filename: &str,
+    content_type: &str,
+    content: &[u8],
+) -> Result<OutboundBody, ExternalApiError> {
+    let template: Value = serde_json::from_str(body_template)
+        .map_err(|_| invalid("api step 'bodyTemplate' must be valid JSON"))?;
+
+    let mut with_file = context.clone();
+    if let Some(Value::Object(document)) = with_file.get_mut("document") {
+        document.insert("base64".to_owned(), Value::String(STANDARD.encode(content)));
+        document.insert(
+            "safeFilename".to_owned(),
+            Value::String(filename.to_owned()),
+        );
+        document.insert(
+            "resolvedContentType".to_owned(),
+            Value::String(content_type.to_owned()),
+        );
+    }
+
+    let resolved = Placeholders::resolve_tree(template, &with_file)?;
+    let bytes = serde_json::to_vec(&resolved)
+        .map_err(|_| invalid("api step failed to serialize the templated body"))?;
+    Ok(OutboundBody {
+        content_type: APPLICATION_JSON.to_owned(),
+        bytes,
+    })
 }
 
 // ===========================================================================
@@ -2046,6 +2470,776 @@ mod tests {
         // the forged boundary did not split the body into an extra part.
         let real_delim = format!("--{real_boundary}");
         assert_eq!(rendered.matches(&real_delim).count(), 2);
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Slice-2 tests — DocumentContext + buildBody.
+//
+// 1:1 translations of `DocumentContextTest.java` and the body-shape assertions
+// in `ExternalApiCallControllerLiveTest.java` (`sendsTheDocumentAndWhatWeKnow…`,
+// `sendsAVendorShapedJsonBody…`, `notifyStyleCallOut…`), plus DEV-level edge
+// coverage for the branches those oracles leave implicit. The live-test HTTP
+// receiver is replaced by asserting directly on the assembled body bytes — this
+// slice has no network, so the wire *is* the [`OutboundBody`].
+// ===========================================================================
+
+#[cfg(test)]
+// `content` (bytes) and `context` (namespace) co-occur throughout these ports —
+// the oracle's own names; the similar-names lint is a false positive here.
+#[allow(clippy::similar_names)]
+mod slice2_tests {
+    use std::collections::BTreeMap;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use lopdf::{Dictionary, Document, Object, dictionary};
+    use serde_json::Value;
+
+    use super::{
+        BODY_BINARY, BODY_JSON, BODY_MULTIPART, BodyRequest, DocumentContext, Escaping,
+        ExternalApiError, Placeholders, RunFacts, build_body,
+    };
+    use crate::purview::{AssignmentMethod, PdfSensitivityLabels, SensitivityLabel};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const TENANT: &str = "cb46c030-1825-4e81-a295-151c039dbf02";
+    const LABEL_GUID: &str = "2096f6a2-d2f7-48be-b329-b73aaa526e5d";
+    const TIMESTAMP: &str = "2026-07-25T12:00:00Z";
+
+    /// No `unwrap`/`expect` (both denied in this crate): assert an error whose
+    /// message contains `needle`, the message-substring check the oracles use.
+    fn assert_err_contains<T>(result: Result<T, ExternalApiError>, needle: &str) {
+        match result {
+            Ok(_) => panic!("expected an error containing {needle:?}, got Ok"),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(needle),
+                    "message {message:?} did not contain {needle:?}"
+                );
+            }
+        }
+    }
+
+    /// A two-page PDF shell, the Rust analogue of the oracle's `pdfBytes(...)`
+    /// (which adds two `PDPage`s). Callers add Info entries / a label, then
+    /// [`serialize`] to the bytes `DocumentContext::build` re-parses.
+    fn two_page_pdf() -> Document {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let page = |document: &mut Document| {
+            document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 300.into()],
+            })
+        };
+        let page_one = page(&mut document);
+        let page_two = page(&mut document);
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_one), Object::Reference(page_two)],
+                "Count" => 2,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document
+    }
+
+    fn serialize(document: &mut Document) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn set_info(document: &mut Document, pairs: &[(&str, &str)]) {
+        let mut info = Dictionary::new();
+        for (key, value) in pairs {
+            info.set(*key, Object::string_literal(*value));
+        }
+        let info_id = document.add_object(info);
+        document.trailer.set("Info", info_id);
+    }
+
+    fn pdf_with_info(pairs: &[(&str, &str)]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut document = two_page_pdf();
+        if !pairs.is_empty() {
+            set_info(&mut document, pairs);
+        }
+        serialize(&mut document)
+    }
+
+    fn confidential_label(
+        method: Option<AssignmentMethod>,
+    ) -> Result<SensitivityLabel, Box<dyn std::error::Error>> {
+        Ok(SensitivityLabel::new(
+            LABEL_GUID.to_owned(),
+            Some("Confidential".to_owned()),
+            TENANT.to_owned(),
+            method,
+            None,
+            None,
+        )?)
+    }
+
+    /// A labelled, classified, titled PDF — the live test's `pdf()` fixture, so
+    /// the context has something real to carry across every namespace.
+    fn rich_pdf() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut document = two_page_pdf();
+        set_info(
+            &mut document,
+            &[
+                ("Title", "Q3 Claim"),
+                (
+                    "StirlingPDFClassification",
+                    "{\"label\":\"invoice\",\"confidence\":0.91}",
+                ),
+            ],
+        );
+        // Writes label keys into the existing Info dict (and the XMP surface),
+        // leaving Title / classification untouched.
+        PdfSensitivityLabels::apply(
+            &mut document,
+            &confidential_label(Some(AssignmentMethod::Privileged))?,
+        )?;
+        serialize(&mut document)
+    }
+
+    fn run() -> RunFacts<'static> {
+        RunFacts {
+            policy_name: Some("Outbound review"),
+            run_id: Some("run-42"),
+            timestamp: TIMESTAMP,
+        }
+    }
+
+    fn str_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
+        value.pointer(pointer).and_then(Value::as_str)
+    }
+
+    // -------------------------------------------------------------------
+    // DocumentContextTest
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn describes_the_pdf_and_the_run() -> TestResult {
+        let content = pdf_with_info(&[("Title", "Q3 Invoice"), ("Author", "Anthony")])?;
+        let context = DocumentContext::build(
+            &content,
+            Some("invoice.pdf"),
+            Some("application/pdf"),
+            &run(),
+        );
+
+        assert_eq!(str_at(&context, "/document/filename"), Some("invoice.pdf"));
+        assert_eq!(str_at(&context, "/document/extension"), Some("pdf"));
+        assert_eq!(
+            str_at(&context, "/document/contentType"),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            context
+                .pointer("/document/sizeBytes")
+                .and_then(Value::as_u64),
+            Some(content.len() as u64)
+        );
+        assert_eq!(
+            context
+                .pointer("/document/pageCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            context
+                .pointer("/document/encrypted")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(str_at(&context, "/document/title"), Some("Q3 Invoice"));
+        assert_eq!(str_at(&context, "/document/author"), Some("Anthony"));
+        assert_eq!(str_at(&context, "/run/policyName"), Some("Outbound review"));
+        assert_eq!(str_at(&context, "/run/runId"), Some("run-42"));
+        assert_eq!(str_at(&context, "/run/timestamp"), Some(TIMESTAMP));
+        Ok(())
+    }
+
+    #[test]
+    fn hashes_the_content_the_api_will_receive() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let sha = DocumentContext::build(&content, Some("a.pdf"), None, &run())
+            .pointer("/document/sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("sha256 present")?;
+
+        assert_eq!(sha.len(), 64);
+        assert!(
+            sha.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        // Same bytes, same hash regardless of filename: dedupe / chain-of-custody.
+        assert_eq!(
+            str_at(
+                &DocumentContext::build(&content, Some("renamed.pdf"), None, &run()),
+                "/document/sha256"
+            ),
+            Some(sha.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn carries_the_bytes_as_base64_for_body_payloads() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let base64 = DocumentContext::build(&content, Some("a.pdf"), None, &run())
+            .pointer("/document/base64")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("base64 present")?;
+        assert_eq!(STANDARD.decode(base64)?, content);
+        Ok(())
+    }
+
+    #[test]
+    fn surfaces_an_existing_purview_label() -> TestResult {
+        let mut document = two_page_pdf();
+        PdfSensitivityLabels::apply(
+            &mut document,
+            &confidential_label(Some(AssignmentMethod::Privileged))?,
+        )?;
+        let content = serialize(&mut document)?;
+
+        let context = DocumentContext::build(
+            &content,
+            Some("secret.pdf"),
+            Some("application/pdf"),
+            &run(),
+        );
+        assert_eq!(
+            str_at(&context, "/sensitivityLabel/name"),
+            Some("Confidential")
+        );
+        assert_eq!(str_at(&context, "/sensitivityLabel/siteId"), Some(TENANT));
+        assert_eq!(
+            str_at(&context, "/sensitivityLabel/method"),
+            Some("PRIVILEGED")
+        );
+        assert_eq!(
+            context
+                .pointer("/sensitivityLabel/protected")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            str_at(&context, "/sensitivityLabel/labelId"),
+            Some(LABEL_GUID)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surfaces_the_classifier_verdict_as_json() -> TestResult {
+        let content = pdf_with_info(&[(
+            "StirlingPDFClassification",
+            "{\"label\":\"invoice\",\"confidence\":0.91}",
+        )])?;
+        let context = DocumentContext::build(&content, Some("a.pdf"), None, &run());
+
+        // Nested, not a JSON string, so {{classification.label}} resolves.
+        assert_eq!(str_at(&context, "/classification/label"), Some("invoice"));
+        assert_eq!(
+            context
+                .pointer("/classification/confidence")
+                .and_then(Value::as_f64),
+            Some(0.91)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn omits_what_is_absent_rather_than_inventing_it() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let context = DocumentContext::build(
+            &content,
+            Some("a.pdf"),
+            None,
+            &RunFacts {
+                policy_name: None,
+                run_id: None,
+                timestamp: TIMESTAMP,
+            },
+        );
+
+        assert!(context.pointer("/sensitivityLabel").is_none());
+        assert!(context.pointer("/classification").is_none());
+        // policyName is present-but-null, so {{run.policyName}} resolves to empty.
+        assert!(
+            context
+                .pointer("/run/policyName")
+                .is_some_and(Value::is_null)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_pdf_still_gets_the_basics() {
+        let content = b"just text";
+        let context =
+            DocumentContext::build(content, Some("notes.txt"), Some("text/plain"), &run());
+
+        assert_eq!(str_at(&context, "/document/filename"), Some("notes.txt"));
+        assert_eq!(str_at(&context, "/document/extension"), Some("txt"));
+        assert_eq!(
+            context
+                .pointer("/document/sizeBytes")
+                .and_then(Value::as_u64),
+            Some(content.len() as u64)
+        );
+        assert_eq!(str_at(&context, "/document/sha256").map(str::len), Some(64));
+        // No PDF facts, and no panic either.
+        assert!(context.pointer("/document/pageCount").is_none());
+    }
+
+    #[test]
+    fn unparseable_bytes_claiming_to_be_a_pdf_do_not_fail_the_step() {
+        let content = b"%PDF-1.7 but truncated";
+        let context =
+            DocumentContext::build(content, Some("broken.pdf"), Some("application/pdf"), &run());
+
+        assert_eq!(str_at(&context, "/document/sha256").map(str::len), Some(64));
+        assert!(context.pointer("/document/pageCount").is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // DEV edge coverage the DocumentContextTest oracle leaves implicit.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parsed_pdf_sets_absent_info_fields_as_present_null() -> TestResult {
+        // A parsed PDF with no Title still carries a null "title" key, so
+        // {{document.title}} resolves to empty rather than erroring — the exact
+        // difference from a non-PDF, where the key is missing.
+        let content = pdf_with_info(&[])?;
+        let context = DocumentContext::build(&content, Some("a.pdf"), None, &run());
+        assert!(
+            context
+                .pointer("/document/title")
+                .is_some_and(Value::is_null)
+        );
+        assert!(
+            context
+                .pointer("/document/author")
+                .is_some_and(Value::is_null)
+        );
+
+        assert_eq!(
+            Placeholders::resolve(Some("[{{document.title}}]"), &context, Escaping::None)?,
+            Some("[]".to_owned())
+        );
+        // A non-PDF omits the key entirely, so the same placeholder errors.
+        let non_pdf = DocumentContext::build(b"plain", Some("a.txt"), None, &run());
+        assert_err_contains(
+            Placeholders::resolve(Some("{{document.title}}"), &non_pdf, Escaping::None),
+            "unknown placeholder",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn classification_that_is_not_json_passes_through_as_text() -> TestResult {
+        let content = pdf_with_info(&[("StirlingPDFClassification", "top secret")])?;
+        let context = DocumentContext::build(&content, Some("a.pdf"), None, &run());
+        assert_eq!(str_at(&context, "/classification"), Some("top secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn blank_classification_is_omitted() -> TestResult {
+        let content = pdf_with_info(&[("StirlingPDFClassification", "   ")])?;
+        let context = DocumentContext::build(&content, Some("a.pdf"), None, &run());
+        assert!(context.pointer("/classification").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn label_without_a_method_renders_method_as_null() -> TestResult {
+        let mut document = two_page_pdf();
+        PdfSensitivityLabels::apply(&mut document, &confidential_label(None)?)?;
+        let content = serialize(&mut document)?;
+        let context = DocumentContext::build(&content, Some("a.pdf"), None, &run());
+        assert!(
+            context
+                .pointer("/sensitivityLabel/method")
+                .is_some_and(Value::is_null)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extension_is_absent_for_a_dotless_or_trailing_dot_name() {
+        for name in ["README", "archive."] {
+            let context = DocumentContext::build(b"x", Some(name), None, &run());
+            assert!(
+                context
+                    .pointer("/document/extension")
+                    .is_some_and(Value::is_null),
+                "expected null extension for {name:?}"
+            );
+        }
+        // A null filename yields a null extension too, without panicking.
+        let context = DocumentContext::build(b"x", None, None, &run());
+        assert!(
+            context
+                .pointer("/document/filename")
+                .is_some_and(Value::is_null)
+        );
+        assert!(
+            context
+                .pointer("/document/extension")
+                .is_some_and(Value::is_null)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // buildBody — the body-shape assertions from ExternalApiCallControllerLiveTest.
+    // -------------------------------------------------------------------
+
+    fn resolved_fields(
+        context: &Value,
+        pairs: &[(&str, &str)],
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let mut fields = BTreeMap::new();
+        for (name, template) in pairs {
+            let resolved = Placeholders::resolve(Some(template), context, Escaping::None)?
+                .ok_or("expected a resolved field")?;
+            fields.insert((*name).to_owned(), resolved);
+        }
+        Ok(fields)
+    }
+
+    #[test]
+    fn multipart_sends_the_document_and_what_we_know_about_it() -> TestResult {
+        let content = rich_pdf()?;
+        let context =
+            DocumentContext::build(&content, Some("claim.pdf"), Some("application/pdf"), &run());
+        let fields = resolved_fields(
+            &context,
+            &[
+                ("label", "{{sensitivityLabel.name}}"),
+                ("class", "{{classification.label}}"),
+                ("pages", "{{document.pageCount}}"),
+            ],
+        )?;
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_MULTIPART,
+                body_template: None,
+                include_file: true,
+                include_context: true,
+                file_field_name: "file",
+                filename: "claim.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &fields,
+            },
+            &context,
+        )?;
+
+        assert!(body.content_type.starts_with("multipart/form-data"));
+        let rendered = String::from_utf8_lossy(&body.bytes);
+        // Fields the vendor asked for, filled from what Stirling already knew.
+        assert!(rendered.contains("name=\"label\""));
+        assert!(rendered.contains("Confidential"));
+        assert!(rendered.contains("name=\"class\""));
+        assert!(rendered.contains("invoice"));
+        assert!(rendered.contains("name=\"pages\""));
+        // {{document.pageCount}} is a JSON number, rendered as "2".
+        assert_eq!(fields.get("pages").map(String::as_str), Some("2"));
+        // The document itself, under the field name the vendor expects.
+        assert!(rendered.contains("name=\"file\"; filename=\"claim.pdf\""));
+        assert!(rendered.contains("%PDF"));
+        // The context, including which policy and run sent it.
+        assert!(rendered.contains("stirlingContext"));
+        assert!(rendered.contains("Outbound review"));
+        assert!(rendered.contains("run-42"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_body_carries_a_vendor_shaped_document_via_template() -> TestResult {
+        let content = rich_pdf()?;
+        let context =
+            DocumentContext::build(&content, Some("claim.pdf"), Some("application/pdf"), &run());
+
+        // ConsignO's submit shape: the PDF base64'd into documents[0].data.
+        let body = build_body(
+            &BodyRequest {
+                // bodyMode is json, but the template takes precedence.
+                body_mode: BODY_JSON,
+                body_template: Some(
+                    "{\"name\":\"{{document.filename}}\",\"status\":1,\
+                     \"documents\":[{\"name\":\"{{document.filename}}\",\"data\":\"{{document.base64}}\"}],\
+                     \"actions\":[{\"mode\":\"remote\",\"signer\":{\"type\":\"certifio\"}}]}",
+                ),
+                include_file: true,
+                include_context: true,
+                file_field_name: "file",
+                filename: "claim.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &BTreeMap::new(),
+            },
+            &context,
+        )?;
+
+        assert_eq!(body.content_type, "application/json");
+        let sent: Value = serde_json::from_slice(&body.bytes)?;
+        assert_eq!(str_at(&sent, "/name"), Some("claim.pdf"));
+        // Numbers keep their type; only strings are substituted.
+        assert!(sent.pointer("/status").is_some_and(Value::is_number));
+        assert_eq!(str_at(&sent, "/actions/0/signer/type"), Some("certifio"));
+        let data = str_at(&sent, "/documents/0/data").ok_or("documents[0].data string")?;
+        assert!(STANDARD.decode(data)?.starts_with(b"%PDF"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_notify_style_sends_the_facts_without_the_document() -> TestResult {
+        let content = rich_pdf()?;
+        let context = DocumentContext::build(
+            &content,
+            Some("claim.pdf"),
+            Some("application/pdf"),
+            &RunFacts {
+                policy_name: Some("Outbound review"),
+                run_id: Some("run-7"),
+                timestamp: TIMESTAMP,
+            },
+        );
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_JSON,
+                body_template: None,
+                include_file: false,
+                include_context: true,
+                file_field_name: "file",
+                filename: "claim.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &BTreeMap::new(),
+            },
+            &context,
+        )?;
+
+        assert_eq!(body.content_type, "application/json");
+        let sent: Value = serde_json::from_slice(&body.bytes)?;
+        assert_eq!(str_at(&sent, "/document/filename"), Some("claim.pdf"));
+        assert_eq!(str_at(&sent, "/run/policyName"), Some("Outbound review"));
+        // No document: the point of a notification is the facts, not the bytes.
+        assert!(sent.pointer("/content").is_none());
+        // The raw PDF header never appears (document.base64 is "JVBERg…", not "%PDF").
+        assert!(!String::from_utf8_lossy(&body.bytes).contains("%PDF"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_body_includes_fields_context_and_the_base64_file() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let context =
+            DocumentContext::build(&content, Some("a.pdf"), Some("application/pdf"), &run());
+        let mut fields = BTreeMap::new();
+        fields.insert("policy".to_owned(), "strict".to_owned());
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_JSON,
+                body_template: None,
+                include_file: true,
+                include_context: true,
+                file_field_name: "file",
+                filename: "a.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &fields,
+            },
+            &context,
+        )?;
+
+        let sent: Value = serde_json::from_slice(&body.bytes)?;
+        assert_eq!(str_at(&sent, "/policy"), Some("strict"));
+        assert_eq!(str_at(&sent, "/document/filename"), Some("a.pdf"));
+        assert_eq!(str_at(&sent, "/filename"), Some("a.pdf"));
+        assert_eq!(str_at(&sent, "/contentType"), Some("application/pdf"));
+        let encoded = str_at(&sent, "/content").ok_or("content string")?;
+        assert_eq!(STANDARD.decode(encoded)?, content);
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_fields_only_when_the_file_is_excluded() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let context =
+            DocumentContext::build(&content, Some("a.pdf"), Some("application/pdf"), &run());
+        let mut fields = BTreeMap::new();
+        fields.insert("event".to_owned(), "reviewed".to_owned());
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_MULTIPART,
+                body_template: None,
+                include_file: false,
+                include_context: false,
+                file_field_name: "file",
+                filename: "a.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &fields,
+            },
+            &context,
+        )?;
+
+        assert!(body.content_type.starts_with("multipart/form-data"));
+        let rendered = String::from_utf8_lossy(&body.bytes);
+        assert!(rendered.contains("name=\"event\""));
+        assert!(rendered.contains("reviewed"));
+        // Fields-only: no file part, so the document bytes never appear.
+        assert!(!rendered.contains("filename=\"a.pdf\""));
+        assert!(!rendered.contains("%PDF"));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_sends_the_raw_bytes_under_the_resolved_content_type() -> TestResult {
+        let content = b"%PDF-1.7 raw";
+        let context =
+            DocumentContext::build(content, Some("a.pdf"), Some("application/pdf"), &run());
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_BINARY,
+                body_template: None,
+                include_file: true,
+                include_context: false,
+                file_field_name: "file",
+                filename: "a.pdf",
+                content_type: "application/pdf",
+                content,
+                fields: &BTreeMap::new(),
+            },
+            &context,
+        )?;
+
+        assert_eq!(body.content_type, "application/pdf");
+        assert_eq!(body.bytes, content);
+        Ok(())
+    }
+
+    #[test]
+    fn binary_refuses_fields_and_an_empty_body() {
+        let context = DocumentContext::build(b"x", Some("a.bin"), None, &run());
+        let mut fields = BTreeMap::new();
+        fields.insert("policy".to_owned(), "strict".to_owned());
+
+        assert_err_contains(
+            build_body(
+                &BodyRequest {
+                    body_mode: BODY_BINARY,
+                    body_template: None,
+                    include_file: true,
+                    include_context: false,
+                    file_field_name: "file",
+                    filename: "a.bin",
+                    content_type: "application/octet-stream",
+                    content: b"x",
+                    fields: &fields,
+                },
+                &context,
+            ),
+            "'fields' cannot be sent",
+        );
+
+        assert_err_contains(
+            build_body(
+                &BodyRequest {
+                    body_mode: BODY_BINARY,
+                    body_template: None,
+                    include_file: false,
+                    include_context: false,
+                    file_field_name: "file",
+                    filename: "a.bin",
+                    content_type: "application/octet-stream",
+                    content: b"x",
+                    fields: &BTreeMap::new(),
+                },
+                &context,
+            ),
+            "would send an empty body",
+        );
+    }
+
+    #[test]
+    fn body_template_must_be_valid_json() {
+        let context = DocumentContext::build(b"%PDF-x", Some("a.pdf"), None, &run());
+        assert_err_contains(
+            build_body(
+                &BodyRequest {
+                    body_mode: BODY_JSON,
+                    body_template: Some("{ not json"),
+                    include_file: true,
+                    include_context: false,
+                    file_field_name: "file",
+                    filename: "a.pdf",
+                    content_type: "application/pdf",
+                    content: b"%PDF-x",
+                    fields: &BTreeMap::new(),
+                },
+                &context,
+            ),
+            "must be valid JSON",
+        );
+    }
+
+    #[test]
+    fn body_template_deep_copies_the_context_and_injects_the_file() -> TestResult {
+        let content = pdf_with_info(&[])?;
+        let context =
+            DocumentContext::build(&content, Some("orig.pdf"), Some("application/pdf"), &run());
+
+        let body = build_body(
+            &BodyRequest {
+                body_mode: BODY_JSON,
+                body_template: Some(
+                    "{\"safe\":\"{{document.safeFilename}}\",\"ct\":\"{{document.resolvedContentType}}\"}",
+                ),
+                include_file: true,
+                include_context: false,
+                file_field_name: "file",
+                filename: "safe.pdf",
+                content_type: "application/pdf",
+                content: &content,
+                fields: &BTreeMap::new(),
+            },
+            &context,
+        )?;
+
+        // The injected fields resolve against the copy…
+        let sent: Value = serde_json::from_slice(&body.bytes)?;
+        assert_eq!(str_at(&sent, "/safe"), Some("safe.pdf"));
+        assert_eq!(str_at(&sent, "/ct"), Some("application/pdf"));
+        // …but the original context was not mutated (deep copy), so its document
+        // still lacks the injected keys.
+        assert!(context.pointer("/document/safeFilename").is_none());
+        assert!(context.pointer("/document/resolvedContentType").is_none());
         Ok(())
     }
 }
