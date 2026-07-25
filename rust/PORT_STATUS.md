@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **934 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **939 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -681,10 +681,11 @@ planned. **P-521 signing now works** (2026-07-25): rather than the `x509-certifi
 signer (which only implements `Secp256r1`/`Secp384r1`), the P-521 path signs the CMS `SignerInfo` directly
 with the pure-Rust `p521` crate (ECDSA-P521 + SHA-512 → `ecdsa-with-SHA512` / `secp521r1`), reusing the
 existing `/ByteRange`+`/Contents` reservation. Independently verified with OpenSSL 3 (`cms -verify` passes;
-tampered content and wrong keys are rejected). **Known pre-existing bug (separate, still open):** the
-P-384 CMS path emits a SHA-256 `digestAlgorithm` against an `ecdsa-with-SHA384` `signatureAlgorithm`, a
-mismatch strict verifiers (Adobe) reject — the P-521 work makes the P-521 path consistent (SHA-512) but
-did not touch P-384.
+tampered content and wrong keys are rejected). **A pre-existing P-384 CMS bug uncovered by that work is
+also fixed** (2026-07-25): the P-384 path used to emit a SHA-256 `digestAlgorithm` against an
+`ecdsa-with-SHA384` `signatureAlgorithm` — a curve inconsistency strict verifiers (OpenSSL, Adobe) reject.
+It now emits SHA-384, verified the same way (OpenSSL `cms -verify` passes where the pre-fix output failed).
+Every EC curve is now digest-consistent: P-256/SHA-256, P-384/SHA-384, P-521/SHA-512.
 A live SoftHSM/token compatibility matrix and broader Windows smart-card coverage
 remain explicit gaps. It also lacks certificate policy validation,
 public Java/Acrobat compatibility fixtures, and security review, so it is not
