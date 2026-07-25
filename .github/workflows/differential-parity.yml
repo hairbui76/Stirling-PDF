@@ -63,7 +63,7 @@ jobs:
           cache-disabled: true
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be9e76fd7c4901d61fb841f559994984270fce7 # stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           toolchain: 1.94.0
 
