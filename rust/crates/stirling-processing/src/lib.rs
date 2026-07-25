@@ -1517,6 +1517,11 @@ impl ProcessingRuntime {
             runtime_config.policies_allow_private_s3_endpoints(),
             runtime_config.allow_custom_api_integrations(),
         ));
+        // The external-API-call step's SSRF-safe caller: long-lived so its TOKEN_LOGIN
+        // token cache persists, gated by the `policies.allowPrivateApiEndpoints` opt-in.
+        let external_api_caller = Arc::new(proprietary_external_api::ExternalApiCaller::new(
+            runtime_config.policies_allow_private_api_endpoints(),
+        ));
         let processed_ledger = initialize_policy_ledger(policies_enabled, &security_store)?;
         let policy_service = processed_ledger.as_ref().map(|_| {
             Arc::new(policy_config::PolicyConfigService::new(
@@ -1615,7 +1620,11 @@ impl ProcessingRuntime {
         ));
         runtime.router = runtime
             .router
-            .merge(integration_http::routes(Arc::clone(&integration_service)))
+            .merge(integration_http::routes(
+                Arc::clone(&integration_service),
+                external_api_caller,
+                max_upload_bytes,
+            ))
             .merge(
                 purview_http::routes(integration_service)
                     .layer(DefaultBodyLimit::max(max_upload_bytes)),

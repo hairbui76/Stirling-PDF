@@ -38,13 +38,18 @@ const CONNECTION_ID_PARAM: &str = "connectionId";
 const INTEGRATION_PREFIX: &str = "/api/v1/integration/";
 
 /// Which connection type each integration step dereferences, mirroring Java
-/// `IntegrationStepValidator.STEP_CONNECTION_TYPES`. Only the **ported** subset is
-/// listed: Java also maps `external-api-call` (`API`) and `consigno-*` (`CONSIGNO`),
-/// neither of which exists in this port — an intentional divergence. A step under
-/// [`INTEGRATION_PREFIX`] that is absent here is rejected rather than waved through,
-/// so a new endpoint cannot silently skip the confused-deputy check by forgetting to
-/// register (fail-closed).
+/// `IntegrationStepValidator.STEP_CONNECTION_TYPES`. Covers the ported subset:
+/// `external-api-call` (`API`, slice 4) and the two Purview label steps. Java also
+/// maps `consigno-*` (`CONSIGNO`), which has no dedicated port — it is reached via
+/// the generic `external-api-call` step's `bodyTemplate`, so its bespoke endpoints
+/// stay absent here on purpose. A step under [`INTEGRATION_PREFIX`] that is absent
+/// here is rejected rather than waved through, so a new endpoint cannot silently
+/// skip the confused-deputy check by forgetting to register (fail-closed).
 const INTEGRATION_STEP_TYPES: &[(&str, IntegrationType)] = &[
+    (
+        "/api/v1/integration/external-api-call",
+        IntegrationType::Api,
+    ),
     (
         "/api/v1/integration/purview-apply-label",
         IntegrationType::Purview,
@@ -2430,8 +2435,13 @@ mod tests {
     }
 
     #[test]
-    fn integration_step_type_lists_only_the_ported_purview_subset() {
+    fn integration_step_type_lists_the_ported_subset() {
         use super::{IntegrationType, integration_step_type};
+        // external-api-call is ported (slice 4) and maps to the API connection type.
+        assert_eq!(
+            integration_step_type("/api/v1/integration/external-api-call"),
+            Some(IntegrationType::Api)
+        );
         assert_eq!(
             integration_step_type("/api/v1/integration/purview-apply-label"),
             Some(IntegrationType::Purview)
@@ -2440,12 +2450,9 @@ mod tests {
             integration_step_type("/api/v1/integration/purview-read-label"),
             Some(IntegrationType::Purview)
         );
-        // Java maps these too, but they are NOT ported: they must miss the registry so
-        // the guard fails them closed rather than resolving an absent connection type.
-        assert_eq!(
-            integration_step_type("/api/v1/integration/external-api-call"),
-            None
-        );
+        // Java maps consigno-* too, but they have no dedicated port (reached via the
+        // generic external-api-call bodyTemplate): they must miss the registry so the
+        // guard fails them closed rather than resolving an absent connection type.
         assert_eq!(
             integration_step_type("/api/v1/integration/consigno-submit"),
             None
@@ -2699,6 +2706,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn save_policy_gates_integration_steps_and_never_persists_a_rejected_one()
     -> Result<(), PolicyFailure> {
         use super::IntegrationType;
@@ -2706,10 +2714,12 @@ mod tests {
         use std::sync::Arc;
 
         let store = Arc::new(SecurityStore::in_memory()?);
-        // An enabled Purview connection (accept target), a same-scope S3 decoy (wrong type),
-        // and a disabled Purview connection — all resolvable by id, all seeded directly.
+        // An enabled Purview connection (accept target), an enabled API connection
+        // (accept target for the external-api-call step), a same-scope S3 decoy (wrong
+        // type), and a disabled Purview connection — all resolvable by id, seeded directly.
         let purview =
             store.create_integration_config(&seed_connection(IntegrationType::Purview, true))?;
+        let api = store.create_integration_config(&seed_connection(IntegrationType::Api, true))?;
         let s3 = store.create_integration_config(&seed_connection(IntegrationType::S3, true))?;
         let disabled =
             store.create_integration_config(&seed_connection(IntegrationType::Purview, false))?;
@@ -2726,6 +2736,16 @@ mod tests {
         )?;
         assert!(!saved.id.is_empty());
         assert_eq!(service.get_policy(&saved.id, &ctx)?.id, saved.id);
+        // ACCEPT: the now-ported external-api-call step against the enabled API connection
+        // persists too — the previously fail-closed divergence is closed (slice 4).
+        let saved_api = service.save_policy(
+            policy_with_step(step(
+                "/api/v1/integration/external-api-call",
+                connection_param(Value::from(api.id)),
+            )),
+            &ctx,
+        )?;
+        assert!(!saved_api.id.is_empty());
         let baseline = service.list_policies(&ctx)?.len();
 
         let reject = |def: super::PolicyDefinition, expected: &str| -> Result<(), PolicyFailure> {
@@ -2781,15 +2801,24 @@ mod tests {
             )),
             "'connectionId' is not a valid connection reference: not-an-id",
         )?;
-        // REJECT unported prefixed endpoint -> fails closed. DIVERGENCE: Java maps
-        // external-api-call to IntegrationType.API and WOULD accept it; the port has no API-step
-        // port, so it rejects rather than resolving an absent type. Documented in purview.md.
+        // REJECT wrong type for the (now-ported) external-api-call step: naming the PURVIEW
+        // connection resolves it as an API step, finds the type mismatch, and collapses into
+        // the SAME opaque error as a missing one (anti-enumeration) — proving the confused-deputy
+        // guard runs for external-api-call rather than waving it through.
         reject(
             policy_with_step(step(
                 "/api/v1/integration/external-api-call",
                 connection_param(Value::from(purview.id)),
             )),
-            "unknown integration step: /api/v1/integration/external-api-call",
+            "unknown or inaccessible api connection",
+        )?;
+        // REJECT a genuinely unported prefixed endpoint -> fails closed (consigno-* has no port).
+        reject(
+            policy_with_step(step(
+                "/api/v1/integration/consigno-submit",
+                connection_param(Value::from(api.id)),
+            )),
+            "unknown integration step: /api/v1/integration/consigno-submit",
         )?;
 
         // ACCEPT: a non-integration operation is skipped entirely (persists with no connection).

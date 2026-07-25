@@ -39,7 +39,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    io::Read as _,
+    io::{Cursor, Read as _},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -56,6 +56,7 @@ use reqwest::{Method, blocking::Client, header::CONTENT_TYPE, redirect::Policy};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use url::Url;
+use zip::ZipArchive;
 
 use crate::{
     oidc_discovery::ip_addr_is_reserved,
@@ -2364,6 +2365,846 @@ impl ResultUrls {
 }
 
 // ===========================================================================
+// (i) Slice 4 — controller orchestration, response handling, and result
+//     parsing. Mirrors the Java oracles `ExternalApiCallController` (the
+//     `call` flow: verdict gate, report mode, replace mode), `ResultFiles`
+//     (naming + archive selection), and reuses slice-3 `ResultUrls`/`getResult`
+//     for the SSRF-vetted result fetch. The axum route + policy-step wiring
+//     live in `integration_http.rs` and `policy_config.rs`.
+// ===========================================================================
+
+/// `ExternalApiCallController.MODE_REPORT` — the document continues untouched and
+/// the API's answer rides in the report header.
+const MODE_REPORT: &str = "report";
+/// `ExternalApiCallController.MODE_REPLACE` — the response body becomes the document.
+const MODE_REPLACE: &str = "replace";
+
+/// The report travels as an HTTP header (Jetty caps a response header at 8 KB),
+/// so a larger body is summarised rather than risking a header the container
+/// refuses to write. (oracle `ExternalApiCallController.MAX_REPORT_BODY_CHARS`)
+const MAX_REPORT_BODY_CHARS: usize = 4096;
+
+/// `MediaType.APPLICATION_OCTET_STREAM_VALUE` — the fallback content type for an
+/// upload/response that names none.
+const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
+
+/// `ExternalApiCallController.safeFileName` fallback when the upload names none.
+const DEFAULT_FILENAME: &str = "document";
+
+// ---- ResultFiles: name + archive selection (oracle ResultFiles.java) -------
+
+/// Standard ZIP local-file-header magic, matching Java
+/// `ZipExtractionUtils.ZIP_MAGIC`. A response is treated as an archive iff its
+/// first four bytes are exactly this.
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+
+/// Recursion bound for nested archives (oracle `ZipExtractionUtils.MAX_UNZIP_DEPTH`);
+/// a deeper nesting is left as a file rather than recursed into.
+const MAX_UNZIP_DEPTH: usize = 10;
+
+/// Adversarial bounds the Java oracle leaves to `ZipSecurity`'s hardened stream:
+/// a cap on how many entries and how many decompressed bytes an archive may yield,
+/// so a zip bomb cannot exhaust memory. The byte cap reuses the response cap.
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = MAX_RESPONSE_BYTES;
+
+/// Works out which bytes, and under which name, a response contributes to the
+/// pipeline. (oracle `ResultFiles`)
+pub(crate) struct ResultFiles;
+
+impl ResultFiles {
+    /// The filename to give the returned bytes: the server's `Content-Disposition`
+    /// first, then the request base name with an extension derived from
+    /// `Content-Type`, and only then the request name unchanged.
+    /// (oracle `ResultFiles.nameFor`)
+    pub(crate) fn name_for(response: &ApiResponse, request_filename: &str) -> String {
+        if let Some(from_server) = response
+            .header("content-disposition")
+            .and_then(filename_from_disposition)
+        {
+            return from_server;
+        }
+        match extension_for(response.content_type.as_deref()) {
+            None => request_filename.to_owned(),
+            Some(extension) => format!("{}.{extension}", base_name(request_filename)),
+        }
+    }
+
+    /// Whether the chosen name is itself an archive, so its content type is not the
+    /// entry's. (oracle `ResultFiles.isArchiveName`)
+    pub(crate) fn is_archive_name(filename: &str) -> bool {
+        filename.to_ascii_lowercase().ends_with(".zip")
+    }
+
+    /// Whether the bytes start with the ZIP magic. (oracle `ResultFiles.isArchive`
+    /// via `ZipExtractionUtils.isZip`)
+    pub(crate) fn is_archive(bytes: &[u8]) -> bool {
+        is_zip_bytes(bytes)
+    }
+
+    /// Pick the file a step asked for out of an archive: a `*`-glob against an
+    /// entry name, or a 0-based index. An empty match or a multi-match is an error
+    /// naming what was there — a silent pick of the wrong file is worse than a
+    /// failed step. (oracle `ResultFiles.selectFromArchive`)
+    pub(crate) fn select_from_archive(
+        bytes: &[u8],
+        select: &str,
+    ) -> Result<(String, Vec<u8>), ExternalApiError> {
+        let entries = extract_zip(bytes)?;
+        if entries.is_empty() {
+            return Err(invalid("The API returned an empty archive"));
+        }
+        if let Some(index) = as_index(select) {
+            let len = entries.len();
+            let Some(position) = usize::try_from(index)
+                .ok()
+                .filter(|position| *position < len)
+            else {
+                return Err(invalid(format!(
+                    "'responseSelect' asked for entry {index} but the archive has {len}: {}",
+                    names_list(entries.iter().map(|(name, _)| name.as_str()))
+                )));
+            };
+            return entries
+                .into_iter()
+                .nth(position)
+                .ok_or_else(|| invalid("archive entry index out of range"));
+        }
+        let matched: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| matches_glob(name, select))
+            .map(|(index, _)| index)
+            .collect();
+        if matched.is_empty() {
+            return Err(invalid(format!(
+                "'responseSelect' matched nothing in the archive; it holds {}",
+                names_list(entries.iter().map(|(name, _)| name.as_str()))
+            )));
+        }
+        if matched.len() > 1 {
+            // Taking the first would be a coin toss the operator did not ask for.
+            return Err(invalid(format!(
+                "'responseSelect' matched {} entries ({}); narrow it, or use an index",
+                matched.len(),
+                names_list(matched.iter().map(|&index| entries[index].0.as_str()))
+            )));
+        }
+        let index = matched[0];
+        entries
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| invalid("archive entry index out of range"))
+    }
+}
+
+/// The ZIP magic-byte test, shared by [`ResultFiles::is_archive`] and the nested
+/// extraction check.
+fn is_zip_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= ZIP_MAGIC.len() && bytes[..ZIP_MAGIC.len()] == ZIP_MAGIC
+}
+
+/// A running budget so extraction cannot be turned into an unbounded memory
+/// allocation by a hostile archive.
+struct ExtractBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+/// Flatten a ZIP into `(name, bytes)` pairs, one per file entry, recursing into
+/// nested archives up to [`MAX_UNZIP_DEPTH`]. (oracle `ZipExtractionUtils.extractZip`)
+///
+/// Everything is held in memory, so there is no filesystem to zip-slip into — the
+/// entry name is used only as data, never as a path. Entry count and decompressed
+/// size are bounded to defuse a zip bomb.
+fn extract_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ExternalApiError> {
+    let mut out = Vec::new();
+    let mut budget = ExtractBudget {
+        entries: 0,
+        bytes: 0,
+    };
+    extract_zip_into(bytes, 0, &mut budget, &mut out)?;
+    Ok(out)
+}
+
+fn extract_zip_into(
+    bytes: &[u8],
+    depth: usize,
+    budget: &mut ExtractBudget,
+    out: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), ExternalApiError> {
+    let read_error = || invalid("The API returned an archive that could not be read");
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| read_error())?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|_| read_error())?;
+        if entry.is_dir() {
+            continue;
+        }
+        budget.entries += 1;
+        if budget.entries > MAX_ARCHIVE_ENTRIES {
+            return Err(invalid("The API returned an archive with too many entries"));
+        }
+        if budget.bytes.saturating_add(entry.size()) > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+            return Err(invalid(
+                "The API returned an archive that expands beyond the allowed size",
+            ));
+        }
+        let name = entry.name().to_owned();
+        // Read under a hard cap so a lying declared size cannot buffer past the
+        // budget either.
+        let remaining = MAX_ARCHIVE_UNCOMPRESSED_BYTES.saturating_sub(budget.bytes);
+        let mut data = Vec::new();
+        entry
+            .by_ref()
+            .take(remaining + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| invalid("The API returned an archive entry that could not be read"))?;
+        if data.len() as u64 > remaining {
+            return Err(invalid(
+                "The API returned an archive that expands beyond the allowed size",
+            ));
+        }
+        budget.bytes += data.len() as u64;
+        drop(entry);
+        if is_zip_bytes(&data) && depth < MAX_UNZIP_DEPTH {
+            // A nested archive is replaced by its own entries (matching the oracle),
+            // never added as a `.zip` itself.
+            extract_zip_into(&data, depth + 1, budget, out)?;
+        } else {
+            out.push((name, data));
+        }
+    }
+    Ok(())
+}
+
+/// `[a, b, c]`, matching Java `List.toString()` used in the selection errors.
+fn names_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    format!("[{}]", names.collect::<Vec<_>>().join(", "))
+}
+
+/// A `*`-only glob against the whole (lower-cased) entry name. (oracle
+/// `ResultFiles.matchesGlob`)
+fn matches_glob(filename: &str, glob: &str) -> bool {
+    let name = filename.to_ascii_lowercase();
+    let pattern = glob.trim().to_ascii_lowercase();
+    let regex_src = format!(
+        "^{}$",
+        pattern
+            .split('*')
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join(".*")
+    );
+    match Regex::new(&regex_src) {
+        Ok(regex) => regex.is_match(&name),
+        Err(_) => false,
+    }
+}
+
+/// `select` as a 0-based index, or `None` when it is not an integer (Java parses
+/// with `Integer.valueOf`, so an out-of-`i32`-range value is treated as a glob).
+fn as_index(select: &str) -> Option<i32> {
+    select.trim().parse::<i32>().ok()
+}
+
+/// `attachment; filename="signed.pdf"` or its RFC 5987 `filename*` form. The name
+/// comes from the remote server, so any path it brings is stripped — it is treated
+/// as data, never as a location. (oracle `ResultFiles.filenameFromDisposition`)
+fn filename_from_disposition(disposition: &str) -> Option<String> {
+    for part in disposition.split(';') {
+        let token = part.trim();
+        let mut value = if starts_with_ci(token, "filename=") {
+            token["filename=".len()..].trim().to_owned()
+        } else if starts_with_ci(token, "filename*=") {
+            let raw = token["filename*=".len()..].trim();
+            match raw.rfind('\'') {
+                Some(tick) => raw[tick + 1..].to_owned(),
+                None => raw.to_owned(),
+            }
+        } else {
+            continue;
+        };
+        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+            value = value[1..value.len() - 1].to_owned();
+        }
+        if let Some(simple) = simple_file_name(&value) {
+            return Some(simple);
+        }
+    }
+    None
+}
+
+/// Case-insensitive ASCII prefix test that never panics on a multi-byte boundary.
+fn starts_with_ci(text: &str, prefix: &str) -> bool {
+    text.is_char_boundary(prefix.len())
+        && text
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Strip any path a server-supplied name carries (defusing traversal) and trim;
+/// a blank result is `None`. (oracle `Filenames.toSimpleFileName`)
+fn simple_file_name(value: &str) -> Option<String> {
+    let last = value.rsplit(['/', '\\']).next().unwrap_or(value).trim();
+    (!last.is_empty()).then(|| last.to_owned())
+}
+
+/// The extension for a content type, or `None` to keep the server's filename.
+/// (oracle `ResultFiles.EXTENSION_BY_TYPE` / `extensionFor`)
+fn extension_for(content_type: Option<&str>) -> Option<&'static str> {
+    let content_type = content_type?;
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    Some(match base.as_str() {
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/json" => "json",
+        "text/plain" => "txt",
+        "text/html" => "html",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/tiff" => "tiff",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        _ => return None,
+    })
+}
+
+/// The base name (everything before the last dot), or the whole name when it has
+/// no dot or only a leading one. (oracle `ResultFiles.baseName`)
+fn base_name(filename: &str) -> &str {
+    match filename.rfind('.') {
+        Some(dot) if dot > 0 => &filename[..dot],
+        _ => filename,
+    }
+}
+
+// ---- The controller `call` orchestration (oracle ExternalApiCallController) -
+
+/// One external-API-call step, resolved down to the values the orchestration
+/// needs. The raw `method` / `body_mode` / `response_mode` are normalised inside
+/// [`ExternalApiCaller::call`] so their rejection messages match the oracle;
+/// `fields` / `headers` are the raw JSON-object strings (parsed there), and `run`
+/// carries the policy/run facts the context is stamped with.
+pub(crate) struct ExternalApiCallRequest<'a> {
+    pub(crate) file_content: &'a [u8],
+    pub(crate) original_filename: Option<&'a str>,
+    pub(crate) file_content_type: Option<&'a str>,
+    pub(crate) path: Option<&'a str>,
+    pub(crate) method: Option<&'a str>,
+    pub(crate) body_mode: Option<&'a str>,
+    pub(crate) file_field_name: &'a str,
+    pub(crate) response_mode: Option<&'a str>,
+    pub(crate) result_url_path: Option<&'a str>,
+    pub(crate) result_url_header: Option<&'a str>,
+    pub(crate) response_select: Option<&'a str>,
+    pub(crate) require_true: Option<&'a str>,
+    pub(crate) fields: Option<&'a str>,
+    pub(crate) body_template: Option<&'a str>,
+    pub(crate) headers: Option<&'a str>,
+    pub(crate) include_context: bool,
+    pub(crate) include_file: bool,
+    pub(crate) run: RunFacts<'a>,
+}
+
+/// The document (and optional report header) a completed step hands back to the
+/// pipeline. `report` is set only in `report` mode; in `replace` mode the `body`
+/// is the new document.
+pub(crate) struct ExternalApiCallResult {
+    pub(crate) content_type: String,
+    pub(crate) filename: String,
+    pub(crate) body: Vec<u8>,
+    pub(crate) report: Option<String>,
+}
+
+impl ExternalApiCaller {
+    /// Run one external-API-call step end to end: build the context and body,
+    /// dispatch under the SSRF-safe caller, gate on the verdict, then either
+    /// replace the document with the response or pass it through with the answer in
+    /// the report header. (oracle `ExternalApiCallController.call`)
+    // `content` (the bytes) and `context` (the namespace) are the oracle's own names.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn call(
+        &self,
+        settings: &ApiConnectionSettings,
+        request: &ExternalApiCallRequest<'_>,
+    ) -> Result<ExternalApiCallResult, ExternalApiError> {
+        let mode = normalise(
+            request.response_mode,
+            MODE_REPORT,
+            &[MODE_REPORT, MODE_REPLACE],
+        )?;
+        let body_mode = normalise(
+            request.body_mode,
+            BODY_MULTIPART,
+            &[BODY_MULTIPART, BODY_JSON, BODY_BINARY],
+        )?;
+        let verb = parse_method(request.method)?;
+
+        let filename = safe_file_name(request.original_filename);
+        let content_type = request
+            .file_content_type
+            .unwrap_or(APPLICATION_OCTET_STREAM);
+        let content = request.file_content;
+
+        let context = DocumentContext::build(
+            content,
+            request.original_filename,
+            request.file_content_type,
+            &request.run,
+        );
+
+        // Argument-evaluation order matches the oracle so error precedence does:
+        // path first, then the body (which resolves `fields`), then the headers.
+        let resolved_path = Placeholders::resolve(request.path, &context, Escaping::UrlPath)?;
+        let fields = resolve_all(&parse_json_object(request.fields, "fields")?, &context)?;
+        let body = build_body(
+            &BodyRequest {
+                body_mode: &body_mode,
+                body_template: request.body_template,
+                include_file: request.include_file,
+                include_context: request.include_context,
+                file_field_name: request.file_field_name,
+                filename: &filename,
+                content_type,
+                content,
+                fields: &fields,
+            },
+            &context,
+        )?;
+        let headers = validated_headers(resolve_all(
+            &parse_json_object(request.headers, "headers")?,
+            &context,
+        )?)?;
+
+        let response = self.dispatch(
+            settings,
+            &verb,
+            resolved_path.as_deref().unwrap_or(""),
+            &body,
+            &headers,
+        )?;
+
+        if !response.is_success() {
+            // Fail the step: a policy that silently continued past a rejected
+            // call-out would deliver documents the external system believes it
+            // never approved.
+            return Err(invalid(format!(
+                "External API returned HTTP {}{}",
+                response.status,
+                summarise(&response)
+            )));
+        }
+
+        enforce_verdict(&response, request.require_true)?;
+
+        if mode == MODE_REPLACE {
+            self.replace_document(
+                settings,
+                &response,
+                &filename,
+                request.result_url_path,
+                request.result_url_header,
+                request.response_select,
+            )
+        } else {
+            report_only(content, &filename, content_type, &response)
+        }
+    }
+
+    /// Turn the response into the document that continues down the pipeline: the
+    /// body inline, a URL to fetch it from, or an archive to pick from. Anything
+    /// else fails the step rather than putting a non-document into the pipeline.
+    /// (oracle `ExternalApiCallController.replaceDocument`)
+    fn replace_document(
+        &self,
+        settings: &ApiConnectionSettings,
+        response: &ApiResponse,
+        request_filename: &str,
+        result_url_path: Option<&str>,
+        result_url_header: Option<&str>,
+        response_select: Option<&str>,
+    ) -> Result<ExternalApiCallResult, ExternalApiError> {
+        let url = result_url(response, result_url_path, result_url_header)?;
+        let followed = url.is_some();
+        // When the API pointed at a URL, ResultUrls decides whether it may be
+        // fetched (operator-declared host allowlist + SSRF vet); the fetch itself
+        // forwards NO credentials.
+        let fetched = match url {
+            Some(url) => {
+                let target = ResultUrls::validate(settings, &url, self.allow_private_endpoints)?;
+                let payload = self.get_result(settings, &target)?;
+                if !payload.is_success() {
+                    return Err(invalid(format!(
+                        "Fetching the API's result URL returned HTTP {}",
+                        payload.status
+                    )));
+                }
+                Some(payload)
+            }
+            None => None,
+        };
+        let payload = fetched.as_ref().unwrap_or(response);
+
+        if payload.body.is_empty() {
+            return Err(invalid(
+                "External API returned an empty body, so there is no document to replace with; use \
+                 responseMode=report to keep the original.",
+            ));
+        }
+        if payload.is_json() && !followed {
+            return Err(invalid(
+                "External API returned JSON, which cannot replace the document. Use \
+                 responseMode=report to keep the original and record the answer, or set \
+                 resultUrlPath if the JSON points at the document.",
+            ));
+        }
+
+        let mut filename = ResultFiles::name_for(payload, request_filename);
+        let document = if ResultFiles::is_archive(&payload.body) {
+            let Some(select) = response_select
+                .map(str::trim)
+                .filter(|select| !select.is_empty())
+            else {
+                // Handing a .zip to a step that expects a PDF fails later and more
+                // obscurely.
+                return Err(invalid(
+                    "External API returned an archive; set 'responseSelect' (e.g. *.pdf, or an \
+                     index) to say which entry becomes the document.",
+                ));
+            };
+            let (member_name, member_bytes) =
+                ResultFiles::select_from_archive(&payload.body, select)?;
+            filename = member_name;
+            member_bytes
+        } else {
+            if response_select
+                .map(str::trim)
+                .is_some_and(|select| !select.is_empty())
+            {
+                return Err(invalid(
+                    "'responseSelect' was set but the API returned a single file, not an archive",
+                ));
+            }
+            payload.body.clone()
+        };
+
+        // Faithful to the oracle: when a member was selected the archive's own
+        // content type still drives this, since `payload.contentType()` is the ZIP's.
+        let content_type =
+            if payload.content_type.is_none() || ResultFiles::is_archive_name(&filename) {
+                APPLICATION_OCTET_STREAM.to_owned()
+            } else {
+                payload
+                    .content_type
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            };
+        Ok(ExternalApiCallResult {
+            content_type,
+            filename,
+            body: document,
+            report: None,
+        })
+    }
+}
+
+/// Normalise an optional enumerated value: blank/absent falls back, otherwise it
+/// is trimmed/lower-cased and must be one of `allowed`. (oracle
+/// `ExternalApiCallController.normalise`)
+fn normalise(
+    value: Option<&str>,
+    fallback: &str,
+    allowed: &[&str],
+) -> Result<String, ExternalApiError> {
+    let out = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.to_lowercase(),
+        None => fallback.to_owned(),
+    };
+    if !allowed.contains(&out.as_str()) {
+        return Err(invalid(format!(
+            "must be one of {}; got {}",
+            allowed.join(", "),
+            value.unwrap_or_default()
+        )));
+    }
+    Ok(out)
+}
+
+/// Only the body-bearing verbs; GET/DELETE would silently drop the document.
+/// `None` defaults to POST (Spring's `defaultValue`). (oracle `parseMethod`)
+fn parse_method(method: Option<&str>) -> Result<String, ExternalApiError> {
+    let verb = match method {
+        None => "POST".to_owned(),
+        Some(method) => method.trim().to_uppercase(),
+    };
+    if !["POST", "PUT", "PATCH"].contains(&verb.as_str()) {
+        return Err(invalid(format!(
+            "'method' must be POST, PUT or PATCH; got {}",
+            method.unwrap_or_default()
+        )));
+    }
+    Ok(verb)
+}
+
+/// A JSON object of string values (`fields` / `headers`); a JSON `null` value
+/// becomes empty, any other non-string its JSON form. Blank/absent yields an empty
+/// map. (oracle `ExternalApiCallController.parseJsonObject`)
+fn parse_json_object(
+    json: Option<&str>,
+    what: &str,
+) -> Result<BTreeMap<String, String>, ExternalApiError> {
+    let Some(json) = json.map(str::trim).filter(|json| !json.is_empty()) else {
+        return Ok(BTreeMap::new());
+    };
+    let parsed: Value = serde_json::from_str(json)
+        .map_err(|_| invalid(format!("api step '{what}' must be a JSON object")))?;
+    let Value::Object(map) = parsed else {
+        return Err(invalid(format!("api step '{what}' must be a JSON object")));
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        let text = match value {
+            Value::Null => String::new(),
+            other => java_to_string(&other),
+        };
+        out.insert(key, text);
+    }
+    Ok(out)
+}
+
+/// Resolve every value's placeholders against the context. (oracle `resolveAll`)
+fn resolve_all(
+    values: &BTreeMap<String, String>,
+    context: &Value,
+) -> Result<BTreeMap<String, String>, ExternalApiError> {
+    let mut out = BTreeMap::new();
+    for (key, value) in values {
+        let resolved =
+            Placeholders::resolve(Some(value), context, Escaping::None)?.unwrap_or_default();
+        out.insert(key.clone(), resolved);
+    }
+    Ok(out)
+}
+
+/// Per-step headers, held to the same rules as a connection's static headers: a
+/// valid RFC-7230 name, not a reserved one, and a value with no injectable
+/// characters (a resolved placeholder could carry a newline out of metadata).
+/// (oracle `ExternalApiCallController.validatedHeaders`)
+fn validated_headers(
+    headers: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ExternalApiError> {
+    for (name, value) in &headers {
+        if !ExternalApiHeaders::is_valid_name(name) {
+            return Err(invalid(format!(
+                "api step 'headers' has an invalid header name: {name}"
+            )));
+        }
+        if ExternalApiHeaders::is_reserved(name) {
+            return Err(invalid(format!(
+                "api step 'headers' must not set '{name}'; it is set by the connection or the client"
+            )));
+        }
+        if !ExternalApiHeaders::is_valid_value(value) {
+            return Err(invalid(format!(
+                "api step 'headers' has an invalid value for '{name}'"
+            )));
+        }
+    }
+    Ok(headers)
+}
+
+/// The result URL the API pointed at, from a header or a dotted body path; `None`
+/// when neither is set. (oracle `ExternalApiCallController.resultUrl`)
+fn result_url(
+    response: &ApiResponse,
+    result_url_path: Option<&str>,
+    result_url_header: Option<&str>,
+) -> Result<Option<String>, ExternalApiError> {
+    if let Some(header) = result_url_header.filter(|header| !header.trim().is_empty()) {
+        return match response.header(header.trim()) {
+            Some(value) if !value.trim().is_empty() => Ok(Some(value.to_owned())),
+            _ => Err(invalid(format!(
+                "'resultUrlHeader' names '{header}' but the response had no such header"
+            ))),
+        };
+    }
+    let Some(path) = result_url_path.filter(|path| !path.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let body = response.body_as_json();
+    match body.as_ref().and_then(|root| navigate(root, path.trim())) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(Value::Bool(flag)) => Ok(Some(flag.to_string())),
+        _ => Err(invalid(format!(
+            "'resultUrlPath' found no URL at '{path}' in the response"
+        ))),
+    }
+}
+
+/// Gate the run on a boolean verdict in the API's JSON answer. `requireTrue` names
+/// a field (dotted for a nested one) that must be JSON `true`, or the step fails so
+/// the document is parked rather than delivered. Fail-closed: a missing field, a
+/// non-boolean, a `false`, or a non-JSON body all stop the run — this is what makes
+/// a scanner's "not clean" actually stop the pipeline.
+/// (oracle `ExternalApiCallController.enforceVerdict`)
+///
+/// DIVERGENCE (deliberate, strictly safer): the oracle uses Jackson's
+/// `node.asBoolean(false)`, which — confirmed against `jackson-databind` 3.1.2 —
+/// coerces a **non-zero integer** verdict to `true` (`IntNode._asBoolean`). Here
+/// only a genuine JSON boolean `true` passes; a numeric/string/`null` verdict fails
+/// closed, exactly as this slice's contract requires ("must be JSON `true`; non-bool
+/// stops the run"). This can only ever *refuse* a verdict the oracle would have
+/// admitted, never the reverse, so it cannot let an unapproved document through.
+fn enforce_verdict(
+    response: &ApiResponse,
+    require_true: Option<&str>,
+) -> Result<(), ExternalApiError> {
+    let Some(require_true) = require_true
+        .map(str::trim)
+        .filter(|require| !require.is_empty())
+    else {
+        return Ok(());
+    };
+    let approved = response.is_json()
+        && response
+            .body_as_json()
+            .as_ref()
+            .and_then(|root| navigate(root, require_true))
+            .is_some_and(|node| matches!(node, Value::Bool(true)));
+    if !approved {
+        return Err(invalid(format!(
+            "External API verdict '{require_true}' was not true{}; the document was not approved, so \
+             the run was stopped.",
+            summarise(response)
+        )));
+    }
+    Ok(())
+}
+
+/// The document passes through; the API's answer rides in the report header.
+/// (oracle `ExternalApiCallController.reportOnly`)
+fn report_only(
+    content: &[u8],
+    filename: &str,
+    content_type: &str,
+    response: &ApiResponse,
+) -> Result<ExternalApiCallResult, ExternalApiError> {
+    Ok(ExternalApiCallResult {
+        content_type: content_type.to_owned(),
+        filename: filename.to_owned(),
+        body: content.to_vec(),
+        report: Some(build_report(response)?),
+    })
+}
+
+/// A JSON object describing the call, small enough to survive as a header: the
+/// parsed body when it is JSON and short enough, else a truncated rendering; the
+/// byte count otherwise. (oracle `ExternalApiCallController.buildReport`)
+fn build_report(response: &ApiResponse) -> Result<String, ExternalApiError> {
+    let mut report = Map::new();
+    report.insert("status".to_owned(), Value::from(response.status));
+    report.insert(
+        "contentType".to_owned(),
+        response
+            .content_type
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    if response.is_json() {
+        let text = response.body_as_text();
+        match serde_json::from_str::<Value>(&text) {
+            Ok(parsed) => {
+                let rendered = serde_json::to_string(&parsed).unwrap_or_default();
+                if rendered.chars().count() <= MAX_REPORT_BODY_CHARS {
+                    report.insert("body".to_owned(), parsed);
+                } else {
+                    report.insert("bodyTruncated".to_owned(), Value::Bool(true));
+                    report.insert(
+                        "body".to_owned(),
+                        Value::String(char_prefix(&rendered, MAX_REPORT_BODY_CHARS)),
+                    );
+                }
+            }
+            Err(error) => {
+                // Content-Type said JSON but the body is not; keep the step alive
+                // and say so.
+                report.insert(
+                    "bodyParseError".to_owned(),
+                    Value::String(error.to_string()),
+                );
+                report.insert("body".to_owned(), Value::String(truncate(&text)));
+            }
+        }
+    } else {
+        report.insert("bodyBytes".to_owned(), Value::from(response.body.len()));
+    }
+    serde_json::to_string(&Value::Object(report))
+        .map_err(|_| invalid("api step failed to build the report header"))
+}
+
+/// `: <one-line truncated body>`, or empty when the body is blank. (oracle
+/// `ExternalApiCallController.summarise`)
+fn summarise(response: &ApiResponse) -> String {
+    let text = truncate(&response.body_as_text());
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
+    }
+}
+
+/// Collapse whitespace to single spaces, trim, and cap at
+/// [`MAX_REPORT_BODY_CHARS`] with an ellipsis. (oracle `truncate`)
+fn truncate(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX_REPORT_BODY_CHARS {
+        one_line
+    } else {
+        format!("{}…", char_prefix(&one_line, MAX_REPORT_BODY_CHARS))
+    }
+}
+
+/// The first `max` characters of `text` (char-safe, never splitting a code point).
+fn char_prefix(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// The upload's safe basename, or `document`. (oracle `safeFileName`)
+fn safe_file_name(original: Option<&str>) -> String {
+    original
+        .and_then(simple_file_name)
+        .unwrap_or_else(|| DEFAULT_FILENAME.to_owned())
+}
+
+/// Walk a dotted path through a JSON tree, returning the node it names or `None`
+/// (a missing key or a non-object mid-path). Trailing empty segments are dropped,
+/// matching Java `String.split` (limit 0).
+fn navigate<'a>(root: &'a Value, dotted: &str) -> Option<&'a Value> {
+    let mut segments: Vec<&str> = dotted.split('.').collect();
+    while segments.last() == Some(&"") {
+        segments.pop();
+    }
+    let mut node = root;
+    for segment in segments {
+        node = node.get(segment)?;
+    }
+    Some(node)
+}
+
+// ===========================================================================
 // Tests — 1:1 translations of the JUnit oracles under
 // app/proprietary/.../integration/api/ (plus focused coverage for the parts
 // with no dedicated JUnit suite: ApiConnectionSettings + ExternalApiHeaders).
@@ -4314,7 +5155,7 @@ mod slice2_tests {
 mod slice3_tests {
     use std::{
         collections::BTreeMap,
-        io::{Read as _, Write as _},
+        io::{Cursor, Read as _, Write as _},
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
         sync::{
             Arc, Mutex,
@@ -4325,13 +5166,14 @@ mod slice3_tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use regex::Regex;
     use serde_json::{Value, json};
     use url::Url;
 
     use super::{
-        ApiConnectionSettings, ApiResponse, ApiTokenLogin, ExternalApiCaller, ExternalApiError,
-        OutboundBody, ResultUrls, SendParts, require_public_host, resolve_host, send,
-        token_cache_key,
+        ApiConnectionSettings, ApiResponse, ApiTokenLogin, ExternalApiCallRequest,
+        ExternalApiCallResult, ExternalApiCaller, ExternalApiError, OutboundBody, ResultFiles,
+        ResultUrls, RunFacts, SendParts, require_public_host, resolve_host, send, token_cache_key,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -4392,6 +5234,7 @@ mod slice3_tests {
     // ---------------------------------------------------------------------
 
     struct MockRequest {
+        method: String,
         path: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -4529,6 +5372,11 @@ mod slice3_tests {
         let head = String::from_utf8_lossy(&buffer[..header_end.min(buffer.len())]);
         let mut lines = head.lines();
         let request_line = lines.next().unwrap_or_default();
+        let method = request_line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
         let path = request_line
             .split_whitespace()
             .nth(1)
@@ -4543,6 +5391,7 @@ mod slice3_tests {
         let body_start = header_end.min(buffer.len());
         let body_end = (body_start + content_length).min(buffer.len());
         MockRequest {
+            method,
             path,
             headers,
             body: buffer[body_start..body_end].to_vec(),
@@ -5648,5 +6497,803 @@ mod slice3_tests {
         // The connection's credentials were deliberately not sent to the CDN host.
         assert_eq!(header_value(&seen, "authorization"), None);
         Ok(())
+    }
+
+    // ======================================================================
+    // Slice 4 — the controller `call` orchestration, driven end-to-end
+    // against the loopback mock. A 1:1 port of `ExternalApiCallControllerLiveTest`
+    // (the receiver is the point: assertions are about what actually left on the
+    // wire), plus focused unit coverage for ResultUrls / ResultFiles / the verdict
+    // gate. No `unwrap`/`expect`.
+    // ======================================================================
+
+    const TIMESTAMP: &str = "2026-07-25T12:00:00Z";
+
+    /// A labelled, classified, titled two-page PDF — the oracle's `pdf()` fixture,
+    /// so the context has something real to carry across every namespace.
+    fn rich_pdf() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use lopdf::{Dictionary, Document, Object, dictionary};
+
+        use crate::purview::{AssignmentMethod, PdfSensitivityLabels, SensitivityLabel};
+
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let page = |document: &mut Document| {
+            document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 300.into()],
+            })
+        };
+        let page_one = page(&mut document);
+        let page_two = page(&mut document);
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_one), Object::Reference(page_two)],
+                "Count" => 2,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut info = Dictionary::new();
+        info.set("Title", Object::string_literal("Q3 Claim"));
+        info.set(
+            "StirlingPDFClassification",
+            Object::string_literal("{\"label\":\"invoice\",\"confidence\":0.91}"),
+        );
+        let info_id = document.add_object(info);
+        document.trailer.set("Info", info_id);
+
+        let label = SensitivityLabel::new(
+            "2096f6a2-d2f7-48be-b329-b73aaa526e5d".to_owned(),
+            Some("Confidential".to_owned()),
+            "cb46c030-1825-4e81-a295-151c039dbf02".to_owned(),
+            Some(AssignmentMethod::Privileged),
+            None,
+            None,
+        )?;
+        PdfSensitivityLabels::apply(&mut document, &label)?;
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// The oracle's `zip()`: an archive holding an audit trail and the signed PDF.
+    fn zip_bundle() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use zip::{ZipWriter, write::SimpleFileOptions};
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        zip.start_file("audit-trail.txt", options)?;
+        zip.write_all(b"who signed what")?;
+        zip.start_file("signed.pdf", options)?;
+        zip.write_all(b"%PDF-1.7 signed")?;
+        Ok(zip.finish()?.into_inner())
+    }
+
+    /// What the receiver saw for the most recent (non-result-fetch) request.
+    struct CapturedReq {
+        method: String,
+        content_type: Option<String>,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+    }
+
+    impl CapturedReq {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn body_text(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+    }
+
+    type Slot = Arc<Mutex<Option<CapturedReq>>>;
+
+    fn capture_into(slot: &Slot, request: &MockRequest) {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(CapturedReq {
+                method: request.method.clone(),
+                content_type: request.header("content-type").map(str::to_owned),
+                body: request.body.clone(),
+                headers: request.headers.clone(),
+            });
+        }
+    }
+
+    fn take_captured(slot: &Slot) -> CapturedReq {
+        let Ok(mut guard) = slot.lock() else {
+            panic!("capture lock was poisoned");
+        };
+        match guard.take() {
+            Some(request) => request,
+            None => panic!("no request was captured by the mock"),
+        }
+    }
+
+    fn mock_bytes(status: u16, content_type: &str, body: Vec<u8>) -> MockResponse {
+        MockResponse {
+            status,
+            headers: vec![("Content-Type".to_owned(), content_type.to_owned())],
+            body,
+            omit_content_length: false,
+        }
+    }
+
+    /// The DLP/converter/deferred/archive receiver the oracle stands up: one server,
+    /// routed on path. `/files/result.pdf` is deliberately NOT captured, matching the
+    /// oracle, so a deferred fetch does not overwrite the primary request.
+    fn dlp_server() -> Result<(MockServer, String, Slot), Box<dyn std::error::Error>> {
+        let slot: Slot = Arc::new(Mutex::new(None));
+        let base: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let bundle = zip_bundle()?;
+        let sink = Arc::clone(&slot);
+        let base_for_handler = Arc::clone(&base);
+        let handler: Handler = Arc::new(move |request: &MockRequest| {
+            if request.path != "/files/result.pdf" {
+                capture_into(&sink, request);
+            }
+            match request.path.as_str() {
+                "/v1/scan" => MockResponse::json(200, "{\"verdict\":\"clean\",\"score\":0.02}"),
+                "/v1/convert" => mock_bytes(
+                    200,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    b"DOCX-BYTES".to_vec(),
+                )
+                .with_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"converted.docx\"",
+                ),
+                "/v1/deferred" => {
+                    let base_url = base_for_handler
+                        .lock()
+                        .map(|guard| guard.clone())
+                        .unwrap_or_default();
+                    MockResponse::json(
+                        200,
+                        &format!(
+                            "{{\"status\":\"done\",\"data\":{{\"downloadUrl\":\"{base_url}/files/result.pdf\"}}}}"
+                        ),
+                    )
+                }
+                "/v1/evil" => MockResponse::json(
+                    200,
+                    "{\"data\":{\"downloadUrl\":\"http://169.254.169.254/latest/meta-data/\"}}",
+                ),
+                "/files/result.pdf" => {
+                    mock_bytes(200, "application/pdf", b"%PDF-1.7 fetched".to_vec())
+                }
+                "/v1/bundle" => mock_bytes(200, "application/zip", bundle.clone()),
+                "/v1/reject" => MockResponse::json(422, "{\"error\":\"policy violation\"}"),
+                "/v1/clean" => MockResponse::json(200, "{\"CleanResult\":true}"),
+                "/v1/infected" => MockResponse::json(
+                    200,
+                    "{\"CleanResult\":false,\"FoundViruses\":[{\"VirusName\":\"EICAR\"}]}",
+                ),
+                _ => MockResponse::json(404, "{\"error\":\"not found\"}"),
+            }
+        });
+        let server = MockServer::start(handler)?;
+        let base_url = server.base_url.clone();
+        if let Ok(mut guard) = base.lock() {
+            *guard = base_url.clone();
+        }
+        Ok((server, base_url, slot))
+    }
+
+    /// A named step, so each test states only what it varies. Mirrors the oracle's
+    /// `Step` builder over the seventeen positional controller arguments.
+    struct Step {
+        path: String,
+        method: String,
+        body_mode: String,
+        file_field_name: String,
+        response_mode: String,
+        result_url_path: Option<String>,
+        response_select: Option<String>,
+        require_true: Option<String>,
+        fields: Option<String>,
+        body_template: Option<String>,
+        headers: Option<String>,
+        include_context: bool,
+        include_file: bool,
+        policy_name: Option<String>,
+        run_id: Option<String>,
+    }
+
+    impl Step {
+        fn new(path: &str) -> Self {
+            Self {
+                path: path.to_owned(),
+                method: "POST".to_owned(),
+                body_mode: "multipart".to_owned(),
+                file_field_name: "file".to_owned(),
+                response_mode: "report".to_owned(),
+                result_url_path: None,
+                response_select: None,
+                require_true: None,
+                fields: None,
+                body_template: None,
+                headers: None,
+                include_context: false,
+                include_file: true,
+                policy_name: None,
+                run_id: None,
+            }
+        }
+
+        fn go(
+            &self,
+            caller: &ExternalApiCaller,
+            settings: &ApiConnectionSettings,
+            file: &[u8],
+        ) -> Result<ExternalApiCallResult, ExternalApiError> {
+            let request = ExternalApiCallRequest {
+                file_content: file,
+                original_filename: Some("claim.pdf"),
+                file_content_type: Some("application/pdf"),
+                path: Some(&self.path),
+                method: Some(&self.method),
+                body_mode: Some(&self.body_mode),
+                file_field_name: &self.file_field_name,
+                response_mode: Some(&self.response_mode),
+                result_url_path: self.result_url_path.as_deref(),
+                result_url_header: None,
+                response_select: self.response_select.as_deref(),
+                require_true: self.require_true.as_deref(),
+                fields: self.fields.as_deref(),
+                body_template: self.body_template.as_deref(),
+                headers: self.headers.as_deref(),
+                include_context: self.include_context,
+                include_file: self.include_file,
+                run: RunFacts {
+                    policy_name: self.policy_name.as_deref(),
+                    run_id: self.run_id.as_deref(),
+                    timestamp: TIMESTAMP,
+                },
+            };
+            caller.call(settings, &request)
+        }
+    }
+
+    #[test]
+    fn sends_the_document_and_what_we_know_about_it_to_the_receiver() -> TestResult {
+        let (server, _base, slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/scan");
+        step.fields = Some(
+            "{\"sha256\":\"{{document.sha256}}\",\"label\":\"{{sensitivityLabel.name}}\",\
+             \"class\":\"{{classification.label}}\",\"pages\":\"{{document.pageCount}}\"}"
+                .to_owned(),
+        );
+        step.include_context = true;
+        step.policy_name = Some("Outbound review".to_owned());
+        step.run_id = Some("run-42".to_owned());
+        let result = step.go(&caller, &settings, &pdf)?;
+
+        let request = take_captured(&slot);
+        assert_eq!(request.method, "POST");
+        assert!(
+            request
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value.starts_with("multipart/form-data"))
+        );
+        // Fields the vendor asked for, filled from what Stirling already knew.
+        let body = request.body_text();
+        assert!(body.contains("name=\"label\"") && body.contains("Confidential"));
+        assert!(body.contains("name=\"class\"") && body.contains("invoice"));
+        assert!(body.contains("name=\"pages\"") && body.contains('2'));
+        let sha_pattern = Regex::new(r#"name="sha256"[\s\S]{0,24}[0-9a-f]{64}"#)?;
+        assert!(sha_pattern.is_match(&body));
+        // The document itself, under the field name the vendor expects.
+        assert!(body.contains("name=\"file\"; filename=\"claim.pdf\"") && body.contains("%PDF"));
+        // The context, including which policy and run sent it.
+        assert!(
+            body.contains("stirlingContext")
+                && body.contains("Outbound review")
+                && body.contains("run-42")
+        );
+
+        let Some(report) = result.report else {
+            panic!("report mode must return a report");
+        };
+        let report: Value = serde_json::from_str(&report)?;
+        assert_eq!(report.pointer("/status").and_then(Value::as_i64), Some(200));
+        assert_eq!(
+            report.pointer("/body/verdict").and_then(Value::as_str),
+            Some("clean")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_mode_returns_the_document_untouched() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let result = Step::new("/v1/scan").go(&caller, &settings, &pdf)?;
+
+        // Byte-for-byte: an inspecting call-out must not perturb what it inspected.
+        assert_eq!(result.body, pdf);
+        assert!(result.body.starts_with(b"%PDF"));
+        assert_eq!(result.filename, "claim.pdf");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_mode_adopts_the_returned_document_and_its_real_name() -> TestResult {
+        let (server, _base, slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/convert");
+        step.body_mode = "binary".to_owned();
+        step.response_mode = "replace".to_owned();
+        let result = step.go(&caller, &settings, &pdf)?;
+
+        let request = take_captured(&slot);
+        assert_eq!(request.content_type.as_deref(), Some("application/pdf"));
+        assert!(request.body_text().starts_with("%PDF"));
+        assert_eq!(result.body, b"DOCX-BYTES");
+        // Named for what came back, not what went out: a DOCX must not be called .pdf.
+        assert_eq!(result.filename, "converted.docx");
+        Ok(())
+    }
+
+    #[test]
+    fn follows_a_result_url_on_the_connections_own_host() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/deferred");
+        step.response_mode = "replace".to_owned();
+        step.result_url_path = Some("data.downloadUrl".to_owned());
+        let result = step.go(&caller, &settings, &pdf)?;
+
+        assert_eq!(result.body, b"%PDF-1.7 fetched");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_result_url_the_connection_never_authorised() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // The URL is chosen by the remote service at run time; obeying it is an SSRF.
+        let mut step = Step::new("/v1/evil");
+        step.response_mode = "replace".to_owned();
+        step.result_url_path = Some("data.downloadUrl".to_owned());
+        assert_err_contains(step.go(&caller, &settings, &pdf), "does not allow");
+        Ok(())
+    }
+
+    #[test]
+    fn picks_the_wanted_file_out_of_a_returned_archive() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/bundle");
+        step.response_mode = "replace".to_owned();
+        step.response_select = Some("*.pdf".to_owned());
+        let result = step.go(&caller, &settings, &pdf)?;
+
+        assert_eq!(result.body, b"%PDF-1.7 signed");
+        assert_eq!(result.filename, "signed.pdf");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unselected_archive_fails_rather_than_becoming_the_document() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/bundle");
+        step.response_mode = "replace".to_owned();
+        assert_err_contains(step.go(&caller, &settings, &pdf), "responseSelect");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_call_out_fails_the_step() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // A policy that continued past a rejection would deliver documents the
+        // external system believes it never approved.
+        let result = Step::new("/v1/reject").go(&caller, &settings, &pdf);
+        assert_err_contains(result, "HTTP 422");
+        assert_err_contains(
+            Step::new("/v1/reject").go(&caller, &settings, &pdf),
+            "policy violation",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_clean_verdict_lets_the_document_through() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // Cloudmersive answers HTTP 200 whether clean or not; a clean result must
+        // pass the document through untouched.
+        let mut step = Step::new("/v1/clean");
+        step.require_true = Some("CleanResult".to_owned());
+        let result = step.go(&caller, &settings, &pdf)?;
+
+        assert!(result.body.starts_with(b"%PDF"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_infected_verdict_stops_the_run_even_on_http_200() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // The whole security proposition: HTTP 200 with CleanResult=false must NOT
+        // sail through.
+        let mut step = Step::new("/v1/infected");
+        step.require_true = Some("CleanResult".to_owned());
+        assert_err_contains(step.go(&caller, &settings, &pdf), "CleanResult");
+        let mut step = Step::new("/v1/infected");
+        step.require_true = Some("CleanResult".to_owned());
+        assert_err_contains(step.go(&caller, &settings, &pdf), "not true");
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_verdict_field_fails_closed() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // /v1/scan answers {"verdict":"clean"} — no CleanResult field at all. A gate
+        // that cannot find its verdict must stop the run, not wave the document through.
+        let mut step = Step::new("/v1/scan");
+        step.require_true = Some("CleanResult".to_owned());
+        assert_err_contains(step.go(&caller, &settings, &pdf), "not true");
+        Ok(())
+    }
+
+    #[test]
+    fn sends_a_vendor_shaped_json_body_with_the_document_nested_inside() -> TestResult {
+        let (server, _base, slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        // ConsignO's submit shape: the PDF base64'd into documents[0].data.
+        let mut step = Step::new("/v1/scan");
+        step.body_mode = "json".to_owned();
+        step.body_template = Some(
+            "{\"name\":\"{{document.filename}}\",\"status\":1,\
+             \"documents\":[{\"name\":\"{{document.filename}}\",\"data\":\"{{document.base64}}\"}],\
+             \"actions\":[{\"mode\":\"remote\",\"signer\":{\"type\":\"certifio\"}}]}"
+                .to_owned(),
+        );
+        step.go(&caller, &settings, &pdf)?;
+
+        let request = take_captured(&slot);
+        assert_eq!(request.content_type.as_deref(), Some("application/json"));
+        let sent: Value = serde_json::from_str(&request.body_text())?;
+        assert_eq!(
+            sent.pointer("/name").and_then(Value::as_str),
+            Some("claim.pdf")
+        );
+        // Numbers keep their type; only strings are substituted.
+        assert!(sent.pointer("/status").is_some_and(Value::is_number));
+        assert_eq!(
+            sent.pointer("/actions/0/signer/type")
+                .and_then(Value::as_str),
+            Some("certifio")
+        );
+        let Some(data) = sent.pointer("/documents/0/data").and_then(Value::as_str) else {
+            panic!("nested document data missing");
+        };
+        assert!(STANDARD.decode(data)?.starts_with(b"%PDF"));
+        Ok(())
+    }
+
+    #[test]
+    fn applies_the_connections_credential_and_the_steps_headers_and_verb() -> TestResult {
+        let (server, _base, slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(
+            &server.base_url,
+            &[
+                ("authType", json!("BEARER")),
+                ("token", json!("s3cr3t-token")),
+            ],
+        )?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/scan");
+        step.method = "PUT".to_owned();
+        step.headers = Some("{\"X-Case-Id\":\"{{run.runId}}\"}".to_owned());
+        step.run_id = Some("run-99".to_owned());
+        step.go(&caller, &settings, &pdf)?;
+
+        let request = take_captured(&slot);
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.header("X-Case-Id"), Some("run-99"));
+        // The connection's credential, which the step never supplies or sees.
+        assert_eq!(request.header("Authorization"), Some("Bearer s3cr3t-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_step_cannot_aim_the_call_at_another_host() -> TestResult {
+        let (server, _base, _slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        assert_err_contains(
+            Step::new("//evil.example/x").go(&caller, &settings, &pdf),
+            "must be relative",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn notify_style_call_out_sends_the_facts_without_the_document() -> TestResult {
+        let (server, _base, slot) = dlp_server()?;
+        let caller = ExternalApiCaller::new(true);
+        let settings = settings_with(&server.base_url, &[])?;
+        let pdf = rich_pdf()?;
+
+        let mut step = Step::new("/v1/scan");
+        step.body_mode = "json".to_owned();
+        step.include_context = true;
+        step.include_file = false;
+        step.policy_name = Some("Outbound review".to_owned());
+        step.run_id = Some("run-7".to_owned());
+        step.go(&caller, &settings, &pdf)?;
+
+        let request = take_captured(&slot);
+        let sent: Value = serde_json::from_str(&request.body_text())?;
+        assert_eq!(
+            sent.pointer("/document/filename").and_then(Value::as_str),
+            Some("claim.pdf")
+        );
+        assert_eq!(
+            sent.pointer("/run/policyName").and_then(Value::as_str),
+            Some("Outbound review")
+        );
+        // No document: the point of a notification is the facts, not the bytes.
+        assert!(sent.pointer("/content").is_none());
+        assert!(!request.body_text().contains("%PDF"));
+        Ok(())
+    }
+
+    // ---- focused unit coverage for the highest-risk result parsing ----------
+
+    fn response_with(
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> ApiResponse {
+        ApiResponse {
+            status: 200,
+            content_type: content_type.map(str::to_owned),
+            body: body.to_vec(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn result_urls_allow_a_subdomain_but_not_a_bare_suffix() -> TestResult {
+        // 'vendor.example' authorises itself and any subdomain, but never
+        // 'evilvendor.example' (the classic naive-suffix bypass).
+        let settings = settings_with(
+            "https://api.vendor.example/v1",
+            &[("resultUrlHosts", json!(["cdn.vendor.example"]))],
+        )?;
+        // The connection's own host.
+        assert!(ResultUrls::is_allowed_host(&settings, "api.vendor.example"));
+        // An exact declared host and a subdomain of it.
+        assert!(ResultUrls::is_allowed_host(&settings, "cdn.vendor.example"));
+        assert!(ResultUrls::is_allowed_host(
+            &settings,
+            "deep.cdn.vendor.example"
+        ));
+        // A bare-suffix impostor and an unrelated host are refused.
+        assert!(!ResultUrls::is_allowed_host(
+            &settings,
+            "evilcdn.vendor.example"
+        ));
+        assert!(!ResultUrls::is_allowed_host(
+            &settings,
+            "cdn.vendor.example.evil.com"
+        ));
+        assert!(!ResultUrls::is_allowed_host(&settings, "attacker.example"));
+        Ok(())
+    }
+
+    #[test]
+    fn result_urls_reject_non_http_userinfo_and_unlisted_hosts() -> TestResult {
+        let settings = settings_with("https://api.vendor.example/v1", &[])?;
+        // A non-http(s) scheme is a local-file-read vector.
+        assert_err_contains(
+            ResultUrls::validate(&settings, "file:///etc/passwd", false),
+            "not http(s)",
+        );
+        // Credentials in a URL are a host-spoofing vector.
+        assert_err_contains(
+            ResultUrls::validate(&settings, "https://user:pass@api.vendor.example/x", false),
+            "carrying credentials",
+        );
+        // A host the operator never declared.
+        assert_err_contains(
+            ResultUrls::validate(&settings, "https://cdn.other.example/x", false),
+            "does not allow",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_urls_block_an_allowlisted_host_that_resolves_internal() -> TestResult {
+        // An allowlisted name whose DNS points at the metadata service is still
+        // blocked: the reserved-range vet runs on the RESOLVED address.
+        let settings = settings_with(
+            "https://api.vendor.example/v1",
+            &[("resultUrlHosts", json!(["cdn.vendor.example"]))],
+        )?;
+        let resolve = |_host: &str, _port: u16| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec![addr("169.254.169.254", 443)])
+        };
+        assert_err_contains(
+            ResultUrls::validate_with_resolver(
+                &settings,
+                "https://cdn.vendor.example/result.pdf",
+                false,
+                &resolve,
+            ),
+            "private/link-local",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_files_name_prefers_disposition_then_content_type_then_request() {
+        // Content-Disposition wins, path components stripped.
+        let response = response_with(
+            Some("application/pdf"),
+            &[(
+                "Content-Disposition",
+                "attachment; filename=\"/etc/signed.pdf\"",
+            )],
+            b"%PDF",
+        );
+        assert_eq!(ResultFiles::name_for(&response, "in.pdf"), "signed.pdf");
+        // No disposition: the request base name with a content-type extension.
+        let response = response_with(
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=x",
+            ),
+            &[],
+            b"x",
+        );
+        assert_eq!(ResultFiles::name_for(&response, "claim.pdf"), "claim.docx");
+        // An unmapped content type keeps the request name unchanged.
+        let response = response_with(Some("application/x-weird"), &[], b"x");
+        assert_eq!(ResultFiles::name_for(&response, "claim.pdf"), "claim.pdf");
+    }
+
+    #[test]
+    fn result_files_disposition_reads_the_rfc5987_form() {
+        let response = response_with(
+            None,
+            &[(
+                "Content-Disposition",
+                "attachment; filename*=UTF-8''report.pdf",
+            )],
+            b"x",
+        );
+        assert_eq!(ResultFiles::name_for(&response, "in.bin"), "report.pdf");
+    }
+
+    #[test]
+    fn result_files_select_by_glob_index_and_the_error_shapes() -> TestResult {
+        let bundle = zip_bundle()?;
+        // A glob picks the single matching entry.
+        let (name, bytes) = ResultFiles::select_from_archive(&bundle, "*.pdf")?;
+        assert_eq!(name, "signed.pdf");
+        assert_eq!(bytes, b"%PDF-1.7 signed");
+        // A 0-based index selects positionally.
+        let (name, _) = ResultFiles::select_from_archive(&bundle, "0")?;
+        assert_eq!(name, "audit-trail.txt");
+        // An empty match names what was there.
+        assert_err_contains(
+            ResultFiles::select_from_archive(&bundle, "*.docx"),
+            "matched nothing",
+        );
+        // A multi-match refuses rather than guessing.
+        assert_err_contains(
+            ResultFiles::select_from_archive(&bundle, "*"),
+            "matched 2 entries",
+        );
+        // An out-of-range index reports the size.
+        assert_err_contains(
+            ResultFiles::select_from_archive(&bundle, "9"),
+            "but the archive has 2",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_zip_body_is_not_an_archive() -> TestResult {
+        assert!(!ResultFiles::is_archive(b"%PDF-1.7 not a zip"));
+        assert!(ResultFiles::is_archive(&zip_bundle()?));
+        assert!(ResultFiles::is_archive_name("bundle.ZIP"));
+        assert!(!ResultFiles::is_archive_name("signed.pdf"));
+        Ok(())
+    }
+
+    #[test]
+    fn verdict_gate_admits_only_a_json_boolean_true() {
+        // The strictly-safer divergence: only a JSON boolean `true` passes. A numeric
+        // 1, a string "true", a nested false, a missing field, and a non-JSON body all
+        // fail closed. (Jackson's asBoolean(false) would have admitted the numeric 1.)
+        let caller = ExternalApiCaller::new(true);
+
+        // A local server that echoes a chosen JSON verdict body, so `call` runs the
+        // real gate over a real response.
+        let verdict = |body: &'static str| -> Result<ExternalApiCallResult, ExternalApiError> {
+            let handler: Handler =
+                Arc::new(move |_request: &MockRequest| MockResponse::json(200, body));
+            let Ok(server) = MockServer::start(handler) else {
+                return Err(super::invalid("mock server failed to start"));
+            };
+            let Ok(settings) = settings_with(&server.base_url, &[]) else {
+                return Err(super::invalid("settings failed"));
+            };
+            let mut step = Step::new("/gate");
+            step.require_true = Some("clean.value".to_owned());
+            step.go(&caller, &settings, b"%PDF-1.7 mini")
+        };
+
+        // JSON boolean true passes (report mode returns the document).
+        assert!(verdict("{\"clean\":{\"value\":true}}").is_ok());
+        // Everything else fails closed.
+        assert_err_contains(verdict("{\"clean\":{\"value\":false}}"), "not true");
+        assert_err_contains(verdict("{\"clean\":{\"value\":1}}"), "not true");
+        assert_err_contains(verdict("{\"clean\":{\"value\":\"true\"}}"), "not true");
+        assert_err_contains(verdict("{\"clean\":{}}"), "not true");
+        assert_err_contains(verdict("{\"other\":true}"), "not true");
     }
 }

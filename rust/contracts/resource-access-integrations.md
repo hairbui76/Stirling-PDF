@@ -74,8 +74,18 @@ usage labels; grants/config are removed only after references are gone. See `pol
 ## Explicit remaining boundary
 
 MCP remains a storage placeholder, matching its current Java integration-config behavior. The
-`external-api-call` step (the `API` integration type) is being ported as a bounded staircase: **slices 1–3
-are landed**. Slice 3 adds the SSRF-safe outbound caller: redirect never followed, a 64 MiB bounded
+`external-api-call` step (the `API` integration type) is now **fully ported** (all four slices). The route
+`POST /api/v1/integration/external-api-call` is live, the previously fail-closed policy step dispatches
+through the ported caller, and the confused-deputy step-validator maps the op to `IntegrationType::Api`.
+Slice 4 added: verdict enforcement (`requireTrue` dotted lookup must be JSON `true`, else fail-closed —
+strictly safer, can only refuse, never over-admit); report mode (document byte-identical + a capped
+`TOOL_REPORT` header); replace mode (non-2xx / empty / resultUrl-less JSON refused); `ResultUrls`
+validation (http(s)-only, no userinfo, exact-or-subdomain allowlist-host match — **not** a naive suffix,
+so `evilvendor.com` never matches `vendor.com` — then SSRF-vet the *resolved* address, blocking
+allowlisted-but-internal hosts and raw metadata IPs; the result fetch forwards no credentials); and
+`ResultFiles` (Content-Disposition/Content-Type/name precedence + zip member selection by glob or index,
+with empty/multi-match errors). ConsignO is served through the generic `bodyTemplate` (no dedicated
+connector). Slice 3 adds the SSRF-safe outbound caller: redirect never followed, a 64 MiB bounded
 response read, per-connection timeout, credential-free error messages, the NONE/BEARER/BASIC/HEADER/
 TOKEN_LOGIN auth application, and a login-once token cache (TTL, per-credential key, 401→evict→retry-once).
 Its base-host gate reuses the OIDC `resolve_to_addrs` pin + `ip_addr_is_reserved` (anti-DNS-rebinding) and

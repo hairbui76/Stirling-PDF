@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **889 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **912 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -341,7 +341,15 @@ auto-rename/auto-split, plus:
   unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
   blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
   of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
-  as a bounded staircase — slices 1–3 are landed and oracle-verified (`proprietary_external_api.rs`):
+  as a bounded staircase — **all four slices are landed and the feature is COMPLETE** (route
+  `POST /api/v1/integration/external-api-call` live; the previously fail-closed policy step now dispatches
+  through the ported caller; ConsignO is covered via the generic `bodyTemplate`). Slice 4 added verdict
+  enforcement (`requireTrue` must be JSON `true` or fail-closed), report/replace modes, the
+  security-sensitive `ResultUrls` validation (http(s)-only, no userinfo, exact-or-subdomain allowlist host
+  match — no naive suffix — then SSRF-vet the *resolved* address so an allowlisted-but-internal host and
+  raw metadata IPs are still blocked, result fetched with no credentials), and `ResultFiles` archive
+  member selection (glob/index, empty/multi-match are errors). All oracle-verified against a loopback mock.
+  The earlier slices (`proprietary_external_api.rs`):
   slice 1 = pure request-construction + config primitives; slice 2 = the `DocumentContext` namespace
   (base/run facts + best-effort PDF Info metadata + classification + sensitivity-label, omit-not-fatal on
   non-PDF) and the four `buildBody` modes (multipart / json / binary / bodyTemplate); slice 3 = the
