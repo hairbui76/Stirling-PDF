@@ -221,7 +221,17 @@ impl PolicyExecutionService {
         }
         let policy_name = definition.name.clone();
         let output = definition.output.unwrap_or_default();
-        if let Err(error) = self.config.validate_run_output(&output, context) {
+        // Confused-deputy gate for an ad-hoc run, mirroring Java
+        // `PolicyController.validateAdHocRun`: steps then output are
+        // authorization-checked on this request thread (caller's principal present),
+        // because the worker thread that later runs and delivers carries none. An
+        // ad-hoc run is never persisted, so save-time `save_policy` validation never
+        // sees it — this is its only access gate.
+        if let Err(error) = self
+            .config
+            .validate_steps(&definition.steps, context)
+            .and_then(|()| self.config.validate_run_output(&output, context))
+        {
             let _ = self.jobs.discard(&prepared.submission.job_id);
             return Err(error.into());
         }

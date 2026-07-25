@@ -63,6 +63,18 @@ S3 sources and outputs accept Java's legacy embedded options or a stored integra
 endpoint restrictions, and required credentials. Stored connection values win except for the
 per-use `prefix` and `mode` fields.
 
+Policy **steps** are likewise access-checked at write time, porting Java's
+`IntegrationStepValidator` (a `PipelineStepValidator` run by `PolicyValidator.validateSteps`): a
+step under `/api/v1/integration/` must name a registered integration endpoint and carry a
+`connectionId` that resolves for the caller. This is the confused-deputy guard — the worker thread
+that later runs the step has no principal, so the ownership check must run here, on the request
+thread, while the caller's identity is available (the resolved config is discarded — the resolve
+*is* the check). `save_policy` runs it between the source loop and output validation; the ad-hoc run
+path runs steps-then-output (`PolicyController.validateAdHocRun`). Only the ported subset is
+registered — `purview-apply-label` / `purview-read-label` (`PURVIEW`); Java's `external-api-call`
+(`API`) and `consigno-*` (`CONSIGNO`) are unported, so those prefixed operations fail closed as
+`unknown integration step`. See `contracts/purview.md` for the connection-id parsing and messages.
+
 The policy overview is derived from the caller's team-scoped policy and source rows. It reports
 total/active/paused KPIs and case-insensitively sorted policy views with status,
 manual-or-configured trigger type, resolved source names, step count, output type, and owner.
