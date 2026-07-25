@@ -6,7 +6,7 @@ axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
 **Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **736 passed / 1
+`cargo test -p stirling-processing --lib --no-fail-fast` reports **754 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
 a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
 unrelated to recent work; it is the only failure in the processing library suite.
@@ -309,14 +309,18 @@ auto-rename/auto-split, plus:
   Paired parity fix: `IntegrationConfigService::create`/`update` now enforce `requireCustomApiAllowed`
   server-side for `API`-type configs (flag on + admin) rather than merely hiding the option in the
   capability response. See `contracts/resource-access-integrations.md`.
-- Secured `GET /api/v1/proprietary/ui-data/{login, account, audit-dashboard, teams, teams/{id}}` — thin
+- Secured `GET /api/v1/proprietary/ui-data/{login, account, audit-dashboard, teams, teams/{id}, admin-settings}` — thin
   read projections over already-ported stores (`SecurityStore`) plus a startup snapshot of server-owned
   config, porting the non-mutating routes of Java `ProprietaryUIDataController` (new
   `proprietary_ui_data.rs`). `login` is public (first-time-setup/default-credentials + OAuth2 provider
   list); `account` is an `/auth/me` superset with the MFA secret masked; `audit-dashboard` (admin +
   verified Enterprise) projects the audit config plus the `AuditLevel`/`AuditEventType` enum listings and
   `retentionDays`; `teams`/`teams/{id}` (admin) reuse `list_teams` plus new per-team latest-activity and
-  team-leader queries in `security.rs`. SAML2 provider entries are deliberately omitted (SAML2 deferred),
+  team-leader queries in `security.rs`; `admin-settings` (admin) aggregates the admin roster with
+  locked-user enumeration, the full `user_seat_metrics` license/seat block, per-principal session
+  activity, and mail/premium config (two documented divergences: `updatedAt` is always omitted — no
+  such column — and locked users derive from the persistent lockout store rather than Java's in-memory
+  count-threshold that honors a `-1` disable). SAML2 provider entries are deliberately omitted (SAML2 deferred),
   so the login `altLogin` flag is OAuth2-only — a documented divergence for a SAML2-only config; OAuth2
   providers are unaffected. Two minor divergences: an unknown `teams/{id}` returns `404` (Java accidentally
   `500`s) and "last activity" derives from session `created_at` (the Rust store has no per-request
@@ -325,6 +329,16 @@ auto-rename/auto-split, plus:
   the secret returned once, cross-owner access `404`, and best-effort usage/last-used recorded on key auth;
   authenticated non-anonymous callers only (no admin/Enterprise/demo gate). Only the H2-only
   `ui-data/database` route remains deferred from this controller. See `contracts/ui-data.md`.
+- Secured `POST /api/v1/policies/classify/meter` — audit-only classification meter (accepts an optional
+  body, clamps `documentCount` to `[1,10000]`, defaults the policy name, stamps a policy-run audit record
+  carrying the `classify-and-label` step, and returns `202`); the SaaS billing side is a deliberate no-op
+  in proprietary mode. Ports Java `ClassificationMeterController`.
+- `settings/update-enable-analytics` and `general/send-email` now honor `?async=true` (added to the
+  async-job allowlist), matching Java's `@AutoJobPostMapping`. With these plus `admin-settings`, a
+  systematic route cross-check finds no remaining bounded parity gap in the OSS-core + proprietary
+  `controller/api` route surface; what remains is the standing deferred-external set (SaaS/cloud, SAML2,
+  external-api/Consigno), upstream-blocked items (P-521 signing, Windows-cert async), the H2-only
+  `ui-data/database`, and unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity).
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
   Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
   app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the
