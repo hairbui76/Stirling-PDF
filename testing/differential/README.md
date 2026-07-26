@@ -219,17 +219,17 @@ routing it to `(informational)` would make it look permanently stale.
 Known differences are printed on every run, verbose or not:
 
 ```
-PASS             get_info_single  (3 known diffs)
+PASS             get_info_single  (4 known diffs)
     KNOWN> BasicInfo.CharacterCount: rust=14 java=18 [expect_rust=14 expect_java=18]
         why: Java's bare PDFTextStripper runs with sortByPosition=false. [...]
 ------------------------------------------------------------------------
-SUMMARY  PASS=13  (total 13)  (2 with known diffs: 4 field(s))
-OK: no unexplained parity differences (4 known, accepted)
+SUMMARY  PASS=13  (total 13)  (2 with known diffs: 5 field(s))
+OK: no unexplained parity differences (5 known, accepted)
 ```
 
 The per-case marker, the `KNOWN>` lines and the summary count all stay in the
 report; `-v` prints each full reason instead of the abridged first sentence. The
-header also prints the registry size (`known diffs : 8 entries over 2 case(s), 3
+header also prints the registry size (`known diffs : 5 entries over 2 case(s), 4
 pinned`).
 
 ### Removing a stale entry
@@ -267,14 +267,14 @@ python3 known_diffs.py     # prints the registry, then self-checks the rules (no
 | `get_info_single` | `BasicInfo.CharacterCount` | rust=14 java=18 | Java's bare `PDFTextStripper` runs with `sortByPosition=false`; on the fixture's `/Rotate 90` page its line-breaking splits per glyph and it counts more. Replicating the quirk needs a text-layout work-item that is deliberately not planned. |
 | `get_info_single` | `BasicInfo.WordCount` | rust=4 java=7 | same root cause |
 | `get_info_single` | `BasicInfo.ParagraphCount` | rust=2 java=6 | same root cause |
-| `get_info_single` | `Other.XMPMetadata` | no — **cannot** be pinned (embeds generation-time timestamps/UUIDs, varies per run) | Java re-serialises the packet through xmpbox (normalised namespaces/indentation, `+00:00` instead of `Z`, elements instead of attributes); Rust returns the stored packet verbatim. Content equivalent. |
-| `get_info_multipage` | `BasicInfo.{Character,Word,Paragraph}Count` | rust=35 / 10 / 5 only | same root cause. The Rust side was measured against the live backend, so a Rust regression still fails; the Java side was never observed, so it stays open — pin it from the first CI run that reports it. |
-| `get_info_multipage` | `Other.XMPMetadata` | no — cannot be pinned (same reason as above) | same root cause |
+| `get_info_single` | `PerPageInfo.Page 1.Text Characters Count` | rust=14 java=18 | same root cause — the per-page mirror of `BasicInfo.CharacterCount`, pinned to the values the first live CI run reported. |
+| `get_info_multipage` | `Other.XMPMetadata` | no — **cannot** be pinned (embeds generation-time timestamps/UUIDs, varies per run) | Java re-serialises the packet through xmpbox (normalised namespaces/indentation, `+00:00` instead of `Z`, elements instead of attributes); Rust returns the stored packet verbatim. Content equivalent. |
 
-Registered defensively for **both** `get_info` cases because the residuals were
-reported per case, not per field. Whichever of them does not actually occur will
-be reported `STALE` on the first real CI run — delete those lines then. That is
-the registry working as designed, not a defect.
+The registry was originally seeded defensively for **both** `get_info` cases
+(the residuals were reported per case, not per field). The first live CI run
+reported the speculative entries `STALE` — the multipage count entries and the
+single-page XMP entry — and they were deleted exactly as their notes instructed.
+That is the registry working as designed, not a defect.
 
 ---
 

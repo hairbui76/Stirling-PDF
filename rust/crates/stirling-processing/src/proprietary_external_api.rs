@@ -23,17 +23,12 @@
 //! module's ported tests) assert on message substrings, and the operator sees
 //! them while editing a connection.
 //!
-//! Deliberate slice-1 scope limits (each carries a `TODO(slice 3)`):
-//! - `TOKEN_LOGIN` sub-config parsing (`ApiTokenLogin.from`) and
-//!   `tokenCacheKey()` are **not** ported here. `token_login` is left as a
-//!   placeholder [`ApiTokenLogin`] when `authType == TOKEN_LOGIN` and `None`
-//!   otherwise; the sub-config is *not* validated in this slice.
-//! - No HTTP dispatch, DNS/SSRF network guard (`ApiIntegrationValidator`), or
-//!   result-URL fetching — those are later slices.
-//!
-//! Because slice 1 is pure plumbing not yet wired to any router, the items are
-//! exercised only by the inline oracle tests; `dead_code` is allowed at the
-//! module level until a later slice mounts the caller.
+//! All four slices are landed: slice 1 (this request-construction plumbing),
+//! slice 2 (`DocumentContext` + `buildBody`), slice 3 (the SSRF-safe outbound
+//! caller with `TOKEN_LOGIN` parsing/validation and the login-once token cache
+//! — oracles `ExternalApiCaller`, `ApiTokenCache`, `ApiTokenLogin`,
+//! `ApiIntegrationValidator`), and slice 4 (verdict/report/replace handling,
+//! `ResultUrls`/`ResultFiles`, and the `integration_http` route wiring).
 #![allow(dead_code)]
 
 use std::{

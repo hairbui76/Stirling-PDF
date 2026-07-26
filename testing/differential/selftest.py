@@ -118,9 +118,11 @@ def main(argv: list[str]) -> int:
     # --- known-difference registry (must accept ONLY what it registered)
     check("registry is structurally valid", known_diffs.validate(), [])
     # An UNPINNED registered field absorbs any difference -> KNOWN, not DIFF.
+    # XMPMetadata is registered (unpinned) for get_info_multipage only — the
+    # speculative get_info_single entry was deleted after the first live run.
     j3 = json.loads(info1)
     j3.setdefault("Other", {})["XMPMetadata"] = "<x:xmpmeta>re-serialised by xmpbox</x:xmpmeta>"
-    r3 = compare.compare_json(info1, json.dumps(j3).encode(), "get_info_single")
+    r3 = compare.compare_json(info1, json.dumps(j3).encode(), "get_info_multipage")
     check("registered unpinned field -> PASS", r3.verdict, "PASS", str(r3.diffs))
     check("...and is still REPORTED as known", len(r3.known) >= 1, True)
     # The same difference is a hard DIFF for a case with no registry entry.

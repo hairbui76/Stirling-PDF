@@ -101,10 +101,7 @@ each a 1:1 port of its Java oracle: `ExternalApiPaths::resolve` (SSRF path ancho
 same-origin, under-base-path, `%2e`/fragment/control-char rejection), `Placeholders` (dotted `{{a.b}}`
 templating with URL-path escaping and unknown→error), `ApiConnectionSettings::from` (base-URL/authType/
 header/timeout validation with credential-free `Debug`), `ExternalApiHeaders` (name/value/reserved
-grammar), and `MultipartBody` (per-request boundary, name-guarded fields, opaque values). The runtime
-still fails closed at the policy step — slices 2–4 (document-context/body assembly, the SSRF-safe
-outbound caller + auth/token-login cache, and response/verdict/result-URL/zip handling + route wiring)
-remain, and will also cover ConsignO through the generic `bodyTemplate` (no dedicated connector). S3
+grammar), and `MultipartBody` (per-request boundary, name-guarded fields, opaque values). S3
 references are durable and deletion-safe, and the policy runner now owns paginated conditional S3
 input, consume cleanup, and collision-safe conditional output delivery. Cross-node ownership and
 recovery remain part of the distributed-runtime boundary.

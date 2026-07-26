@@ -4,7 +4,7 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-24):** `cargo fmt --check` and strict locked all-target
+**Latest validation (2026-07-26):** `cargo fmt --check` and strict locked all-target
 workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
 `cargo test -p stirling-processing --lib --no-fail-fast` reports **961 passed / 1
 failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
@@ -47,7 +47,10 @@ the packet through xmpbox while Rust returns it verbatim (equivalent content, un
 per-run timestamps). The registry does not blind the gate: a pinned value that drifts, or any unregistered
 field, still fails; a declared difference that disappears is reported STALE.
 
-**Route-count scoping note:** the Rust service registers 313 HTTP routes total.
+**Route-count scoping note:** the Rust service registers 321 HTTP routes total
+(production registrations; an earlier 313 figure was an undercount that dropped
+the routes declared after inner `#[cfg(test)]` attributes in
+`server_certificate.rs` and `classification.rs`).
 Only a subset of those are directly comparable to Java's OSS `controller/api`
 PDF-operation surface (~140 endpoint mappings, several of which are the
 project's composed `@AutoJobPostMapping` annotation rather than the four plain
@@ -61,8 +64,14 @@ raw total as the denominator would understate actual coverage.
 
 ## Ported compatibility endpoints
 
-Each ported surface has a `contracts/<name>.md` compatibility document and focused
-unit/integration coverage. Coverage spans merge/split/rearrange/remove/rotate,
+Most ported surfaces have a `contracts/<name>.md` compatibility document, and all
+have focused unit/integration coverage. Known contract-doc gaps (implemented and
+tested, but no contract file yet): durable storage (`storage_http.rs`, 16 routes),
+collaborative signing beyond the single route `cert-sign.md` covers
+(`workflow_signing_http.rs`, 19 routes), `admin/settings` delta/section/key (5),
+`admin/server-certificate` (6), `admin/job/*` (3), `policies/classify/meter` (1),
+and the `security_http` account/team/invite/MFA-admin routes that
+`account-lifecycle.md` does not enumerate. Coverage spans merge/split/rearrange/remove/rotate,
 crop/scale/layout/booklet/poster, page numbers/stamp/watermark/comments/AI comments/attachments,
 metadata/info/analysis/filters, forms (inspect/fill/modify/delete/export), password/
 sanitize/flatten/repair/decompress, image↔PDF, PDF→image/text/vector/comic-book,
@@ -363,7 +372,7 @@ auto-rename/auto-split, plus:
   upstream-blocked items (Windows-cert async), the H2-only `ui-data/database`, and
   unbounded PDF-fidelity work (Type3 glyph synthesis, Type0/Type3 byte-parity — the latter now confirmed
   blocked, needing a net-new embedded-font-program parser AND poisoned by the Java oracle's C0-stripping
-  of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) is now IN PROGRESS
+  of 2-byte CIDs). The proprietary `external-api-call` step (`API` integration type) was executed
   as a bounded staircase — **all four slices are landed and the feature is COMPLETE** (route
   `POST /api/v1/integration/external-api-call` live; the previously fail-closed policy step now dispatches
   through the ported caller; ConsignO is covered via the generic `bodyTemplate`). Slice 4 added verdict
@@ -380,9 +389,7 @@ auto-rename/auto-split, plus:
   NONE/BEARER/BASIC/HEADER/TOKEN_LOGIN auth and a login-once token cache (401→evict→retry-once),
   reusing the OIDC `resolve_to_addrs` pin + `ip_addr_is_reserved`, gated by an **unconditional
   cloud-metadata deny** (169.254.169.254/.253/.250, `fd00:ec2::254`) that runs before the new
-  `policies.allowPrivateApiEndpoints` opt-in (default false). Slice 4 (response/verdict/result-URL/zip
-  handling + policy-step route wiring — which closes the fail-closed step and covers ConsignO via the
-  generic `bodyTemplate`) remains. See `contracts/resource-access-integrations.md`.
+  `policies.allowPrivateApiEndpoints` opt-in (default false). See `contracts/resource-access-integrations.md`.
 - Secured `integration/purview-apply-label` and `integration/purview-read-label` — fully offline
   Microsoft Purview sensitivity-labelling (no Microsoft Graph call on the label path; the
   app-registration `clientId`/`clientSecret` only gate an unbuilt taxonomy lookup). Apply writes the
@@ -715,7 +722,10 @@ surface: health/auth, classification, PDF comments, both math-audit rounds,
 durable SQLite documents with ACL/TTL and provider embeddings, PDF questions,
 bounded long-document map/reduce, contradiction detection, schema-grounded PDF
 edit planning, PDF review, structured PDF creation, saved-agent draft/revision,
-the current terminal next-action contract, and the NDJSON orchestrator with
+the next-action contract (which, matching the Python oracle, is a live stub:
+`POST /api/v1/agents/next-action` always returns
+`cannot_continue`/"Execution planning is not implemented yet" — see
+`contracts/ai-engine-foundation.md`), and the NDJSON orchestrator with
 math-audit resume. The smart and fast model tiers share the Python-compatible
 process-wide `STIRLING_MODEL_MAX_CONCURRENCY` ceiling, in addition to narrower
 per-agent worker limits. Its MCP manifest publishes all eight completed Python
@@ -828,12 +838,19 @@ legacy oracle.
 
 ### SaaS hosted-cloud layer (`app/saas/`) — PAUSED, unverifiable in this env
 
-With durable storage and collaborative signing ported, the entire OSS +
-proprietary-security + processing backend is ported. The remaining unported Java
-controllers all live in the hosted-SaaS product and depend on an entire un-ported
-external-service domain (Supabase auth, payment gateways, cloud billing/entitlement,
-instance registry) that cannot be exercised or verified in this dev environment — the
-same rationale that PAUSED the external-tool converters. They are deliberately deferred:
+With durable storage and collaborative signing ported, the OSS core, the
+proprietary `controller/api` route surface, and the processing backend are ported.
+The remaining unported Java controllers live in the hosted-SaaS product **plus one
+proprietary-module subsystem**: `stirling.software.proprietary.accountlink` — the
+`@Profile("!saas")` self-hosted combined-billing `AccountLinkController`
+(`/api/v1/account-link`: `link`/`status`/`unlink`/`usage`/`sync-now`, admin-only,
+gated behind `stirling.billing.account-link.enabled`) and its
+`InstanceEntitlementInterceptor`, which `AccountLinkWebMvcConfig` registers over
+`/api/v1/**` as a request-time 402 entitlement gate with per-request metering.
+Both call the same un-ported external cloud-billing domain as the SaaS layer
+(Supabase auth, payment gateways, cloud billing/entitlement, instance registry)
+that cannot be exercised or verified in this dev environment — the same rationale
+that PAUSED the external-tool converters. All are deliberately deferred:
 
 - `AiCreateController` / `AiCreateInternalController` — `ai/create/sessions/*`
   (AI document-creation sessions + `JobChargeService` metering).
@@ -849,6 +866,8 @@ same rationale that PAUSED the external-tool converters. They are deliberately d
 - `DatabaseController`/`DatabaseControllerEnterprise` — H2-only
   (`@Conditional(H2SQLCondition)`) DB backup/restore; N/A for the Rust sqlite store
   (a sqlite-backup equivalent would be net-new, not strict parity).
+- `PaygCucumberThrowController` — a `@Profile("payg-cucumber")` hidden test stub
+  that forces a 500 for cucumber runs; never registered in production, nothing to port.
 
 `CertSignController`'s base `/api/v1/security` and `PrintFileController`'s
 `/api/v1/misc/print-file` show up in naive scans but are false positives — the real
