@@ -28,10 +28,13 @@ use crate::security::{
     AuthContext, SecurityAuditEvent, SecurityAuditFilter, SecurityError, SecurityStore,
 };
 
-/// Portal Documents review queue.
-pub(crate) const DOCUMENTS_PATH: &str = "/api/v1/documents";
-/// Portal Infrastructure -> Audit tab.
-pub(crate) const INFRA_AUDIT_LOG_PATH: &str = "/api/v1/infrastructure/audit-log";
+/// Portal Documents review queue. Java's `PortalDocumentsController` is a
+/// `@ProprietaryUiDataApi`, so the class-level `/api/v1/proprietary/ui-data`
+/// prefix is part of the route.
+pub(crate) const DOCUMENTS_PATH: &str = "/api/v1/proprietary/ui-data/documents";
+/// Portal Infrastructure -> Audit tab (same `@ProprietaryUiDataApi` prefix).
+pub(crate) const INFRA_AUDIT_LOG_PATH: &str =
+    "/api/v1/proprietary/ui-data/infrastructure/audit-log";
 
 /// Rows returned to each surface after filtering (mirrors Java `RETURN_LIMIT`).
 const RETURN_LIMIT: usize = 40;

@@ -32,7 +32,10 @@ const AUDITED_SETTINGS_YAML: &str = "security:\n  initialLogin:\n    username: a
 #[tokio::test]
 async fn unauthenticated_requests_are_rejected() -> Result<(), Box<dyn Error>> {
     let (_directory, _store, app) = secured_app(LicenseTier::Enterprise)?;
-    for path in ["/api/v1/documents", "/api/v1/infrastructure/audit-log"] {
+    for path in [
+        "/api/v1/proprietary/ui-data/documents",
+        "/api/v1/proprietary/ui-data/infrastructure/audit-log",
+    ] {
         let response = app
             .clone()
             .oneshot(Request::get(path).body(Body::empty())?)
@@ -43,10 +46,26 @@ async fn unauthenticated_requests_are_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn the_old_unprefixed_paths_are_not_registered() -> Result<(), Box<dyn Error>> {
+    // The Java controllers are @ProprietaryUiDataApi, so the bare paths never
+    // existed there; serving them here would hide a frontend-visible 404.
+    let (_directory, _store, app) = secured_app(LicenseTier::Enterprise)?;
+    let token = login_token(&app, "admin@example.test", "test-only-password").await?;
+    for path in ["/api/v1/documents", "/api/v1/infrastructure/audit-log"] {
+        let response = authorized_get(&app, path, &token).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path {path}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_enterprise_tier_is_rejected() -> Result<(), Box<dyn Error>> {
     let (_directory, _store, app) = secured_app(LicenseTier::Normal)?;
     let token = login_token(&app, "admin@example.test", "test-only-password").await?;
-    for path in ["/api/v1/documents", "/api/v1/infrastructure/audit-log"] {
+    for path in [
+        "/api/v1/proprietary/ui-data/documents",
+        "/api/v1/proprietary/ui-data/infrastructure/audit-log",
+    ] {
         let response = authorized_get(&app, path, &token).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "path {path}");
         let body = response_json(response).await?;
@@ -70,7 +89,7 @@ async fn admin_sees_shaped_server_views() -> Result<(), Box<dyn Error>> {
     let infra = response_json(
         authorized_get(
             &app,
-            "/api/v1/infrastructure/audit-log?tier=ignored",
+            "/api/v1/proprietary/ui-data/infrastructure/audit-log?tier=ignored",
             &token,
         )
         .await?,
@@ -134,9 +153,15 @@ async fn admin_sees_shaped_server_views() -> Result<(), Box<dyn Error>> {
     assert_eq!(summary["elevation"], 0);
 
     // --- Documents review queue --------------------------------------------
-    let documents_response =
-        response_json(authorized_get(&app, "/api/v1/documents?tier=ignored", &token).await?)
-            .await?;
+    let documents_response = response_json(
+        authorized_get(
+            &app,
+            "/api/v1/proprietary/ui-data/documents?tier=ignored",
+            &token,
+        )
+        .await?,
+    )
+    .await?;
     let documents = documents_response["documents"]
         .as_array()
         .ok_or("missing documents")?;
@@ -201,7 +226,10 @@ async fn non_privileged_caller_is_forbidden() -> Result<(), Box<dyn Error>> {
     create_regular_user(&app, &admin_token, "member@example.test", "member-password").await?;
     let member_token = login_token(&app, "member@example.test", "member-password").await?;
 
-    for path in ["/api/v1/documents", "/api/v1/infrastructure/audit-log"] {
+    for path in [
+        "/api/v1/proprietary/ui-data/documents",
+        "/api/v1/proprietary/ui-data/infrastructure/audit-log",
+    ] {
         let response = authorized_get(&app, path, &member_token).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "path {path}");
     }
@@ -226,14 +254,22 @@ async fn results_are_capped_at_the_return_limit() -> Result<(), Box<dyn Error>> 
     }
     let token = login_token(&app, "admin@example.test", "test-only-password").await?;
 
-    let infra =
-        response_json(authorized_get(&app, "/api/v1/infrastructure/audit-log", &token).await?)
-            .await?;
+    let infra = response_json(
+        authorized_get(
+            &app,
+            "/api/v1/proprietary/ui-data/infrastructure/audit-log",
+            &token,
+        )
+        .await?,
+    )
+    .await?;
     assert_eq!(infra["events"].as_array().map(Vec::len), Some(40));
     assert_eq!(infra["summary"]["totalEvents"], 40);
     assert_eq!(infra["summary"]["processing"], 40);
 
-    let documents = response_json(authorized_get(&app, "/api/v1/documents", &token).await?).await?;
+    let documents =
+        response_json(authorized_get(&app, "/api/v1/proprietary/ui-data/documents", &token).await?)
+            .await?;
     assert_eq!(documents["documents"].as_array().map(Vec::len), Some(40));
     assert_eq!(documents["summary"]["totalInQueue"], 40);
     Ok(())
@@ -269,7 +305,9 @@ async fn authenticated_direct_upload_populates_the_documents_view() -> Result<()
     );
     assert_eq!(repair_data["files"][0]["pdfAuthor"], "Audit Author");
 
-    let view = response_json(authorized_get(&app, "/api/v1/documents", &token).await?).await?;
+    let view =
+        response_json(authorized_get(&app, "/api/v1/proprietary/ui-data/documents", &token).await?)
+            .await?;
     let documents = view["documents"].as_array().ok_or("missing documents")?;
     assert_eq!(documents.len(), 1);
     assert_eq!(documents[0]["name"], "review.pdf");
