@@ -744,35 +744,36 @@ impl RuntimeConfig {
     /// The Rust service currently implements only the Java-compatible open OSS
     /// mode. The binary must reject this request rather than accidentally
     /// serving protected routes without their authentication middleware. A
-    /// non-Unicode value for one of the environment variables is a hard error:
-    /// this guard's only purpose is refusing to start unauthenticated, so an
-    /// unreadable value must never be silently treated the same as "unset".
+    /// value this guard cannot read — non-Unicode, or present-and-non-empty
+    /// but not a boolean Spring accepts — is a hard error: the guard's only
+    /// purpose is refusing to start unauthenticated, so an unreadable value
+    /// must never be silently treated the same as "unset". Java behaves the
+    /// same way (a malformed `security.enableLogin` fails the boot with a
+    /// relaxed-binding `BindException`). An empty/blank value is "not
+    /// configured", the way compose files express an unset variable.
     ///
     /// # Errors
     ///
-    /// Returns an error naming the variable when `DOCKER_ENABLE_SECURITY`,
-    /// `SECURITY_ENABLELOGIN`, or `SECURITY_ENABLE_LOGIN` is set to a
-    /// non-Unicode value.
+    /// Returns an error naming the source when `DOCKER_ENABLE_SECURITY`,
+    /// `SECURITY_ENABLELOGIN`, `SECURITY_ENABLE_LOGIN`, or the YAML
+    /// `security.enableLogin` holds a non-Unicode or non-boolean value.
     pub fn security_mode_is_requested(&self) -> Result<bool, io::Error> {
         let env_values = [
             "DOCKER_ENABLE_SECURITY",
             "SECURITY_ENABLELOGIN",
             "SECURITY_ENABLE_LOGIN",
         ]
-        .map(|variable| match env::var(variable) {
-            Ok(value) => Ok(Some(value)),
-            Err(env::VarError::NotPresent) => Ok(None),
-            Err(env::VarError::NotUnicode(_)) => Err(variable),
+        .map(|variable| {
+            let value = match env::var(variable) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => Err(variable),
+            };
+            (variable, value)
         });
-        let yaml_requested = value_at(&self.settings, &["security", "enableLogin"])
-            .and_then(yaml_bool)
-            .unwrap_or(false);
-        resolve_security_mode_request(&env_values, yaml_requested).map_err(|variable| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{variable} must contain valid Unicode"),
-            )
-        })
+        let yaml_value = value_at(&self.settings, &["security", "enableLogin"]);
+        resolve_security_mode_request(&env_values, yaml_value)
+            .map_err(SecurityModeValueError::into_io_error)
     }
 
     /// Returns whether team classification policies are enabled.
@@ -2520,39 +2521,92 @@ fn parse_boolean(value: &str) -> Option<bool> {
 /// here as *strings*, while `SnakeYAML` (YAML 1.1) hands Java a real `Boolean`.
 /// Falling back to [`parse_boolean`] keeps `enableLogin: yes` and
 /// `enabled: on` meaning the same thing in both runtimes; genuine YAML
-/// booleans still take the direct path.
+/// booleans still take the direct path. An unquoted numeric `1`/`0` reaches
+/// Java as an `Integer` that Spring's binder coerces truthily, so the numeric
+/// arm keeps `enableLogin: 1` requesting secured mode instead of silently
+/// reading as unset (which would fail open in the security guard).
 fn yaml_bool(value: &Value) -> Option<bool> {
     value
         .as_bool()
         .or_else(|| value.as_str().and_then(parse_boolean))
+        .or_else(|| match value.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        })
 }
 
-fn security_mode_requested_from_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| parse_boolean(value) == Some(true))
+/// Why [`RuntimeConfig::security_mode_is_requested`] refused to answer.
+///
+/// Both variants refuse startup: this guard's only purpose is declining to run
+/// unauthenticated, so a value it cannot read must never be treated as "off".
+/// Java behaves the same way — Spring's relaxed binding of a malformed
+/// `security.enableLogin` value fails the boot with a `BindException`.
+#[derive(Debug, PartialEq, Eq)]
+enum SecurityModeValueError {
+    /// The environment variable is set but not valid Unicode.
+    NotUnicode(&'static str),
+    /// The value is present and non-empty but is not a boolean Spring accepts.
+    NotABoolean(&'static str),
+}
+
+impl SecurityModeValueError {
+    fn into_io_error(self) -> io::Error {
+        let message = match self {
+            Self::NotUnicode(source) => {
+                format!("{source} must contain valid Unicode")
+            }
+            Self::NotABoolean(source) => format!(
+                "{source} must be a boolean (true/on/yes/1 or false/off/no/0); \
+                 refusing to guess whether secured login mode was requested"
+            ),
+        };
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
 }
 
 /// Pure decision logic behind [`RuntimeConfig::security_mode_is_requested`],
-/// factored out so the non-Unicode fail-closed path is unit-testable without
-/// touching real process environment variables. `env_values` holds one
-/// already-read result per compatible environment variable name (`Ok(Some(v))`
-/// present, `Ok(None)` unset, `Err(name)` present but not valid Unicode).
-/// Returns the offending variable name on the first unreadable value found;
-/// otherwise `true` if any variable explicitly requested it, else the YAML
-/// fallback.
+/// factored out so the fail-closed paths are unit-testable without touching
+/// real process environment variables. `env_values` holds one already-read
+/// result per compatible environment variable name (`Ok(Some(v))` present,
+/// `Ok(None)` unset, `Err(name)` present but not valid Unicode);
+/// `yaml_value` is the raw `security.enableLogin` node when the key exists.
+///
+/// A present, non-empty value that does not parse as a Spring boolean is an
+/// error, not `false`: Java refuses to boot on the same input (relaxed-binding
+/// `BindException`), and this guard fails open if it guesses. An empty or
+/// blank value is treated as unset — `SECURITY_ENABLELOGIN=` is how compose
+/// files commonly express "not configured".
 fn resolve_security_mode_request(
-    env_values: &[Result<Option<String>, &'static str>],
-    yaml_requested: bool,
-) -> Result<bool, &'static str> {
-    for value in env_values {
+    env_values: &[(&'static str, Result<Option<String>, &'static str>)],
+    yaml_value: Option<&Value>,
+) -> Result<bool, SecurityModeValueError> {
+    for (variable, value) in env_values {
         match value {
-            Err(variable) => return Err(variable),
-            Ok(value) if security_mode_requested_from_value(value.as_deref()) => {
-                return Ok(true);
-            }
+            Err(variable) => return Err(SecurityModeValueError::NotUnicode(variable)),
+            Ok(Some(value)) if !value.trim().is_empty() => match parse_boolean(value) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => return Err(SecurityModeValueError::NotABoolean(variable)),
+            },
             Ok(_) => {}
         }
     }
-    Ok(yaml_requested)
+    match yaml_value {
+        None => Ok(false),
+        Some(value) => match yaml_bool(value) {
+            Some(requested) => Ok(requested),
+            // A null (`enableLogin:`) or empty/blank scalar is "not
+            // configured", the same allowance the env path makes; any other
+            // unreadable value is malformed and refuses startup.
+            None if value.is_null()
+                || value.as_str().is_some_and(|value| value.trim().is_empty()) =>
+            {
+                Ok(false)
+            }
+            None => Err(SecurityModeValueError::NotABoolean("security.enableLogin")),
+        },
+    }
 }
 
 fn split_strings(value: &str) -> Vec<String> {
@@ -2635,9 +2689,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        McpAuthConfig, McpConfig, RuntimeConfig, endpoint_key_for_uri, merge_json, parse_boolean,
-        resolve_security_mode_request, security_mode_requested_from_value, split_strings,
-        yaml_bool,
+        McpAuthConfig, McpConfig, RuntimeConfig, SecurityModeValueError, endpoint_key_for_uri,
+        merge_json, parse_boolean, resolve_security_mode_request, split_strings, yaml_bool,
     };
 
     #[test]
@@ -3140,21 +3193,44 @@ mod tests {
         assert_eq!(split_strings("one, two,,three"), ["one", "two", "three"]);
     }
 
+    fn env_slot(value: &str) -> [(&'static str, Result<Option<String>, &'static str>); 1] {
+        [("SECURITY_ENABLELOGIN", Ok(Some(value.to_owned())))]
+    }
+
     #[test]
     fn security_mode_guard_accepts_every_spring_truthy_spelling() {
         for truthy in ["true", " TRUE ", "1", "on", "oN", "yes", " YES "] {
-            assert!(
-                security_mode_requested_from_value(Some(truthy)),
+            assert_eq!(
+                resolve_security_mode_request(&env_slot(truthy), None),
+                Ok(true),
                 "{truthy:?} must request the secured mode"
             );
         }
-        for not_a_request in ["false", "off", "no", "0", "", "enabled", "2"] {
-            assert!(
-                !security_mode_requested_from_value(Some(not_a_request)),
-                "{not_a_request:?} must not request the secured mode"
+        for falsy in ["false", "off", "no", "0"] {
+            assert_eq!(
+                resolve_security_mode_request(&env_slot(falsy), None),
+                Ok(false),
+                "{falsy:?} must not request the secured mode"
             );
         }
-        assert!(!security_mode_requested_from_value(None));
+        // Empty/blank is how compose files express "unset" — not configured.
+        for blank in ["", "   "] {
+            assert_eq!(
+                resolve_security_mode_request(&env_slot(blank), None),
+                Ok(false),
+                "{blank:?} must be treated as unset"
+            );
+        }
+        // A present, non-empty, non-boolean value refuses startup: Java's
+        // relaxed binding fails the boot on the same input, and guessing
+        // here would fail open.
+        for malformed in ["enabled", "2", "banana", "ture"] {
+            assert_eq!(
+                resolve_security_mode_request(&env_slot(malformed), None),
+                Err(SecurityModeValueError::NotABoolean("SECURITY_ENABLELOGIN")),
+                "{malformed:?} must refuse startup, not fail open"
+            );
+        }
     }
 
     #[test]
@@ -3183,6 +3259,9 @@ mod tests {
             ("value: off", Some(false)),
             ("value: \"1\"", Some(true)),
             ("value: \"0\"", Some(false)),
+            // Unquoted numerics reach Java as Integers that Spring coerces.
+            ("value: 1", Some(true)),
+            ("value: 0", Some(false)),
             ("value: banana", None),
             ("value: 42", None),
         ] {
@@ -3197,7 +3276,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let settings = directory.path().join("settings.yml");
-        for requested in ["true", "yes", "on", "\"1\""] {
+        for requested in ["true", "yes", "on", "\"1\"", "1"] {
             fs::write(
                 &settings,
                 format!("security:\n  enableLogin: {requested}\n"),
@@ -3209,7 +3288,7 @@ mod tests {
                 "enableLogin: {requested} must request the secured mode"
             );
         }
-        for not_requested in ["false", "no", "off", "\"0\"", "banana"] {
+        for not_requested in ["false", "no", "off", "\"0\"", "0", ""] {
             fs::write(
                 &settings,
                 format!("security:\n  enableLogin: {not_requested}\n"),
@@ -3218,8 +3297,26 @@ mod tests {
             assert_eq!(
                 config.security_mode_is_requested().ok(),
                 Some(false),
-                "enableLogin: {not_requested} must not request the secured mode"
+                "enableLogin: {not_requested:?} must not request the secured mode"
             );
+        }
+        // A malformed value refuses startup instead of failing open — Java's
+        // relaxed binding fails the boot on the same input.
+        for malformed in ["banana", "42", "[]"] {
+            fs::write(
+                &settings,
+                format!("security:\n  enableLogin: {malformed}\n"),
+            )?;
+            let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+            match config.security_mode_is_requested() {
+                Err(error) => assert!(
+                    error.to_string().contains("security.enableLogin"),
+                    "error must name the YAML key: {error}"
+                ),
+                Ok(answer) => {
+                    panic!("enableLogin: {malformed} must refuse startup, got Ok({answer})")
+                }
+            }
         }
         Ok(())
     }
@@ -3249,22 +3346,46 @@ mod tests {
 
     #[test]
     fn security_mode_request_falls_back_to_yaml_and_fails_closed_on_non_unicode() {
-        let unset = [Ok(None), Ok(None), Ok(None)];
-        assert_eq!(resolve_security_mode_request(&unset, false), Ok(false));
-        assert_eq!(resolve_security_mode_request(&unset, true), Ok(true));
-
-        let env_true = [Ok(None), Ok(Some("true".to_owned())), Ok(None)];
-        assert_eq!(resolve_security_mode_request(&env_true, false), Ok(true));
-
-        let malformed = [Ok(None), Err("SECURITY_ENABLELOGIN"), Ok(None)];
+        let unset = [
+            ("DOCKER_ENABLE_SECURITY", Ok(None)),
+            ("SECURITY_ENABLELOGIN", Ok(None)),
+            ("SECURITY_ENABLE_LOGIN", Ok(None)),
+        ];
+        assert_eq!(resolve_security_mode_request(&unset, None), Ok(false));
         assert_eq!(
-            resolve_security_mode_request(&malformed, true),
-            Err("SECURITY_ENABLELOGIN")
+            resolve_security_mode_request(&unset, Some(&json!(false))),
+            Ok(false)
         );
         assert_eq!(
-            resolve_security_mode_request(&malformed, false),
-            Err("SECURITY_ENABLELOGIN")
+            resolve_security_mode_request(&unset, Some(&json!(true))),
+            Ok(true)
         );
+        // A null yaml node (`enableLogin:`) is "not configured".
+        assert_eq!(
+            resolve_security_mode_request(&unset, Some(&serde_json::Value::Null)),
+            Ok(false)
+        );
+
+        let env_true = [
+            ("DOCKER_ENABLE_SECURITY", Ok(None)),
+            ("SECURITY_ENABLELOGIN", Ok(Some("true".to_owned()))),
+            ("SECURITY_ENABLE_LOGIN", Ok(None)),
+        ];
+        assert_eq!(resolve_security_mode_request(&env_true, None), Ok(true));
+
+        let non_unicode = [
+            ("DOCKER_ENABLE_SECURITY", Ok(None)),
+            ("SECURITY_ENABLELOGIN", Err("SECURITY_ENABLELOGIN")),
+            ("SECURITY_ENABLE_LOGIN", Ok(None)),
+        ];
+        let yaml_true = json!(true);
+        let yaml_false = json!(false);
+        for yaml in [Some(&yaml_true), Some(&yaml_false), None] {
+            assert_eq!(
+                resolve_security_mode_request(&non_unicode, yaml),
+                Err(SecurityModeValueError::NotUnicode("SECURITY_ENABLELOGIN"))
+            );
+        }
     }
 
     #[test]

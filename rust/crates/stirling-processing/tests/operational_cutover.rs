@@ -121,5 +121,27 @@ fn rust_binary_fails_closed_when_login_mode_is_requested() -> Result<(), Box<dyn
             "unexpected startup failure for SECURITY_ENABLELOGIN={requested}: {stderr}"
         );
     }
+    // A malformed value also refuses startup — Java's relaxed binding fails
+    // the boot on the same input, and guessing "off" here would fail open.
+    for malformed in ["banana", "2"] {
+        let working_directory = tempfile::tempdir()?;
+        let output = Command::new(env!("CARGO_BIN_EXE_stirling-processing"))
+            .current_dir(working_directory.path())
+            .env("STIRLING_PORT", "0")
+            .env("SECURITY_ENABLELOGIN", malformed)
+            .env_remove("SECURITY_ENABLE_LOGIN")
+            .env_remove("DOCKER_ENABLE_SECURITY")
+            .output()?;
+
+        assert!(
+            !output.status.success(),
+            "SECURITY_ENABLELOGIN={malformed} must refuse to start rather than fail open"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("must be a boolean"),
+            "unexpected startup failure for SECURITY_ENABLELOGIN={malformed}: {stderr}"
+        );
+    }
     Ok(())
 }
