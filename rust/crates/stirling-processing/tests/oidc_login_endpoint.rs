@@ -4,9 +4,11 @@
 //! These drive the whole login handshake through the HTTP boundary against a
 //! loopback mock `IdP` (discovery + token + JWKS + a self-signed id token). The
 //! mock mirrors the fixture in `src/oidc_login.rs`, but here every step goes
-//! over the router: `POST /authorize` yields the authorization URL + `state`,
-//! the mock's id token echoes the URL's `nonce`, `GET /callback` completes the
-//! login, and the returned access token is exercised against `GET /auth/me`.
+//! over the router: `POST /authorize` yields the authorization URL + `state`
+//! (and sets the login-CSRF browser-binding cookie), the mock's id token echoes
+//! the URL's `nonce`, `GET /callback` — riding that cookie back, as the
+//! initiating browser would — completes the login, and the returned access
+//! token is exercised against `GET /auth/me`.
 
 use std::{
     fs,
@@ -248,6 +250,30 @@ async fn oidc_callback(
         .await?)
 }
 
+/// Like [`oidc_callback`], but rides the browser-binding cookie the authorize
+/// response set — the genuine same-browser callback of the login-CSRF defense.
+async fn oidc_callback_with_cookie(
+    app: &Router,
+    query: &str,
+    cookie: &str,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/auth/oidc/callback?{query}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())?,
+        )
+        .await?)
+}
+
+/// Extracts the `name=value` pair of the browser-binding cookie set by the
+/// authorize response, ready to be sent back verbatim as a `Cookie` header.
+fn binding_cookie_pair(response: &axum::response::Response) -> Option<String> {
+    let set_cookie = response.headers().get(header::SET_COOKIE)?.to_str().ok()?;
+    Some(set_cookie.split(';').next()?.trim().to_owned())
+}
+
 async fn response_json(
     response: axum::response::Response,
 ) -> Result<Value, Box<dyn std::error::Error>> {
@@ -265,16 +291,20 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Runs `POST /authorize`, then mints an id token for the returned `nonce`
-/// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`.
-/// Returns the raw callback response so callers assert status/body themselves.
+/// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`,
+/// forwarding the browser-binding cookie the authorize response set (as the
+/// initiating browser would). Returns the issued `state`, that cookie pair,
+/// and the raw callback response so callers assert status/body themselves.
 async fn drive_login(
     app: &Router,
     idp: &MockIdp,
     fixture: &SigningFixture,
     nonce_for_token: impl Fn(&str) -> String,
-) -> Result<(String, axum::response::Response), Box<dyn std::error::Error>> {
+) -> Result<(String, String, axum::response::Response), Box<dyn std::error::Error>> {
     let authorize = oidc_authorize(app).await?;
     assert_eq!(authorize.status(), StatusCode::OK);
+    let binding_cookie = binding_cookie_pair(&authorize)
+        .ok_or("authorize response set no browser-binding cookie")?;
     let authorize = response_json(authorize).await?;
     let authorization_url = authorize["authorizationUrl"]
         .as_str()
@@ -291,8 +321,13 @@ async fn drive_login(
     );
     let nonce = query_param(&authorization_url, "nonce").ok_or("missing nonce in url")?;
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce_for_token(&nonce)))?);
-    let callback = oidc_callback(app, &format!("code=auth-code-endpoint&state={state}")).await?;
-    Ok((state, callback))
+    let callback = oidc_callback_with_cookie(
+        app,
+        &format!("code=auth-code-endpoint&state={state}"),
+        &binding_cookie,
+    )
+    .await?;
+    Ok((state, binding_cookie, callback))
 }
 
 // ---- happy path end-to-end --------------------------------------------------
@@ -304,7 +339,7 @@ async fn oidc_login_issues_a_working_session_end_to_end() -> Result<(), Box<dyn 
     let idp = start_mock_idp(fixture.jwks_json.clone())?;
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
-    let (_state, callback) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
+    let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
     assert_eq!(callback.status(), StatusCode::OK);
     let session = response_json(callback).await?;
 
@@ -382,13 +417,19 @@ async fn oidc_callback_state_is_single_use_a_replay_is_rejected()
     let idp = start_mock_idp(fixture.jwks_json.clone())?;
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
-    let (state, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
+    let (state, cookie, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
     assert_eq!(first.status(), StatusCode::OK);
 
-    // Replay the exact same state+code. The id token is still available, so if
-    // the store used get-not-remove this would succeed — the single-use guard
-    // is the only thing rejecting it, proven here at the route level.
-    let replay = oidc_callback(&app, &format!("code=auth-code-endpoint&state={state}")).await?;
+    // Replay the exact same state+code WITH the same browser-binding cookie.
+    // The id token is still available and the binding matches, so if the store
+    // used get-not-remove this would succeed — the single-use guard is the
+    // only thing rejecting it, proven here at the route level.
+    let replay = oidc_callback_with_cookie(
+        &app,
+        &format!("code=auth-code-endpoint&state={state}"),
+        &cookie,
+    )
+    .await?;
     assert_eq!(
         replay.status(),
         StatusCode::UNAUTHORIZED,
@@ -410,7 +451,7 @@ async fn oidc_callback_rejects_a_mismatched_nonce_as_generic_auth_failure()
     // The id token is otherwise valid but carries the wrong nonce; the callback
     // must reject it, and with the SAME 401 a bad state produces (no leak of
     // whether it was a CSRF-state miss or a verification failure).
-    let (_state, callback) = drive_login(&app, &idp, &fixture, |_nonce| {
+    let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, |_nonce| {
         "a-different-nonce-not-the-login-one".to_owned()
     })
     .await?;
