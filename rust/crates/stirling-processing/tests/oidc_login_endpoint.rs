@@ -238,14 +238,37 @@ async fn oidc_authorize(
         .await?)
 }
 
+/// `browser_cookie` is the `name=value` pair the `/authorize` response set as
+/// the browser-binding cookie; `None` models a caller that never initiated the
+/// login in this browser (e.g. a cross-site forged callback).
 async fn oidc_callback(
     app: &Router,
     query: &str,
+    browser_cookie: Option<&str>,
 ) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
-    Ok(app
-        .clone()
-        .oneshot(Request::get(format!("/api/v1/auth/oidc/callback?{query}")).body(Body::empty())?)
-        .await?)
+    let mut request = Request::get(format!("/api/v1/auth/oidc/callback?{query}"));
+    if let Some(cookie) = browser_cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    Ok(app.clone().oneshot(request.body(Body::empty())?).await?)
+}
+
+/// Extracts the `name=value` pair of the browser-binding cookie the
+/// `/authorize` response sets (the callback requires it back — login-CSRF).
+fn browser_binding_cookie(
+    response: &axum::response::Response,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .ok_or("authorize response set no browser-binding cookie")?
+        .to_str()?;
+    Ok(set_cookie
+        .split(';')
+        .next()
+        .ok_or("empty Set-Cookie header")?
+        .trim()
+        .to_owned())
 }
 
 async fn response_json(
@@ -265,16 +288,19 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Runs `POST /authorize`, then mints an id token for the returned `nonce`
-/// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`.
-/// Returns the raw callback response so callers assert status/body themselves.
+/// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`,
+/// riding the browser-binding cookie the authorize response set. Returns the
+/// state, that cookie, and the raw callback response so callers assert
+/// status/body (and can replay with the same cookie) themselves.
 async fn drive_login(
     app: &Router,
     idp: &MockIdp,
     fixture: &SigningFixture,
     nonce_for_token: impl Fn(&str) -> String,
-) -> Result<(String, axum::response::Response), Box<dyn std::error::Error>> {
+) -> Result<(String, String, axum::response::Response), Box<dyn std::error::Error>> {
     let authorize = oidc_authorize(app).await?;
     assert_eq!(authorize.status(), StatusCode::OK);
+    let cookie = browser_binding_cookie(&authorize)?;
     let authorize = response_json(authorize).await?;
     let authorization_url = authorize["authorizationUrl"]
         .as_str()
@@ -291,8 +317,13 @@ async fn drive_login(
     );
     let nonce = query_param(&authorization_url, "nonce").ok_or("missing nonce in url")?;
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce_for_token(&nonce)))?);
-    let callback = oidc_callback(app, &format!("code=auth-code-endpoint&state={state}")).await?;
-    Ok((state, callback))
+    let callback = oidc_callback(
+        app,
+        &format!("code=auth-code-endpoint&state={state}"),
+        Some(&cookie),
+    )
+    .await?;
+    Ok((state, cookie, callback))
 }
 
 // ---- happy path end-to-end --------------------------------------------------
@@ -304,7 +335,7 @@ async fn oidc_login_issues_a_working_session_end_to_end() -> Result<(), Box<dyn 
     let idp = start_mock_idp(fixture.jwks_json.clone())?;
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
-    let (_state, callback) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
+    let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
     assert_eq!(callback.status(), StatusCode::OK);
     let session = response_json(callback).await?;
 
@@ -361,7 +392,13 @@ async fn oidc_callback_rejects_a_state_that_was_never_issued()
     // ...but the id token is ready, so only the state gates the forged callback.
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce))?);
 
-    let forged = oidc_callback(&app, "code=auth-code-endpoint&state=attacker-forged-state").await?;
+    // A cross-site forged callback rides no browser-binding cookie either.
+    let forged = oidc_callback(
+        &app,
+        "code=auth-code-endpoint&state=attacker-forged-state",
+        None,
+    )
+    .await?;
     assert_eq!(
         forged.status(),
         StatusCode::UNAUTHORIZED,
@@ -382,13 +419,21 @@ async fn oidc_callback_state_is_single_use_a_replay_is_rejected()
     let idp = start_mock_idp(fixture.jwks_json.clone())?;
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
-    let (state, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
+    let (state, cookie, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
     assert_eq!(first.status(), StatusCode::OK);
 
-    // Replay the exact same state+code. The id token is still available, so if
-    // the store used get-not-remove this would succeed — the single-use guard
-    // is the only thing rejecting it, proven here at the route level.
-    let replay = oidc_callback(&app, &format!("code=auth-code-endpoint&state={state}")).await?;
+    // Replay the exact same state+code FROM THE SAME BROWSER (same binding
+    // cookie). The id token is still available, so if the store used
+    // get-not-remove this would succeed — the single-use guard is the only
+    // thing rejecting it, proven here at the route level. (Without the cookie
+    // the 401 could come from the browser-binding check instead, which would
+    // pass this test for the wrong reason.)
+    let replay = oidc_callback(
+        &app,
+        &format!("code=auth-code-endpoint&state={state}"),
+        Some(&cookie),
+    )
+    .await?;
     assert_eq!(
         replay.status(),
         StatusCode::UNAUTHORIZED,
@@ -410,7 +455,7 @@ async fn oidc_callback_rejects_a_mismatched_nonce_as_generic_auth_failure()
     // The id token is otherwise valid but carries the wrong nonce; the callback
     // must reject it, and with the SAME 401 a bad state produces (no leak of
     // whether it was a CSRF-state miss or a verification failure).
-    let (_state, callback) = drive_login(&app, &idp, &fixture, |_nonce| {
+    let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, |_nonce| {
         "a-different-nonce-not-the-login-one".to_owned()
     })
     .await?;
@@ -434,7 +479,7 @@ async fn oidc_callback_missing_code_or_state_is_a_bad_request()
         "state=only-a-state",
         "code=&state=abc",
     ] {
-        let response = oidc_callback(&app, query).await?;
+        let response = oidc_callback(&app, query, None).await?;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -457,7 +502,7 @@ async fn oidc_routes_are_absent_when_no_provider_is_configured()
         StatusCode::NOT_FOUND,
         "authorize must not exist when OIDC login is unconfigured"
     );
-    let callback = oidc_callback(&app, "code=abc&state=def").await?;
+    let callback = oidc_callback(&app, "code=abc&state=def", None).await?;
     assert_eq!(
         callback.status(),
         StatusCode::NOT_FOUND,
