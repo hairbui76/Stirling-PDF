@@ -149,8 +149,8 @@ async fn integrations_enforce_portal_ownership_and_preserve_masked_secrets()
         "/api/v1/integrations",
         &user_token,
         json!({
-            "integrationType":"API",
-            "name":"Personal API",
+            "integrationType":"MCP",
+            "name":"Personal MCP",
             "config":{
                 "apiToken":"top-secret",
                 "endpoint":"https://api.example.test",
@@ -186,7 +186,7 @@ async fn integrations_enforce_portal_ownership_and_preserve_masked_secrets()
     .await?;
     assert_eq!(updated.status(), StatusCode::OK);
     let updated = response_json(updated).await?;
-    assert_eq!(updated["integrationType"], "API");
+    assert_eq!(updated["integrationType"], "MCP");
     assert_eq!(updated["scope"], "USER");
     assert_eq!(updated["config"]["apiToken"], "********");
     assert_eq!(updated["config"]["nested"]["password"], "********");
@@ -298,8 +298,8 @@ async fn server_lock_blocks_personal_override_and_disabled_config_ignores_grants
         "/api/v1/integrations",
         &admin_token,
         json!({
-            "integrationType":"API",
-            "name":"Locked server API",
+            "integrationType":"MCP",
+            "name":"Locked server MCP",
             "scope":"SERVER",
             "locked":true,
             "config":{}
@@ -329,7 +329,7 @@ async fn server_lock_blocks_personal_override_and_disabled_config_ignores_grants
         Method::POST,
         "/api/v1/integrations",
         &user_token,
-        json!({"integrationType":"API","name":"Personal override","config":{}}),
+        json!({"integrationType":"MCP","name":"Personal override","config":{}}),
     )
     .await?;
     assert_eq!(personal_override.status(), StatusCode::FORBIDDEN);

@@ -771,6 +771,11 @@ async fn verify_trigger_metadata(
                 "type":"schedule",
                 "requiresSource":false,
                 "supportedSourceTypes":[]
+            },
+            {
+                "type":"webhook",
+                "requiresSource":true,
+                "supportedSourceTypes":["webhook"]
             }
         ])
     );

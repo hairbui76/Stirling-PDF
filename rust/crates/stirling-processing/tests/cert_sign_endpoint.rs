@@ -83,34 +83,85 @@ async fn signs_a_pdf_with_an_uploaded_pem_key_and_der_certificate() -> TestResul
     Ok(())
 }
 
-/// A P-521 key parses but cannot sign (the `x509-certificate` backend
-/// implements only secp256r1/secp384r1). The endpoint must return 400 with the
-/// specific "P-521 not supported" message, not a vague failure or a 500.
-#[tokio::test]
-#[allow(deprecated)]
-async fn rejects_a_p521_signing_key_with_a_specific_message() -> TestResult {
-    use p521::elliptic_curve::Generate;
-    use pkcs8::EncodePrivateKey;
+/// A P-521 (secp521r1) private key and its self-signed certificate.
+/// Generated with OpenSSL (`ecparam secp521r1` + `req -x509 -sha512`); the
+/// same fixture the `signing_key` unit tests verify against OpenSSL semantics.
+const P521_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBwjfNy3ndVkidl8/i\n\
+V2pPvah68CP9+MDrdk223SvIQTigHgAidxkIXw3spX3uSIZLNIXagXxxEEvkpBiv\n\
+3Z6UNhOhgYkDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC+kFwgDDunFexpDJf\n\
+fUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFAiqfJndYEYQ2utLGA\n\
+UWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCLrPLRA6DuJEpamSp0\n\
+sA==\n\
+-----END PRIVATE KEY-----\n";
 
-    // The certificate need not match the P-521 key: the curve rejection
-    // happens before the key/certificate match check.
-    let (certificate, _) = self_signed_ecdsa_key_pair(None);
-    let p521_key = p521::SecretKey::generate_from_rng(&mut rand::rng());
-    let private_key = pem_document("PRIVATE KEY", p521_key.to_pkcs8_der()?.as_bytes());
+const P521_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIICGTCCAXqgAwIBAgIURyuRCEttmk0wOq2ytxrpIgOZlJcwCgYIKoZIzj0EAwQw\n\
+HjEcMBoGA1UEAwwTU3RpcmxpbmcgUC01MjEgVGVzdDAeFw0yNjA3MjUxNDUxMDVa\n\
+Fw0zNjA3MjIxNDUxMDVaMB4xHDAaBgNVBAMME1N0aXJsaW5nIFAtNTIxIFRlc3Qw\n\
+gZswEAYHKoZIzj0CAQYFK4EEACMDgYYABAGdFIoAYJTKMikaLqe+tTxctMDRnBVC\n\
++kFwgDDunFexpDJffUwlVIqHAJQ0aVoHnQncLFKYb6FX12BVmLjb+syY2AALBAFA\n\
+iqfJndYEYQ2utLGAUWoqkItFKVQRtwpTqHDB72WHcSe41pZJt/XujLiZSTKsFYCL\n\
+rPLRA6DuJEpamSp0sKNTMFEwHQYDVR0OBBYEFAg5plmhxEqSaLrJqbFy8hQkL6hA\n\
+MB8GA1UdIwQYMBaAFAg5plmhxEqSaLrJqbFy8hQkL6hAMA8GA1UdEwEB/wQFMAMB\n\
+Af8wCgYIKoZIzj0EAwQDgYwAMIGIAkIBTCtwawyMW65d7KK1C6rYZcm61/S1uUMC\n\
+4MiORYKcKBlAe/dFgs3gZ6dvLU/rswaau+6NECe0RYvjhTYkBh/aQNYCQgEdm5gs\n\
+0OhBQ0hHKV6fln9/bStY/qH3kOBG1jD60nj8AKV61+EWtRuBX4gmlYMY4CWhTE1U\n\
+amwXixTh3YlrdOneww==\n\
+-----END CERTIFICATE-----\n";
+
+/// P-521 keys sign through the dedicated pure-Rust path (`ecdsa-with-SHA512`),
+/// so the endpoint accepts them end-to-end. The high-level
+/// `cryptographic-message-syntax` verifier cannot parse an `ecdsa-with-SHA512`
+/// `SignerInfo`, so this asserts the digest binding directly: the CMS must
+/// embed SHA-512 of the `ByteRange` content as its `messageDigest` OCTET STRING.
+/// Deep, OpenSSL-equivalent CMS verification lives in the `signing_key` and
+/// `pdf_incremental_signature` unit tests.
+#[tokio::test]
+async fn signs_a_pdf_with_a_p521_key_and_its_certificate() -> TestResult {
+    use sha2::{Digest, Sha512};
+
     let response = post_cert_sign(
         &single_page_pdf()?,
-        &private_key,
-        certificate.constructed_data(),
+        P521_PKCS8_PEM,
+        P521_CERTIFICATE_PEM.as_bytes(),
         &[("name", "Stirling Test")],
     )
     .await?;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), usize::MAX).await?;
-    let body = String::from_utf8_lossy(&body);
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        return Err(format!(
+            "P-521 certificate signing returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        )
+        .into());
+    }
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+    let signed_pdf = to_bytes(response.into_body(), usize::MAX).await?.to_vec();
+    let document = Document::load_mem(&signed_pdf)?;
+    let signature = signature_dictionary(&document)?;
+    assert_eq!(signature.get(b"Name")?.as_str()?, b"Stirling P-521 Test");
+    let byte_range = signature
+        .get(b"ByteRange")?
+        .as_array()?
+        .iter()
+        .map(Object::as_i64)
+        .collect::<Result<Vec<_>, _>>()?;
+    let excluded_start = usize::try_from(byte_range[1])?;
+    let second_start = usize::try_from(byte_range[2])?;
+    let second_length = usize::try_from(byte_range[3])?;
+    let mut signed_content = signed_pdf[..excluded_start].to_vec();
+    signed_content.extend_from_slice(&signed_pdf[second_start..second_start + second_length]);
+    // messageDigest = SHA-512(content) as an OCTET STRING (tag 0x04, len 0x40).
+    let mut expected_message_digest = vec![0x04u8, 0x40u8];
+    expected_message_digest.extend_from_slice(Sha512::digest(&signed_content).as_slice());
+    let cms = signature.get(b"Contents")?.as_str()?;
     assert!(
-        body.contains("P-521"),
-        "expected a P-521-specific rejection message, got: {body}"
+        cms.windows(expected_message_digest.len())
+            .any(|window| window == expected_message_digest),
+        "CMS must bind SHA-512 of the signed content via the messageDigest attribute"
     );
     Ok(())
 }

@@ -16,8 +16,7 @@ use axum::http::{HeaderMap, header};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 
-const VERSION_PROPERTIES: &str =
-    include_str!("../../../../app/common/src/main/resources/version.properties");
+const VERSION_PROPERTIES: &str = include_str!(concat!(env!("OUT_DIR"), "/version.properties"));
 const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug)]

@@ -4,9 +4,11 @@
 //! These drive the whole login handshake through the HTTP boundary against a
 //! loopback mock `IdP` (discovery + token + JWKS + a self-signed id token). The
 //! mock mirrors the fixture in `src/oidc_login.rs`, but here every step goes
-//! over the router: `POST /authorize` yields the authorization URL + `state`,
-//! the mock's id token echoes the URL's `nonce`, `GET /callback` completes the
-//! login, and the returned access token is exercised against `GET /auth/me`.
+//! over the router: `POST /authorize` yields the authorization URL + `state`
+//! (and sets the login-CSRF browser-binding cookie), the mock's id token echoes
+//! the URL's `nonce`, `GET /callback` — riding that cookie back, as the
+//! initiating browser would — completes the login, and the returned access
+//! token is exercised against `GET /auth/me`.
 
 use std::{
     fs,
@@ -238,37 +240,38 @@ async fn oidc_authorize(
         .await?)
 }
 
-/// `browser_cookie` is the `name=value` pair the `/authorize` response set as
-/// the browser-binding cookie; `None` models a caller that never initiated the
-/// login in this browser (e.g. a cross-site forged callback).
 async fn oidc_callback(
     app: &Router,
     query: &str,
-    browser_cookie: Option<&str>,
 ) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
-    let mut request = Request::get(format!("/api/v1/auth/oidc/callback?{query}"));
-    if let Some(cookie) = browser_cookie {
-        request = request.header(header::COOKIE, cookie);
-    }
-    Ok(app.clone().oneshot(request.body(Body::empty())?).await?)
+    Ok(app
+        .clone()
+        .oneshot(Request::get(format!("/api/v1/auth/oidc/callback?{query}")).body(Body::empty())?)
+        .await?)
 }
 
-/// Extracts the `name=value` pair of the browser-binding cookie the
-/// `/authorize` response sets (the callback requires it back — login-CSRF).
-fn browser_binding_cookie(
-    response: &axum::response::Response,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .ok_or("authorize response set no browser-binding cookie")?
-        .to_str()?;
-    Ok(set_cookie
-        .split(';')
-        .next()
-        .ok_or("empty Set-Cookie header")?
-        .trim()
-        .to_owned())
+/// Like [`oidc_callback`], but rides the browser-binding cookie the authorize
+/// response set — the genuine same-browser callback of the login-CSRF defense.
+async fn oidc_callback_with_cookie(
+    app: &Router,
+    query: &str,
+    cookie: &str,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/auth/oidc/callback?{query}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())?,
+        )
+        .await?)
+}
+
+/// Extracts the `name=value` pair of the browser-binding cookie set by the
+/// authorize response, ready to be sent back verbatim as a `Cookie` header.
+fn binding_cookie_pair(response: &axum::response::Response) -> Option<String> {
+    let set_cookie = response.headers().get(header::SET_COOKIE)?.to_str().ok()?;
+    Some(set_cookie.split(';').next()?.trim().to_owned())
 }
 
 async fn response_json(
@@ -289,9 +292,9 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 
 /// Runs `POST /authorize`, then mints an id token for the returned `nonce`
 /// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`,
-/// riding the browser-binding cookie the authorize response set. Returns the
-/// state, that cookie, and the raw callback response so callers assert
-/// status/body (and can replay with the same cookie) themselves.
+/// forwarding the browser-binding cookie the authorize response set (as the
+/// initiating browser would). Returns the issued `state`, that cookie pair,
+/// and the raw callback response so callers assert status/body themselves.
 async fn drive_login(
     app: &Router,
     idp: &MockIdp,
@@ -300,7 +303,8 @@ async fn drive_login(
 ) -> Result<(String, String, axum::response::Response), Box<dyn std::error::Error>> {
     let authorize = oidc_authorize(app).await?;
     assert_eq!(authorize.status(), StatusCode::OK);
-    let cookie = browser_binding_cookie(&authorize)?;
+    let binding_cookie = binding_cookie_pair(&authorize)
+        .ok_or("authorize response set no browser-binding cookie")?;
     let authorize = response_json(authorize).await?;
     let authorization_url = authorize["authorizationUrl"]
         .as_str()
@@ -317,13 +321,13 @@ async fn drive_login(
     );
     let nonce = query_param(&authorization_url, "nonce").ok_or("missing nonce in url")?;
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce_for_token(&nonce)))?);
-    let callback = oidc_callback(
+    let callback = oidc_callback_with_cookie(
         app,
         &format!("code=auth-code-endpoint&state={state}"),
-        Some(&cookie),
+        &binding_cookie,
     )
     .await?;
-    Ok((state, cookie, callback))
+    Ok((state, binding_cookie, callback))
 }
 
 // ---- happy path end-to-end --------------------------------------------------
@@ -392,13 +396,7 @@ async fn oidc_callback_rejects_a_state_that_was_never_issued()
     // ...but the id token is ready, so only the state gates the forged callback.
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce))?);
 
-    // A cross-site forged callback rides no browser-binding cookie either.
-    let forged = oidc_callback(
-        &app,
-        "code=auth-code-endpoint&state=attacker-forged-state",
-        None,
-    )
-    .await?;
+    let forged = oidc_callback(&app, "code=auth-code-endpoint&state=attacker-forged-state").await?;
     assert_eq!(
         forged.status(),
         StatusCode::UNAUTHORIZED,
@@ -422,16 +420,14 @@ async fn oidc_callback_state_is_single_use_a_replay_is_rejected()
     let (state, cookie, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
     assert_eq!(first.status(), StatusCode::OK);
 
-    // Replay the exact same state+code FROM THE SAME BROWSER (same binding
-    // cookie). The id token is still available, so if the store used
-    // get-not-remove this would succeed — the single-use guard is the only
-    // thing rejecting it, proven here at the route level. (Without the cookie
-    // the 401 could come from the browser-binding check instead, which would
-    // pass this test for the wrong reason.)
-    let replay = oidc_callback(
+    // Replay the exact same state+code WITH the same browser-binding cookie.
+    // The id token is still available and the binding matches, so if the store
+    // used get-not-remove this would succeed — the single-use guard is the
+    // only thing rejecting it, proven here at the route level.
+    let replay = oidc_callback_with_cookie(
         &app,
         &format!("code=auth-code-endpoint&state={state}"),
-        Some(&cookie),
+        &cookie,
     )
     .await?;
     assert_eq!(
@@ -479,7 +475,7 @@ async fn oidc_callback_missing_code_or_state_is_a_bad_request()
         "state=only-a-state",
         "code=&state=abc",
     ] {
-        let response = oidc_callback(&app, query, None).await?;
+        let response = oidc_callback(&app, query).await?;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -502,7 +498,7 @@ async fn oidc_routes_are_absent_when_no_provider_is_configured()
         StatusCode::NOT_FOUND,
         "authorize must not exist when OIDC login is unconfigured"
     );
-    let callback = oidc_callback(&app, "code=abc&state=def", None).await?;
+    let callback = oidc_callback(&app, "code=abc&state=def").await?;
     assert_eq!(
         callback.status(),
         StatusCode::NOT_FOUND,
