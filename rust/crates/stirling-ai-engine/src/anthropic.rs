@@ -39,6 +39,28 @@ impl AnthropicClassifierModel {
         Self::new(model_name, api_key, base_url)
     }
 
+    /// Builds the adapter for an admin-pushed config: the model name is bare
+    /// (no `anthropic:` prefix) and the pushed key wins over the environment.
+    ///
+    /// The push path deliberately fails closed when no key is available at
+    /// all — the Python oracle would accept the push with an "unconfigured"
+    /// placeholder key and fail on the first model call instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty model name or when neither the push nor
+    /// `ANTHROPIC_API_KEY` provides a key.
+    pub fn from_pushed_config(bare_model: &str, api_key: Option<&str>) -> Result<Self, ModelError> {
+        let api_key = match api_key {
+            Some(api_key) if !api_key.is_empty() => api_key.to_owned(),
+            _ => env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| ModelError::new("ANTHROPIC_API_KEY is not configured"))?,
+        };
+        let base_url =
+            env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        Self::new(&format!("anthropic:{bare_model}"), api_key, base_url)
+    }
+
     /// Builds the adapter with an explicit key and base URL, primarily for
     /// deployment wiring and contract tests.
     ///

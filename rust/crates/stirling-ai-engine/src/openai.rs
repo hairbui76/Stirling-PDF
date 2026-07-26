@@ -64,6 +64,63 @@ impl OpenAiClassifierModel {
         )
     }
 
+    /// Builds the adapter for an admin-pushed `openai` provider: the model
+    /// name is bare and the pushed key wins over `OPENAI_API_KEY`.
+    ///
+    /// Mirroring the oracle's push path, a pushed base URL is ignored for the
+    /// hosted `openai` provider; `OPENAI_BASE_URL` still applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty model name or when neither the push nor
+    /// the environment provides a key.
+    pub fn from_pushed_config(bare_model: &str, api_key: Option<&str>) -> Result<Self, ModelError> {
+        let api_key = match api_key {
+            Some(api_key) if !api_key.is_empty() => api_key.to_owned(),
+            _ => env::var("OPENAI_API_KEY")
+                .map_err(|_| ModelError::new("OPENAI_API_KEY is not configured"))?,
+        };
+        let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        Self::new(&format!("openai:{bare_model}"), api_key, base_url)
+    }
+
+    /// Builds the adapter for an admin-pushed `ollama` or `custom` provider:
+    /// an OpenAI-compatible endpoint that needs the native json-schema output
+    /// protocol (the Rust analogue of the oracle's `ToolOutput` switch for
+    /// local providers) and works keyless.
+    ///
+    /// An empty pushed base URL falls back to `OLLAMA_BASE_URL` for `ollama`
+    /// and to `OPENAI_BASE_URL` (then the hosted default) for `custom`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty model name or a base URL that is not
+    /// absolute HTTP(S).
+    pub fn from_pushed_compatible(
+        provider: &str,
+        bare_model: &str,
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<Self, ModelError> {
+        let base_url = match base_url {
+            Some(base_url) if !base_url.is_empty() => base_url.to_owned(),
+            _ if provider == "ollama" => optional_environment_value("OLLAMA_BASE_URL")?
+                .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_owned()),
+            _ => optional_environment_value("OPENAI_BASE_URL")?
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+        };
+        let api_key = api_key
+            .filter(|api_key| !api_key.trim().is_empty())
+            .map(str::to_owned);
+        Self::new_compatible(
+            &format!("{provider}:{bare_model}"),
+            &format!("{provider}:"),
+            api_key,
+            base_url,
+            StructuredOutputProtocol::NativeJsonSchema,
+        )
+    }
+
     /// Builds with explicit credentials and a compatible API origin.
     ///
     /// # Errors

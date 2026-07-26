@@ -8,6 +8,8 @@
 
 pub mod anthropic;
 pub mod chunked_reasoner;
+pub mod config_cache;
+pub mod config_push;
 pub mod contradiction;
 pub mod document_classifier;
 pub mod document_migration;
@@ -28,12 +30,19 @@ mod progress;
 pub mod structured_output;
 pub mod user_spec;
 
-use std::{convert::Infallible, env, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, PoisonError, RwLock},
+    time::Duration,
+};
 
 use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
-    extract::{Path as AxumPath, Query, Request},
+    extract::{ConnectInfo, Path as AxumPath, Query, Request},
     http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -47,6 +56,7 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::{
     anthropic::AnthropicClassifierModel,
+    config_push::{ConfigApplyResponse, ConfigPushRequest},
     document_classifier::{ClassifierError, DocumentClassifier},
     documents::{
         DeleteDocumentResponse, DocumentError, DocumentRepository, IngestDocumentRequest,
@@ -93,15 +103,33 @@ const AGENT_REVISE_PATH: &str = "/api/v1/agents/revise";
 const AI_AGENT_REVISE_PATH: &str = "/api/v1/ai/agents/revise";
 const AGENT_NEXT_ACTION_PATH: &str = "/api/v1/agents/next-action";
 const ORCHESTRATOR_PATH: &str = "/api/v1/orchestrator";
+const CONFIG_PATH: &str = "/api/v1/config";
 const ORCHESTRATOR_HEARTBEAT_SECONDS: u64 = 10;
+
+// Copied verbatim from the Python oracle so processors see identical guidance.
+const REINDEX_NOTE: &str = "Embedding model changed; existing indexed documents were embedded \
+     with the previous model and must be re-indexed. If the embedding dimensionality changed, \
+     re-ingest before searching.";
+const PERSIST_FAILURE_NOTE: &str = "Config applied on this worker but could not be persisted; it \
+     will not survive an engine restart and other workers will not pick it up.";
 
 #[derive(Clone)]
 pub struct EngineSettings {
     smart_model_name: String,
     fast_model_name: String,
+    // Provider backing the active chat models; empty for env/native, set by a
+    // config push ("anthropic"/"openai"/"ollama"/"custom") so a second push
+    // knows the running model names are already bare.
+    chat_provider: String,
     shared_secret: String,
     require_auth: bool,
     require_user_id: bool,
+    // When true, the Java processor may push admin AI settings to
+    // POST /api/v1/config. Off means env is the single source of truth.
+    allow_config_push: bool,
+    // Directory holding the encrypted config-push cache; empty disables
+    // persistence (the in-memory test default, like the :memory: sqlite path).
+    config_cache_dir: PathBuf,
     smart_model_max_tokens: u32,
     fast_model_max_tokens: u32,
     model_max_concurrency: usize,
@@ -114,6 +142,7 @@ pub struct EngineSettings {
     rag_chunk_size: usize,
     rag_chunk_overlap: usize,
     rag_default_top_k: usize,
+    rag_max_searches: usize,
     max_pages: usize,
     max_characters: usize,
     chunked_reasoner_chars_per_slice: usize,
@@ -165,9 +194,13 @@ impl EngineSettings {
                 "STIRLING_FAST_MODEL",
                 "anthropic:claude-haiku-4-5",
             )?,
+            chat_provider: String::new(),
             shared_secret: environment_value("STIRLING_ENGINE_SHARED_SECRET", "")?,
             require_auth: environment_bool("STIRLING_ENGINE_REQUIRE_AUTH", false)?,
             require_user_id: environment_bool("STIRLING_REQUIRE_USER_ID", false)?,
+            // Python default: config push is allowed unless explicitly disabled.
+            allow_config_push: environment_bool("STIRLING_ALLOW_CONFIG_PUSH", true)?,
+            config_cache_dir: PathBuf::from("data"),
             smart_model_max_tokens: environment_u32("STIRLING_SMART_MODEL_MAX_TOKENS", 8_192)?,
             fast_model_max_tokens: environment_u32("STIRLING_FAST_MODEL_MAX_TOKENS", 2_048)?,
             model_max_concurrency: environment_usize("STIRLING_MODEL_MAX_CONCURRENCY", 32)?,
@@ -192,6 +225,7 @@ impl EngineSettings {
             rag_chunk_size: environment_usize("STIRLING_RAG_CHUNK_SIZE", 512)?,
             rag_chunk_overlap: environment_usize("STIRLING_RAG_CHUNK_OVERLAP", 64)?,
             rag_default_top_k: environment_usize("STIRLING_RAG_TOP_K", 20)?,
+            rag_max_searches: environment_usize("STIRLING_RAG_MAX_SEARCHES", 5)?,
             max_pages: environment_usize("STIRLING_MAX_PAGES", 200)?,
             max_characters: environment_usize("STIRLING_MAX_CHARACTERS", 200_000)?,
             chunked_reasoner_chars_per_slice: environment_usize(
@@ -318,9 +352,12 @@ impl EngineSettings {
         Self {
             smart_model_name: smart_model_name.into(),
             fast_model_name: fast_model_name.into(),
+            chat_provider: String::new(),
             shared_secret: shared_secret.into(),
             require_auth,
             require_user_id: false,
+            allow_config_push: true,
+            config_cache_dir: PathBuf::new(),
             smart_model_max_tokens: 8_192,
             fast_model_max_tokens: 2_048,
             model_max_concurrency: 32,
@@ -333,6 +370,7 @@ impl EngineSettings {
             rag_chunk_size: 512,
             rag_chunk_overlap: 64,
             rag_default_top_k: 20,
+            rag_max_searches: 5,
             max_pages: 200,
             max_characters: 200_000,
             chunked_reasoner_chars_per_slice: 16_000,
@@ -350,6 +388,18 @@ impl EngineSettings {
     #[must_use]
     pub fn with_required_user_id(mut self, require_user_id: bool) -> Self {
         self.require_user_id = require_user_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_allow_config_push(mut self, allow_config_push: bool) -> Self {
+        self.allow_config_push = allow_config_push;
+        self
+    }
+
+    #[must_use]
+    pub fn with_config_cache_dir(mut self, config_cache_dir: impl Into<PathBuf>) -> Self {
+        self.config_cache_dir = config_cache_dir.into();
         self
     }
 
@@ -509,12 +559,65 @@ struct EngineRuntime {
     embedder: Result<Arc<EmbeddingClient>, EmbeddingError>,
 }
 
-/// Builds the Rust AI engine router from environment-backed provider settings.
+/// Holds the live runtime bundle; a config push swaps in a rebuilt bundle
+/// atomically while in-flight requests keep their snapshot.
+struct RuntimeCell {
+    current: RwLock<Arc<EngineRuntime>>,
+}
+
+impl RuntimeCell {
+    fn new(runtime: EngineRuntime) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(runtime)),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<EngineRuntime> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn swap(&self, runtime: EngineRuntime) {
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(runtime);
+    }
+}
+
+/// Builds the Rust AI engine router from environment-backed provider settings,
+/// re-applying a persisted config push (if any) before the runtime is built so
+/// an engine-only restart keeps admin config.
 pub fn app(settings: EngineSettings) -> Router {
-    let settings = Arc::new(settings);
-    let fast_model = structured_model_from_environment(settings.fast_model_name());
-    let smart_model = structured_model_from_environment(&settings.smart_model_name);
-    app_with_runtime(settings, fast_model, smart_model)
+    let mut settings = Arc::new(settings);
+    let mut fast_model = structured_model_from_environment(settings.fast_model_name());
+    let mut smart_model = structured_model_from_environment(&settings.smart_model_name);
+    let mut pushed_embedder = None;
+    if let Some(cached) = load_cached_push(&settings) {
+        match resolve_pushed_config(&settings, &cached) {
+            Ok(resolved) => {
+                tracing::info!(
+                    smart_model = %resolved.effective.smart_model_name,
+                    fast_model = %resolved.effective.fast_model_name,
+                    "restored persisted AI config push"
+                );
+                settings = Arc::new(resolved.effective);
+                fast_model = Ok(resolved.fast_model);
+                smart_model = Ok(resolved.smart_model);
+                pushed_embedder = resolved.embedder;
+            }
+            Err(detail) => {
+                tracing::warn!(
+                    %detail,
+                    "cached AI config could not be applied; falling back to env settings"
+                );
+            }
+        }
+    }
+    app_with_runtime(settings, fast_model, smart_model, pushed_embedder)
+}
+
+fn load_cached_push(settings: &EngineSettings) -> Option<ConfigPushRequest> {
+    if !settings.allow_config_push || settings.config_cache_dir.as_os_str().is_empty() {
+        return None;
+    }
+    config_cache::load_config(&settings.config_cache_dir, &settings.shared_secret)
 }
 
 fn structured_model_from_environment(
@@ -551,6 +654,7 @@ pub fn app_with_classifier(
         settings,
         Ok(Arc::clone(&classifier_model)),
         Ok(classifier_model),
+        None,
     )
 }
 
@@ -558,11 +662,15 @@ fn app_with_runtime(
     settings: Arc<EngineSettings>,
     model: Result<Arc<dyn StructuredOutputModel>, ModelError>,
     smart_model: Result<Arc<dyn StructuredOutputModel>, ModelError>,
+    pushed_embedder: Option<EmbeddingClient>,
 ) -> Router {
     let model_semaphore = Arc::new(Semaphore::new(settings.model_max_concurrency));
     let model = concurrency_limited_model(model, Arc::clone(&model_semaphore));
     let smart_model = concurrency_limited_model(smart_model, model_semaphore);
-    let embedder = EmbeddingClient::from_environment(&settings.rag_embedding_model).map(Arc::new);
+    let embedder = match pushed_embedder {
+        Some(embedder) => Ok(Arc::new(embedder)),
+        None => EmbeddingClient::from_environment(&settings.rag_embedding_model).map(Arc::new),
+    };
     let documents: Result<Arc<dyn DocumentRepository>, DocumentError> =
         match settings.documents_backend.as_str() {
             "sqlite" => SqliteDocumentStore::open(
@@ -596,14 +704,15 @@ fn app_with_runtime(
         ))),
         Err(error) => Err(error.clone()),
     };
-    let runtime = Arc::new(EngineRuntime {
+    let runtime = EngineRuntime {
         settings: Arc::clone(&settings),
         classifier,
         model,
         smart_model,
         documents,
         embedder,
-    });
+    };
+    let cell = Arc::new(RuntimeCell::new(runtime));
     Router::new()
         .route(HEALTH_PATH, get(health))
         .route(CAPABILITIES_PATH, get(capabilities))
@@ -622,11 +731,341 @@ fn app_with_runtime(
         .route(AI_AGENT_REVISE_PATH, post(revise_agent))
         .route(AGENT_NEXT_ACTION_PATH, post(next_agent_action))
         .route(ORCHESTRATOR_PATH, post(orchestrate))
-        .layer(Extension(runtime))
+        .route(CONFIG_PATH, post(apply_config))
+        .layer(middleware::from_fn_with_state(cell, inject_runtime))
         .layer(middleware::from_fn_with_state(
             settings,
             enforce_request_guards,
         ))
+}
+
+/// Inserts the current runtime snapshot (and the swappable cell itself) into
+/// request extensions, so handlers keep a stable bundle for the whole request
+/// while a config push can swap the live one.
+async fn inject_runtime(
+    axum::extract::State(cell): axum::extract::State<Arc<RuntimeCell>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request.extensions_mut().insert(cell.snapshot());
+    request.extensions_mut().insert(Arc::clone(&cell));
+    next.run(request).await
+}
+
+/// The outcome of resolving a pushed config against the running settings; the
+/// caller decides whether to swap it live (route) or boot from it (restore).
+struct ResolvedPush {
+    effective: EngineSettings,
+    fast_model: Arc<dyn StructuredOutputModel>,
+    smart_model: Arc<dyn StructuredOutputModel>,
+    embedder: Option<EmbeddingClient>,
+    notes: Vec<String>,
+}
+
+/// Drops a leading `provider:` from an env model string (`anthropic:x` -> `x`).
+fn strip_provider_prefix(model_name: &str) -> &str {
+    model_name
+        .split_once(':')
+        .map_or(model_name, |(_prefix, rest)| rest)
+}
+
+/// Splits an env embedding string (`voyageai:voyage-4`) into (provider, model).
+fn split_embedding_ref(reference: &str) -> (&str, &str) {
+    reference
+        .split_once(':')
+        .map_or(("", reference), |(provider, model)| (provider, model))
+}
+
+/// Composes the engine's `provider:model` embedding string from pushed parts.
+fn compose_embedding_model(provider: &str, model: &str) -> String {
+    if provider.is_empty() {
+        model.to_owned()
+    } else {
+        format!("{provider}:{model}")
+    }
+}
+
+fn non_empty_or<'value>(pushed: &'value str, current: &'value str) -> &'value str {
+    if pushed.is_empty() { current } else { pushed }
+}
+
+/// Resolves a pushed config against the running settings. It never swaps live
+/// state; any model/provider construction failure rejects the whole push.
+fn resolve_pushed_config(
+    current: &EngineSettings,
+    request: &ConfigPushRequest,
+) -> Result<ResolvedPush, String> {
+    let models = &request.models;
+    let rag = &request.rag;
+    let limits = &request.limits;
+    let mut notes = Vec::new();
+
+    let provider = models.provider.trim();
+    let use_explicit_provider =
+        !provider.is_empty() || !models.api_key.is_empty() || !models.base_url.is_empty();
+
+    let (smart_name, fast_name) = if use_explicit_provider && current.chat_provider.is_empty() {
+        // First push over an env engine: running names are still
+        // "provider:model", strip the prefix.
+        (
+            non_empty_or(
+                &models.smart_model,
+                strip_provider_prefix(&current.smart_model_name),
+            )
+            .to_owned(),
+            non_empty_or(
+                &models.fast_model,
+                strip_provider_prefix(&current.fast_model_name),
+            )
+            .to_owned(),
+        )
+    } else {
+        // Either a provider was already pushed (running names are bare and may
+        // legitimately contain a colon, e.g. "llama3.1:8b") or the push keeps
+        // the fully env-driven model strings.
+        (
+            non_empty_or(&models.smart_model, &current.smart_model_name).to_owned(),
+            non_empty_or(&models.fast_model, &current.fast_model_name).to_owned(),
+        )
+    };
+
+    let build = |bare_name: &str| -> Result<Arc<dyn StructuredOutputModel>, String> {
+        if use_explicit_provider {
+            build_pushed_model(provider, bare_name, &models.api_key, &models.base_url)
+        } else {
+            structured_model_from_environment(bare_name).map_err(|error| error.to_string())
+        }
+    };
+    let smart_model = build(&smart_name)?;
+    let fast_model = build(&fast_name)?;
+
+    // Embedding: any non-empty embedding field triggers a rebuild; empty
+    // fields fall back to the running provider/model/creds so a partial push
+    // never clobbers env.
+    let embedding_changed = !rag.embedding_provider.trim().is_empty()
+        || !rag.embedding_model.trim().is_empty()
+        || !rag.embedding_api_key.is_empty()
+        || !rag.embedding_base_url.is_empty();
+    let mut rag_embedding_model = current.rag_embedding_model.clone();
+    let mut embedder = None;
+    if embedding_changed {
+        let (current_provider, current_model) = split_embedding_ref(&current.rag_embedding_model);
+        let embed_provider = non_empty_or(rag.embedding_provider.trim(), current_provider);
+        let embed_model = non_empty_or(rag.embedding_model.trim(), current_model);
+        rag_embedding_model = compose_embedding_model(embed_provider, embed_model);
+        let pushed_key =
+            (!rag.embedding_api_key.is_empty()).then_some(rag.embedding_api_key.as_str());
+        let pushed_base =
+            (!rag.embedding_base_url.is_empty()).then_some(rag.embedding_base_url.as_str());
+        embedder = Some(
+            EmbeddingClient::from_pushed_config(
+                embed_provider,
+                embed_model,
+                pushed_key,
+                pushed_base,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        notes.push(REINDEX_NOTE.to_owned());
+    }
+
+    // Scalars: an omitted value keeps the current one.
+    let mut effective = current.clone();
+    provider.clone_into(&mut effective.chat_provider);
+    effective.smart_model_name = smart_name;
+    effective.fast_model_name = fast_name;
+    effective.smart_model_max_tokens = models
+        .smart_max_tokens
+        .unwrap_or(current.smart_model_max_tokens);
+    effective.fast_model_max_tokens = models
+        .fast_max_tokens
+        .unwrap_or(current.fast_model_max_tokens);
+    effective.rag_embedding_model = rag_embedding_model;
+    effective.rag_default_top_k = rag.top_k.unwrap_or(current.rag_default_top_k);
+    effective.rag_max_searches = rag.max_searches.unwrap_or(current.rag_max_searches);
+    effective.max_pages = limits.max_pages.unwrap_or(current.max_pages);
+    effective.max_characters = limits.max_characters.unwrap_or(current.max_characters);
+    effective.model_max_concurrency = limits
+        .model_max_concurrency
+        .unwrap_or(current.model_max_concurrency);
+
+    Ok(ResolvedPush {
+        effective,
+        fast_model,
+        smart_model,
+        embedder,
+        notes,
+    })
+}
+
+/// Constructs a model for an explicitly pushed provider, mirroring the
+/// oracle's `_build_model` config-push path (keyless ollama, provider
+/// `custom` as an OpenAI-compatible endpoint).
+fn build_pushed_model(
+    provider: &str,
+    bare_name: &str,
+    api_key: &str,
+    base_url: &str,
+) -> Result<Arc<dyn StructuredOutputModel>, String> {
+    let pushed_key = (!api_key.is_empty()).then_some(api_key);
+    let pushed_base = (!base_url.is_empty()).then_some(base_url);
+    let provider = provider.to_ascii_lowercase();
+    match provider.as_str() {
+        "anthropic" => AnthropicClassifierModel::from_pushed_config(bare_name, pushed_key)
+            .map(|model| Arc::new(model) as Arc<dyn StructuredOutputModel>)
+            .map_err(|error| error.to_string()),
+        "openai" => OpenAiClassifierModel::from_pushed_config(bare_name, pushed_key)
+            .map(|model| Arc::new(model) as Arc<dyn StructuredOutputModel>)
+            .map_err(|error| error.to_string()),
+        "ollama" | "custom" => OpenAiClassifierModel::from_pushed_compatible(
+            &provider,
+            bare_name,
+            pushed_key,
+            pushed_base,
+        )
+        .map(|model| Arc::new(model) as Arc<dyn StructuredOutputModel>)
+        .map_err(|error| error.to_string()),
+        other => Err(format!("Unsupported model provider {other:?}.")),
+    }
+}
+
+/// Builds the post-push runtime bundle: fresh models under a fresh shared
+/// concurrency ceiling, the store and (unless re-pushed) embedder reused.
+fn rebuilt_runtime(current: &EngineRuntime, resolved: ResolvedPush) -> EngineRuntime {
+    let effective = Arc::new(resolved.effective);
+    let semaphore = Arc::new(Semaphore::new(effective.model_max_concurrency));
+    let model = Arc::new(ConcurrencyLimitedModel::new(
+        resolved.fast_model,
+        Arc::clone(&semaphore),
+    )) as Arc<dyn StructuredOutputModel>;
+    let smart_model = Arc::new(ConcurrencyLimitedModel::new(
+        resolved.smart_model,
+        semaphore,
+    )) as Arc<dyn StructuredOutputModel>;
+    let classifier = Arc::new(DocumentClassifier::new(
+        Arc::clone(&model),
+        effective.fast_model_max_tokens(),
+    ));
+    let embedder = match resolved.embedder {
+        Some(embedder) => Ok(Arc::new(embedder)),
+        None => current.embedder.clone(),
+    };
+    EngineRuntime {
+        settings: effective,
+        classifier: Ok(classifier),
+        model: Ok(model),
+        smart_model: Ok(smart_model),
+        documents: current.documents.clone(),
+        embedder,
+    }
+}
+
+// Presence of any of these means the transport peer may be proxy-rewritten, so
+// a spoofed X-Forwarded-For could otherwise read as loopback; fail closed.
+const FORWARDING_HEADERS: [&str; 4] = [
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+    "forwarded",
+];
+
+/// True only for a direct local connection with no proxy in evidence.
+fn is_direct_loopback_client(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+    if FORWARDING_HEADERS
+        .iter()
+        .any(|header| headers.contains_key(*header))
+    {
+        return false;
+    }
+    peer.is_some_and(|peer| peer.ip().is_loopback())
+}
+
+/// Applies admin-pushed AI settings by rebuilding the runtime bundle,
+/// persisting it (encrypted, best-effort) so it survives a restart.
+async fn apply_config(
+    Extension(cell): Extension<Arc<RuntimeCell>>,
+    Extension(runtime): Extension<Arc<EngineRuntime>>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigPushRequest>,
+) -> Response {
+    let settings = &runtime.settings;
+    if !settings.allow_config_push {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Config push is disabled on this deployment (STIRLING_ALLOW_CONFIG_PUSH is false).",
+        );
+    }
+    // Secure-by-default: with no shared secret set, only trust a direct
+    // loopback caller, since a pushed base_url/model could repoint the engine
+    // to exfiltrate document content.
+    let peer = connect_info.map(|Extension(ConnectInfo(address))| address);
+    if settings.shared_secret.is_empty() && !is_direct_loopback_client(&headers, peer) {
+        tracing::warn!(
+            client = ?peer,
+            "rejected config push from non-local/proxied caller with no shared secret set"
+        );
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Config push from a non-local or proxied caller requires \
+             STIRLING_ENGINE_SHARED_SECRET to be set on both the engine and the processor.",
+        );
+    }
+    if let Err(detail) = request.validate() {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, detail);
+    }
+    let resolved = match resolve_pushed_config(settings, &request) {
+        Ok(resolved) => resolved,
+        // Reject without touching the running config.
+        Err(detail) => return error_response(StatusCode::BAD_REQUEST, detail),
+    };
+    let mut notes = resolved.notes.clone();
+    let new_runtime = rebuilt_runtime(&runtime, resolved);
+    let effective = Arc::clone(&new_runtime.settings);
+    cell.swap(new_runtime);
+
+    // Persist (encrypted) so the config survives a restart. Best-effort: it is
+    // already applied live, so a persist failure must never become a 500. An
+    // empty cache dir is the in-memory test seam and skips persistence.
+    if !effective.config_cache_dir.as_os_str().is_empty()
+        && let Err(error) = config_cache::save_config(
+            &request,
+            &effective.config_cache_dir,
+            &effective.shared_secret,
+        )
+    {
+        tracing::warn!(%error, "applied AI config but failed to persist the encrypted cache");
+        notes.push(PERSIST_FAILURE_NOTE.to_owned());
+    }
+
+    tracing::info!(
+        provider = %if effective.chat_provider.is_empty() {
+            "<env>"
+        } else {
+            effective.chat_provider.as_str()
+        },
+        smart_model = %effective.smart_model_name,
+        fast_model = %effective.fast_model_name,
+        top_k = effective.rag_default_top_k,
+        "applied pushed AI config"
+    );
+
+    Json(ConfigApplyResponse {
+        status: "applied",
+        provider: request.models.provider.trim().to_owned(),
+        smart_model: effective.smart_model_name.clone(),
+        fast_model: effective.fast_model_name.clone(),
+        smart_max_tokens: effective.smart_model_max_tokens,
+        fast_max_tokens: effective.fast_model_max_tokens,
+        rag_embedding_model: effective.rag_embedding_model.clone(),
+        rag_top_k: effective.rag_default_top_k,
+        rag_max_searches: effective.rag_max_searches,
+        max_pages: effective.max_pages,
+        max_characters: effective.max_characters,
+        model_max_concurrency: effective.model_max_concurrency,
+        notes,
+    })
+    .into_response()
 }
 
 fn concurrency_limited_model(
@@ -1545,7 +1984,9 @@ async fn enforce_request_guards(
     let user_id = provided_user_id(request.headers()).map(str::to_owned);
     if let Some(user_id) = user_id {
         request.extensions_mut().insert(UserId(user_id));
-    } else if settings.require_user_id {
+    } else if settings.require_user_id && request.uri().path() != CONFIG_PATH {
+        // The config push is processor-to-engine plumbing with no acting user;
+        // the Python oracle leaves it outside the user-id gate too.
         return error_response(StatusCode::UNAUTHORIZED, "X-User-Id header is required");
     }
     next.run(request).await
@@ -1676,8 +2117,10 @@ mod tests {
     };
 
     use axum::{
+        Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{HeaderValue, Request, StatusCode},
+        response::Response,
     };
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -3725,6 +4168,410 @@ mod tests {
                 case.path
             );
         }
+        Ok(())
+    }
+
+    fn config_push(
+        body: &serde_json::Value,
+        secret: Option<&str>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        let mut request =
+            Request::post("/api/v1/config").header("content-type", "application/json");
+        if let Some(secret) = secret {
+            request = request.header("X-Engine-Auth", secret);
+        }
+        if let Some(peer) = peer {
+            request = request.extension(axum::extract::ConnectInfo(peer));
+        }
+        Ok(request.body(Body::from(serde_json::to_vec(body)?))?)
+    }
+
+    fn loopback_peer() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 45_000))
+    }
+
+    async fn json_body(
+        response: Response,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let body = to_bytes(response.into_body(), 65_536).await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    async fn health_models(app: &Router) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty())?)
+            .await?;
+        json_body(response).await
+    }
+
+    fn ollama_push_body() -> serde_json::Value {
+        serde_json::json!({
+            "models": {
+                "provider": "ollama",
+                "smartModel": "llama3.1:8b",
+                "fastModel": "llama3.1:8b",
+                "baseUrl": "http://localhost:11434"
+            },
+            "limits": {"maxPages": 50},
+            "rag": {"topK": 7}
+        })
+    }
+
+    #[tokio::test]
+    async fn config_push_is_forbidden_when_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let app =
+            app(EngineSettings::new("smart", "fast", "secret", true).with_allow_config_push(false));
+        let response = app
+            .oneshot(config_push(
+                &serde_json::json!({}),
+                Some("secret"),
+                Some(loopback_peer()),
+            )?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await?;
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("STIRLING_ALLOW_CONFIG_PUSH")),
+            "detail should name the gating flag: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_without_secret_trusts_only_a_direct_loopback_caller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new("smart", "fast", "", false));
+
+        // No transport peer at all (e.g. a proxied deployment) fails closed.
+        let no_peer = app
+            .clone()
+            .oneshot(config_push(&serde_json::json!({}), None, None)?)
+            .await?;
+        assert_eq!(no_peer.status(), StatusCode::FORBIDDEN);
+        let body = json_body(no_peer).await?;
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("STIRLING_ENGINE_SHARED_SECRET")),
+            "detail should name the shared-secret requirement: {body}"
+        );
+
+        // A loopback peer behind any forwarding header may be proxy-rewritten.
+        let mut forwarded = config_push(&serde_json::json!({}), None, Some(loopback_peer()))?;
+        forwarded
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        let forwarded = app.clone().oneshot(forwarded).await?;
+        assert_eq!(forwarded.status(), StatusCode::FORBIDDEN);
+
+        // A non-loopback peer is rejected.
+        let remote = app
+            .clone()
+            .oneshot(config_push(
+                &serde_json::json!({}),
+                None,
+                Some(std::net::SocketAddr::from(([10, 1, 2, 3], 45_000))),
+            )?)
+            .await?;
+        assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+
+        // A direct loopback caller is trusted.
+        let direct = app
+            .oneshot(config_push(
+                &ollama_push_body(),
+                None,
+                Some(loopback_peer()),
+            )?)
+            .await?;
+        assert_eq!(direct.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_requires_the_shared_secret_but_no_user_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app =
+            app(EngineSettings::new("smart", "fast", "secret", true).with_required_user_id(true));
+
+        let missing_secret = app
+            .clone()
+            .oneshot(config_push(&serde_json::json!({}), None, None)?)
+            .await?;
+        assert_eq!(missing_secret.status(), StatusCode::UNAUTHORIZED);
+
+        // Processor-to-engine plumbing carries no acting user; the push stays
+        // outside the user-id gate exactly like the Python oracle's router.
+        let no_user = app
+            .oneshot(config_push(&ollama_push_body(), Some("secret"), None)?)
+            .await?;
+        assert_eq!(no_user.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_applies_models_and_limits_to_the_live_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new(
+            "anthropic:claude-haiku-4-5",
+            "anthropic:claude-haiku-4-5",
+            "secret",
+            true,
+        ));
+        let before = health_models(&app).await?;
+        assert_eq!(before["smart_model"], "anthropic:claude-haiku-4-5");
+
+        let body = serde_json::json!({
+            "models": {
+                "provider": "ollama",
+                "smartModel": "llama3.1:8b",
+                "fastModel": "qwen3:4b",
+                "smartMaxTokens": 4096,
+                "apiKey": "push-key-not-a-real-secret",
+                "baseUrl": "http://localhost:11434"
+            },
+            "rag": {"topK": 7, "maxSearches": 0},
+            "limits": {"maxPages": 50, "modelMaxConcurrency": 8}
+        });
+        let response = app
+            .clone()
+            .oneshot(config_push(&body, Some("secret"), None)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = json_body(response).await?;
+        assert_eq!(response["status"], "applied");
+        assert_eq!(response["provider"], "ollama");
+        assert_eq!(response["smartModel"], "llama3.1:8b");
+        assert_eq!(response["fastModel"], "qwen3:4b");
+        assert_eq!(response["smartMaxTokens"], 4096);
+        assert_eq!(response["ragTopK"], 7);
+        assert_eq!(response["ragMaxSearches"], 0);
+        assert_eq!(response["maxPages"], 50);
+        assert_eq!(response["modelMaxConcurrency"], 8);
+        assert!(
+            !serde_json::to_string(&response)?.contains("push-key-not-a-real-secret"),
+            "the response must never echo credentials"
+        );
+
+        // The rebuilt runtime is what later requests observe.
+        let after = health_models(&app).await?;
+        assert_eq!(after["smart_model"], "llama3.1:8b");
+        assert_eq!(after["fast_model"], "qwen3:4b");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_with_unsupported_provider_is_rejected_without_swap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new("smart", "fast", "secret", true));
+        let response = app
+            .clone()
+            .oneshot(config_push(
+                &serde_json::json!({"models": {"provider": "mystery", "smartModel": "x"}}),
+                Some("secret"),
+                None,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await?;
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("mystery")),
+            "detail should name the rejected provider: {body}"
+        );
+
+        let after = health_models(&app).await?;
+        assert_eq!(after["smart_model"], "smart");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_rejects_out_of_range_numbers_without_swap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new("smart", "fast", "secret", true));
+        for body in [
+            serde_json::json!({"limits": {"modelMaxConcurrency": 0}}),
+            serde_json::json!({"models": {"smartMaxTokens": 0}}),
+            serde_json::json!({"rag": {"topK": 0}}),
+            serde_json::json!({"limits": {"maxPages": -3}}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(config_push(&body, Some("secret"), None)?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} should be out of range"
+            );
+        }
+        let after = health_models(&app).await?;
+        assert_eq!(after["smart_model"], "smart");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_push_keeps_a_colon_bearing_model_name() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let app = app(EngineSettings::new(
+            "anthropic:claude-haiku-4-5",
+            "anthropic:claude-haiku-4-5",
+            "secret",
+            true,
+        ));
+        let first = app
+            .clone()
+            .oneshot(config_push(&ollama_push_body(), Some("secret"), None)?)
+            .await?;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The second push repeats the provider without model names; stripping
+        // again would truncate "llama3.1:8b" to "8b".
+        let second_body = serde_json::json!({
+            "models": {"provider": "ollama", "baseUrl": "http://localhost:11434"},
+            "limits": {"maxPages": 42}
+        });
+        let second = app
+            .clone()
+            .oneshot(config_push(&second_body, Some("secret"), None)?)
+            .await?;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = json_body(second).await?;
+        assert_eq!(second["smartModel"], "llama3.1:8b");
+        assert_eq!(second["maxPages"], 42);
+
+        let after = health_models(&app).await?;
+        assert_eq!(after["smart_model"], "llama3.1:8b");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_rebuilds_the_embedder_and_flags_reindexing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Env model names must stay rebuildable: a push always reconstructs
+        // both tiers, and keyless ollama needs no credentials to construct.
+        let app = app(EngineSettings::new(
+            "ollama:qwen3:8b",
+            "ollama:qwen3:8b",
+            "secret",
+            true,
+        ));
+        let response = app
+            .clone()
+            .oneshot(config_push(
+                &serde_json::json!({
+                    "rag": {"embeddingProvider": "test", "embeddingModel": "test-embed"}
+                }),
+                Some("secret"),
+                None,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(body["ragEmbeddingModel"], "test:test-embed");
+        assert!(
+            body["notes"].as_array().is_some_and(|notes| notes
+                .iter()
+                .any(|note| note.as_str().is_some_and(|note| note.contains("re-index")))),
+            "an embedding change must warn about re-indexing: {body}"
+        );
+
+        let unsupported = app
+            .oneshot(config_push(
+                &serde_json::json!({
+                    "rag": {"embeddingProvider": "mystery", "embeddingModel": "embed-x"}
+                }),
+                Some("secret"),
+                None,
+            )?)
+            .await?;
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_persists_and_boot_restores_the_encrypted_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "stirling-ai-config-push-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&cache_dir)?;
+        let settings = || {
+            EngineSettings::new(
+                "anthropic:claude-haiku-4-5",
+                "anthropic:claude-haiku-4-5",
+                "restart-secret",
+                true,
+            )
+            .with_config_cache_dir(&cache_dir)
+        };
+
+        let first_boot = app(settings());
+        let pushed = first_boot
+            .oneshot(config_push(
+                &ollama_push_body(),
+                Some("restart-secret"),
+                None,
+            )?)
+            .await?;
+        assert_eq!(pushed.status(), StatusCode::OK);
+        let pushed = json_body(pushed).await?;
+        assert!(
+            pushed["notes"].as_array().is_some_and(|notes| !notes
+                .iter()
+                .any(|note| note.as_str().is_some_and(|note| note.contains("persisted")))),
+            "a successful persist must not warn: {pushed}"
+        );
+
+        // A fresh app from the same env settings simulates an engine restart:
+        // the cache decrypts under the shared secret and wins over env.
+        let second_boot = app(settings());
+        let restored = health_models(&second_boot).await?;
+        assert_eq!(restored["smart_model"], "llama3.1:8b");
+
+        // With the flag off, the same cache is ignored and env wins.
+        let flag_off_boot = app(settings().with_allow_config_push(false));
+        let ignored = health_models(&flag_off_boot).await?;
+        assert_eq!(ignored["smart_model"], "anthropic:claude-haiku-4-5");
+
+        // A corrupt cache never breaks boot.
+        std::fs::write(cache_dir.join("ai_config_cache.enc"), b"garbage")?;
+        let corrupt_boot = app(settings());
+        let recovered = health_models(&corrupt_boot).await?;
+        assert_eq!(recovered["smart_model"], "anthropic:claude-haiku-4-5");
+
+        let _cleanup = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_push_tolerates_unknown_fields_from_a_newer_processor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = app(EngineSettings::new("smart", "fast", "secret", true));
+        let response = app
+            .oneshot(config_push(
+                &serde_json::json!({
+                    "models": {
+                        "provider": "ollama",
+                        "smartModel": "llama3.1:8b",
+                        "fastModel": "llama3.1:8b",
+                        "baseUrl": "http://localhost:11434",
+                        "futureKnob": "later"
+                    },
+                    "futureSection": {"x": 1}
+                }),
+                Some("secret"),
+                None,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
         Ok(())
     }
 }
