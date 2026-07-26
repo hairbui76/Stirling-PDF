@@ -112,16 +112,11 @@ _TEXT_STRIPPER_REASON = (
     "Accepted, not a Rust defect."
 )
 
-_MULTIPAGE_HALF_PINNED = (
-    " Only the RUST side is pinned here: its value was measured directly against "
-    "the current Rust backend on the generated 5-page fixture (deterministic -- "
-    "the fixture's text is fixed by the generating PostScript), but the Java-side "
-    "count was never observed, as no Java oracle was reachable when this entry "
-    "was written. So this entry still catches a Rust-side regression while "
-    "tolerating the unknown Java value; pin expect_java too as soon as CI reports "
-    "it. NOTE: that fixture's pages carry no /Rotate, so the quirk above probably "
-    "does not fire at all and this entry is likely to be reported STALE -- delete "
-    "it when CI says so."
+_PER_PAGE_MIRROR_NOTE = (
+    " This is the per-page mirror of BasicInfo.CharacterCount: GetInfoOnPDF reports "
+    "the same stripper-derived count again under PerPageInfo, so the identical quirk "
+    "surfaces on both paths and both are pinned to the values the first live "
+    "Java-vs-Rust CI run reported."
 )
 
 _XMP_REASON = (
@@ -133,14 +128,6 @@ _XMP_REASON = (
     "here would fail on the next run."
 )
 
-_XMP_SINGLE_NOTE = (
-    " NOTE: test_pdf_1.pdf carries no /Metadata stream and no xpacket at all "
-    "(verified over its raw and its flate-compressed objects, and the Rust "
-    "backend returns null for it), so both backends should agree on null and "
-    "this entry is EXPECTED to be reported STALE. Delete it the first time CI "
-    "says so -- it is registered defensively because the residual was reported "
-    "per case, not per field."
-)
 
 REGISTRY: tuple[KnownDiff, ...] = (
     # -- get_info_single: test_pdf_1.pdf, a 1-page US-Letter page with /Rotate 90.
@@ -167,28 +154,15 @@ REGISTRY: tuple[KnownDiff, ...] = (
     ),
     KnownDiff(
         case="get_info_single",
-        field="Other.XMPMetadata",
-        reason=_XMP_REASON + _XMP_SINGLE_NOTE,
+        field="PerPageInfo.Page 1.Text Characters Count",
+        reason=_TEXT_STRIPPER_REASON + _PER_PAGE_MIRROR_NOTE,
+        expect_rust=14,
+        expect_java=18,
     ),
     # -- get_info_multipage: the generated 5-page fixture.
-    KnownDiff(
-        case="get_info_multipage",
-        field="BasicInfo.CharacterCount",
-        reason=_TEXT_STRIPPER_REASON + _MULTIPAGE_HALF_PINNED,
-        expect_rust=35,
-    ),
-    KnownDiff(
-        case="get_info_multipage",
-        field="BasicInfo.WordCount",
-        reason=_TEXT_STRIPPER_REASON + _MULTIPAGE_HALF_PINNED,
-        expect_rust=10,
-    ),
-    KnownDiff(
-        case="get_info_multipage",
-        field="BasicInfo.ParagraphCount",
-        reason=_TEXT_STRIPPER_REASON + _MULTIPAGE_HALF_PINNED,
-        expect_rust=5,
-    ),
+    # Its pages carry no /Rotate, so the PDFTextStripper quirk above does not fire and
+    # the two backends agree on every count -- CI reported the speculative count entries
+    # STALE on the first live run and they were deleted, exactly as their note instructed.
     KnownDiff(
         case="get_info_multipage",
         field="Other.XMPMetadata",
