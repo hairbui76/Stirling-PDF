@@ -4,25 +4,30 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-26):** `cargo fmt --check` and strict locked all-target
-workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are clean.
-`cargo test -p stirling-processing --lib --no-fail-fast` reports **961 passed / 1
-failed** — the single failure is `pdf_markdown::tests::infers_heading_from_font_size_end_to_end`,
-a known pre-existing failure confirmed via clean-tree (`git stash`) reruns to be
-unrelated to recent work; it is the only failure in the processing library suite.
-Separately, a small number of tests are environmental (not code defects) and are
-not exercisable in this sandbox: two `stirling-ai-engine` `process_smoke` tests
-(`binary_serves_ephemeral_port_with_auth_and_post_contracts`,
-`binary_infers_keyless_ollama_and_completes_an_http_agent_request`) time out on
-network/process-timing; and two `stirling-processing` integration tests depend on
-state outside this sandbox — `ai_workflow_endpoint`'s AI-engine-backed tests (503
-because the AI engine is unreachable here) and
-`policy_config_endpoint::disconnecting_a_policy_stream_does_not_cancel_the_run` (a
-wall-clock timing assertion). All 111 AI-engine library tests otherwise pass, as
-does the endpoint/integration matrix aside from those environmental cases.
+**Latest validation (2026-07-26, post-batch):** `cargo fmt --check` and strict locked
+all-target workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are
+clean. With PDFium bound via `STIRLING_PDFIUM_LIBRARY_PATH` (as `task rust:test` does),
+`cargo test -p stirling-processing --locked --no-fail-fast` reports **1360 passed /
+0 failed** across the library suite and all 107 integration suites, and
+`cargo test -p stirling-ai-engine --locked` reports **147 passed / 0 failed** across
+all targets. Four previously-red areas are now green rather than excused: the
+`pdf_markdown` heading test (it required PDFium — earlier snapshots ran without the
+library bound and misread the fallback as a pre-existing failure); the two
+`stirling-ai-engine` `process_smoke` timeouts (root-caused, not environmental:
+`tracing-subscriber` wrote ANSI escapes into piped output and broke the handshake
+parse); and six endpoint tests that had rotted against later features (webhook
+trigger listing, P-521 signing message, admin-only custom-API authoring, and the
+OIDC login-CSRF browser-binding cookie). The clean-checkout build defect is fixed:
+`build.rs` now stages `version.properties` into `OUT_DIR` (verbatim when the
+Gradle-generated file exists, parsed from `build.gradle`'s canonical version
+otherwise), so the crate compiles on a fresh clone and the `rust-processing` CI
+gate no longer dies before running tests. The security-mode guard now reads every
+boolean spelling Spring accepts (`1`/`on`/`yes`, YAML-1.1 strings, numeric `1`) and
+**fails closed on unreadable values** — a present-but-malformed
+`SECURITY_ENABLELOGIN`/`security.enableLogin` refuses startup, matching Java's
+relaxed-binding boot failure, instead of silently starting unauthenticated.
 External-runtime happy paths remain conditional on their respective tools and
-services. (This snapshot supersedes an earlier one that undercounted the
-processing library suite at 443 tests.)
+services.
 
 **Security-review hardening (2026-07-25):** an AI-assisted security review of the secured/crypto/SSRF
 surface (adversarially verified) found the surface broadly sound (no critical/high; no auth-bypass /
@@ -292,8 +297,11 @@ auto-rename/auto-split, plus:
   invisible incremental CMS signature over the finalized PDF. Gated by `storage.signing.enabled`;
   fails closed (403) when disabled. Closes Java `SigningSessionController`,
   `WorkflowParticipantController`.
-- Enterprise-gated portal audit views — `GET /api/v1/documents` (Documents review queue) and
-  `GET /api/v1/infrastructure/audit-log` (Infrastructure → Audit tab): read-only projections of
+- Enterprise-gated portal audit views — `GET /api/v1/proprietary/ui-data/documents` (Documents
+  review queue) and `GET /api/v1/proprietary/ui-data/infrastructure/audit-log` (Infrastructure →
+  Audit tab), matching Java's `@ProprietaryUiDataApi` class prefix and the frontend's calls (an
+  earlier Rust registration at the bare unprefixed paths was a live 404 against the portal and is
+  fixed; the bare paths are now pinned 404 by test): read-only projections of
   the durable audit store with the faithful Java category/action/target/status/pretty-tool
   shaping, policy-dispatch detection, and read-noise (`UI_DATA`/`HTTP_REQUEST`) exclusion.
   Enforced through the same central Enterprise entitlement + `enforce_security` gate as
@@ -742,6 +750,22 @@ binary now performs idempotent Python-store cutover to Rust SQLite or pgvector:
 it preserves pages, metadata, TTL and read ACLs while re-embedding content
 without loading the sqlite-vec extension, and fails closed on unreconstructable
 legacy records.
+
+The engine also ports the Python oracle's admin config-push subsystem (Python
+PR #7069): `POST /api/v1/config` accepts Java's `AiEngineConfigSync` body (both
+camelCase and snake_case field spellings; unknown fields tolerated, matching
+the oracle's `TolerantApiModel`), is gated by the Python-compatible
+`STIRLING_ALLOW_CONFIG_PUSH` flag (default on, same as Python; flag-off → 403
+naming the flag), rebuilds the live model tiers with a fresh shared semaphore
+while in-flight requests keep their runtime snapshot, and persists the pushed
+config through an encrypted at-rest cache restored on boot (0600 files;
+corrupt/wrong-key cache falls back to environment config, matching
+`_restore_cached_config`). One documented divergence: the cache cipher is
+AES-GCM rather than Python's Fernet — the cache is engine-private, never read
+across languages. The two `process_smoke` timeouts previously written off as
+environmental are fixed: `tracing-subscriber` emitted ANSI escapes into piped
+output, breaking the handshake parse; smoke tests now capture child stderr and
+all five pass in under a second. See `contracts/ai-engine-foundation.md`.
 
 Structured provider inference now includes the Python-compatible native
 `ollama:<model>` path for both model tiers: keyless local or optionally
