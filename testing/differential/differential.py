@@ -16,6 +16,15 @@ Modes
               SKIP-java-absent (not a failure). Any real semantic DIFF makes the
               process exit non-zero.
 
+Known differences
+-----------------
+Differences that have been root-caused and accepted are declared in
+known_diffs.py, keyed by (case, field path) with a mandatory reason and optional
+pinned values. They report as KNOWN> instead of DIFF and do not fail the run --
+but they are printed at every verbosity, counted in the summary, and (when
+pinned) still fail the moment the observed values move. A registered field that
+no longer differs is reported STALE (warning only) so the entry gets deleted.
+
 Auto: if --java-url is given, defaults to --diff; otherwise --rust-only.
 
 Examples
@@ -33,11 +42,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import compare
 import fixtures
 import httpclient
+import known_diffs
 import manifest
 
 RESET = "\033[0m"
@@ -47,6 +57,8 @@ COLORS = {
     "ERROR": "\033[31m",
     "SKIP": "\033[33m",
     "SKIP-java-absent": "\033[33m",
+    "KNOWN": "\033[36m",
+    "STALE": "\033[33m",
     "head": "\033[1m",
 }
 
@@ -55,6 +67,18 @@ def _c(tag: str, text: str, enabled: bool) -> str:
     if not enabled:
         return text
     return f"{COLORS.get(tag, '')}{text}{RESET}"
+
+
+def _reason(text: str, verbose: bool, limit: int = 150) -> str:
+    """Full registered reason under -v, first sentence otherwise."""
+    text = " ".join(text.split())
+    if verbose or len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rfind(". ")
+    if cut > 40:
+        head = head[: cut + 1]
+    return head.rstrip() + " [...] (full text: known_diffs.REGISTRY, or re-run with -v)"
 
 
 CONTENT_TYPE_FOR = {
@@ -71,6 +95,19 @@ class CaseOutcome:
     rust_status: int | None
     java_status: int | None
     messages: list[str]
+    # Accepted known differences observed for this case (never fail the run, but
+    # are ALWAYS printed so they cannot silently rot).
+    known: list[compare.KnownFinding] = field(default_factory=list)
+    # Registered known differences that did not show up at all -> clean them up.
+    stale: list[known_diffs.KnownDiff] = field(default_factory=list)
+
+    def marker(self) -> str:
+        parts = []
+        if self.known:
+            parts.append(f"{len(self.known)} known diff{'s' if len(self.known) != 1 else ''}")
+        if self.stale:
+            parts.append(f"{len(self.stale)} stale")
+        return f"  ({', '.join(parts)})" if parts else ""
 
 
 def _probe(url: str) -> httpclient.HttpResult:
@@ -164,9 +201,9 @@ def run_diff(case: manifest.Case, rust_url: str, java_url: str, timeout: float) 
     if case.response_type == "pdf":
         cmp = compare.compare_pdf(rust.body, java.body)
     elif case.response_type == "zip":
-        cmp = compare.compare_zip(rust.body, java.body)
+        cmp = compare.compare_zip(rust.body, java.body, case.name)
     elif case.response_type == "json":
-        cmp = compare.compare_json(rust.body, java.body)
+        cmp = compare.compare_json(rust.body, java.body, case.name)
     else:
         cmp = compare.CompareResult.error(f"unknown response_type {case.response_type!r}")
 
@@ -175,7 +212,14 @@ def run_diff(case: manifest.Case, rust_url: str, java_url: str, timeout: float) 
     verdict = cmp.verdict
     if status_diff and verdict == "PASS":
         verdict = "DIFF"
-    return CaseOutcome(case.name, verdict, rust.status, java.status, msgs)
+
+    # A registered known difference that produced no difference at all is STALE:
+    # the gap closed (or the field vanished) and the entry is dead weight. Warn
+    # loudly, never fail -- fixing a known gap must not break the fixer's build.
+    # Skipped when the compare ERRORed: nothing was actually compared, so "the
+    # backends agree now" would be a lie.
+    stale = [] if cmp.verdict == "ERROR" else known_diffs.stale_entries(case.name, cmp.known_keys)
+    return CaseOutcome(case.name, verdict, rust.status, java.status, msgs, cmp.known, stale)
 
 
 def main(argv: list[str]) -> int:
@@ -217,9 +261,18 @@ def main(argv: list[str]) -> int:
             print(f"FIXTURE PROBLEM: {p}", file=sys.stderr)
         return 2
 
+    # Registry hygiene: a malformed entry (no reason, duplicate, unknown case)
+    # would silently accept nothing or accept it twice. Hard error.
+    registry_problems = known_diffs.validate(valid_cases={c.name for c in manifest.CASES})
+    if registry_problems:
+        for p in registry_problems:
+            print(f"KNOWN-DIFF REGISTRY PROBLEM: {p}", file=sys.stderr)
+        return 2
+
     print(_c("head", f"Stirling-PDF differential harness  [mode={mode}]", color))
     print(f"  http backend : {httpclient.backend()}")
     print(f"  compare tools: {compare.capabilities()}")
+    print(f"  known diffs  : {known_diffs.summary_line()}")
     print(f"  rust-url     : {args.rust_url}")
     if mode == "diff":
         print(f"  java-url     : {args.java_url}")
@@ -246,11 +299,24 @@ def main(argv: list[str]) -> int:
             outcome = run_diff(case, args.rust_url, args.java_url, args.timeout)
         outcomes.append(outcome)
         tag = outcome.status
-        print(f"{_c(tag, tag.ljust(16), color)} {outcome.name}")
+        print(f"{_c(tag, tag.ljust(16), color)} {outcome.name}{outcome.marker()}")
         show = args.verbose or outcome.status in ("DIFF", "ERROR")
         if show:
             for m in outcome.messages:
                 print(f"    {m}")
+        # KNOWN / STALE lines print at EVERY verbosity: an accepted difference
+        # that nobody ever sees is an unmonitored difference. The full reason is
+        # long by design, so it is abridged unless -v is given.
+        for k in outcome.known:
+            print(f"    {_c('KNOWN', 'KNOWN>', color)} {k.field}: {k.detail}")
+            print(f"        why: {_reason(k.reason, args.verbose)}")
+        for s in outcome.stale:
+            print(
+                f"    {_c('STALE', 'STALE>', color)} {s.field}: registered as a known "
+                "difference but the backends now AGREE (or the field is gone) -- "
+                "delete this entry from known_diffs.REGISTRY"
+            )
+            print(f"        reason on record: {_reason(s.reason, args.verbose)}")
 
     # Summary.
     print("-" * 72)
@@ -258,12 +324,36 @@ def main(argv: list[str]) -> int:
     for o in outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
     summary = "  ".join(f"{_c(k, k, color)}={v}" for k, v in sorted(counts.items()))
-    print(f"SUMMARY  {summary}  (total {len(outcomes)})")
+    known_cases = [o for o in outcomes if o.known]
+    known_fields = sum(len(o.known) for o in known_cases)
+    known_note = (
+        f"  ({len(known_cases)} with known diffs: {known_fields} field(s))" if known_cases else ""
+    )
+    print(f"SUMMARY  {summary}  (total {len(outcomes)}){_c('KNOWN', known_note, color)}")
+
+    stale_cases = [o for o in outcomes if o.stale]
+    stale_count = sum(len(o.stale) for o in stale_cases)
+    if stale_count:
+        print(
+            _c(
+                "STALE",
+                f"WARNING: {stale_count} STALE known-difference entr"
+                f"{'y' if stale_count == 1 else 'ies'} in known_diffs.REGISTRY across "
+                f"{len(stale_cases)} case(s) -- the difference is gone, delete the "
+                "entr(y/ies). This warning does NOT fail the run.",
+                color,
+            )
+        )
 
     real_diffs = [o for o in outcomes if o.status in ("DIFF", "ERROR")]
     if real_diffs:
         print(_c("DIFF", f"FAIL: {len(real_diffs)} case(s) with DIFF/ERROR", color))
         return 1
+    if known_fields:
+        print(
+            _c("PASS", f"OK: no unexplained parity differences ({known_fields} known, accepted)", color)
+        )
+        return 0
     print(_c("PASS", "OK: no parity differences", color))
     return 0
 

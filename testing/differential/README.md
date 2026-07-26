@@ -49,6 +49,7 @@ pairs from the Rust backend and asserts the engine reaches the right verdict.
 | File | Role |
 |---|---|
 | `manifest.py` | The deterministic endpoint cases (name, path, input fixtures, form params, response type). |
+| `known_diffs.py` | The known-difference registry: analysed, accepted Java-vs-Rust differences, each with a mandatory reason and optional pinned values. |
 | `fixtures.py` | Resolves input files; generates the multi-page fixture with Ghostscript on demand. |
 | `httpclient.py` | Multipart POST. Uses `requests` if importable, else a pure-stdlib multipart encoder. |
 | `compare.py` | The semantic comparison engine (PDF visual / JSON deep / ZIP structural) + single-artifact validation. |
@@ -125,7 +126,10 @@ python3 differential.py \
 ```
 
 Exit code is **non-zero if any case is DIFF or ERROR**; SKIP-java-absent and PASS
-do not fail the run. Wire that exit code into CI.
+do not fail the run. Wire that exit code into CI. Differences that have been
+analysed and accepted are declared in
+[`known_diffs.py`](#known-difference-registry-known_diffspy) so they report as
+`KNOWN` instead of `DIFF` — visibly, and without blinding the gate.
 
 ### CLI reference
 
@@ -151,6 +155,126 @@ Mode is auto-selected: `--java-url` present ⇒ `--diff`, else `--rust-only`.
 | `DIFF` | A real semantic difference (page count, pixels, JSON field, ZIP entries, status). | **yes** |
 | `SKIP-java-absent` | Rust responded; the Java backend was unreachable for this case. | no |
 | `ERROR` | Rust unreachable, non-2xx where success expected, or malformed body. | **yes** |
+
+A `PASS` case may still carry per-field annotations, printed **at every verbosity**:
+
+| Line | Meaning | Fails run? |
+|---|---|---|
+| `KNOWN>` | This field differs, and the difference is registered in `known_diffs.py` with a reason (and, ideally, pinned values). | no |
+| `STALE>` | A registered known difference did **not** show up — the field agrees now (or is gone). Delete the entry. | no (warn) |
+
+---
+
+## Known-difference registry (`known_diffs.py`)
+
+**The problem it solves.** A permanently-red gate is a worthless gate: everyone
+learns to ignore it, and the next *real* regression rides in on the noise. But
+deleting a field from the comparison to get green is worse — that blinds the gate
+forever. The registry is the middle path: differences that have been **analysed
+and accepted** stop failing the run, while staying fully visible and still being
+watched for change.
+
+Each entry is keyed by **(case name, field path)** and **requires a
+human-readable `reason`**. It may additionally **pin** the expected values
+(`expect_rust` / `expect_java`), independently per side.
+
+```python
+KnownDiff(
+    case="get_info_single",
+    field="BasicInfo.CharacterCount",
+    reason="Java's bare PDFTextStripper runs with sortByPosition=false ...",
+    expect_rust=14,
+    expect_java=18,
+),
+```
+
+`field` is the dotted JSON path exactly as the report prints it
+(`BasicInfo.CharacterCount`, `Other.XMPMetadata`); for JSON nested in a ZIP member
+the path is relative to that member.
+
+### Classification
+
+| Observed | Classified | Fails run? |
+|---|---|---|
+| Field differs, **not** in the registry | `DIFF` (unchanged behaviour) | **yes** |
+| Field differs, registered, observed values **match the pins** (or the side is unpinned) | `KNOWN` | no |
+| Field differs, registered, **pinned values no longer hold** | `DIFF` — *"the known-difference expectation is stale"* | **yes** |
+| Field registered but **does not differ any more** | `STALE` warning | no |
+
+**Pinned values are what make an entry regression-proof.** Unpinned, an entry
+accepts *any* difference in that field forever — if Rust's character count later
+collapsed to `0`, the gate would stay green. Pinned, the entry accepts *exactly*
+the difference that was analysed: the moment either side moves, the run fails with
+a message saying the expectation itself is stale and must be re-verified against
+the Java oracle. So: **pin whenever the values are deterministic**, and justify in
+the reason whenever they are not (e.g. `Other.XMPMetadata` embeds generation-time
+timestamps and UUIDs, so its value varies run to run and *cannot* be pinned).
+
+Registering a field also takes precedence over the generic
+`INFORMATIONAL_JSON_KEYS` heuristic — an explicit entry is more specific, and
+routing it to `(informational)` would make it look permanently stale.
+
+### Visibility — nothing is ever hidden
+
+Known differences are printed on every run, verbose or not:
+
+```
+PASS             get_info_single  (3 known diffs)
+    KNOWN> BasicInfo.CharacterCount: rust=14 java=18 [expect_rust=14 expect_java=18]
+        why: Java's bare PDFTextStripper runs with sortByPosition=false. [...]
+------------------------------------------------------------------------
+SUMMARY  PASS=13  (total 13)  (2 with known diffs: 4 field(s))
+OK: no unexplained parity differences (4 known, accepted)
+```
+
+The per-case marker, the `KNOWN>` lines and the summary count all stay in the
+report; `-v` prints each full reason instead of the abridged first sentence. The
+header also prints the registry size (`known diffs : 8 entries over 2 case(s), 3
+pinned`).
+
+### Removing a stale entry
+
+When the underlying difference is fixed (or the field disappears), the run prints:
+
+```
+    STALE> Other.XMPMetadata: registered as a known difference but the backends now
+           AGREE (or the field is gone) -- delete this entry from known_diffs.REGISTRY
+------------------------------------------------------------------------
+WARNING: 1 STALE known-difference entry in known_diffs.REGISTRY ... does NOT fail the run.
+```
+
+**Stale entries warn loudly but deliberately do NOT fail the run.** Closing a
+known parity gap must never break the build of the person who closed it — the
+gate's job is to catch *divergence*, not to punish convergence. Cleanup is a
+one-line deletion:
+
+1. Delete the `KnownDiff(...)` entry from `REGISTRY` in `known_diffs.py`.
+2. Re-run — the field is now covered by the normal DIFF rules again, so any
+   future divergence in it fails immediately.
+
+Registry hygiene is checked at startup (missing reason, duplicate key, unknown
+case name ⇒ hard error, exit 2), and the classification rules have offline
+assertions:
+
+```bash
+python3 known_diffs.py     # prints the registry, then self-checks the rules (no backend needed)
+```
+
+### What is registered today
+
+| Case | Field | Pinned | Why |
+|---|---|---|---|
+| `get_info_single` | `BasicInfo.CharacterCount` | rust=14 java=18 | Java's bare `PDFTextStripper` runs with `sortByPosition=false`; on the fixture's `/Rotate 90` page its line-breaking splits per glyph and it counts more. Replicating the quirk needs a text-layout work-item that is deliberately not planned. |
+| `get_info_single` | `BasicInfo.WordCount` | rust=4 java=7 | same root cause |
+| `get_info_single` | `BasicInfo.ParagraphCount` | rust=2 java=6 | same root cause |
+| `get_info_single` | `Other.XMPMetadata` | no — **cannot** be pinned (embeds generation-time timestamps/UUIDs, varies per run) | Java re-serialises the packet through xmpbox (normalised namespaces/indentation, `+00:00` instead of `Z`, elements instead of attributes); Rust returns the stored packet verbatim. Content equivalent. |
+| `get_info_multipage` | `BasicInfo.{Character,Word,Paragraph}Count` | rust=35 / 10 / 5 only | same root cause. The Rust side was measured against the live backend, so a Rust regression still fails; the Java side was never observed, so it stays open — pin it from the first CI run that reports it. |
+| `get_info_multipage` | `Other.XMPMetadata` | no — cannot be pinned (same reason as above) | same root cause |
+
+Registered defensively for **both** `get_info` cases because the residuals were
+reported per case, not per field. Whichever of them does not actually occur will
+be reported `STALE` on the first real CI run — delete those lines then. That is
+the registry working as designed, not a defect.
 
 ---
 
@@ -209,6 +333,12 @@ Both bodies are parsed and deep-compared field by field.
   even for identical content.)
 
 The informational key list lives in `compare.INFORMATIONAL_JSON_KEYS`.
+
+- **Known, accepted differences (reported as `KNOWN>`, never a DIFF):** specific
+  `(case, field)` pairs registered in `known_diffs.py` with a written reason and,
+  where deterministic, pinned values. Unlike the informational list, this is
+  *per-case and per-field*, and a pinned entry fails the run the moment the values
+  move. See [Known-difference registry](#known-difference-registry-known_diffspy).
 
 ### PDF — visual, never byte-diff
 Raw PDF bytes are **never** compared. Instead:

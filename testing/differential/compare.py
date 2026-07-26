@@ -13,6 +13,15 @@ Three response families, three comparators:
 * ZIP   -> compare the set of entry basenames, then compare each shared entry
   with the PDF or JSON rules above (by extension / sniffed content).
 
+Known differences
+-----------------
+A JSON field difference is additionally classified against ``known_diffs.REGISTRY``
+when the caller passes the case name. A registered (case, field) whose values
+satisfy the registered pins becomes a KNOWN difference: still reported (never
+hidden), but not a DIFF. A registered field whose *pinned* values no longer hold
+stays a DIFF, tagged as a stale expectation. Everything unregistered is a DIFF
+exactly as before. See ``known_diffs.py``.
+
 Visual compare (the hard part)
 ------------------------------
 Two *different* PDF producers (PDFBox on the Java side, lopdf/pdfium on the Rust
@@ -51,6 +60,8 @@ import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import known_diffs
 
 
 def _env_int(name: str, default: int) -> int:
@@ -109,10 +120,24 @@ def gs_bin() -> str:
 # Result types
 # ---------------------------------------------------------------------------
 @dataclass
+class KnownFinding:
+    """An accepted, registered difference that was actually observed."""
+
+    field: str  # dotted JSON path (zip-prefixed once merged into a parent result)
+    detail: str  # observed values + the registered pins
+    reason: str  # why this difference is accepted (from the registry)
+
+
+@dataclass
 class CompareResult:
     verdict: str  # PASS | DIFF | ERROR
     diffs: list[str] = field(default_factory=list)
     info: list[str] = field(default_factory=list)
+    # Accepted known differences (see known_diffs.py). Reported, never fatal.
+    known: list[KnownFinding] = field(default_factory=list)
+    # (case, field) registry keys this comparison actually hit -- the driver uses
+    # them to spot registry entries that no longer correspond to any difference.
+    known_keys: set[tuple[str, str]] = field(default_factory=set)
 
     @staticmethod
     def error(msg: str) -> "CompareResult":
@@ -125,6 +150,8 @@ class CompareResult:
             self.verdict = "DIFF"
         self.diffs.extend(f"{prefix}: {d}" for d in child.diffs)
         self.info.extend(f"{prefix}: {i}" for i in child.info)
+        self.known.extend(KnownFinding(f"{prefix}: {k.field}", k.detail, k.reason) for k in child.known)
+        self.known_keys |= child.known_keys
 
 
 # ---------------------------------------------------------------------------
@@ -304,36 +331,67 @@ def _is_informational(path: str, leaf: str) -> bool:
     return any(tok in leaf_l or tok in path_l for tok in INFORMATIONAL_JSON_KEYS)
 
 
-def _walk_json(rust, java, path: str, diffs: list[str], info: list[str]) -> None:
+def _walk_json(rust, java, path: str, out: CompareResult, case: str | None) -> None:
     if isinstance(rust, dict) and isinstance(java, dict):
         for key in sorted(set(rust) | set(java), key=str):
             child_path = f"{path}.{key}" if path else str(key)
             if key not in rust:
-                _record(child_path, str(key), "<missing in rust>", java[key], diffs, info)
+                _record(child_path, str(key), "<missing in rust>", java[key], out, case)
             elif key not in java:
-                _record(child_path, str(key), rust[key], "<missing in java>", diffs, info)
+                _record(child_path, str(key), rust[key], "<missing in java>", out, case)
             else:
-                _walk_json(rust[key], java[key], child_path, diffs, info)
+                _walk_json(rust[key], java[key], child_path, out, case)
     elif isinstance(rust, list) and isinstance(java, list):
         if len(rust) != len(java):
-            diffs.append(f"{path or '<root>'}: list length rust={len(rust)} java={len(java)}")
+            out.diffs.append(f"{path or '<root>'}: list length rust={len(rust)} java={len(java)}")
         for i, (r, j) in enumerate(zip(rust, java)):
-            _walk_json(r, j, f"{path}[{i}]", diffs, info)
+            _walk_json(r, j, f"{path}[{i}]", out, case)
     else:
         if rust != java:
             leaf = path.rsplit(".", 1)[-1].split("[")[0]
-            _record(path or "<root>", leaf, rust, java, diffs, info)
+            _record(path or "<root>", leaf, rust, java, out, case)
 
 
-def _record(path: str, leaf: str, rust_val, java_val, diffs: list[str], info: list[str]) -> None:
+def _short(value, limit: int = 110) -> str:
+    """repr() capped for report lines -- an XMP packet is kilobytes long."""
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}...({len(text)} chars)"
+
+
+def _record(path: str, leaf: str, rust_val, java_val, out: CompareResult, case: str | None) -> None:
     line = f"{path}: rust={rust_val!r} java={java_val!r}"
+
+    # The registry is checked FIRST: an explicit (case, field) entry is more
+    # specific than the generic informational key heuristic, and routing a
+    # registered field to `info` would make it look permanently stale.
+    verdict = known_diffs.classify(case, path, rust_val, java_val)
+    if verdict.entry is not None:
+        out.known_keys.add(verdict.entry.key)
+        if verdict.kind == known_diffs.KNOWN:
+            pins = verdict.entry.pins_text() if verdict.entry.pinned else "UNPINNED"
+            out.known.append(
+                KnownFinding(
+                    field=path,
+                    detail=f"rust={_short(rust_val)} java={_short(java_val)} [{pins}]",
+                    reason=verdict.entry.reason,
+                )
+            )
+        else:  # PIN_MISMATCH -> a real DIFF, the expectation itself has rotted
+            out.diffs.append(f"{line} -- {verdict.message}")
+        return
+
     if _is_informational(path, leaf):
-        info.append("(informational) " + line)
+        out.info.append("(informational) " + line)
     else:
-        diffs.append(line)
+        out.diffs.append(line)
 
 
-def compare_json(rust: bytes, java: bytes) -> CompareResult:
+def compare_json(rust: bytes, java: bytes, case: str | None = None) -> CompareResult:
+    """Deep-compare two JSON bodies.
+
+    ``case`` enables known-difference classification for this case's registry
+    entries; without it every difference is a plain DIFF (previous behaviour).
+    """
     try:
         rj = json.loads(rust.decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -342,11 +400,10 @@ def compare_json(rust: bytes, java: bytes) -> CompareResult:
         jj = json.loads(java.decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
         return CompareResult.error(f"java body is not valid JSON: {exc}")
-    diffs: list[str] = []
-    info: list[str] = []
-    _walk_json(rj, jj, "", diffs, info)
-    verdict = "DIFF" if diffs else "PASS"
-    return CompareResult(verdict=verdict, diffs=diffs, info=info)
+    result = CompareResult(verdict="PASS")
+    _walk_json(rj, jj, "", result, case)
+    result.verdict = "DIFF" if result.diffs else "PASS"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +432,7 @@ def _orig_name(zf: zipfile.ZipFile, basename: str) -> str:
     return basename
 
 
-def compare_zip(rust: bytes, java: bytes) -> CompareResult:
+def compare_zip(rust: bytes, java: bytes, case: str | None = None) -> CompareResult:
     try:
         rz = zipfile.ZipFile(io.BytesIO(rust))
     except Exception as exc:  # noqa: BLE001
@@ -405,7 +462,8 @@ def compare_zip(rust: bytes, java: bytes) -> CompareResult:
         if kind == "pdf":
             child = compare_pdf(rdata, jdata)
         elif kind == "json":
-            child = compare_json(rdata, jdata)
+            # Registry field paths are relative to the zip member.
+            child = compare_json(rdata, jdata, case)
         else:
             child = _compare_bytes(rdata, jdata)
         result.merge_child(f"entry[{name}]", child)

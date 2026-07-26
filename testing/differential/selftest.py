@@ -26,6 +26,7 @@ import sys
 import compare
 import fixtures
 import httpclient
+import known_diffs
 
 
 class _Backend:
@@ -113,6 +114,34 @@ def main(argv: list[str]) -> int:
     j2 = json.loads(info1)
     j2["BasicInfo"]["WordCount"] += 7
     check("JSON WordCount diff -> DIFF", compare.compare_json(info1, json.dumps(j2).encode()).verdict, "DIFF")
+
+    # --- known-difference registry (must accept ONLY what it registered)
+    check("registry is structurally valid", known_diffs.validate(), [])
+    # An UNPINNED registered field absorbs any difference -> KNOWN, not DIFF.
+    j3 = json.loads(info1)
+    j3.setdefault("Other", {})["XMPMetadata"] = "<x:xmpmeta>re-serialised by xmpbox</x:xmpmeta>"
+    r3 = compare.compare_json(info1, json.dumps(j3).encode(), "get_info_single")
+    check("registered unpinned field -> PASS", r3.verdict, "PASS", str(r3.diffs))
+    check("...and is still REPORTED as known", len(r3.known) >= 1, True)
+    # The same difference is a hard DIFF for a case with no registry entry.
+    check(
+        "same field, unregistered case -> DIFF",
+        compare.compare_json(info1, json.dumps(j3).encode(), "rotate_90").verdict,
+        "DIFF",
+    )
+    # A PINNED field whose observed values drift away from the pins must FAIL:
+    # registration must not become a blanket exemption.
+    r4 = compare.compare_json(info1, json.dumps(j2).encode(), "get_info_single")
+    check("registered pinned field, pins broken -> DIFF", r4.verdict, "DIFF", str(r4.diffs))
+    check(
+        "...and says the expectation is stale",
+        any("expectation is stale" in d for d in r4.diffs),
+        True,
+        str(r4.diffs),
+    )
+    # Nothing registered was hit -> every entry for that case is stale.
+    stale = known_diffs.stale_entries("get_info_single", set())
+    check("stale sweep flags untouched entries", len(stale), 4)
 
     # --- ZIP
     check("ZIP identical -> PASS", compare.compare_zip(split24, split24).verdict, "PASS")
