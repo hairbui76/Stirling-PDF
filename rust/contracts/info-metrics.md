@@ -7,7 +7,12 @@ filters.
 
 - `GET /api/v1/info/status` and `GET /api/v1/info/health` return
   `{ "status": "UP", "version": "<application version>" }`. The version is
-  loaded from the repository's authoritative `version.properties` file.
+  loaded from the repository's authoritative `version.properties` file. Because
+  that file is gitignored (Gradle's `writeVersion` generates it), the crate's
+  `build.rs` stages a copy into `OUT_DIR`: the Gradle artifact is copied
+  verbatim when present, otherwise the version is parsed from the canonical
+  `version = '<x.y.z>'` assignment in `build.gradle`, so a clean checkout
+  compiles and reports the same version.
 - `GET /api/v1/info/load[?endpoint=<path>]` and `/load/unique` return the total
   or unique-session count for GET requests.
 - `GET /api/v1/info/load/all` and `/load/all/unique` return ordered

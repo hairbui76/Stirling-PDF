@@ -60,6 +60,66 @@ fn main() {
         &workspace_root,
         output_path.parent().unwrap_or(&output_path),
     );
+    write_version_properties(
+        &workspace_root,
+        output_path.parent().unwrap_or(&output_path),
+    );
+}
+
+/// Stages `version.properties` into `OUT_DIR` so the crate compiles on a clean
+/// checkout: the Gradle-generated artifact is copied verbatim when present,
+/// otherwise the canonical version assignment in `build.gradle` is used.
+fn write_version_properties(workspace_root: &Path, output_directory: &Path) {
+    let repository_root = workspace_root
+        .parent()
+        .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf);
+    let properties_path = repository_root.join("app/common/src/main/resources/version.properties");
+    let gradle_path = repository_root.join("build.gradle");
+    println!("cargo:rerun-if-changed={}", properties_path.display());
+    println!("cargo:rerun-if-changed={}", gradle_path.display());
+    let contents = if properties_path.is_file() {
+        fs::read_to_string(&properties_path).unwrap_or_else(|error| {
+            panic!("could not read {}: {error}", properties_path.display());
+        })
+    } else if let Some(version) = gradle_version(&gradle_path) {
+        format!("#Derived from the build.gradle version assignment\nversion={version}\n")
+    } else {
+        println!(
+            "cargo:warning=no version source: neither {} nor a version assignment in {} is \
+             available; falling back to version=0.0.0-unknown",
+            properties_path.display(),
+            gradle_path.display(),
+        );
+        "#No version source available\nversion=0.0.0-unknown\n".to_owned()
+    };
+    let output_path = output_directory.join("version.properties");
+    fs::write(&output_path, contents).unwrap_or_else(|error| {
+        panic!("could not write {}: {error}", output_path.display());
+    });
+}
+
+/// Returns the value of the first top-level `version = '<x.y.z>'` assignment
+/// in `build.gradle`, tolerating single or double quotes.
+fn gradle_version(gradle_path: &Path) -> Option<String> {
+    let build_gradle = fs::read_to_string(gradle_path).ok()?;
+    build_gradle.lines().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix("version")?
+            .trim_start()
+            .strip_prefix('=')?
+            .trim();
+        value
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+            .or_else(|| {
+                value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .filter(|version| !version.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn write_bundled_language_codes(workspace_root: &Path, output_directory: &Path) {
