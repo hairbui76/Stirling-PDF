@@ -1,4 +1,8 @@
-use std::{env, fmt, net::IpAddr};
+use std::{
+    env, fmt,
+    io::IsTerminal as _,
+    net::{IpAddr, SocketAddr},
+};
 
 use stirling_ai_engine::{EngineSettings, app};
 use tracing::info;
@@ -24,6 +28,10 @@ impl std::error::Error for BindAddressError {}
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        // Colour only real terminals: piped logs (CI, containers, the process
+        // smoke tests) must not interleave ANSI escapes into machine-read
+        // lines such as the startup `address=` report.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let settings = EngineSettings::from_environment()?;
@@ -31,7 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let bound_address = listener.local_addr()?;
     info!(address = %bound_address, "starting Stirling Rust AI engine foundation");
-    axum::serve(listener, app(settings)).await?;
+    // Peer addresses feed the config push's loopback-only fallback gate.
+    axum::serve(
+        listener,
+        app(settings).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

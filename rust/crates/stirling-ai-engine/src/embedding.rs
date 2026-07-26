@@ -94,6 +94,101 @@ impl EmbeddingClient {
         ))
     }
 
+    /// Builds the adapter for an admin-pushed embedding config with explicit
+    /// provider parts; empty pushed credentials fall back to the environment.
+    ///
+    /// `custom` is an OpenAI-compatible endpoint and, like `ollama`, works
+    /// keyless. An empty provider defers to the composed
+    /// `provider:model` reference via [`Self::from_environment`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported provider, a missing hosted-provider
+    /// credential, or an invalid endpoint.
+    pub fn from_pushed_config(
+        provider: &str,
+        model: &str,
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<Self, EmbeddingError> {
+        let pushed_key = api_key.filter(|value| !value.trim().is_empty());
+        let pushed_base = base_url.filter(|value| !value.is_empty());
+        match provider {
+            "" => Self::from_environment(model),
+            "voyageai" => {
+                let api_key = match pushed_key {
+                    Some(api_key) => api_key.to_owned(),
+                    None => env::var("VOYAGE_API_KEY")
+                        .map_err(|_| EmbeddingError::new("VOYAGE_API_KEY is not configured"))?,
+                };
+                let endpoint = pushed_base.map_or_else(
+                    || {
+                        env::var("VOYAGE_BASE_URL").map_or_else(
+                            |_| DEFAULT_VOYAGE_ENDPOINT.to_owned(),
+                            |base_url| voyage_endpoint(&base_url),
+                        )
+                    },
+                    voyage_endpoint,
+                );
+                Self::new(EmbeddingProvider::Voyage, model, Some(api_key), &endpoint)
+            }
+            "openai" => {
+                let api_key = match pushed_key {
+                    Some(api_key) => api_key.to_owned(),
+                    None => env::var("OPENAI_API_KEY")
+                        .map_err(|_| EmbeddingError::new("OPENAI_API_KEY is not configured"))?,
+                };
+                let base_url = pushed_base.map_or_else(
+                    || {
+                        env::var("OPENAI_BASE_URL")
+                            .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_owned())
+                    },
+                    str::to_owned,
+                );
+                Self::new(
+                    EmbeddingProvider::OpenAi,
+                    model,
+                    Some(api_key),
+                    &openai_endpoint(&base_url),
+                )
+            }
+            "custom" => {
+                let base_url = pushed_base.map_or_else(
+                    || {
+                        env::var("OPENAI_BASE_URL")
+                            .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_owned())
+                    },
+                    str::to_owned,
+                );
+                Self::new(
+                    EmbeddingProvider::OpenAi,
+                    model,
+                    pushed_key.map(str::to_owned),
+                    &openai_endpoint(&base_url),
+                )
+            }
+            "ollama" => {
+                let base_url = pushed_base.map_or_else(
+                    || {
+                        env::var("OLLAMA_BASE_URL")
+                            .unwrap_or_else(|_| DEFAULT_OLLAMA_BASE_URL.to_owned())
+                    },
+                    str::to_owned,
+                );
+                Self::new(
+                    EmbeddingProvider::Ollama,
+                    model,
+                    None,
+                    &ollama_endpoint(&base_url),
+                )
+            }
+            "test" => Self::new(EmbeddingProvider::Test, model, None, "http://localhost"),
+            _ => Err(EmbeddingError::new(
+                "embedding provider must be voyageai, openai, ollama, or custom",
+            )),
+        }
+    }
+
     fn new(
         provider: EmbeddingProvider,
         model: &str,

@@ -19,7 +19,10 @@ sqlite-vec files.
 - When `STIRLING_REQUIRE_USER_ID=true`, non-health routes require a non-empty
   `X-User-Id` after shared-secret authentication. The identity is carried to
   handlers as the typed `UserId` request extension; a missing identity returns
-  Python-compatible `401`.
+  Python-compatible `401`. `POST /api/v1/config` is the one exception: it is
+  processor-to-engine plumbing with no acting user and, exactly like the Python
+  oracle's router wiring, stays outside the user-id gate while remaining behind
+  the shared-secret gate.
 - Environment-backed booleans and numeric limits are parsed strictly before the
   listener binds. A present malformed or non-Unicode value terminates startup
   instead of substituting a default; this applies in particular to
@@ -29,7 +32,10 @@ sqlite-vec files.
   boundary.
 - Every JSON POST request accepts both the Python `ApiModel` camel-case aliases
   and its snake-case field names, including nested request models. Unknown
-  fields are rejected with `422` instead of being silently ignored.
+  fields are rejected with `422` instead of being silently ignored. The one
+  deliberate exception is the config-push contract, which mirrors the oracle's
+  `TolerantApiModel` (`extra="ignore"`): a newer processor must be able to push
+  to an older engine, so unknown push fields are ignored.
 - Default model names match the existing engine configuration:
   `anthropic:claude-haiku-4-5` for both smart and fast models.
 
@@ -228,6 +234,81 @@ the combined deterministic-operation registry.
 terminal `cannot_continue` behavior rather than pretending execution planning
 exists.
 
+## Ported admin config push
+
+`POST /api/v1/config` accepts the Java processor's admin AI settings push
+(`AiEngineConfigSync` posts it at startup and after every admin AI-settings
+save) with the oracle's `ConfigPushRequest` shape: `models`
+(provider/smartModel/fastModel/smartMaxTokens/fastMaxTokens/apiKey/baseUrl),
+`rag` (embeddingProvider/embeddingModel/embeddingApiKey/embeddingBaseUrl/
+topK/maxSearches), and `limits` (maxPages/maxCharacters/modelMaxConcurrency).
+Empty strings and omitted numbers keep the engine's current values; camel-case
+and snake-case names are both accepted; unknown fields are tolerated (see the
+boundary note above). Responses use the oracle's `ConfigApplyResponse`
+camel-case summary and never echo credentials.
+
+Gating and authorization match Python:
+
+- `STIRLING_ALLOW_CONFIG_PUSH` defaults to `true` (Python default) and is
+  strict-parsed at the fail-closed env boundary; when false the route returns
+  `403` naming the flag.
+- With a shared secret configured, the normal `X-Engine-Auth` middleware
+  protects the route. With no secret, only a direct loopback transport peer is
+  trusted; any forwarding header (`x-forwarded-for`, `x-forwarded-host`,
+  `x-real-ip`, `forwarded`) or a non-loopback/unknown peer returns `403`
+  naming `STIRLING_ENGINE_SHARED_SECRET`. Peer addresses come from
+  `into_make_service_with_connect_info`; a build without connect info (e.g.
+  embedded router tests) fails closed.
+- Out-of-range numbers (zero where the oracle requires `ge=1`; negative
+  anywhere) return `422`; `rag.maxSearches` legitimately accepts `0`.
+
+Apply semantics mirror `resolve_and_apply`: an explicit provider/api-key/base-
+URL push rebuilds both model tiers (`anthropic`, `openai`, keyless `ollama`,
+and `custom` as an OpenAI-compatible endpoint); the first explicit push over an
+env engine strips `provider:` prefixes from the running names while later
+pushes keep bare names intact (tracked via the pushed `chat_provider`, so
+`llama3.1:8b` is never truncated). Any non-empty embedding field rebuilds the
+embedder from the merged provider/model/credentials and appends the oracle's
+re-index note. A rebuilt runtime gets a fresh shared concurrency semaphore
+sized by the effective `modelMaxConcurrency`; the document store is always
+reused. Construction failures reject the push with `400` and leave the running
+config untouched. The swap is atomic: in-flight requests keep the snapshot
+they started with.
+
+The applied push is persisted encrypted as `data/ai_config_cache.enc` (with an
+`ai_config_cache.key` 0600 fallback keyfile when no shared secret is set —
+same filenames and location convention as Python) and re-applied at boot when
+`STIRLING_ALLOW_CONFIG_PUSH` is enabled; an unreadable, corrupt, or
+wrong-key cache logs a warning and boots from env. Deliberate divergences from
+the oracle, chosen because the cache is engine-private (neither Java nor
+Python ever reads the Rust file):
+
+- The cipher is the repository's established AES-256-GCM AEAD with an
+  HKDF-SHA256 key (info string `stirling-ai-config-cache/v1/aead-key`), not
+  Python's Fernet; a leftover Python Fernet file is ignored like a corrupt
+  cache and self-heals on the next push.
+- The Rust engine is single-process, so Python's multi-worker cache-stamp
+  watcher/poller has no analogue and is not ported.
+- A push whose model rebuild cannot authenticate fails closed with `400`
+  (e.g. provider `anthropic` with no pushed key and no `ANTHROPIC_API_KEY`),
+  where Python would apply an "unconfigured" placeholder key and fail on the
+  first model call.
+- For pushed `ollama`/`custom` providers with an empty `baseUrl`, the engine
+  falls back to `OLLAMA_BASE_URL`/`http://localhost:11434` (ollama) or
+  `OPENAI_BASE_URL`/the hosted default (custom), matching the Rust engine's
+  own env conventions rather than Python's fall-through to the OpenAI URL.
+- `rag.maxSearches` is accepted, persisted, and echoed, but the Rust question
+  agent does not yet consume a max-searches bound at runtime.
+
+The oracle's provider-aware output-mode switch (ToolOutput for `ollama`/
+`custom` because local OpenAI-compatible endpoints reject forced tools under
+native json-schema) maps to the Rust adapters' structured-output protocol:
+pushed `ollama`/`custom` providers use the native json-schema
+`response_format` protocol, while `openai` keeps forced function calls — the
+same per-provider split the env path already used. The MCP capability manifest
+deliberately stays at eight entries: Python does not expose config push as an
+agent capability either.
+
 ## Operational runtime
 
 Normal Task entry points now run `stirling-ai-engine`: `task engine:dev`,
@@ -294,7 +375,13 @@ parsing.
 Every advertised capability has a typed request/response boundary and contract
 coverage. A process-level smoke test starts the compiled binary on an ephemeral
 port and verifies public health, shared-secret and user-ID failures,
-authenticated capabilities, and a representative POST independently of the
-in-process router tests. Production cutover still requires provider
+authenticated capabilities, a representative POST, and an authenticated config
+push independently of the in-process router tests. The two server smoke tests
+previously timed out everywhere — not environmentally: the binary emitted ANSI
+escapes into piped stdout by default, so the harness's `address=` startup parse
+could never match. The binary now colours only real terminals
+(`with_ansi(stdout().is_terminal())`), and the smoke harness captures both
+child streams and prints them on a startup timeout so any future hang is
+diagnosable from the failure message alone. Production cutover still requires provider
 credentials, Java proxy routing, storage selection, and the relevant processing
 service to be verified in the target deployment.
