@@ -34,17 +34,18 @@ per-IP auth rate-limiting; (2) tower-http request/body timeouts + concurrency li
 (4) the cloud-metadata SSRF deny now covers all embedded-IPv4 forms and applies to result URLs. This is
 AI-assisted and does not replace the independent human security review the production cutover requires.
 
-**Live Java-vs-Rust parity signal (2026-07-26):** the `differential-parity` CI workflow now drives BOTH
-backends and semantically diffs their output (`testing/differential/`). Current result: **11 PASS / 2 DIFF of
-13** deterministic cases. All page operations are equivalent (rotate, merge, rearrange, remove-pages, crop,
-to-single-page, split, remove-blank-pages, and both scale cases). The first run found 4 real divergences;
-two are now fixed (scale-pages inherited-page-tree attributes; get-info field/format parity, which took the
-diff from 116 field mismatches down to 5). The two remaining `get-info-on-pdf` diffs are understood and
-documented: (a) word/character/paragraph counts on a rotated page — Java's bare `PDFTextStripper` runs with
-`sortByPosition=false`, so its line-breaking splits per glyph on `/Rotate 90`; matching that quirk needs a
-text-layout work-item; (b) `XMPMetadata` — Java re-serialises the packet through xmpbox (normalised
-namespaces/indentation, `+00:00` vs `Z`) while Rust returns the stored packet verbatim; the content is
-equivalent.
+**Live Java-vs-Rust parity signal (2026-07-26):** the `differential-parity` CI workflow drives BOTH
+backends and semantically diffs their output (`testing/differential/`). **Current result: 13 PASS / 13 —
+green**, with 5 declared known differences. The first live run found 4 real divergences; two were fixed
+(scale-pages leaked inherited page-tree attributes, causing double rotation; get-info field/format parity,
+which took the diff from 116 field mismatches down to 5). The 5 remaining field differences are declared in
+`testing/differential/known_diffs.py` with a mandatory root-cause `reason` and pinned expected values:
+(a) the word/character/paragraph counts on a rotated page — Java's bare `PDFTextStripper` runs with
+`sortByPosition=false`, so its line-breaking splits per glyph on `/Rotate 90`; the Rust value is the correct
+reading and replicating the Java quirk is deliberately not planned; (b) `XMPMetadata` — Java re-serialises
+the packet through xmpbox while Rust returns it verbatim (equivalent content, unpinnable because it embeds
+per-run timestamps). The registry does not blind the gate: a pinned value that drifts, or any unregistered
+field, still fails; a declared difference that disappears is reported STALE.
 
 **Route-count scoping note:** the Rust service registers 313 HTTP routes total.
 Only a subset of those are directly comparable to Java's OSS `controller/api`
