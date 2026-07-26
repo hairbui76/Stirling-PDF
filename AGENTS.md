@@ -532,11 +532,22 @@ The frontend is organized with a clear separation of concerns:
 - **Adding Tools**: See `ADDING_TOOLS.md` for complete guide to creating new PDF tools
 
 ## Communication Style
+- The user may write prompts in English, but agents must reply to the user in Vietnamese unless the user explicitly requests another response language
+- Only user-facing natural-language responses are translated; source code, code comments, identifiers, file contents, patches, commands, logs, and other technical artifacts must remain in English
 - Be direct and to the point
 - No apologies or conversational filler
 - Answer questions directly without preamble
 - Explain reasoning concisely when asked
 - Avoid unnecessary elaboration
+
+## Agent Delegation
+- Agents may freely delegate independent work to subagents and use all available concurrency without additional user confirmation
+- Respect platform concurrency limits and the mandatory dev/test agent-pair workflow for substantial Rust porting work
+
+## Rust Build Storage Guard
+- Before every Rust compile or test command, check the size of `rust/target/debug/deps` in the active worktree
+- If `rust/target/debug/deps` exceeds 50 GB, run `task rust:clean:deps` to remove exactly that directory before compiling or testing
+- Never remove a broader `target` directory as part of this automatic storage guard
 
 ## Decision Making
 - Ask clarifying questions before making assumptions
