@@ -96,6 +96,20 @@ pub fn add_geometry_page(
     })
 }
 
+/// The page attributes a `/Pages` node hands down to its kids (PDF 32000-1
+/// table 30).
+const INHERITABLE_PAGE_ATTRIBUTES: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
+/// Re-roots the page tree onto freshly generated pages.
+///
+/// Java builds its output into a brand-new `PDDocument`, so the page tree root
+/// it hands to `addPage` carries no inheritable attributes at all. We rewrite
+/// the source document in place and therefore reuse its root, so those
+/// attributes have to be cleared: otherwise a source whose `/Pages` node
+/// carries `/Rotate` or `/CropBox` would pass them down to the generated pages,
+/// which already have the rotation baked into their form matrices and their own
+/// boxes written out. Leaving `/Rotate 90` in place rotates the page a second
+/// time (827x1169 becomes 1169x827); leaving `/CropBox` crops the result.
 pub fn replace_page_tree(
     document: &mut Document,
     root_pages_id: ObjectId,
@@ -104,6 +118,9 @@ pub fn replace_page_tree(
     let count = i64::try_from(output_pages.len())
         .map_err(|error| lopdf::Error::NumericCast(error.to_string()))?;
     let pages = document.get_dictionary_mut(root_pages_id)?;
+    for attribute in INHERITABLE_PAGE_ATTRIBUTES {
+        pages.remove(attribute);
+    }
     pages.set(
         "Kids",
         output_pages

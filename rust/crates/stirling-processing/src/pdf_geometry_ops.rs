@@ -1,11 +1,13 @@
 use std::path::Path;
 
-use lopdf::Document;
+use lopdf::{Document, Object, ObjectId};
 use thiserror::Error;
 
 use crate::{
     pdf_form_transform::{copy_multi_page_form_fields, has_rotated_page},
-    pdf_page_geometry::{FormPlacement, PageForm, add_geometry_page, page_form, replace_page_tree},
+    pdf_page_geometry::{
+        FormPlacement, PageForm, add_geometry_page, inherited_value, page_form, replace_page_tree,
+    },
 };
 
 const A0: (f32, f32) = (2383.937, 3370.394);
@@ -17,6 +19,17 @@ const A5: (f32, f32) = (419.528, 595.276);
 const A6: (f32, f32) = (297.638, 419.528);
 const LETTER: (f32, f32) = (612.0, 792.0);
 const LEGAL: (f32, f32) = (612.0, 1008.0);
+
+/// `PDFBox` clamps rectangle coordinates to `Integer.MAX_VALUE` as a float.
+const COORDINATE_LIMIT: f32 = 2.147_483_6e9;
+
+/// `PDFBox` falls back to US Letter when a page has no `/MediaBox`.
+const DEFAULT_MEDIA_BOX: Rect = Rect {
+    llx: 0.0,
+    lly: 0.0,
+    urx: LETTER.0,
+    ury: LETTER.1,
+};
 
 #[derive(Debug, Error)]
 pub enum GeometryError {
@@ -108,6 +121,11 @@ pub fn pdf_to_single_page(
 
 /// Scales each source page into a centered target page size.
 ///
+/// Mirrors `ScalePagesController`: each source page is imported as a form
+/// `XObject` the way `PDFBox` does in `LayerUtility.importPageAsForm` (so `/Rotate`
+/// and `/CropBox` are baked into the form matrix), then centred on the target
+/// page at `min(widthRatio, heightRatio) * scaleFactor`.
+///
 /// # Errors
 ///
 /// Returns an error for invalid target settings, unreadable or empty PDFs,
@@ -129,24 +147,49 @@ pub fn scale_pdf_pages(
         return Err(GeometryError::NoPages);
     }
     let root_pages_id = document.catalog()?.get(b"Pages")?.as_reference()?;
+    let sources: Vec<_> = page_ids
+        .iter()
+        .map(|page_id| source_page(&document, *page_id))
+        .collect();
+    for (page_id, source) in page_ids.iter().zip(&sources) {
+        // `page_form` refuses a page without a usable `/MediaBox`; PDFBox falls
+        // back to US Letter instead, so write that box out before importing.
+        if page_rect(&document, *page_id, b"MediaBox").is_none() {
+            document
+                .get_dictionary_mut(*page_id)?
+                .set("MediaBox", source.media.to_object());
+        }
+    }
     let forms = page_ids
-        .into_iter()
-        .map(|page_id| page_form(&mut document, page_id))
+        .iter()
+        .map(|page_id| page_form(&mut document, *page_id))
         .collect::<Result<Vec<_>, _>>()?;
-    let target = target_page_size(page_size, orientation, forms[0])?;
+    for (form, source) in forms.iter().zip(&sources) {
+        import_page_as_form(&mut document, form.id, *source)?;
+    }
+    let target = target_page_rect(page_size, orientation, sources[0])?;
     let mut output_pages = Vec::with_capacity(forms.len());
-    for form in forms {
-        let scale = (target.0 / form.width).min(target.1 / form.height) * scale_factor;
-        let x = (target.0 - form.width * scale) / 2.0;
-        let y = (target.1 - form.height * scale) / 2.0;
+    for (form, source) in forms.iter().copied().zip(&sources) {
+        let source_width = source.media.width();
+        let source_height = source.media.height();
+        let scale =
+            (target.width() / source_width).min(target.height() / source_height) * scale_factor;
+        let x = (target.width() - source_width * scale) / 2.0;
+        let y = (target.height() - source_height * scale) / 2.0;
         finite_geometry(&[scale, x, y])?;
-        output_pages.push(add_geometry_page(
+        let page_id = add_geometry_page(
             &mut document,
             root_pages_id,
-            target.0,
-            target.1,
+            target.width(),
+            target.height(),
             &[placement(form, scale, x, y, None)],
-        ));
+        );
+        if target.llx != 0.0 || target.lly != 0.0 {
+            document
+                .get_dictionary_mut(page_id)?
+                .set("MediaBox", target.to_object());
+        }
+        output_pages.push(page_id);
     }
     replace_page_tree(&mut document, root_pages_id, output_pages)?;
     document.catalog_mut()?.remove(b"AcroForm");
@@ -257,13 +300,174 @@ fn placement(
     }
 }
 
-fn target_page_size(
+/// A normalised PDF rectangle, matching `PDFBox`'s `PDRectangle(COSArray)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rect {
+    llx: f32,
+    lly: f32,
+    urx: f32,
+    ury: f32,
+}
+
+impl Rect {
+    const fn sized(width: f32, height: f32) -> Self {
+        Self {
+            llx: 0.0,
+            lly: 0.0,
+            urx: width,
+            ury: height,
+        }
+    }
+
+    fn width(self) -> f32 {
+        self.urx - self.llx
+    }
+
+    fn height(self) -> f32 {
+        self.ury - self.lly
+    }
+
+    fn to_object(self) -> Object {
+        Object::Array(vec![
+            self.llx.into(),
+            self.lly.into(),
+            self.urx.into(),
+            self.ury.into(),
+        ])
+    }
+}
+
+/// The boxes and rotation `PDFBox` reads off a source page.
+#[derive(Debug, Clone, Copy)]
+struct SourcePage {
+    /// `PDPage.getMediaBox()`; drives the scale ratio and the centring offsets.
+    media: Rect,
+    /// `PDPage.getCropBox()`; the form's `/BBox` and origin compensation.
+    view: Rect,
+    /// `PDPage.getRotation()`, normalised to 0, 90, 180 or 270.
+    rotation: u16,
+}
+
+fn source_page(document: &Document, page_id: ObjectId) -> SourcePage {
+    let media = page_rect(document, page_id, b"MediaBox").unwrap_or(DEFAULT_MEDIA_BOX);
+    let view = page_rect(document, page_id, b"CropBox").map_or(media, |crop| Rect {
+        llx: media.llx.max(crop.llx),
+        lly: media.lly.max(crop.lly),
+        urx: media.urx.min(crop.urx),
+        ury: media.ury.min(crop.ury),
+    });
+    SourcePage {
+        media,
+        view,
+        rotation: page_rotation(document, page_id),
+    }
+}
+
+fn page_rect(document: &Document, page_id: ObjectId, key: &[u8]) -> Option<Rect> {
+    let value = inherited_value(document, page_id, key).ok()?;
+    let (_, value) = document.dereference(&value).ok()?;
+    let corners = value.as_array().ok()?;
+    if corners.len() < 4 {
+        return None;
+    }
+    let mut values = [0.0_f32; 4];
+    for (slot, corner) in values.iter_mut().zip(corners) {
+        let (_, corner) = document.dereference(corner).ok()?;
+        *slot = corner
+            .as_float()
+            .ok()?
+            .clamp(-COORDINATE_LIMIT, COORDINATE_LIMIT);
+    }
+    Some(Rect {
+        llx: values[0].min(values[2]),
+        lly: values[1].min(values[3]),
+        urx: values[0].max(values[2]),
+        ury: values[1].max(values[3]),
+    })
+}
+
+fn page_rotation(document: &Document, page_id: ObjectId) -> u16 {
+    let Ok(value) = inherited_value(document, page_id, b"Rotate") else {
+        return 0;
+    };
+    let Ok((_, value)) = document.dereference(&value) else {
+        return 0;
+    };
+    let Ok(degrees) = value.as_i64() else {
+        return 0;
+    };
+    if degrees % 90 != 0 {
+        return 0;
+    }
+    u16::try_from((degrees % 360 + 360) % 360).unwrap_or_default()
+}
+
+/// Rewrites a page form so it matches `LayerUtility.importPageAsForm`.
+///
+/// `page_form` builds the form from the media box with no rotation handling.
+/// `PDFBox` instead clips to the crop box and folds `/Rotate` into `/Matrix`,
+/// including the non-uniform squeeze that keeps a quarter-turned page inside
+/// its original (unrotated) footprint.
+fn import_page_as_form(
+    document: &mut Document,
+    form_id: ObjectId,
+    source: SourcePage,
+) -> Result<(), GeometryError> {
+    let matrix = page_form_matrix(source);
+    finite_geometry(&matrix)?;
+    let form = document.get_object_mut(form_id)?.as_stream_mut()?;
+    form.dict.set("BBox", source.view.to_object());
+    form.dict.set(
+        "Matrix",
+        matrix.into_iter().map(Object::from).collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+fn page_form_matrix(source: SourcePage) -> [f32; 6] {
+    let view = source.view;
+    let width = view.width();
+    let height = view.height();
+    // PDFBox starts from `mediaBox.lowerLeft - viewBox.lowerLeft`, then undoes
+    // the crop-box origin at the very end.
+    let offset_x = source.media.llx - view.llx;
+    let offset_y = source.media.lly - view.lly;
+    match source.rotation {
+        90 => [
+            0.0,
+            -(height / width),
+            width / height,
+            0.0,
+            -(width / height) * view.lly + offset_x,
+            (height / width) * (view.llx + width) + offset_y,
+        ],
+        180 => [
+            -1.0,
+            0.0,
+            0.0,
+            -1.0,
+            width + view.llx + offset_x,
+            height + view.lly + offset_y,
+        ],
+        270 => [
+            0.0,
+            height / width,
+            -(width / height),
+            0.0,
+            (width / height) * (height + view.lly) + offset_x,
+            -(height / width) * view.llx + offset_y,
+        ],
+        _ => [1.0, 0.0, 0.0, 1.0, offset_x - view.llx, offset_y - view.lly],
+    }
+}
+
+fn target_page_rect(
     page_size: &str,
     orientation: Option<&str>,
-    first_page: PageForm,
-) -> Result<(f32, f32), GeometryError> {
+    first_page: SourcePage,
+) -> Result<Rect, GeometryError> {
     if page_size == "KEEP" {
-        return Ok((first_page.width, first_page.height));
+        return Ok(first_page.media);
     }
     let base = match page_size {
         "A0" => A0,
@@ -279,9 +483,9 @@ fn target_page_size(
     };
     Ok(
         if orientation.is_some_and(|value| value.eq_ignore_ascii_case("LANDSCAPE")) {
-            (base.1, base.0)
+            Rect::sized(base.1, base.0)
         } else {
-            base
+            Rect::sized(base.0, base.1)
         },
     )
 }
@@ -497,7 +701,554 @@ fn invalid_layout(message: &str) -> GeometryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MultiPageLayoutOptions, ValidatedLayout, default_grid};
+    use std::path::{Path, PathBuf};
+
+    use lopdf::{Document, Object, ObjectId, Stream, dictionary};
+    use tempfile::{TempDir, tempdir};
+
+    use super::{
+        MultiPageLayoutOptions, Rect, SourcePage, ValidatedLayout, default_grid, inherited_value,
+        page_form_matrix, scale_pdf_pages, source_page, target_page_rect,
+    };
+
+    /// The attributes a `/Pages` node hands down to its kids.
+    const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
+    const CONTENT: &[u8] = b"0 0 1 rg 20 20 120 60 re f\n";
+    const EPSILON: f32 = 1e-3;
+
+    fn rect(values: [f32; 4]) -> Rect {
+        Rect {
+            llx: values[0],
+            lly: values[1],
+            urx: values[2],
+            ury: values[3],
+        }
+    }
+
+    fn numbers(values: [f32; 4]) -> Vec<Object> {
+        values.iter().copied().map(Object::Real).collect()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= EPSILON,
+                "{label}[{index}]: {actual} != {expected}",
+            );
+        }
+    }
+
+    /// Builds a source PDF whose pages carry the given boxes and rotation.
+    fn write_source(
+        directory: &TempDir,
+        pages: usize,
+        media: [f32; 4],
+        crop: Option<[f32; 4]>,
+        rotate: Option<i64>,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let mut document = Document::with_version("1.6");
+        let pages_id = document.new_object_id();
+        let mut page_ids = Vec::new();
+        for _ in 0..pages {
+            let content_id = document.add_object(Stream::new(dictionary! {}, CONTENT.to_vec()));
+            let mut page = dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => numbers(media),
+                "Contents" => content_id,
+                "Resources" => dictionary! {},
+            };
+            if let Some(crop) = crop {
+                page.set("CropBox", numbers(crop));
+            }
+            if let Some(rotate) = rotate {
+                page.set("Rotate", rotate);
+            }
+            page_ids.push(document.add_object(page));
+        }
+        let count = i64::try_from(page_ids.len())?;
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
+                "Count" => count,
+            }),
+        );
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        document.trailer.set("Root", catalog_id);
+        let path = directory.path().join("source.pdf");
+        document.save(&path)?;
+        Ok(path)
+    }
+
+    /// Builds a single-page source PDF whose inheritable attributes sit on the
+    /// root `/Pages` node rather than on the page, so the page only sees them
+    /// through inheritance.
+    fn write_inheriting_source(
+        directory: &TempDir,
+        media: [f32; 4],
+        crop: Option<[f32; 4]>,
+        rotate: Option<i64>,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let mut document = Document::with_version("1.6");
+        let tree_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(dictionary! {}, CONTENT.to_vec()));
+        let leaf_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => tree_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        let mut tree = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(leaf_id)],
+            "Count" => 1,
+            "MediaBox" => numbers(media),
+        };
+        if let Some(crop) = crop {
+            tree.set("CropBox", numbers(crop));
+        }
+        if let Some(rotate) = rotate {
+            tree.set("Rotate", rotate);
+        }
+        document.objects.insert(tree_id, Object::Dictionary(tree));
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => tree_id });
+        document.trailer.set("Root", catalog_id);
+        let path = directory.path().join("inheriting.pdf");
+        document.save(&path)?;
+        Ok(path)
+    }
+
+    fn read_floats(document: &Document, values: &Object) -> Result<Vec<f32>, lopdf::Error> {
+        values
+            .as_array()?
+            .iter()
+            .map(|value| document.dereference(value)?.1.as_float())
+            .collect()
+    }
+
+    fn form_of(document: &Document, page_id: ObjectId) -> Result<ObjectId, lopdf::Error> {
+        document
+            .get_dictionary(page_id)?
+            .get(b"Resources")?
+            .as_dict()?
+            .get(b"XObject")?
+            .as_dict()?
+            .get(b"Fm0")?
+            .as_reference()
+    }
+
+    /// Runs the endpoint's scale operation and returns the loaded output.
+    fn scale(
+        input: &Path,
+        output_directory: &TempDir,
+        page_size: &str,
+        orientation: &str,
+        scale_factor: f32,
+    ) -> Result<Document, Box<dyn std::error::Error>> {
+        let output = output_directory.path().join("scaled.pdf");
+        scale_pdf_pages(
+            input,
+            "input.pdf",
+            page_size,
+            Some(orientation),
+            scale_factor,
+            &output,
+        )?;
+        Ok(Document::load(&output)?)
+    }
+
+    #[test]
+    fn form_matrix_matches_pdfbox_layer_utility_for_every_rotation() {
+        let media = rect([0.0, 0.0, 612.0, 792.0]);
+        let upright = SourcePage {
+            media,
+            view: media,
+            rotation: 0,
+        };
+        assert_close(
+            &page_form_matrix(upright),
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "rotation 0",
+        );
+        // A quarter turn is squeezed back into the unrotated footprint, which is
+        // what makes Java's output non-uniformly scaled.
+        assert_close(
+            &page_form_matrix(SourcePage {
+                rotation: 90,
+                ..upright
+            }),
+            &[0.0, -792.0 / 612.0, 612.0 / 792.0, 0.0, 0.0, 792.0],
+            "rotation 90",
+        );
+        assert_close(
+            &page_form_matrix(SourcePage {
+                rotation: 180,
+                ..upright
+            }),
+            &[-1.0, 0.0, 0.0, -1.0, 612.0, 792.0],
+            "rotation 180",
+        );
+        assert_close(
+            &page_form_matrix(SourcePage {
+                rotation: 270,
+                ..upright
+            }),
+            &[0.0, 792.0 / 612.0, -(612.0 / 792.0), 0.0, 612.0, 0.0],
+            "rotation 270",
+        );
+    }
+
+    #[test]
+    fn form_matrix_compensates_for_a_crop_box_origin() {
+        let source = SourcePage {
+            media: rect([0.0, 0.0, 612.0, 792.0]),
+            view: rect([50.0, 100.0, 400.0, 700.0]),
+            rotation: 0,
+        };
+        // PDFBox: translate(media.ll - view.ll) then translate(-view.ll).
+        assert_close(
+            &page_form_matrix(source),
+            &[1.0, 0.0, 0.0, 1.0, -100.0, -200.0],
+            "cropped rotation 0",
+        );
+        let width = 350.0_f32;
+        let height = 600.0_f32;
+        assert_close(
+            &page_form_matrix(SourcePage {
+                rotation: 90,
+                ..source
+            }),
+            &[
+                0.0,
+                -(height / width),
+                width / height,
+                0.0,
+                -(width / height) * 100.0 - 50.0,
+                (height / width) * (50.0 + width) - 100.0,
+            ],
+            "cropped rotation 90",
+        );
+    }
+
+    #[test]
+    fn reads_boxes_and_rotation_the_way_pdfbox_does() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        // Reversed corners are normalised, the crop box is clipped to the media
+        // box, and a rotation that is not a multiple of 90 is ignored.
+        let path = write_source(
+            &directory,
+            1,
+            [612.0, 792.0, 0.0, 0.0],
+            Some([-40.0, -40.0, 900.0, 900.0]),
+            Some(45),
+        )?;
+        let document = Document::load(&path)?;
+        let page_id = *document
+            .get_pages()
+            .values()
+            .next()
+            .ok_or("source has no pages")?;
+        let source = source_page(&document, page_id);
+        assert_eq!(source.media, rect([0.0, 0.0, 612.0, 792.0]));
+        assert_eq!(source.view, rect([0.0, 0.0, 612.0, 792.0]));
+        assert_eq!(source.rotation, 0);
+
+        // Negative and over-full-turn rotations normalise into 0..360.
+        for (written, expected) in [(-90_i64, 270_u16), (450, 90), (720, 0), (180, 180)] {
+            let path = write_source(&directory, 1, [0.0, 0.0, 612.0, 792.0], None, Some(written))?;
+            let document = Document::load(&path)?;
+            let page_id = *document
+                .get_pages()
+                .values()
+                .next()
+                .ok_or("source has no pages")?;
+            assert_eq!(
+                source_page(&document, page_id).rotation,
+                expected,
+                "/Rotate {written}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_size_keeps_the_first_media_box_and_honours_orientation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = SourcePage {
+            media: rect([20.0, 30.0, 632.0, 822.0]),
+            view: rect([20.0, 30.0, 632.0, 822.0]),
+            rotation: 90,
+        };
+        // KEEP takes the page's media box verbatim, offsets included, and never
+        // consults the orientation.
+        assert_eq!(
+            target_page_rect("KEEP", Some("LANDSCAPE"), first)?,
+            first.media
+        );
+        assert_eq!(
+            target_page_rect("A4", Some("portrait"), first)?,
+            rect([0.0, 0.0, 595.276, 841.890])
+        );
+        assert_eq!(
+            target_page_rect("A4", Some("landscape"), first)?,
+            rect([0.0, 0.0, 841.890, 595.276])
+        );
+        assert!(target_page_rect("B5", None, first).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scaling_a_rotated_page_bakes_the_rotation_into_the_form()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let input = write_source(&directory, 1, [0.0, 0.0, 612.0, 792.0], None, Some(90))?;
+        let output_directory = tempdir()?;
+        let document = scale(&input, &output_directory, "A4", "PORTRAIT", 1.0)?;
+
+        let page_id = *document
+            .get_pages()
+            .values()
+            .next()
+            .ok_or("output has no pages")?;
+        let page = document.get_dictionary(page_id)?;
+        assert_close(
+            &read_floats(&document, page.get(b"MediaBox")?)?,
+            &[0.0, 0.0, 595.276, 841.890],
+            "output media box",
+        );
+
+        let form = document
+            .get_object(form_of(&document, page_id)?)?
+            .as_stream()?;
+        assert_close(
+            &read_floats(&document, form.dict.get(b"Matrix")?)?,
+            &[0.0, -792.0 / 612.0, 612.0 / 792.0, 0.0, 0.0, 792.0],
+            "form matrix",
+        );
+        assert_close(
+            &read_floats(&document, form.dict.get(b"BBox")?)?,
+            &[0.0, 0.0, 612.0, 792.0],
+            "form bbox",
+        );
+
+        // scale = min(595.276/612, 841.89/792) = 0.9726732, centred vertically.
+        let content = String::from_utf8(document.get_page_content(page_id))?;
+        let numbers: Vec<f32> = content
+            .split_whitespace()
+            .take_while(|token| *token != "cm")
+            .filter_map(|token| token.parse().ok())
+            .collect();
+        assert_close(
+            &numbers,
+            &[0.972_673_2, 0.0, 0.0, 0.972_673_2, 0.0, 35.766_41],
+            "placement matrix",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_pages_never_inherit_the_source_page_tree_attributes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        // `/Rotate` and `/CropBox` sit on the root `/Pages` node, so PDFBox sees
+        // them on the source page by inheritance and folds them into the form.
+        // Java then writes the result into a brand-new document whose page tree
+        // root is empty; we rewrite the source in place and reuse its root, so
+        // that root has to be stripped or the generated page picks the same
+        // attributes up a second time.
+        let input = write_inheriting_source(
+            &directory,
+            [0.0, 0.0, 612.0, 792.0],
+            Some([50.0, 100.0, 400.0, 700.0]),
+            Some(90),
+        )?;
+        let output_directory = tempdir()?;
+        let document = scale(&input, &output_directory, "A4", "PORTRAIT", 1.0)?;
+
+        let page_id = *document
+            .get_pages()
+            .values()
+            .next()
+            .ok_or("output has no pages")?;
+        // The quarter turn is already baked into the form matrix, so an output
+        // page that inherited `/Rotate 90` as well would render 841.89x595.276.
+        assert!(
+            inherited_value(&document, page_id, b"Rotate").is_err(),
+            "output page inherited /Rotate and is turned twice",
+        );
+        // An inherited crop box would clip the scaled result.
+        assert!(
+            inherited_value(&document, page_id, b"CropBox").is_err(),
+            "output page inherited /CropBox and is cropped",
+        );
+        assert_close(
+            &read_floats(
+                &document,
+                &inherited_value(&document, page_id, b"MediaBox")?,
+            )?,
+            &[0.0, 0.0, 595.276, 841.890],
+            "output media box",
+        );
+
+        let root_pages_id = document.catalog()?.get(b"Pages")?.as_reference()?;
+        let root_pages = document.get_dictionary(root_pages_id)?;
+        for attribute in INHERITABLE {
+            assert!(
+                root_pages.get(attribute).is_err(),
+                "page tree root still carries /{}",
+                String::from_utf8_lossy(attribute),
+            );
+        }
+
+        // The inherited boxes are still read off the source page: the crop box
+        // is the form's bounding box and the rotation is in its matrix.
+        let form = document
+            .get_object(form_of(&document, page_id)?)?
+            .as_stream()?;
+        assert_close(
+            &read_floats(&document, form.dict.get(b"BBox")?)?,
+            &[50.0, 100.0, 400.0, 700.0],
+            "form bbox",
+        );
+        let width = 350.0_f32;
+        let height = 600.0_f32;
+        assert_close(
+            &read_floats(&document, form.dict.get(b"Matrix")?)?,
+            &[
+                0.0,
+                -(height / width),
+                width / height,
+                0.0,
+                -(width / height) * 100.0 - 50.0,
+                (height / width) * (50.0 + width) - 100.0,
+            ],
+            "form matrix",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keep_scales_about_the_page_centre_on_every_page() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let input = write_source(&directory, 3, [0.0, 0.0, 612.0, 792.0], None, None)?;
+        let output_directory = tempdir()?;
+        let document = scale(&input, &output_directory, "KEEP", "PORTRAIT", 2.0)?;
+
+        let page_ids: Vec<_> = document.get_pages().into_values().collect();
+        assert_eq!(page_ids.len(), 3);
+        for page_id in page_ids {
+            assert_close(
+                &read_floats(
+                    &document,
+                    document.get_dictionary(page_id)?.get(b"MediaBox")?,
+                )?,
+                &[0.0, 0.0, 612.0, 792.0],
+                "kept media box",
+            );
+            // KEEP means the ratio is 1, so scale is the factor alone and the
+            // centring offsets go negative: the content zooms about the centre.
+            let content = String::from_utf8(document.get_page_content(page_id))?;
+            let numbers: Vec<f32> = content
+                .split_whitespace()
+                .take_while(|token| *token != "cm")
+                .filter_map(|token| token.parse().ok())
+                .collect();
+            assert_close(
+                &numbers,
+                &[2.0, 0.0, 0.0, 2.0, -306.0, -396.0],
+                "placement matrix",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn keep_preserves_a_media_box_that_does_not_start_at_the_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let input = write_source(&directory, 1, [20.0, 30.0, 632.0, 822.0], None, None)?;
+        let output_directory = tempdir()?;
+        let document = scale(&input, &output_directory, "KEEP", "PORTRAIT", 1.0)?;
+
+        let page_id = *document
+            .get_pages()
+            .values()
+            .next()
+            .ok_or("output has no pages")?;
+        assert_close(
+            &read_floats(
+                &document,
+                document.get_dictionary(page_id)?.get(b"MediaBox")?,
+            )?,
+            &[20.0, 30.0, 632.0, 822.0],
+            "offset media box",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn falls_back_to_us_letter_when_a_page_has_no_media_box()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut document = Document::with_version("1.6");
+        let tree_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(dictionary! {}, CONTENT.to_vec()));
+        let boxless_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => tree_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! {},
+        });
+        document.objects.insert(
+            tree_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(boxless_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            document.add_object(dictionary! { "Type" => "Catalog", "Pages" => tree_id });
+        document.trailer.set("Root", catalog_id);
+        let input = directory.path().join("no-media-box.pdf");
+        document.save(&input)?;
+
+        // PDFBox logs and uses US Letter rather than failing, so KEEP must yield
+        // a 612x792 page instead of an error.
+        let output_directory = tempdir()?;
+        let scaled = scale(&input, &output_directory, "KEEP", "PORTRAIT", 1.0)?;
+        let scaled_id = *scaled
+            .get_pages()
+            .values()
+            .next()
+            .ok_or("output has no pages")?;
+        assert_close(
+            &read_floats(&scaled, scaled.get_dictionary(scaled_id)?.get(b"MediaBox")?)?,
+            &[0.0, 0.0, 612.0, 792.0],
+            "letter fallback",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_non_finite_scale_factor() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let input = write_source(&directory, 1, [0.0, 0.0, 612.0, 792.0], None, None)?;
+        let output_directory = tempdir()?;
+        for factor in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(scale(&input, &output_directory, "A4", "PORTRAIT", factor).is_err());
+        }
+        // A degenerate media box cannot produce a finite form matrix.
+        let degenerate = write_source(&directory, 1, [0.0, 0.0, 0.0, 792.0], None, Some(90))?;
+        assert!(scale(&degenerate, &output_directory, "A4", "PORTRAIT", 1.0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn validates_default_and_custom_grids() -> Result<(), Box<dyn std::error::Error>> {
