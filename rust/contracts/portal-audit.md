@@ -6,10 +6,14 @@ Both shape recent `audit_events` into portal DTOs. They live in the reviewed,
 opt-in security router (`crate::portal_audit`, mounted in `auth_routes()` beside
 `security_audit_http`).
 
+Both Java controllers are `@ProprietaryUiDataApi`, which carries the class-level
+`@RequestMapping("/api/v1/proprietary/ui-data")` prefix; the frontend portal
+calls these prefixed paths.
+
 | Route | Behavior |
 | --- | --- |
-| `GET /api/v1/documents` | Documents review queue derived from file-bearing audit events. |
-| `GET /api/v1/infrastructure/audit-log` | Recent audit events shaped for the Infrastructure -> Audit tab. |
+| `GET /api/v1/proprietary/ui-data/documents` | Documents review queue derived from file-bearing audit events. |
+| `GET /api/v1/proprietary/ui-data/infrastructure/audit-log` | Recent audit events shaped for the Infrastructure -> Audit tab. |
 
 Both accept an optional `tier` query parameter that is **accepted and ignored**
 (mock-seam symmetry with Java; neither surface is tier-scoped).

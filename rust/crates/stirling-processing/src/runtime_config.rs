@@ -468,7 +468,7 @@ impl RuntimeConfig {
     pub fn ai_engine_settings(&self) -> (bool, String, u64) {
         let enabled = env_bool("AIENGINE_ENABLED")
             .or_else(|| env_bool("STIRLING_AI_ENGINE_ENABLED"))
-            .or_else(|| value_at(&self.settings, &["aiEngine", "enabled"]).and_then(Value::as_bool))
+            .or_else(|| value_at(&self.settings, &["aiEngine", "enabled"]).and_then(yaml_bool))
             .unwrap_or(false);
         let url = env::var("AIENGINE_URL")
             .ok()
@@ -555,7 +555,7 @@ impl RuntimeConfig {
             environment_value(names)
                 .as_deref()
                 .and_then(parse_boolean)
-                .or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+                .or_else(|| value_at(&self.settings, path).and_then(yaml_bool))
                 .unwrap_or(default)
         };
         let string = |names: &[&str], path: &[&str], default: &str| {
@@ -708,9 +708,7 @@ impl RuntimeConfig {
     pub fn login_disclaimer_requires_authentication(&self) -> bool {
         env_bool("SECURITY_ENABLELOGIN")
             .or_else(|| env_bool("SECURITY_ENABLE_LOGIN"))
-            .or_else(|| {
-                value_at(&self.settings, &["security", "enableLogin"]).and_then(Value::as_bool)
-            })
+            .or_else(|| value_at(&self.settings, &["security", "enableLogin"]).and_then(yaml_bool))
             .unwrap_or(false)
     }
 
@@ -767,7 +765,7 @@ impl RuntimeConfig {
             Err(env::VarError::NotUnicode(_)) => Err(variable),
         });
         let yaml_requested = value_at(&self.settings, &["security", "enableLogin"])
-            .and_then(Value::as_bool)
+            .and_then(yaml_bool)
             .unwrap_or(false);
         resolve_security_mode_request(&env_values, yaml_requested).map_err(|variable| {
             io::Error::new(
@@ -1143,7 +1141,7 @@ impl RuntimeConfig {
             environment(name)
                 .as_deref()
                 .and_then(parse_boolean)
-                .or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+                .or_else(|| value_at(&self.settings, path).and_then(yaml_bool))
                 .unwrap_or(false)
         };
         let configured_string = |path: &[&str], name: &str, default: &str| {
@@ -2174,7 +2172,7 @@ impl RuntimeConfig {
             .or_else(|| env_bool("LEGAL_LOGIN_AGREEMENT_ENABLED"))
             .or_else(|| {
                 value_at(&self.settings, &["legal", "loginAgreement", "enabled"])
-                    .and_then(Value::as_bool)
+                    .and_then(yaml_bool)
             })
             .unwrap_or(false)
     }
@@ -2187,7 +2185,7 @@ impl RuntimeConfig {
                     &self.settings,
                     &["legal", "loginAgreement", "showInAnonymousMode"],
                 )
-                .and_then(Value::as_bool)
+                .and_then(yaml_bool)
             })
             .unwrap_or(true)
     }
@@ -2244,12 +2242,12 @@ impl RuntimeConfig {
 
     fn boolean(&self, path: &[&str], environment: &str, default: bool) -> bool {
         env_bool(environment)
-            .or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+            .or_else(|| value_at(&self.settings, path).and_then(yaml_bool))
             .unwrap_or(default)
     }
 
     fn optional_boolean(&self, path: &[&str], environment: &str) -> Option<bool> {
-        env_bool(environment).or_else(|| value_at(&self.settings, path).and_then(Value::as_bool))
+        env_bool(environment).or_else(|| value_at(&self.settings, path).and_then(yaml_bool))
     }
 
     fn analytics_enabled(&self) -> Option<bool> {
@@ -2501,18 +2499,36 @@ fn env_bool(name: &str) -> Option<bool> {
     env::var(name).ok().and_then(|value| parse_boolean(&value))
 }
 
+/// Parses a configuration boolean with Spring's relaxed vocabulary.
+///
+/// Java binds environment and YAML values through spring-core's
+/// `StringToBooleanConverter`, which accepts `true`/`on`/`yes`/`1` and
+/// `false`/`off`/`no`/`0` (trimmed, case-insensitive). Anything narrower here
+/// would make the Rust binary read the same deployment configuration
+/// differently from Java — in the security guard's case, fail-open.
 fn parse_boolean(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
+        "true" | "on" | "yes" | "1" => Some(true),
+        "false" | "off" | "no" | "0" => Some(false),
         _ => None,
     }
 }
 
-fn security_mode_requested_from_value(value: Option<&str>) -> bool {
+/// Reads a YAML setting as a boolean with Java's SnakeYAML/Spring semantics.
+///
+/// `serde_yaml` implements YAML 1.2, so unquoted `yes`/`on`/`no`/`off` arrive
+/// here as *strings*, while `SnakeYAML` (YAML 1.1) hands Java a real `Boolean`.
+/// Falling back to [`parse_boolean`] keeps `enableLogin: yes` and
+/// `enabled: on` meaning the same thing in both runtimes; genuine YAML
+/// booleans still take the direct path.
+fn yaml_bool(value: &Value) -> Option<bool> {
     value
-        .map(str::trim)
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        .as_bool()
+        .or_else(|| value.as_str().and_then(parse_boolean))
+}
+
+fn security_mode_requested_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| parse_boolean(value) == Some(true))
 }
 
 /// Pure decision logic behind [`RuntimeConfig::security_mode_is_requested`],
@@ -2619,8 +2635,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        McpAuthConfig, McpConfig, RuntimeConfig, endpoint_key_for_uri, merge_json,
+        McpAuthConfig, McpConfig, RuntimeConfig, endpoint_key_for_uri, merge_json, parse_boolean,
         resolve_security_mode_request, security_mode_requested_from_value, split_strings,
+        yaml_bool,
     };
 
     #[test]
@@ -3124,12 +3141,110 @@ mod tests {
     }
 
     #[test]
-    fn security_mode_guard_only_accepts_the_explicit_true_value() {
-        assert!(security_mode_requested_from_value(Some("true")));
-        assert!(security_mode_requested_from_value(Some(" TRUE ")));
-        assert!(!security_mode_requested_from_value(Some("1")));
-        assert!(!security_mode_requested_from_value(Some("false")));
+    fn security_mode_guard_accepts_every_spring_truthy_spelling() {
+        for truthy in ["true", " TRUE ", "1", "on", "oN", "yes", " YES "] {
+            assert!(
+                security_mode_requested_from_value(Some(truthy)),
+                "{truthy:?} must request the secured mode"
+            );
+        }
+        for not_a_request in ["false", "off", "no", "0", "", "enabled", "2"] {
+            assert!(
+                !security_mode_requested_from_value(Some(not_a_request)),
+                "{not_a_request:?} must not request the secured mode"
+            );
+        }
         assert!(!security_mode_requested_from_value(None));
+    }
+
+    #[test]
+    fn parse_boolean_matches_springs_relaxed_vocabulary() {
+        for truthy in ["true", "on", "yes", "1", " TRUE ", "On", "YeS"] {
+            assert_eq!(parse_boolean(truthy), Some(true), "{truthy:?}");
+        }
+        for falsy in ["false", "off", "no", "0", " FALSE ", "oFf", "No"] {
+            assert_eq!(parse_boolean(falsy), Some(false), "{falsy:?}");
+        }
+        for malformed in ["", "2", "enable", "true!", "y", "n", "t", "f", "10"] {
+            assert_eq!(parse_boolean(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn yaml_bool_reads_yaml_1_1_spellings_the_way_snakeyaml_gives_them_to_java()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // serde_yaml (YAML 1.2) delivers unquoted yes/on/no/off as strings.
+        for (yaml, expected) in [
+            ("value: true", Some(true)),
+            ("value: false", Some(false)),
+            ("value: yes", Some(true)),
+            ("value: on", Some(true)),
+            ("value: no", Some(false)),
+            ("value: off", Some(false)),
+            ("value: \"1\"", Some(true)),
+            ("value: \"0\"", Some(false)),
+            ("value: banana", None),
+            ("value: 42", None),
+        ] {
+            let parsed: serde_json::Value = serde_yaml::from_str(yaml)?;
+            assert_eq!(yaml_bool(&parsed["value"]), expected, "yaml {yaml:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn security_mode_request_reads_every_java_yaml_spelling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        for requested in ["true", "yes", "on", "\"1\""] {
+            fs::write(
+                &settings,
+                format!("security:\n  enableLogin: {requested}\n"),
+            )?;
+            let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+            assert_eq!(
+                config.security_mode_is_requested().ok(),
+                Some(true),
+                "enableLogin: {requested} must request the secured mode"
+            );
+        }
+        for not_requested in ["false", "no", "off", "\"0\"", "banana"] {
+            fs::write(
+                &settings,
+                format!("security:\n  enableLogin: {not_requested}\n"),
+            )?;
+            let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+            assert_eq!(
+                config.security_mode_is_requested().ok(),
+                Some(false),
+                "enableLogin: {not_requested} must not request the secured mode"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_settings_read_every_java_yaml_spelling() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let settings = directory.path().join("settings.yml");
+        for (spelling, expected) in [("yes", true), ("on", true), ("\"1\"", true), ("no", false)] {
+            fs::write(
+                &settings,
+                format!("system:\n  googlevisibility: {spelling}\n"),
+            )?;
+            let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+            assert_eq!(
+                config.google_visibility(),
+                expected,
+                "googlevisibility: {spelling}"
+            );
+        }
+        // Malformed values fall back to the Java default (false here).
+        fs::write(&settings, "system:\n  googlevisibility: banana\n")?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        assert!(!config.google_visibility());
+        Ok(())
     }
 
     #[test]
