@@ -409,16 +409,65 @@ systems.
     being momentarily at capacity (`AtCapacity`) — collapses to the same generic
     retryable `503`, leaking neither which stage failed nor which limit was hit.
   - `GET /api/v1/auth/oidc/callback?code=…&state=…` calls `complete_oidc_login`
-    and, on success, returns the session **exactly** as `POST /api/v1/auth/login`
-    does — the same `{ user, session }` `AuthenticationResponse` shape with the
-    same opaque `spdf_at_`/`spdf_rt_` tokens — so callers treat an OIDC session
-    identically to a password session. Missing/empty `code` or `state` is a
-    `400`; every genuine login rejection (unknown/expired/replayed `state`,
-    token-exchange or id-token/nonce verification failure, account-level denial)
-    collapses to one generic `401`, so the response never reveals whether a
-    CSRF-`state` miss or a verification failure tripped. Infrastructure faults (a
-    poisoned store lock, a repository/crypto failure while provisioning) are
-    retryable `503`s.
+    and answers the **browser** that landed on it, mirroring Java's
+    `CustomOAuth2AuthenticationSuccessHandler` /
+    `CustomOAuth2AuthenticationFailureHandler` pair (a browser must never land
+    on raw JSON here):
+    - **Success** is a `302 Found` to
+      `{origin}{redirect-path}#access_token={token}` — byte-level the format
+      Java's `buildContextAwareRedirectUrl` produces for the web flow, and
+      exactly the fragment the SPA's `AuthCallback.tsx` consumes
+      (`URLSearchParams` over the hash, `access_token` key). The token is the
+      same opaque `spdf_at_` access token `POST /api/v1/auth/login` issues, so
+      an OIDC session remains indistinguishable from a password session once
+      stored. The token rides the URL **fragment**, never the query, so it is
+      not transmitted to the target server by the browser.
+    - **`redirect-path`** honors the SPA's `stirling_redirect_path` cookie
+      (Java: `TauriOAuthUtils.SPA_REDIRECT_COOKIE`): form-urlencoded-decoded
+      with `URLDecoder` semantics, trimmed, and required to start with `/`,
+      else the default `/auth/callback`. One hardening on top of Java: values
+      starting `//` or `/\` are rejected too (on the context-relative failure
+      `Location` a protocol-relative path would be an attacker-settable open
+      redirect; Java's failure path has that hole). Every callback redirect —
+      success or failure — clears the cookie with Java's exact clearing
+      attributes: `stirling_redirect_path=; Path=/; Max-Age=0; SameSite=Lax`.
+    - **`origin`** is resolved context-aware with Java's exact precedence
+      (`buildContextAwareRedirectUrl`): `X-Forwarded-Host` (first
+      comma-separated entry; scheme from the first `X-Forwarded-Proto` entry,
+      else the engine's own plain `http`; `X-Forwarded-Port` appended only
+      when the host has no port and the port is not the scheme default), then
+      the `Referer`'s `scheme://host[:port]` (explicit non-80/443 port kept)
+      unless the referer host is a known OAuth provider domain
+      (google/googleapis/github/microsoft/microsoftonline/linkedin/apple —
+      the `IdP` that just redirected here, not where the SPA lives), then the
+      request's own `Host` header on `http` with a default `:80` dropped.
+      Forwarded headers are trusted exactly as far as Java trusts them and no
+      further; with no resolvable origin at all the `Location` degrades to a
+      context-relative path, which the browser resolves against the origin it
+      is already on. If the composed `Location` cannot be a header value, the
+      redirect falls back to the bare default path (fail-closed).
+    - **Every genuine login rejection** — missing/empty `code`/`state` (Java's
+      `OAuth2LoginAuthenticationFilter` treats a non-authorization-response as
+      an authentication failure too), an absent/wrong browser-binding cookie
+      (login-CSRF), an unknown/expired/replayed `state`, token-exchange or
+      id-token/nonce verification failure, account-level denial — is a `302`
+      to `{redirect-path}?errorOAuth=oauth2AuthenticationError`. The error
+      value is **always** that one fixed string (Java's generic fallback)
+      rather than Java's per-cause OAuth2 error code: the redirect-shaped
+      counterpart of the old single generic `401`, still revealing nothing
+      about which check tripped. The failure `Location` is context-relative
+      (no origin), matching Java's `DefaultRedirectStrategy`, so no
+      forwarded-header trust exists on the failure path at all.
+    - **Infrastructure faults** (a poisoned store lock, a repository/crypto
+      failure while provisioning) stay retryable `503` JSON — in Java those
+      surface as 5xx error responses, not redirects.
+    - **Deliberate divergence:** Java's `tauri:`-prefixed desktop-state
+      branches (the `/auth/callback/tauri` path, the `&nonce=…` fragment
+      suffix, the state/nonce query echo on failure) are **not** ported. This
+      port never issues `tauri:` states — its `state` is CSPRNG base64url,
+      which cannot contain `:` — so a success can never be a Tauri flow, and
+      a forged `tauri:` state fails the store lookup and follows the generic
+      failure redirect without reflecting any request parameter.
   Both routes are **public** (the browser has no session yet), classified in
   `security_policy::endpoint_policy` — `authorize` on `POST`, `callback` on
   `GET`, on those verbs only. The single-use `OidcLoginStateStore`, the
@@ -459,15 +508,16 @@ binary, so — as with every other auth feature living behind this boundary — 
 routes are reachable only from the integration/review harness (`app_with_reviewed_security`)
 for now; the boundary is unchanged.
 
-Out of scope here, and noted as follow-ups: the **frontend redirect/cookie UX**
-(the callback returning the session tokens as JSON is the backend boundary; a
-browser-facing flow that issues a `302` to the provider, then sets the session
-in a cookie on callback, is a separate frontend concern). Also still out of
-scope: durable (cross-process) `state` storage — the store is in-memory, so
-pending logins do not survive a restart, which is acceptable for the short
-bounded TTL of an in-flight login handshake. (Two earlier follow-ups have since
-landed: confidential-client `client_secret` authentication and the bounded JWKS
-cache in the id-token verifier — see the bullets above.)
+Still out of scope: durable (cross-process) `state` storage — the store is
+in-memory, so pending logins do not survive a restart, which is acceptable for
+the short bounded TTL of an in-flight login handshake. (Three earlier
+follow-ups have since landed: confidential-client `client_secret`
+authentication, the bounded JWKS cache in the id-token verifier, and the
+**browser callback UX** — the callback now `302`s the browser to the SPA with
+the access token in the URL fragment and honors/clears the SPA's
+redirect-path cookie, see the callback bullet above. `POST /authorize`
+remains JSON-out by design: turning the authorization URL into a navigation
+is still the frontend's job.)
 
 ## MFA recovery codes (backup codes)
 

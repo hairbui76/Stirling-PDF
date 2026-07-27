@@ -63,6 +63,21 @@ const OIDC_CSRF_COOKIE: &str = "spdf_oidc_csrf";
 /// Path the OIDC browser-binding cookie is scoped to: the OIDC login routes
 /// only, so it is never attached to unrelated requests.
 const OIDC_COOKIE_PATH: &str = "/api/v1/auth/oidc";
+/// Name of the SPA's post-login redirect-path cookie (Java parity:
+/// `TauriOAuthUtils.SPA_REDIRECT_COOKIE`). The SPA writes the path it wants to
+/// land on after SSO; the OIDC callback honors it once and clears it.
+const SPA_REDIRECT_COOKIE: &str = "stirling_redirect_path";
+/// Default SPA landing path for the OIDC browser callback (Java parity:
+/// `TauriOAuthUtils.DEFAULT_CALLBACK_PATH`) — the route `AuthCallback.tsx`
+/// serves, which reads `#access_token=…` on success / `?errorOAuth=…` on
+/// failure.
+const SPA_CALLBACK_PATH: &str = "/auth/callback";
+/// The one `errorOAuth` value every browser-facing OIDC callback failure
+/// carries (Java's generic fallback in
+/// `CustomOAuth2AuthenticationFailureHandler`). Deliberately a single constant:
+/// the redirect must not reveal which check tripped, the redirect-shaped
+/// counterpart of the API's single generic 401 principle.
+const OIDC_BROWSER_ERROR_VALUE: &str = "oauth2AuthenticationError";
 const AUDIT_LEVEL_OFF: u8 = 0;
 const AUDIT_LEVEL_BASIC: u8 = 1;
 const AUDIT_LEVEL_STANDARD: u8 = 2;
@@ -1085,28 +1100,53 @@ fn oidc_binding_cookie(value: &str, max_age: Duration) -> Option<HeaderValue> {
     .ok()
 }
 
-/// Reads the OIDC login browser-binding cookie ([`OIDC_CSRF_COOKIE`]) from a
-/// request's `Cookie` header, if present. The header may pack several cookies
-/// separated by `;`; only ours is returned.
-fn oidc_binding_cookie_value(headers: &HeaderMap) -> Option<String> {
+/// Reads one named cookie from a request's `Cookie` header, if present. The
+/// header may pack several cookies separated by `;`; only the named one is
+/// returned.
+fn request_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies
         .split(';')
         .filter_map(|pair| pair.split_once('='))
-        .find(|(name, _)| name.trim() == OIDC_CSRF_COOKIE)
+        .find(|(candidate, _)| candidate.trim() == name)
         .map(|(_, value)| value.trim().to_owned())
 }
 
-/// Completes a generic-OIDC login from the provider's callback: extracts `code`
-/// and `state`, reads the login-CSRF browser-binding cookie ([`OIDC_CSRF_COOKIE`])
-/// set at [`oidc_authorize`], exchanges and verifies through [`complete_oidc_login`]
-/// (which requires that cookie to equal the binding stored for this login before
-/// it does anything else), and on success issues a session and returns it EXACTLY
-/// as [`login`] does (the same [`AuthenticationResponse`] shape). Missing
-/// `code`/`state` is a 400; every other failure — including an absent or wrong
-/// browser-binding cookie (the login-CSRF rejection) — collapses to one generic
-/// 401 (see [`oidc_callback_error_response`]), revealing nothing about which
-/// check tripped.
+/// Reads the OIDC login browser-binding cookie ([`OIDC_CSRF_COOKIE`]) from a
+/// request's `Cookie` header, if present.
+fn oidc_binding_cookie_value(headers: &HeaderMap) -> Option<String> {
+    request_cookie_value(headers, OIDC_CSRF_COOKIE)
+}
+
+/// Completes a generic-OIDC login from the provider's callback and answers the
+/// BROWSER that landed here, mirroring Java's
+/// `CustomOAuth2AuthenticationSuccessHandler` /
+/// `CustomOAuth2AuthenticationFailureHandler` pair: extracts `code` and
+/// `state`, reads the login-CSRF browser-binding cookie ([`OIDC_CSRF_COOKIE`])
+/// set at [`oidc_authorize`], exchanges and verifies through
+/// [`complete_oidc_login`] (which requires that cookie to equal the binding
+/// stored for this login before it does anything else), and:
+///
+/// - on success, 302-redirects to the SPA —
+///   `{origin}{redirect-path}#access_token={token}` — exactly the fragment
+///   `AuthCallback.tsx` consumes, with the origin resolved context-aware (see
+///   [`oidc_redirect_origin`]) and the path taken from the
+///   [`SPA_REDIRECT_COOKIE`] the SPA set before starting SSO (see
+///   [`spa_redirect_path`]); the cookie is cleared on the way out
+///   ([`oidc_browser_redirect`]).
+/// - on every genuine login rejection — a missing/empty `code` or `state`
+///   (Java's `OAuth2LoginAuthenticationFilter` treats that as an
+///   authentication failure too), an absent or wrong browser-binding cookie
+///   (the login-CSRF rejection), an unknown/expired/replayed `state`, a failed
+///   token exchange or id-token/nonce verification, or an account-level denial
+///   — 302-redirects to `{redirect-path}?errorOAuth=oauth2AuthenticationError`
+///   ([`oidc_failure_redirect`]), one fixed error value so the redirect never
+///   reveals which check tripped (the browser-flow counterpart of the API's
+///   single generic 401 principle; Java redirects here as well, it never
+///   answers this browser flow with raw JSON).
+/// - infrastructure faults (a poisoned lock, repository/crypto failures) stay
+///   retryable 503 JSON — in Java those surface as 5xx error responses, not
+///   redirects (see [`oidc_callback_error_response`]).
 async fn oidc_callback(
     Extension(store): Extension<Arc<OidcLoginStateStore>>,
     Extension(jwks_cache): Extension<Arc<OidcJwksCache>>,
@@ -1116,10 +1156,10 @@ async fn oidc_callback(
     Query(query): Query<OidcCallbackQuery>,
 ) -> Response {
     let (Some(code), Some(state)) = (query.code, query.state) else {
-        return json_error(StatusCode::BAD_REQUEST, "Invalid request");
+        return oidc_failure_redirect(&headers);
     };
     if code.is_empty() || state.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "Invalid request");
+        return oidc_failure_redirect(&headers);
     }
     // Login-CSRF binding (RFC 9700): hand the browser's binding cookie to
     // `complete_oidc_login`, which rejects the login unless it equals the binding
@@ -1141,12 +1181,10 @@ async fn oidc_callback(
     })
     .await;
     match result {
-        Ok(Ok(completed)) => Json(AuthenticationResponse {
-            user: authentication_user(&completed.context),
-            session: completed.tokens,
-        })
-        .into_response(),
-        Ok(Err(error)) => oidc_callback_error_response(&error),
+        Ok(Ok(completed)) => {
+            oidc_success_redirect(&headers, completed.tokens.access_token.as_str())
+        }
+        Ok(Err(error)) => oidc_callback_error_response(&error, &headers),
         Err(_) => service_unavailable_response(),
     }
 }
@@ -1156,9 +1194,10 @@ async fn oidc_callback(
 /// verified identity) are retryable 503s; every genuine login rejection —
 /// an absent/wrong browser-binding cookie (login-CSRF), an unknown/expired/replayed
 /// `state`, a failed token exchange, a failed id-token (or nonce) verification,
-/// or an account-level denial — collapses to one generic 401 so the response
-/// never reveals which check tripped.
-fn oidc_callback_error_response(error: &OidcLoginError) -> Response {
+/// or an account-level denial — collapses to the single browser error redirect
+/// ([`oidc_failure_redirect`]) so the response never reveals which check
+/// tripped.
+fn oidc_callback_error_response(error: &OidcLoginError, headers: &HeaderMap) -> Response {
     match error {
         OidcLoginError::StateUnavailable
         | OidcLoginError::Identity(
@@ -1171,16 +1210,226 @@ fn oidc_callback_error_response(error: &OidcLoginError) -> Response {
             | SecurityError::IntegrationProtectionUnavailable
             | SecurityError::AuditEventLimitExceeded,
         ) => service_unavailable_response(),
-        _ => oidc_authentication_failed(),
+        _ => oidc_failure_redirect(headers),
     }
 }
 
-/// The single generic 401 every genuine OIDC callback rejection collapses to
-/// (absent/wrong browser binding, unknown/expired/replayed `state`, a failed
-/// token or id-token verification, an account denial), so the response never
-/// reveals which check tripped.
-fn oidc_authentication_failed() -> Response {
-    json_error(StatusCode::UNAUTHORIZED, "Authentication failed")
+/// The success redirect the browser lands on after a completed OIDC login:
+/// `302 Found` to `{origin}{redirect-path}#access_token={token}` — byte-level
+/// the format Java's `buildContextAwareRedirectUrl` produces for the web flow
+/// and the fragment `AuthCallback.tsx` parses (`URLSearchParams` over the
+/// hash). The token rides the URL FRAGMENT, never the query, so it is not sent
+/// to any server the origin resolution may pick.
+///
+/// Java appends `&nonce=…` only for `tauri:`-prefixed desktop states; this
+/// port never issues such states (the state is CSPRNG base64url, which cannot
+/// contain `:`), so a success here can never be a Tauri flow and no nonce is
+/// appended.
+fn oidc_success_redirect(headers: &HeaderMap, access_token: &str) -> Response {
+    let origin = oidc_redirect_origin(headers);
+    let path = spa_redirect_path(headers);
+    oidc_browser_redirect(&format!("{origin}{path}#access_token={access_token}"))
+}
+
+/// The failure redirect the browser lands on when the OIDC login is rejected:
+/// `302 Found` to `{redirect-path}?errorOAuth=oauth2AuthenticationError`,
+/// mirroring Java's `CustomOAuth2AuthenticationFailureHandler`
+/// (`buildFailureRedirectUrl` + `errorOAuth` query param). Deliberate
+/// differences from Java, both documented in the contract:
+///
+/// - the `Location` is context-relative (a bare path), exactly like Java's
+///   `DefaultRedirectStrategy` — the browser resolves it against the origin it
+///   is already on, so no forwarded-header trust is needed on the failure path;
+/// - the error value is ALWAYS the one fixed [`OIDC_BROWSER_ERROR_VALUE`]
+///   rather than Java's per-cause `OAuth2` error code, preserving this port's
+///   "reveal nothing about which check tripped" principle in redirect form;
+/// - the `tauri:` desktop-state branch is not ported (no such states are ever
+///   issued here), so no request parameters are ever reflected into the
+///   redirect.
+fn oidc_failure_redirect(headers: &HeaderMap) -> Response {
+    let path = spa_redirect_path(headers);
+    let separator = if path.contains('?') { '&' } else { '?' };
+    oidc_browser_redirect(&format!(
+        "{path}{separator}errorOAuth={OIDC_BROWSER_ERROR_VALUE}"
+    ))
+}
+
+/// Builds the `302 Found` browser redirect both OIDC callback outcomes share,
+/// clearing the SPA redirect-path cookie on the way out with Java's exact
+/// clearing attributes (`clearRedirectCookie`: `Path=/; Max-Age=0;
+/// SameSite=Lax`, no `HttpOnly`/`Secure` — the SPA itself writes this cookie
+/// from script). If `location` cannot be a header value (a non-ASCII or
+/// control byte smuggled through a forwarded header), the redirect falls back
+/// to the default SPA callback path instead of failing open.
+fn oidc_browser_redirect(location: &str) -> Response {
+    let location = HeaderValue::from_str(location)
+        .unwrap_or_else(|_| HeaderValue::from_static(SPA_CALLBACK_PATH));
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(header::LOCATION, location);
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("stirling_redirect_path=; Path=/; Max-Age=0; SameSite=Lax"),
+    );
+    response
+}
+
+/// Resolves the SPA path the OIDC callback should send the browser to, from
+/// the [`SPA_REDIRECT_COOKIE`] the SPA sets right before starting SSO
+/// (`springAuthClient.signInWithOAuth` persists the user's intended
+/// destination there, URL-encoded). Mirrors Java's `resolveRedirectPath` +
+/// `TauriOAuthUtils.extractRedirectPathFromCookie`: the value is
+/// form-urlencoded-decoded (`URLDecoder` semantics), trimmed, and must start
+/// with `/` — otherwise the default [`SPA_CALLBACK_PATH`] is used. One
+/// hardening on top of Java: values starting `//` or `/\` are rejected too,
+/// because on the (context-relative) failure redirect a protocol-relative
+/// `Location` would be an attacker-settable open redirect.
+fn spa_redirect_path(headers: &HeaderMap) -> String {
+    let cookie_path = request_cookie_value(headers, SPA_REDIRECT_COOKIE)
+        .and_then(|raw| form_urlencoded_decode(&raw))
+        .map(|decoded| decoded.trim().to_owned())
+        .filter(|path| {
+            path.starts_with('/') && !path.starts_with("//") && !path.starts_with("/\\")
+        });
+    cookie_path.unwrap_or_else(|| SPA_CALLBACK_PATH.to_owned())
+}
+
+/// Decodes an `application/x-www-form-urlencoded` value with Java
+/// `URLDecoder.decode` semantics: `+` becomes a space and `%XX` becomes the
+/// byte `XX`. Returns [`None`] where Java would throw (a truncated or
+/// non-hex `%` escape) or where the decoded bytes are not UTF-8 — the caller
+/// then falls back to the default path.
+fn form_urlencoded_decode(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let escape = [bytes.next()?, bytes.next()?];
+                let escape = std::str::from_utf8(&escape).ok()?;
+                decoded.push(u8::from_str_radix(escape, 16).ok()?);
+            }
+            other => decoded.push(other),
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Resolves the browser-facing origin for the OIDC success redirect,
+/// mirroring Java's `buildContextAwareRedirectUrl` precedence exactly:
+/// `X-Forwarded-Host`(+`-Proto`/`-Port`) first, then the `Referer` (unless it
+/// is a known OAuth provider domain — the `IdP` just redirected here), then the
+/// request's own `Host`. Trusting `X-Forwarded-*` unconditionally is Java's
+/// choice, deliberately mirrored no further: these headers only steer where
+/// THIS browser is sent, and the token travels in the fragment, which
+/// browsers never transmit to the target server.
+///
+/// Java can always name a server (`serverName`); a raw socket has no such
+/// guarantee, so with no resolvable origin this returns the empty string and
+/// the `Location` degrades to a context-relative path — the browser then
+/// resolves it against the origin it is already on, which is strictly safer.
+fn oidc_redirect_origin(headers: &HeaderMap) -> String {
+    forwarded_origin(headers)
+        .or_else(|| referer_origin(headers))
+        .or_else(|| host_origin(headers))
+        .unwrap_or_default()
+}
+
+/// `X-Forwarded-Host` branch of [`oidc_redirect_origin`] (Java's
+/// `resolveForwardedOrigin`): first comma-separated host, scheme from the
+/// first `X-Forwarded-Proto` entry (falling back to the engine's own scheme,
+/// plain `http`), and — only when the host carries no port of its own —
+/// `X-Forwarded-Port` unless it is the scheme's default.
+fn forwarded_origin(headers: &HeaderMap) -> Option<String> {
+    let forwarded_host = headers.get("x-forwarded-host")?.to_str().ok()?;
+    let host = forwarded_host.split(',').next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.split(',').next())
+        .map_or("http", str::trim);
+    let mut host = host.to_owned();
+    if !host.contains(':')
+        && let Some(port) = headers
+            .get("x-forwarded-port")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|port| !port.is_empty())
+        && !is_default_port(proto, port)
+    {
+        host = format!("{host}:{port}");
+    }
+    Some(format!("{proto}://{host}"))
+}
+
+/// `Referer` branch of [`oidc_redirect_origin`] (Java's
+/// `resolveOriginFromReferer`): the referer's `scheme://host[:port]` — port
+/// only when explicit and neither 80 nor 443 — unless the referer is a known
+/// OAuth provider domain (the `IdP` that just redirected the browser here, not
+/// where the SPA lives).
+fn referer_origin(headers: &HeaderMap) -> Option<String> {
+    let referer = headers.get(header::REFERER)?.to_str().ok()?;
+    if referer.is_empty() {
+        return None;
+    }
+    let referer = url::Url::parse(referer).ok()?;
+    let host = referer.host_str()?;
+    if is_oauth_provider_domain(&host.to_lowercase()) {
+        return None;
+    }
+    let origin = match referer.port() {
+        Some(port) if port != 80 && port != 443 => {
+            format!("{}://{host}:{port}", referer.scheme())
+        }
+        _ => format!("{}://{host}", referer.scheme()),
+    };
+    Some(origin)
+}
+
+/// Last-resort branch of [`oidc_redirect_origin`] (Java's
+/// `buildOriginFromRequest`): the request's own `Host` header on the engine's
+/// own scheme (plain `http` — TLS terminates in front of this service, and
+/// that case is covered by the forwarded branch), dropping the scheme-default
+/// port the way Java skips `serverPort` 80.
+fn host_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let host = host.strip_suffix(":80").unwrap_or(host);
+    Some(format!("http://{host}"))
+}
+
+/// Java's `isDefaultPort`: 80 for `http`, 443 for `https` (schemes compared
+/// case-insensitively); an unparseable port is NOT default, so it gets
+/// appended verbatim exactly as Java appends it.
+fn is_default_port(proto: &str, port: &str) -> bool {
+    match port.parse::<u32>() {
+        Ok(80) => proto.eq_ignore_ascii_case("http"),
+        Ok(443) => proto.eq_ignore_ascii_case("https"),
+        _ => false,
+    }
+}
+
+/// Java's `isOAuthProviderDomain`: substring match over the lowercased
+/// referer host, so a redirect never targets the `IdP` the browser just came
+/// from.
+fn is_oauth_provider_domain(hostname: &str) -> bool {
+    [
+        "google.com",
+        "googleapis.com",
+        "github.com",
+        "microsoft.com",
+        "microsoftonline.com",
+        "linkedin.com",
+        "apple.com",
+    ]
+    .iter()
+    .any(|provider| hostname.contains(provider))
 }
 
 async fn setup_mfa(
@@ -3004,8 +3253,8 @@ mod tests {
         MAX_AUDIT_RESULT_CHARS, OIDC_CSRF_COOKIE, SecurityAuditFileCaptureConfig,
         SecurityHttpConfig, SecurityStartupError, audit_client_ip, bounded_operation_result,
         inferred_audit_event, initialize_security_store, oidc_binding_cookie,
-        oidc_binding_cookie_value, random_temporary_password, secure_router,
-        secure_router_with_config,
+        oidc_binding_cookie_value, oidc_redirect_origin, random_temporary_password, secure_router,
+        secure_router_with_config, spa_redirect_path,
     };
     use crate::admin_settings::AdminSettingsService;
     use crate::job_manager::{JobManager, JobOwner};
@@ -3019,7 +3268,7 @@ mod tests {
         Extension, Router,
         body::{Body, to_bytes},
         extract::ConnectInfo,
-        http::{HeaderValue, Request, StatusCode, header},
+        http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
         routing::{get, post},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -3125,24 +3374,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_callback_without_a_binding_cookie_is_a_generic_401()
+    async fn oidc_callback_without_a_binding_cookie_redirects_to_the_generic_error_location()
     -> Result<(), Box<dyn std::error::Error>> {
         let app = test_router_with_oidc()?;
         // A syntactically-valid callback (code+state present) but no binding
         // cookie: the route is public (reaches the handler, not the auth
-        // middleware) and collapses to the generic "Authentication failed" 401,
-        // never a 500 and never a distinguishing message.
+        // middleware) and collapses to the single browser failure redirect —
+        // never a 500, never a distinguishing error value (Java's failure
+        // handler redirects this browser flow too, it does not answer JSON).
         let response = app
             .oneshot(
                 Request::get("/api/v1/auth/oidc/callback?code=some-code&state=some-state")
                     .body(Body::empty())?,
             )
             .await?;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::FOUND);
         assert_eq!(
-            response_json(response).await?["message"],
-            "Authentication failed"
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/auth/callback?errorOAuth=oauth2AuthenticationError")
         );
+        // The SPA redirect-path cookie is cleared with Java's exact attributes.
+        assert_eq!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("stirling_redirect_path=; Path=/; Max-Age=0; SameSite=Lax")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spa_redirect_path_honors_a_valid_cookie_and_rejects_hostile_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let with_cookie = |value: &str| -> Result<String, Box<dyn std::error::Error>> {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("stirling_redirect_path={value}"))?,
+            );
+            Ok(spa_redirect_path(&headers))
+        };
+        // No cookie at all ⇒ the default SPA callback path.
+        assert_eq!(spa_redirect_path(&HeaderMap::new()), "/auth/callback");
+        // The SPA writes the path through encodeURIComponent, so `/` arrives
+        // as `%2F` — decoded with URLDecoder semantics (`+` ⇒ space too).
+        assert_eq!(with_cookie("%2Fdashboard")?, "/dashboard");
+        assert_eq!(with_cookie("/plain/path")?, "/plain/path");
+        assert_eq!(with_cookie("%2Fa+b")?, "/a b");
+        // Not an absolute path ⇒ default (Java's startsWith("/") rule).
+        assert_eq!(with_cookie("relative/path")?, "/auth/callback");
+        assert_eq!(with_cookie("https%3A%2F%2Fevil.example")?, "/auth/callback");
+        // Protocol-relative would be an open redirect on the context-relative
+        // failure Location ⇒ rejected (hardening on top of Java).
+        assert_eq!(with_cookie("%2F%2Fevil.example")?, "/auth/callback");
+        assert_eq!(with_cookie("//evil.example")?, "/auth/callback");
+        assert_eq!(with_cookie("%2F%5Cevil.example")?, "/auth/callback");
+        // A truncated escape is where Java would throw ⇒ default here.
+        assert_eq!(with_cookie("%2")?, "/auth/callback");
+        assert_eq!(with_cookie("%zz")?, "/auth/callback");
+        Ok(())
+    }
+
+    #[test]
+    fn oidc_redirect_origin_follows_javas_forwarded_referer_host_precedence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let origin = |pairs: &[(&str, &str)]| -> Result<String, Box<dyn std::error::Error>> {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(HeaderName::try_from(*name)?, HeaderValue::from_str(value)?);
+            }
+            Ok(oidc_redirect_origin(&headers))
+        };
+
+        // Forwarded host wins over referer and host; first entry of each list.
+        assert_eq!(
+            origin(&[
+                ("x-forwarded-host", "app.example.test, inner.proxy"),
+                ("x-forwarded-proto", "https, http"),
+                ("referer", "https://elsewhere.example"),
+                ("host", "127.0.0.1:8080"),
+            ])?,
+            "https://app.example.test"
+        );
+        // Forwarded port is appended only when the host has none and the port
+        // is not the scheme default.
+        assert_eq!(
+            origin(&[
+                ("x-forwarded-host", "app.example.test"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-port", "8443"),
+            ])?,
+            "https://app.example.test:8443"
+        );
+        assert_eq!(
+            origin(&[
+                ("x-forwarded-host", "app.example.test"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-port", "443"),
+            ])?,
+            "https://app.example.test"
+        );
+        assert_eq!(
+            origin(&[
+                ("x-forwarded-host", "app.example.test:9000"),
+                ("x-forwarded-port", "8443"),
+            ])?,
+            "http://app.example.test:9000"
+        );
+        // No forwarded host ⇒ referer origin (explicit non-default port kept).
+        assert_eq!(
+            origin(&[
+                ("referer", "https://spa.example.test:8443/login"),
+                ("host", "127.0.0.1:8080"),
+            ])?,
+            "https://spa.example.test:8443"
+        );
+        // ...unless the referer is the IdP itself ⇒ fall through to Host.
+        assert_eq!(
+            origin(&[
+                ("referer", "https://accounts.google.com/o/oauth2"),
+                ("host", "127.0.0.1:8080"),
+            ])?,
+            "http://127.0.0.1:8080"
+        );
+        // Host alone: the engine speaks plain http; default port dropped.
+        assert_eq!(
+            origin(&[("host", "example.test:80")])?,
+            "http://example.test"
+        );
+        // Nothing at all ⇒ empty origin, the Location stays context-relative.
+        assert_eq!(origin(&[])?, "");
         Ok(())
     }
 
