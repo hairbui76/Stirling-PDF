@@ -528,6 +528,46 @@ async fn oidc_redirect_cookie_cannot_escape_the_path() -> Result<(), Box<dyn std
     Ok(())
 }
 
+// ---- header injection via the redirect cookie is impossible -----------------
+
+#[tokio::test]
+async fn oidc_redirect_cookie_cannot_inject_headers_or_control_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = SigningFixture::new()?;
+    let idp = start_mock_idp(fixture.jwks_json.clone())?;
+    let (_guard, app) = build_app(Some(&idp.issuer))?;
+
+    // Decoded cookie values that start with `/` (so they pass the path filter)
+    // but smuggle CR/LF or other control bytes: the composed Location cannot
+    // be a header value, so the redirect must fall back to the bare default
+    // path — dropping the token rather than risking response splitting. No
+    // header other than the expected ones may appear.
+    for hostile in [
+        "%2Fx%0D%0AX-Evil%3A%201", // /x\r\nX-Evil: 1 — classic response splitting
+        "%2Fx%0Ainjected",         // bare \n
+        "%2Fx%00null",             // NUL byte
+    ] {
+        let (_state, _cookie, callback) = drive_login_with_cookies(
+            &app,
+            &idp,
+            &fixture,
+            str::to_owned,
+            &[&format!("stirling_redirect_path={hostile}")],
+        )
+        .await?;
+        let location = assert_browser_redirect(&callback)?;
+        assert_eq!(
+            location, "/auth/callback",
+            "control bytes in cookie {hostile:?} must collapse to the bare default path"
+        );
+        assert!(
+            callback.headers().get("x-evil").is_none(),
+            "no header may be injected through the redirect cookie"
+        );
+    }
+    Ok(())
+}
+
 // ---- CSRF: a state that was never issued (route-level rejection) ------------
 
 #[tokio::test]
