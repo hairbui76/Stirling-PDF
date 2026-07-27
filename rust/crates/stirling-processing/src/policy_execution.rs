@@ -730,6 +730,29 @@ impl PolicyExecutionService {
         Ok(())
     }
 
+    /// Periodic registry eviction: removes run records whose backing job the
+    /// [`JobManager`] has already reclaimed (its TTL expired) once they are
+    /// older than the grace window. The lazy per-request eviction in
+    /// [`Self::status`] and [`Self::list_stored_runs`] stays as-is; this sweep
+    /// reclaims records for runs nobody queries again.
+    pub(crate) fn evict_stale_runs(&self, now_millis: i64, grace_millis: i64) -> usize {
+        let candidates = match self.runs.lock() {
+            Ok(runs) => stale_run_candidates(&runs, now_millis, grace_millis),
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for (run_id, owner) in candidates {
+            let job_missing = matches!(self.jobs.status(owner, &run_id), Ok(None));
+            if job_missing
+                && let Ok(mut runs) = self.runs.lock()
+                && runs.remove(&run_id).is_some()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     fn mark_running(&self, run_id: &str) {
         if let Ok(mut runs) = self.runs.lock()
             && let Some(record) = runs.get_mut(run_id)
@@ -991,6 +1014,20 @@ fn safe_filename(filename: Option<&str>) -> String {
         .collect()
 }
 
+/// Age-gated candidates for registry eviction, factored out of
+/// [`PolicyExecutionService::evict_stale_runs`] so the time filter is testable
+/// without constructing the full service or waiting wall-clock time.
+fn stale_run_candidates(
+    runs: &HashMap<String, RunRecord>,
+    now_millis: i64,
+    grace_millis: i64,
+) -> Vec<(String, JobOwner)> {
+    runs.iter()
+        .filter(|(_, record)| record.created_at.saturating_add(grace_millis) <= now_millis)
+        .map(|(run_id, record)| (run_id.clone(), record.owner))
+        .collect()
+}
+
 fn enter_step(runs: &Mutex<HashMap<String, RunRecord>>, run_id: &str, step: usize) {
     if let Ok(mut runs) = runs.lock()
         && let Some(record) = runs.get_mut(run_id)
@@ -1062,7 +1099,43 @@ impl From<JobManagerError> for PolicyExecutionFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_field, safe_filename};
+    use std::collections::HashMap;
+
+    use super::{JobOwner, RunRecord, RunStatus, asset_field, safe_filename, stale_run_candidates};
+
+    fn record(created_at: i64) -> RunRecord {
+        RunRecord {
+            owner: JobOwner::Open,
+            policy_id: None,
+            status: RunStatus::Completed,
+            current_step: 1,
+            step_count: 1,
+            error: None,
+            error_code: None,
+            error_subscribed: None,
+            outputs: Vec::new(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn eviction_candidates_respect_the_grace_window() {
+        let mut runs = HashMap::new();
+        runs.insert("old-run".to_owned(), record(0));
+        runs.insert("boundary-run".to_owned(), record(400));
+        runs.insert("young-run".to_owned(), record(401));
+
+        let mut candidates = stale_run_candidates(&runs, 1_000, 600);
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            candidates,
+            vec![
+                ("boundary-run".to_owned(), JobOwner::Open),
+                ("old-run".to_owned(), JobOwner::Open),
+            ]
+        );
+        assert!(stale_run_candidates(&runs, 1_000, i64::MAX).is_empty());
+    }
 
     #[test]
     fn parses_only_bounded_asset_fields() {

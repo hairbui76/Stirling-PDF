@@ -35,6 +35,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     runtime.spawn_pipeline_directory_watcher();
     runtime.spawn_policy_triggers();
+    // Periodic license re-verification (Java LicenseKeyChecker parity). The
+    // open runtime carries no license state, so this is a no-op until secured
+    // mode ships; the desktop sidecar shares this same entry point.
+    let license_refresh_active = runtime.spawn_license_refresh();
+    // Background maintenance loops ported from the Java @Scheduled tasks plus
+    // the one-shot startup sweep of crash-abandoned temp artifacts.
+    let maintenance_loops = runtime.spawn_background_maintenance();
+    info!(
+        license_refresh_active,
+        maintenance_loops, "spawned background maintenance"
+    );
     info!(%address, "starting Stirling Rust processing service");
     // Desktop discovers an ephemeral sidecar port from this stable handshake.
     // It must not depend on RUST_LOG: EnvFilter defaults to ERROR when that

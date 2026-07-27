@@ -267,6 +267,36 @@ impl MobileScannerService {
         }
     }
 
+    /// Sweeps every session that exceeded the inactivity timeout, mirroring
+    /// Java's five-minute `MobileScannerService.cleanupExpiredSessions` sweep.
+    /// Returns the number of sessions removed. The lazy per-access expiry in
+    /// [`Self::validate_session`] remains the primary guard; this reclaims
+    /// sessions nobody touches again.
+    pub fn cleanup_expired_sessions(&self) -> usize {
+        self.cleanup_sessions_older_than(SESSION_TIMEOUT)
+    }
+
+    fn cleanup_sessions_older_than(&self, timeout: Duration) -> usize {
+        let expired = {
+            let Ok(mut sessions) = self.sessions.lock() else {
+                return 0;
+            };
+            let expired = sessions
+                .iter()
+                .filter(|(_, session)| session.last_access.elapsed() > timeout)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            for session_id in &expired {
+                sessions.remove(session_id);
+            }
+            expired
+        };
+        for session_id in &expired {
+            self.remove_session_directory(session_id);
+        }
+        expired.len()
+    }
+
     /// Deletes a session. Missing or malformed IDs are a no-op to match Java's delete endpoint.
     pub fn delete_session(&self, session_id: &str) {
         let Ok(mut sessions) = self.sessions.lock() else {
@@ -380,6 +410,29 @@ mod tests {
             },
         )?;
         assert_eq!(service.files("scanner-1")[0].filename, filename);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_removes_only_sessions_past_the_inactivity_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = MobileScannerService::new()?;
+        let directory = service.upload_directory("stale-session")?;
+        std::fs::write(directory.join("scan.jpg"), b"image")?;
+        service.create_session("fresh-session")?;
+
+        // A ten-minute timeout means nothing just created is expired yet.
+        assert_eq!(service.cleanup_expired_sessions(), 0);
+
+        // A zero timeout expires every session immediately, proving the sweep
+        // removes state and the on-disk directory without waiting wall-clock.
+        assert_eq!(
+            service.cleanup_sessions_older_than(std::time::Duration::ZERO),
+            2
+        );
+        assert!(!directory.exists());
+        assert!(service.files("stale-session").is_empty());
+        assert!(service.validate_session("fresh-session").is_none());
         Ok(())
     }
 }

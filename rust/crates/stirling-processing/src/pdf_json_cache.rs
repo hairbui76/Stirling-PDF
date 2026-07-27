@@ -177,8 +177,20 @@ fn remove_entry_file(entry: Option<CacheEntry>) {
     }
 }
 
+const CACHE_FILE_PREFIX: &str = "stirling-pdf-json-";
+const CACHE_FILE_SUFFIX: &str = ".pdf";
+
 fn cache_path(job_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("stirling-pdf-json-{job_id}.pdf"))
+    std::env::temp_dir().join(format!("{CACHE_FILE_PREFIX}{job_id}{CACHE_FILE_SUFFIX}"))
+}
+
+/// Returns whether a temp-directory entry name matches this cache's private
+/// naming pattern. Shared with the startup maintenance sweep so it only ever
+/// reclaims artifacts this runtime created itself.
+pub(crate) fn is_cache_file_name(name: &str) -> bool {
+    name.len() > CACHE_FILE_PREFIX.len() + CACHE_FILE_SUFFIX.len()
+        && name.starts_with(CACHE_FILE_PREFIX)
+        && name.ends_with(CACHE_FILE_SUFFIX)
 }
 
 fn random_job_id() -> String {

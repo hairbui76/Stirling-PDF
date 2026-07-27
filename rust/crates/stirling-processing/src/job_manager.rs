@@ -24,6 +24,11 @@ use crate::security::AuthContext;
 const JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// Name of the runtime-owned job workspace directory under the system temp
+/// directory. Shared with the startup maintenance sweep so crash-abandoned job
+/// directories from a previous run can be reclaimed by exact name.
+pub(crate) const JOB_ROOT_DIRECTORY_NAME: &str = "stirling-rust-jobs";
+
 /// A process-local registry of asynchronous operation results.
 #[derive(Clone, Debug)]
 pub(crate) struct JobManager {
@@ -157,7 +162,7 @@ impl JobManager {
     pub(crate) fn with_result_ttl(result_ttl: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(JobStore::default())),
-            root: Arc::new(std::env::temp_dir().join("stirling-rust-jobs")),
+            root: Arc::new(std::env::temp_dir().join(JOB_ROOT_DIRECTORY_NAME)),
             result_ttl,
         }
     }

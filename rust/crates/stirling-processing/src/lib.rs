@@ -20,6 +20,7 @@ mod job_queue;
 pub mod license;
 mod license_admin;
 mod login_agreement_admin;
+mod maintenance;
 pub mod markdown_to_pdf;
 mod mcp;
 pub mod mobile_scanner;
@@ -1363,6 +1364,19 @@ pub struct ProcessingRuntime {
     smtp_mail_service: Option<Arc<smtp_mail::SmtpMailService>>,
     policy_trigger_runtime: Option<policy_triggers::PolicyTriggerRuntime>,
     license_refresh_runtime: Option<license::LicenseRefreshRuntime>,
+    mobile_scanner: Option<Arc<MobileScannerService>>,
+    policy_execution: Option<Arc<policy_execution::PolicyExecutionService>>,
+    audit_retention: Option<AuditRetentionMaintenance>,
+    storage_maintenance: Option<Arc<storage::StorageService>>,
+}
+
+/// Handle for the periodic audit-retention sweep: the durable store plus the
+/// retention window captured from configuration at startup, exactly as Java's
+/// `AuditCleanupService` reads `premium.enterpriseFeatures.audit.retentionDays`.
+#[derive(Clone)]
+struct AuditRetentionMaintenance {
+    store: Arc<SecurityStore>,
+    retention_days: i64,
 }
 
 impl ProcessingRuntime {
@@ -1387,6 +1401,7 @@ impl ProcessingRuntime {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn with_runtime_config(
         max_upload_bytes: usize,
         timestamp_settings: TimestampSettings,
@@ -1473,7 +1488,7 @@ impl ProcessingRuntime {
         .layer(Extension(Arc::clone(&runtime_metrics)))
         .layer(Extension(Arc::clone(&job_manager)))
         .layer(Extension(Arc::clone(&job_queue)))
-        .layer(Extension(mobile_scanner))
+        .layer(Extension(mobile_scanner.clone()))
         .layer(Extension(pipeline_dispatcher.clone()))
         .layer(middleware::from_fn_with_state(
             runtime_metrics,
@@ -1488,6 +1503,10 @@ impl ProcessingRuntime {
             smtp_mail_service,
             policy_trigger_runtime: None,
             license_refresh_runtime: None,
+            mobile_scanner,
+            policy_execution: None,
+            audit_retention: None,
+            storage_maintenance: None,
         }
     }
 
@@ -1623,6 +1642,7 @@ impl ProcessingRuntime {
         // moved into the runtime; the read projections never re-parse settings.
         let proprietary_ui_data_config =
             proprietary_ui_data::UiDataConfig::from_runtime_config(&runtime_config);
+        let audit_retention_days = runtime_config.security_audit_retention_days();
         let mut runtime =
             Self::with_runtime_config(max_upload_bytes, timestamp_settings, runtime_config);
         runtime.license_refresh_runtime = Some(license::LicenseRefreshRuntime::new(
@@ -1630,6 +1650,18 @@ impl ProcessingRuntime {
             Arc::clone(&initialized_license.config),
             Arc::clone(&initialized_license.state),
         ));
+        // Background retention sweeps, spawned later by the executable through
+        // `spawn_background_maintenance`. The audit sweep mirrors Java's
+        // `AuditCleanupService` gate on `audit.enabled`; the storage sweep only
+        // exists when durable storage is switched on.
+        runtime.audit_retention =
+            security_http_config
+                .audit_enabled
+                .then(|| AuditRetentionMaintenance {
+                    store: Arc::clone(&security_store),
+                    retention_days: audit_retention_days,
+                });
+        runtime.storage_maintenance = storage_enabled.then(|| Arc::clone(&storage_service));
         runtime.router = runtime
             .router
             .merge(integration_http::routes(
@@ -1717,10 +1749,137 @@ impl ProcessingRuntime {
         }
     }
 
-    pub fn spawn_license_refresh(&self) {
+    /// Spawns the periodic license re-verification loop, mirroring Java
+    /// `LicenseKeyChecker.checkLicensePeriodically` (`@Scheduled` every seven
+    /// days after a seven-day initial delay). Returns whether a refresh task
+    /// was actually spawned so callers and tests can verify the wiring; the
+    /// open (non-secured) runtime carries no license state and returns `false`.
+    #[must_use = "the flag reports whether license refresh is actually running"]
+    pub fn spawn_license_refresh(&self) -> bool {
         if let Some(refresh) = self.license_refresh_runtime.clone() {
             tokio::spawn(refresh.run_forever());
+            true
+        } else {
+            false
         }
+    }
+
+    /// Spawns the periodic maintenance loops ported from the Java backend's
+    /// `@Scheduled` tasks, plus a one-shot startup sweep of this runtime's own
+    /// crash-abandoned temp artifacts. Every loop logs-and-continues on error
+    /// and never terminates the process. Returns the number of periodic loops
+    /// spawned so callers and tests can verify the wiring.
+    #[must_use = "the count reports which maintenance loops are actually running"]
+    pub fn spawn_background_maintenance(&self) -> usize {
+        // One-shot startup reclamation, mirroring Java
+        // `TempFileCleanupService.runStartupCleanup` conservatively: only the
+        // runtime's own naming patterns, only entries older than 24 hours.
+        tokio::task::spawn_blocking(|| {
+            let removed = maintenance::startup_temp_sweep(
+                &std::env::temp_dir(),
+                maintenance::STARTUP_TEMP_MAX_AGE,
+                std::time::SystemTime::now(),
+            );
+            if removed > 0 {
+                tracing::info!(
+                    removed,
+                    "startup sweep reclaimed crash-abandoned temp artifacts"
+                );
+            }
+        });
+
+        let mut spawned = 0;
+
+        let jobs = Arc::clone(&self.job_manager);
+        maintenance::spawn_maintenance_loop(maintenance::MaintenanceLoop {
+            name: "job-results",
+            schedule: maintenance::schedule_from_environment(
+                "JOB_RESULTS",
+                maintenance::JOB_RESULT_SCHEDULE,
+            ),
+            tick: Arc::new(move || jobs.cleanup_expired().map_err(|error| error.to_string())),
+        });
+        spawned += 1;
+
+        if let Some(scanner) = self.mobile_scanner.clone() {
+            maintenance::spawn_maintenance_loop(maintenance::MaintenanceLoop {
+                name: "mobile-scanner-sessions",
+                schedule: maintenance::schedule_from_environment(
+                    "MOBILE_SCANNER",
+                    maintenance::MOBILE_SCANNER_SCHEDULE,
+                ),
+                tick: Arc::new(move || Ok(scanner.cleanup_expired_sessions())),
+            });
+            spawned += 1;
+        }
+
+        if let Some(audit) = self.audit_retention.clone() {
+            maintenance::spawn_maintenance_loop(maintenance::MaintenanceLoop {
+                name: "audit-retention",
+                schedule: maintenance::schedule_from_environment(
+                    "AUDIT_RETENTION",
+                    maintenance::AUDIT_RETENTION_SCHEDULE,
+                ),
+                tick: Arc::new(move || {
+                    match maintenance::audit_cutoff(
+                        chrono::Utc::now().timestamp(),
+                        audit.retention_days,
+                    ) {
+                        // Java rule: retentionDays <= 0 retains indefinitely.
+                        None => Ok(0),
+                        Some(cutoff) => audit
+                            .store
+                            .delete_audit_events_before(cutoff)
+                            .map_err(|error| error.to_string()),
+                    }
+                }),
+            });
+            spawned += 1;
+        }
+
+        if let Some(storage) = self.storage_maintenance.clone() {
+            maintenance::spawn_maintenance_loop(maintenance::MaintenanceLoop {
+                name: "storage-cleanup",
+                schedule: maintenance::schedule_from_environment(
+                    "STORAGE_CLEANUP",
+                    maintenance::STORAGE_CLEANUP_SCHEDULE,
+                ),
+                tick: Arc::new(move || {
+                    // Both sweeps always run; one failing must not starve the other.
+                    let queue = storage.sweep_cleanup_queue();
+                    let shares = storage.purge_expired_share_links();
+                    match (queue, shares) {
+                        (Ok(reclaimed), Ok(purged)) => Ok(reclaimed + purged),
+                        (queue, shares) => Err([queue.err(), shares.err()]
+                            .into_iter()
+                            .flatten()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ")),
+                    }
+                }),
+            });
+            spawned += 1;
+        }
+
+        if let Some(policy) = self.policy_execution.clone() {
+            maintenance::spawn_maintenance_loop(maintenance::MaintenanceLoop {
+                name: "policy-run-registry",
+                schedule: maintenance::schedule_from_environment(
+                    "POLICY_RUNS",
+                    maintenance::POLICY_RUN_SCHEDULE,
+                ),
+                tick: Arc::new(move || {
+                    Ok(policy.evict_stale_runs(
+                        chrono::Utc::now().timestamp_millis(),
+                        maintenance::POLICY_RUN_EVICTION_GRACE_MILLIS,
+                    ))
+                }),
+            });
+            spawned += 1;
+        }
+
+        spawned
     }
 
     pub fn into_router(self) -> Router {
@@ -1842,6 +2001,7 @@ fn attach_policy_routes(
         output_service,
         settings.audit,
     ));
+    runtime.policy_execution = Some(Arc::clone(&execution_service));
     let source_runner = Arc::new(policy_sources::PolicySourceRunner::new(
         Arc::clone(&policy_service),
         Arc::clone(&execution_service),
