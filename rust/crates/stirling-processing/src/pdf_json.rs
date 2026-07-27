@@ -642,12 +642,15 @@ pub fn pdf_to_json_metadata(
 /// `/Indexed` images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
 /// colour spaces are projected both unfiltered and through bounded single Flate/LZW/
 /// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
-/// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
+/// samples, native CMYK DCT samples, and explicit 1-bit stencil masks are applied.
+/// `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
 /// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
 /// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
 /// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
-/// `/Decode`, and then evaluate their tint transforms. CalGray/CalRGB/Lab direct images, Indexed
+/// `/Decode`, and then evaluate their tint transforms; four-component `ICCBased` DCT images
+/// decode the same native CMYK planes and convert through the embedded profile.
+/// CalGray/CalRGB/Lab direct images, Indexed
 /// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
 /// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
 /// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
@@ -749,12 +752,15 @@ fn build_page(
 /// images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
 /// colour spaces are emitted both unfiltered and through bounded single Flate/LZW/
 /// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
-/// samples and explicit 1-bit stencil masks are applied. `ICCBased` images and decoded
+/// samples, native CMYK DCT samples, and explicit 1-bit stencil masks are applied.
+/// `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
 /// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
 /// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
 /// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
-/// `/Decode`, and then evaluate their tint transforms. CalGray/CalRGB/Lab direct images, Indexed
+/// `/Decode`, and then evaluate their tint transforms; four-component `ICCBased` DCT images
+/// decode the same native CMYK planes and convert through the embedded profile.
+/// CalGray/CalRGB/Lab direct images, Indexed
 /// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
 /// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
 /// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
@@ -1482,60 +1488,7 @@ fn decode_pdf_raster(
     let filters = image_filter_names(document, stream);
     let color_space = image_color_space(document, stream);
     if filters.as_slice() == ["DCTDecode"] {
-        if color_space.is_none() && image_uses_transformed_color_space(document, stream) {
-            return None;
-        }
-        if let Some(PdfImageColorSpace::DeviceN { channels, .. }) = &color_space {
-            let samples = decode_dct_device_n_samples(document, stream, width, height, *channels)?;
-            return decoded_samples_to_image(color_space?, width, height, samples);
-        }
-        let image = image::load_from_memory(&stream.content).ok()?;
-        let pixels = u64::from(image.width()).checked_mul(u64::from(image.height()))?;
-        if pixels > MAX_EDITOR_IMAGE_PIXELS {
-            return None;
-        }
-        return match color_space {
-            Some(PdfImageColorSpace::Icc {
-                channels, profile, ..
-            }) => profile
-                .as_deref()
-                .and_then(|profile| icc_dynamic_image_to_rgb(&image, channels, profile))
-                .or(Some(image)),
-            Some(PdfImageColorSpace::Separation {
-                alternate,
-                alternate_profile,
-                tint_transform,
-            }) => {
-                let DynamicImage::ImageLuma8(image) = image else {
-                    return None;
-                };
-                let samples = apply_image_decode_to_u8(document, stream, 1, image.into_raw())?;
-                let samples = tint_transform.apply(&samples, alternate)?;
-                tint_output_to_image(
-                    alternate,
-                    alternate_profile.as_deref(),
-                    width,
-                    height,
-                    samples,
-                )
-            }
-            Some(PdfImageColorSpace::DeviceN { .. }) => unreachable!(),
-            Some(PdfImageColorSpace::Calibrated(color_space)) => {
-                let channels = color_space.channels();
-                let samples = match (channels, image) {
-                    (1, DynamicImage::ImageLuma8(image)) => image.into_raw(),
-                    (3, DynamicImage::ImageRgb8(image)) => image.into_raw(),
-                    _ => return None,
-                };
-                let samples = if color_space.ignores_image_decode() {
-                    samples
-                } else {
-                    apply_image_decode_to_u8(document, stream, channels, samples)?
-                };
-                device_samples_to_image(color_space, width, height, samples)
-            }
-            _ => Some(image),
-        };
+        return decode_dct_raster(document, stream, width, height, color_space);
     }
     if filters.iter().any(|filter| filter == "DCTDecode") {
         return None;
@@ -1576,7 +1529,93 @@ fn decode_pdf_raster(
     decoded_samples_to_image(color_space, width, height, samples)
 }
 
-fn decode_dct_device_n_samples(
+/// Decodes a raster whose only filter is `DCTDecode`, dispatching between the
+/// native-plane paths (`DeviceN`, four-component ICC) and the decoder-projected
+/// image for the remaining color spaces.
+fn decode_dct_raster(
+    document: &Document,
+    stream: &Stream,
+    width: u32,
+    height: u32,
+    color_space: Option<PdfImageColorSpace>,
+) -> Option<DynamicImage> {
+    if color_space.is_none() && image_uses_transformed_color_space(document, stream) {
+        return None;
+    }
+    if let Some(PdfImageColorSpace::DeviceN { channels, .. }) = &color_space {
+        let samples = decode_dct_native_samples(document, stream, width, height, *channels)?;
+        let samples = apply_image_decode_to_u8(document, stream, *channels, samples)?;
+        return decoded_samples_to_image(color_space?, width, height, samples);
+    }
+    let image = image::load_from_memory(&stream.content).ok()?;
+    let pixels = u64::from(image.width()).checked_mul(u64::from(image.height()))?;
+    if pixels > MAX_EDITOR_IMAGE_PIXELS {
+        return None;
+    }
+    match color_space {
+        Some(PdfImageColorSpace::Icc {
+            channels, profile, ..
+        }) => profile
+            .as_deref()
+            .and_then(|profile| match channels {
+                // The image decoder has already projected a CMYK JPEG into
+                // RGB, so recover the four native source planes before
+                // converting through the embedded profile.
+                4 => {
+                    let samples = decode_dct_native_samples(document, stream, width, height, 4)?;
+                    let samples = apply_image_decode_to_u8(document, stream, 4, samples)?;
+                    let rgb = icc_samples_to_rgb(&samples, 4, profile)?;
+                    Some(DynamicImage::ImageRgb8(RgbImage::from_raw(
+                        width, height, rgb,
+                    )?))
+                }
+                _ => icc_dynamic_image_to_rgb(&image, channels, profile),
+            })
+            .or(Some(image)),
+        Some(PdfImageColorSpace::Separation {
+            alternate,
+            alternate_profile,
+            tint_transform,
+        }) => {
+            let DynamicImage::ImageLuma8(image) = image else {
+                return None;
+            };
+            let samples = apply_image_decode_to_u8(document, stream, 1, image.into_raw())?;
+            let samples = tint_transform.apply(&samples, alternate)?;
+            tint_output_to_image(
+                alternate,
+                alternate_profile.as_deref(),
+                width,
+                height,
+                samples,
+            )
+        }
+        Some(PdfImageColorSpace::DeviceN { .. }) => unreachable!(),
+        Some(PdfImageColorSpace::Calibrated(color_space)) => {
+            let channels = color_space.channels();
+            let samples = match (channels, image) {
+                (1, DynamicImage::ImageLuma8(image)) => image.into_raw(),
+                (3, DynamicImage::ImageRgb8(image)) => image.into_raw(),
+                _ => return None,
+            };
+            let samples = if color_space.ignores_image_decode() {
+                samples
+            } else {
+                apply_image_decode_to_u8(document, stream, channels, samples)?
+            };
+            device_samples_to_image(color_space, width, height, samples)
+        }
+        _ => Some(image),
+    }
+}
+
+/// Decodes a DCT stream into its native interleaved component planes without
+/// letting the decoder project them into RGB, then applies the PDF.js-compatible
+/// Adobe/`ColorTransform` JPEG colour conversion. The declared dimensions and
+/// component count must match the JPEG header. The image `/Decode` mapping is
+/// deliberately *not* applied: color-key `/Mask` ranges compare against these
+/// raw decoder samples, while raster decoding applies it on top.
+fn decode_dct_native_samples(
     document: &Document,
     stream: &Stream,
     width: u32,
@@ -1631,7 +1670,7 @@ fn decode_dct_device_n_samples(
         return None;
     }
     apply_dct_color_transform(document, stream, source_color_space, &mut samples)?;
-    apply_image_decode_to_u8(document, stream, channels, samples)
+    Some(samples)
 }
 
 fn apply_dct_color_transform(
@@ -2677,8 +2716,8 @@ fn icc_dynamic_image_to_rgb(
     let samples = match channels {
         1 => image.to_luma8().into_raw(),
         3 => image.to_rgb8().into_raw(),
-        // The image decoder has already projected a CMYK JPEG into RGB, so the
-        // original four source channels are unavailable for an ICC transform.
+        // A decoded `DynamicImage` no longer carries four source channels;
+        // CMYK DCT streams are decoded natively by the caller instead.
         _ => return None,
     };
     let rgb = icc_samples_to_rgb(&samples, channels, profile)?;
@@ -3406,6 +3445,16 @@ fn color_key_samples(
     if filters.as_slice() == ["DCTDecode"] {
         if bits_per_component != 8 {
             return None;
+        }
+        // The image decoder projects a CMYK JPEG into RGB, so decode the four
+        // native planes directly; `/Mask` ranges compare against raw decoder
+        // samples, before any `/Decode` mapping.
+        if matches!(
+            color_space,
+            PdfImageColorSpace::Cmyk | PdfImageColorSpace::Icc { channels: 4, .. }
+        ) {
+            let samples = decode_dct_native_samples(document, stream, width, height, 4)?;
+            return Some((samples.into_iter().map(u16::from).collect(), 4, 255));
         }
         let image = image::load_from_memory(&stream.content).ok()?;
         if image.width() != width || image.height() != height {
@@ -12943,6 +12992,342 @@ end"
             image::load_from_memory(&png)?.to_rgb8().as_raw(),
             &[255, 255, 255, 0, 0, 0]
         );
+        Ok(())
+    }
+
+    /// Two CMYK pixels (pure cyan and white) encoded by Pillow at quality 100.
+    /// The Adobe APP14 marker is transform 0 and the ink values are stored
+    /// inverted per the Adobe convention, so a PDF-level `/Decode` array of
+    /// `[1 0 1 0 1 0 1 0]` restores the native samples exactly:
+    /// `[255, 0, 0, 0]` (cyan) and `[0, 0, 0, 0]` (white).
+    fn cyan_white_cmyk_jpeg() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        Ok(STANDARD.decode(concat!(
+            "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB/8AAFAgAAQAC",
+            "BEMRAE0RAFkRAEsRAP/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQ",
+            "AAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNi",
+            "coIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3",
+            "eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV",
+            "1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD+vn/gk7/yiy/4",
+            "Jp/9mAfsb/8ArOvw5r+/iv7+K/v4r//Z"
+        ))?)
+    }
+
+    /// The inverted-ink `/Decode` array Acrobat writes for Adobe CMYK JPEGs.
+    fn inverted_cmyk_decode() -> Vec<lopdf::Object> {
+        vec![
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+        ]
+    }
+
+    /// Builds a small but fully valid CMYK→Lab `lut16` ICC profile with moxcms.
+    /// The 2-grid CLUT keeps white at Lab white, registration black at Lab
+    /// black, and pushes chromatic inks well away from the decoder's naive
+    /// device projection so tests can tell the two conversions apart.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::field_reassign_with_default
+    )]
+    fn cmyk_test_icc_profile() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use moxcms::{
+            ColorProfile, DataColorSpace, LutDataType, LutStore, LutType, LutWarehouse, Matrix3d,
+            ProfileClass,
+        };
+
+        // ICC v2 16-bit Lab encoding: L over 0..=0xFF00, a/b offset by 128.
+        let lab_l = |lightness: f64| (lightness / 100.0 * 65280.0).round() as u16;
+        let lab_ab = |value: f64| ((value + 128.0) * 256.0).round().clamp(0.0, 65535.0) as u16;
+        let mut clut = Vec::with_capacity(16 * 3);
+        // Standard ICC CLUT ordering: the first input channel varies slowest.
+        for corner in 0_u32..16 {
+            let cyan = f64::from((corner >> 3) & 1);
+            let magenta = f64::from((corner >> 2) & 1);
+            let yellow = f64::from((corner >> 1) & 1);
+            let black = f64::from(corner & 1);
+            let lightness = 100.0
+                * (1.0 - black)
+                * (1.0 - 0.5 * cyan)
+                * (1.0 - 0.6 * magenta)
+                * (1.0 - 0.1 * yellow);
+            clut.push(lab_l(lightness));
+            clut.push(lab_ab(60.0 * (magenta - cyan)));
+            clut.push(lab_ab(60.0 * (yellow - 0.5 * cyan - 0.5 * magenta)));
+        }
+        // `ColorProfile` has a private version field, so build from `default()`
+        // instead of struct-update syntax.
+        let mut profile = ColorProfile::default();
+        profile.profile_class = ProfileClass::OutputDevice;
+        profile.color_space = DataColorSpace::Cmyk;
+        profile.pcs = DataColorSpace::Lab;
+        profile.lut_a_to_b_perceptual = Some(LutWarehouse::Lut(LutDataType {
+            num_input_channels: 4,
+            num_output_channels: 3,
+            num_clut_grid_points: 2,
+            matrix: Matrix3d::IDENTITY,
+            num_input_table_entries: 2,
+            num_output_table_entries: 2,
+            input_table: LutStore::Store16([0, 65535].repeat(4)),
+            clut_table: LutStore::Store16(clut),
+            output_table: LutStore::Store16([0, 65535].repeat(3)),
+            lut_type: LutType::Lut16,
+        }));
+        Ok(profile.encode()?)
+    }
+
+    #[test]
+    fn converts_icc_based_cmyk_dct_images_through_the_embedded_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+        use moxcms::{ColorProfile, Layout, TransformOptions};
+
+        let jpeg = cyan_white_cmyk_jpeg()?;
+        let profile_bytes = cmyk_test_icc_profile()?;
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 4, "Alternate" => "DeviceCMYK" },
+            profile_bytes.clone(),
+        ));
+        let icc_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => inverted_cmyk_decode(),
+                "Filter" => "DCTDecode",
+            },
+            jpeg.clone(),
+        );
+
+        // The native planes round-trip exactly at quality 100.
+        let native = super::decode_dct_native_samples(&document, &icc_image, 2, 1, 4)
+            .ok_or("native CMYK samples were not decoded")?;
+        let native = super::apply_image_decode_to_u8(&document, &icc_image, 4, native)
+            .ok_or("decode mapping was not applied")?;
+        assert_eq!(native, vec![255, 0, 0, 0, 0, 0, 0, 0]);
+
+        // moxcms-computed reference for the same profile and samples.
+        let source_profile = ColorProfile::new_from_slice(&profile_bytes)?;
+        let transform = source_profile.create_transform_8bit(
+            Layout::Rgba,
+            &ColorProfile::new_srgb(),
+            Layout::Rgb,
+            TransformOptions::default(),
+        )?;
+        let mut expected = vec![0; 6];
+        transform.transform(&native, &mut expected)?;
+        // The profile keeps the white pixel white and moves cyan away from the
+        // naive projection.
+        assert!(expected[3..].iter().all(|&value| value >= 245));
+
+        let (png, format) = encode_image_xobject(&document, &icc_image, 2, 1)
+            .ok_or("ICCBased CMYK DCT image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &expected);
+
+        // The embedded profile is no longer silently ignored: the output
+        // differs from the decoder's device projection of the JPEG.
+        let projected = image::load_from_memory(&jpeg)?.to_rgb8();
+        assert_ne!(projected.as_raw(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn falls_back_to_device_projection_for_invalid_cmyk_dct_profiles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let jpeg = cyan_white_cmyk_jpeg()?;
+        let mut document = Document::with_version("1.7");
+        let invalid_profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 4, "Alternate" => "DeviceCMYK" },
+            b"not-an-icc-profile".to_vec(),
+        ));
+        let fallback_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(invalid_profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => inverted_cmyk_decode(),
+                "Filter" => "DCTDecode",
+            },
+            jpeg.clone(),
+        );
+        let (png, format) = encode_image_xobject(&document, &fallback_image, 2, 1)
+            .ok_or("invalid-profile CMYK DCT image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(
+            image::load_from_memory(&png)?.to_rgb8().as_raw(),
+            image::load_from_memory(&jpeg)?.to_rgb8().as_raw()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn converts_ycck_dct_images_through_the_embedded_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use lopdf::{Document, Object, Stream, dictionary};
+        use moxcms::{ColorProfile, Layout, TransformOptions};
+
+        // Re-tag the Adobe APP14 transform byte as 2 so the stored planes are
+        // decoded as YCCK and must run the Adobe YCCK→CMYK conversion.
+        let mut jpeg = cyan_white_cmyk_jpeg()?;
+        let marker = jpeg
+            .windows(5)
+            .position(|window| window == b"Adobe")
+            .ok_or("Adobe marker missing from fixture")?;
+        assert_eq!(jpeg[marker + 11], 0);
+        jpeg[marker + 11] = 2;
+
+        // Mirror of the production YCCK→CMYK math over the stored planes
+        // (`[0, 255, 255, 255]` and `[255, 255, 255, 255]`), followed by the
+        // inverted-ink `/Decode` mapping.
+        let stored: [[f32; 4]; 2] = [[0.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0]];
+        let mut expected_samples = Vec::with_capacity(8);
+        for [luminance, blue_difference, red_difference, black] in stored {
+            let cyan = 434.456 - luminance - 1.402 * red_difference;
+            let magenta = 119.541 - luminance + 0.344 * blue_difference + 0.714 * red_difference;
+            let yellow = 481.816 - luminance - 1.772 * blue_difference;
+            for value in [cyan, magenta, yellow, black] {
+                expected_samples.push(255 - value.clamp(0.0, 255.0).round() as u8);
+            }
+        }
+
+        let profile_bytes = cmyk_test_icc_profile()?;
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 4, "Alternate" => "DeviceCMYK" },
+            profile_bytes.clone(),
+        ));
+        let ycck_image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => inverted_cmyk_decode(),
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        );
+
+        let native = super::decode_dct_native_samples(&document, &ycck_image, 2, 1, 4)
+            .ok_or("native YCCK samples were not decoded")?;
+        let native = super::apply_image_decode_to_u8(&document, &ycck_image, 4, native)
+            .ok_or("decode mapping was not applied")?;
+        assert_eq!(native, expected_samples);
+
+        let source_profile = ColorProfile::new_from_slice(&profile_bytes)?;
+        let transform = source_profile.create_transform_8bit(
+            Layout::Rgba,
+            &ColorProfile::new_srgb(),
+            Layout::Rgb,
+            TransformOptions::default(),
+        )?;
+        let mut expected = vec![0; 6];
+        transform.transform(&expected_samples, &mut expected)?;
+
+        let (png, format) = encode_image_xobject(&document, &ycck_image, 2, 1)
+            .ok_or("YCCK DCT image was not encoded")?;
+        assert_eq!(format, "png");
+        assert_eq!(image::load_from_memory(&png)?.to_rgb8().as_raw(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn applies_color_key_masks_to_cmyk_dct_images() -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_image_xobject;
+        use image::RgbaImage;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        // `/Mask` ranges compare against the raw decoder output, where the
+        // stored (inverted) white pixel is [255, 255, 255, 255] and the cyan
+        // pixel [0, 255, 255, 255] escapes through its first component.
+        let mask_ranges: Vec<Object> = std::iter::repeat_n([255.into(), 255.into()], 4)
+            .flatten()
+            .collect();
+        let jpeg = cyan_white_cmyk_jpeg()?;
+
+        let document = Document::with_version("1.7");
+        let device_color_key = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => "DeviceCMYK",
+                "BitsPerComponent" => 8,
+                "Decode" => inverted_cmyk_decode(),
+                "Filter" => "DCTDecode",
+                "Mask" => mask_ranges.clone(),
+            },
+            jpeg.clone(),
+        );
+        let (png, format) = encode_image_xobject(&document, &device_color_key, 2, 1)
+            .ok_or("DeviceCMYK color-key image was not encoded")?;
+        assert_eq!(format, "png");
+        let rgba: RgbaImage = image::load_from_memory(&png)?.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0)[3], 255);
+        assert_eq!(rgba.get_pixel(1, 0)[3], 0);
+
+        // The same ranges apply to a four-channel ICCBased CMYK JPEG.
+        let mut document = Document::with_version("1.7");
+        let profile_id = document.add_object(Stream::new(
+            dictionary! { "N" => 4, "Alternate" => "DeviceCMYK" },
+            cmyk_test_icc_profile()?,
+        ));
+        let icc_color_key = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 1,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"ICCBased".to_vec()),
+                    Object::Reference(profile_id),
+                ]),
+                "BitsPerComponent" => 8,
+                "Decode" => inverted_cmyk_decode(),
+                "Filter" => "DCTDecode",
+                "Mask" => mask_ranges,
+            },
+            jpeg,
+        );
+        let (png, format) = encode_image_xobject(&document, &icc_color_key, 2, 1)
+            .ok_or("ICCBased CMYK color-key image was not encoded")?;
+        assert_eq!(format, "png");
+        let rgba: RgbaImage = image::load_from_memory(&png)?.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0)[3], 255);
+        assert_eq!(rgba.get_pixel(1, 0)[3], 0);
         Ok(())
     }
 
