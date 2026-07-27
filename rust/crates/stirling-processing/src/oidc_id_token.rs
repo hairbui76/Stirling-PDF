@@ -95,8 +95,9 @@ const MAX_EMAIL_BYTES: usize = 320;
 /// Generic ceiling for the optional human-readable string claims.
 const MAX_CLAIM_BYTES: usize = 1_024;
 /// Clock-skew leeway for `exp`, matching [`crate::security_jwt`]'s explicit
-/// leeway convention (and `jsonwebtoken`'s own default).
-const CLOCK_SKEW_SECONDS: u64 = 60;
+/// leeway convention (and `jsonwebtoken`'s own default). Shared with
+/// [`crate::mcp_oauth`] so the MCP bearer verifier keeps the same convention.
+pub(crate) const CLOCK_SKEW_SECONDS: u64 = 60;
 /// Lifetime of a cached JWKS entry in [`OidcJwksCache`], matching the discovery
 /// cache's TTL and [`crate::security_jwt`]'s default `jwks_cache_seconds` (both
 /// 5 minutes): staleness after an un-signalled key rotation is bounded by this,
@@ -275,7 +276,8 @@ impl OidcJwksCache {
     ///
     /// Propagates the `fetch` error when a fetch was needed and failed. A
     /// poisoned cache lock is *not* fatal: the set is fetched uncached instead.
-    fn jwks_for(
+    /// `pub(crate)` for [`crate::mcp_oauth`], which shares this cache model.
+    pub(crate) fn jwks_for(
         &self,
         jwks_uri: &str,
         kid: &str,
@@ -380,8 +382,9 @@ fn verify_oidc_id_token_cached_with_fetch(
     verify_id_token_with_jwks(provider, client_id, expected_nonce, id_token, &jwks)
 }
 
-/// Fetches and validates the provider's JWKS via the SSRF-safe GET.
-fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet, OidcIdTokenError> {
+/// Fetches and validates the provider's JWKS via the SSRF-safe GET. Shared
+/// with [`crate::mcp_oauth`], whose bearer verifier resolves keys the same way.
+pub(crate) fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet, OidcIdTokenError> {
     // Every fetch failure — unreachable, timeout, over-cap, and crucially the
     // SSRF BlockedAddress rejection — collapses to JwksUnavailable (fail-closed;
     // no distinction leaked about why the provider-controlled URL was refused).
@@ -509,8 +512,11 @@ impl OidcIdTokenClaims {
 /// rejected here, BEFORE a `Validation` is built, a key is selected, or (on the
 /// cached path) the cache/network is touched. Shared by
 /// [`verify_id_token_with_jwks`] and [`verify_oidc_id_token_cached_with_fetch`]
-/// so the two paths' pre-key gates cannot drift apart.
-fn validated_header_and_kid(id_token: &str) -> Result<(Header, String), OidcIdTokenError> {
+/// so the two paths' pre-key gates cannot drift apart. Also the pre-gate of
+/// [`crate::mcp_oauth`]'s bearer-JWT verifier.
+pub(crate) fn validated_header_and_kid(
+    id_token: &str,
+) -> Result<(Header, String), OidcIdTokenError> {
     validate_token_shape(id_token)?;
     let header = decode_header(id_token).map_err(|_| OidcIdTokenError::InvalidToken)?;
     if !algorithm_is_allowed(header.alg)
@@ -575,8 +581,8 @@ fn validate_token_shape(token: &str) -> Result<(), OidcIdTokenError> {
 
 /// Rejects a selected JWK that is symmetric, or whose declared use/operations/
 /// algorithm are incompatible with verifying a signature with `algorithm`.
-/// Mirrors [`crate::security_jwt`].
-fn validate_jwk(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OidcIdTokenError> {
+/// Mirrors [`crate::security_jwt`]. Shared with [`crate::mcp_oauth`].
+pub(crate) fn validate_jwk(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OidcIdTokenError> {
     if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_))
         || jwk
             .common

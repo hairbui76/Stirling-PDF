@@ -1,4 +1,4 @@
-//! API-key-authenticated MCP JSON-RPC boundary.
+//! MCP JSON-RPC boundary, in both of Java's authentication modes.
 //!
 //! Alongside the Rust AI-engine catalog (`stirling_describe_operation`,
 //! `stirling_ai`), this owns reusable file artifacts (`stirling_upload`,
@@ -8,14 +8,22 @@
 //! Rust-only extension Java does not have), reusing the existing owner-scoped
 //! [`crate::job_manager::JobManager`] for storage and the same in-process
 //! router dispatch [`crate::pipeline`] uses to run a pipeline step.
-//! Authorization matches Java's apikey mode exactly: `McpApiKeyAuthFilter`
-//! statically grants every valid API key BOTH `mcp.tools.read` and
-//! `mcp.tools.write`, so a valid key plus the operation allow/block lists is
-//! full Java parity. Granular per-caller scopes exist only in Java's OAuth/JWT
-//! mode (token claims), which remains a documented later phase.
+//!
+//! Authentication follows Java's `McpSecurityConfig` mode split exactly:
+//! `mcp.auth.mode=apikey` accepts a Stirling per-user API key
+//! (`McpApiKeyAuthFilter` semantics — every valid key is statically granted
+//! BOTH `mcp.tools.read` and `mcp.tools.write`), while **any other mode value
+//! runs the `OAuth2` resource-server chain**: bearer JWTs validated through
+//! [`crate::mcp_oauth`] (issuer + JWKS + RFC 8707 audience), token subjects
+//! bound to provisioned Stirling accounts (`McpUserBindingFilter` → 403
+//! `insufficient_account`), RFC 9728 protected-resource metadata served under
+//! `/.well-known/oauth-protected-resource`, and a 401 challenge carrying the
+//! metadata pointer. In OAuth mode the token's `scope` claim is the caller's
+//! real per-call grant, enforced tool-by-tool through [`McpCallContext`]
+//! exactly like Java's `McpCallContext.hasScope`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read as _,
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex},
@@ -26,9 +34,9 @@ use axum::{
     Router,
     body::to_bytes,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::blocking::Client;
@@ -41,6 +49,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     job_manager::{JobManager, JobOwner},
+    mcp_oauth::{self, McpOAuthVerifier, PROTECTED_RESOURCE_METADATA_PATH},
     pdf_ai_comments::AiCommentEngineSettings,
     pipeline::{PipelineFile, PipelineOperation, SupportingFiles},
     runtime_config::{McpConfig, RuntimeConfig},
@@ -191,6 +200,40 @@ struct McpState {
     job_manager: Arc<JobManager>,
     dispatch_router: Router,
     runtime_config: Arc<RuntimeConfig>,
+    /// `Some` when the `OAuth2` resource-server chain is active (any
+    /// `mcp.auth.mode` other than exactly `apikey`, mirroring Java's
+    /// `isApiKeyMode`); `None` in API-key mode.
+    oauth: Option<Arc<McpOAuthVerifier>>,
+}
+
+/// Per-call identity and granted scopes — Java's `McpCallContext`. In API-key
+/// mode every valid key is statically granted both tool scopes
+/// (`McpApiKeyAuthFilter` parity); in OAuth mode the grant is the validated
+/// token's real `scope` claim, so per-tool checks genuinely gate callers.
+#[derive(Clone, Debug)]
+struct McpCallContext {
+    auth: AuthContext,
+    scopes_enabled: bool,
+    granted_scopes: BTreeSet<String>,
+}
+
+impl McpCallContext {
+    /// The static both-scopes grant Java's API-key filter attaches to every
+    /// valid key.
+    fn for_api_key(auth: AuthContext, scopes_enabled: bool) -> Self {
+        Self {
+            auth,
+            scopes_enabled,
+            granted_scopes: BTreeSet::from([READ_SCOPE.to_owned(), WRITE_SCOPE.to_owned()]),
+        }
+    }
+
+    /// Java `McpCallContext.hasScope`: everything passes while scope
+    /// enforcement is off or the requirement is blank; otherwise the scope
+    /// must have been granted.
+    fn has_scope(&self, required: &str) -> bool {
+        !self.scopes_enabled || required.trim().is_empty() || self.granted_scopes.contains(required)
+    }
 }
 
 #[derive(Clone)]
@@ -309,7 +352,12 @@ enum EngineError {
     InvalidManifest,
 }
 
-/// Builds the API-key MCP router. OAuth mode deliberately remains unmounted.
+/// Builds the MCP router in the configured authentication mode. Mirroring
+/// Java's `McpSecurityConfig.mcpSecurityFilterChain`, `apikey` (exact,
+/// case-insensitive) mounts the API-key chain, and **every other mode value —
+/// including blank or a near-miss like `api-key` — mounts the `OAuth2`
+/// resource-server chain**, which also claims the RFC 9728 protected-resource
+/// metadata paths.
 pub(crate) fn routes(
     config: McpConfig,
     store: Arc<SecurityStore>,
@@ -318,13 +366,21 @@ pub(crate) fn routes(
     dispatch_router: Router,
     runtime_config: Arc<RuntimeConfig>,
 ) -> Router {
-    if !config.enabled || !config.auth.mode.trim().eq_ignore_ascii_case("apikey") {
+    if !config.enabled {
         return Router::new();
     }
+    let api_key_mode = config.auth.mode.trim().eq_ignore_ascii_case("apikey");
+    let oauth = if api_key_mode {
+        None
+    } else {
+        log_oauth_config_findings(&config);
+        Some(Arc::new(McpOAuthVerifier::from_config(&config)))
+    };
     let catalog = Arc::new(AiCapabilityCatalog::new(
         EngineConnection::from_settings(engine_settings),
         config.engine_capability_refresh_minutes,
     ));
+    let oauth_mode = oauth.is_some();
     let state = Arc::new(McpState {
         config,
         store,
@@ -332,10 +388,78 @@ pub(crate) fn routes(
         job_manager,
         dispatch_router,
         runtime_config,
+        oauth,
     });
-    Router::new()
-        .route(MCP_PATH, post(handle))
-        .with_state(state)
+    let mut router = Router::new().route(MCP_PATH, post(handle));
+    if oauth_mode {
+        // RFC 9728 section 3.1: the path-inserted form for a resource with a
+        // path component ({metadata}/mcp) plus the bare document — Java claims
+        // both (and all subpaths) in its OAuth chain's security matcher.
+        router = router
+            .route(
+                PROTECTED_RESOURCE_METADATA_PATH,
+                get(protected_resource_metadata_handler),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/{*resource}",
+                get(protected_resource_metadata_handler),
+            );
+    }
+    router.with_state(state)
+}
+
+/// Startup findings for the OAuth chain, a condensed port of Java's
+/// `McpConfigValidator` WARN cases so a fail-closed misconfiguration shows up
+/// in the logs instead of as a later rejected-token 401.
+fn log_oauth_config_findings(config: &McpConfig) {
+    let auth = &config.auth;
+    let mode = auth.mode.trim();
+    if !mode.is_empty() && !mode.eq_ignore_ascii_case("oauth") {
+        warn!(
+            mode = auth.mode,
+            "mcp.auth.mode is not recognized (expected 'oauth' or 'apikey'); it falls back to the \
+             OAuth chain, which rejects every token unless issuer-uri and resource-id are set. A \
+             near-miss like 'api-key' is NOT treated as API-key mode."
+        );
+    }
+    if auth.issuer_uri.trim().is_empty() {
+        warn!(
+            "mcp.auth.issuer-uri is not set: the JWT validator fails closed and rejects every \
+             token."
+        );
+    }
+    if auth.resource_id.trim().is_empty()
+        && !auth
+            .accepted_audiences
+            .iter()
+            .any(|audience| !audience.trim().is_empty())
+    {
+        warn!(
+            "neither mcp.auth.resource-id nor mcp.auth.accepted-audiences is set: the audience \
+             validator fails closed and rejects every token (RFC 8707)."
+        );
+    }
+    if !auth.require_existing_account {
+        warn!(
+            "mcp.auth.require-existing-account=false is not honored by the Rust MCP boundary: a \
+             validated token subject must still resolve to a provisioned, enabled Stirling \
+             account (fail-closed divergence documented in rust/contracts/mcp.md)."
+        );
+    }
+}
+
+/// Serves the RFC 9728 protected-resource metadata document (GET, no
+/// authentication), Java's Spring `OAuth2ProtectedResourceMetadataFilter` +
+/// `buildResourceMetadata` customizer.
+async fn protected_resource_metadata_handler(
+    State(state): State<Arc<McpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    json_response(
+        StatusCode::OK,
+        mcp_oauth::protected_resource_metadata(&state.config, &headers, uri.path()),
+    )
 }
 
 async fn handle(State(state): State<Arc<McpState>>, request: Request) -> Response {
@@ -349,10 +473,9 @@ async fn handle(State(state): State<Arc<McpState>>, request: Request) -> Respons
     let Ok(body) = to_bytes(body, state.config.max_request_bytes).await else {
         return payload_too_large(state.config.max_request_bytes);
     };
-    let context = match authenticate_api_key(&state.store, &parts.headers).await {
+    let context = match authenticate(&state, &parts.headers).await {
         Ok(context) => context,
-        Err(AuthFailure::Unauthorized) => return unauthorized(),
-        Err(AuthFailure::Unavailable) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(response) => return response,
     };
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return json_response(
@@ -399,7 +522,7 @@ fn decode_request(body: &Value) -> Option<RpcRequest> {
     })
 }
 
-async fn dispatch(state: &McpState, context: &AuthContext, request: &RpcRequest) -> Value {
+async fn dispatch(state: &McpState, context: &McpCallContext, request: &RpcRequest) -> Value {
     match request.method.as_str() {
         "initialize" => rpc_success(
             request.id.clone(),
@@ -438,7 +561,11 @@ fn initialize_result(params: Option<&Value>) -> Value {
     })
 }
 
-async fn handle_tools_call(state: &McpState, context: &AuthContext, request: &RpcRequest) -> Value {
+async fn handle_tools_call(
+    state: &McpState,
+    context: &McpCallContext,
+    request: &RpcRequest,
+) -> Value {
     let Some(params) = request.params.as_ref().and_then(Value::as_object) else {
         return rpc_failure(request.id.clone(), -32602, "Missing params for tools/call");
     };
@@ -511,12 +638,14 @@ fn find_pdf_operation(state: &McpState, id: &str) -> PdfLookup {
 
 /// Runs one category tool call with Java `AbstractCategoryTool.call` semantics:
 /// a missing, unknown, wrong-category, blocked, or endpoint-disabled operation
-/// returns the category's operation-list error. Every PDF operation requires
-/// `mcp.tools.write`, which Java's apikey filter statically grants to every
-/// valid key, so no per-call scope check is needed in apikey mode.
+/// returns the category's operation-list error, and — in Java's exact order,
+/// after the operation resolves — the caller must hold the operation's
+/// required scope (`mcp.tools.write` for every PDF operation). API keys carry
+/// both scopes statically; OAuth callers are gated by their token's real
+/// `scope` claim.
 async fn call_category(
     state: &McpState,
-    context: &AuthContext,
+    context: &McpCallContext,
     category: PdfCategory,
     arguments: &Value,
 ) -> Value {
@@ -527,6 +656,11 @@ async fn call_category(
         PdfLookup::Enabled(operation) if operation.category == category => operation,
         _ => return operation_list_error(state, category, Some(operation_id)),
     };
+    if !context.has_scope(WRITE_SCOPE) {
+        return tool_error(&format!(
+            "Insufficient scope: this operation requires '{WRITE_SCOPE}'."
+        ));
+    }
     dispatch_operation(
         state,
         context,
@@ -813,7 +947,7 @@ fn describe_operation(
 
 async fn call_ai(
     state: &McpState,
-    context: &AuthContext,
+    context: &McpCallContext,
     arguments: &Value,
     operations: &BTreeMap<String, AiCapability>,
 ) -> Value {
@@ -825,9 +959,12 @@ async fn call_ai(
             "Unknown AI capability '{operation_id}'. The engine manifest may not be loaded yet - retry shortly or confirm the engine is reachable."
         ));
     };
-    if state.config.scopes_enabled
-        && !matches!(operation.required_scope.as_str(), READ_SCOPE | WRITE_SCOPE)
-    {
+    // Java StirlingAiTool: the manifest's required scope is checked against
+    // the caller's real grant after the capability resolves. An API key's
+    // static read+write grant reproduces the old apikey-mode behavior
+    // (anything outside the two known scopes is refused); an OAuth token must
+    // actually carry the scope.
+    if !context.has_scope(&operation.required_scope) {
         return tool_error(&format!(
             "Insufficient scope: this capability requires '{}'.",
             operation.required_scope
@@ -843,7 +980,7 @@ async fn call_ai(
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
     let connection = state.catalog.connection.clone();
-    let username = context.username.clone();
+    let username = context.auth.username.clone();
     match task::spawn_blocking(move || post_engine(&connection, &route, &parameters, &username))
         .await
     {
@@ -869,7 +1006,11 @@ const UPLOAD_FILE_NAME: &str = "upload.bin";
 /// it can be reused by `fileId` across later `stirling_operation`/
 /// `stirling_download` calls. Reuses [`JobManager`] verbatim: no new storage
 /// mechanism, no new ownership semantics.
-async fn upload_file(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+async fn upload_file(state: &McpState, context: &McpCallContext, arguments: &Value) -> Value {
+    // Java StirlingUploadTool: storing a file is a write.
+    if !context.has_scope(WRITE_SCOPE) {
+        return tool_error("Insufficient scope: stirling_upload requires 'mcp.tools.write'.");
+    }
     let Some(base64) = text_argument(arguments, "file") else {
         return tool_error("Missing required argument: file (base64-encoded content).");
     };
@@ -877,7 +1018,7 @@ async fn upload_file(state: &McpState, context: &AuthContext, arguments: &Value)
         return tool_error("The 'file' argument is not valid base64.");
     };
     let name = text_argument(arguments, "fileName").unwrap_or("upload.bin");
-    let owner = JobOwner::from_auth_context(Some(context));
+    let owner = JobOwner::from_auth_context(Some(&context.auth));
     let Ok(submission) = state.job_manager.create_job(owner) else {
         return tool_error("Failed to store the uploaded file.");
     };
@@ -906,11 +1047,15 @@ async fn upload_file(state: &McpState, context: &AuthContext, arguments: &Value)
 /// isolation comes entirely from [`JobManager::job_file`], which already
 /// returns the same "not found" result for a foreign fileId as for a missing
 /// one - this function must not distinguish those cases either.
-async fn download_file(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+async fn download_file(state: &McpState, context: &McpCallContext, arguments: &Value) -> Value {
+    // Java StirlingDownloadTool: fetching a stored file is a read.
+    if !context.has_scope(READ_SCOPE) {
+        return tool_error("Insufficient scope: stirling_download requires 'mcp.tools.read'.");
+    }
     let Some(file_id) = text_argument(arguments, "fileId") else {
         return tool_error("Missing required argument: fileId.");
     };
-    let owner = JobOwner::from_auth_context(Some(context));
+    let owner = JobOwner::from_auth_context(Some(&context.auth));
     let file = match state.job_manager.job_file(owner, file_id) {
         Ok(Some((_, file))) => file,
         Ok(None) => {
@@ -944,7 +1089,7 @@ async fn download_file(state: &McpState, context: &AuthContext, arguments: &Valu
 /// router `pipeline` uses to run a step, with an input resolved from an
 /// uploaded `fileId` or inline base64. This tool is a Rust-only extension:
 /// Java addresses PDF operations exclusively through the category tools.
-async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
+async fn run_operation(state: &McpState, context: &McpCallContext, arguments: &Value) -> Value {
     let Some(operation) = text_argument(arguments, "operation") else {
         return tool_error(
             "Missing required argument: operation (the Stirling API path, e.g. /api/v1/general/split-pages).",
@@ -955,6 +1100,14 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
     {
         return tool_error(&format!(
             "Operation '{operation}' is not permitted for MCP dispatch."
+        ));
+    }
+    // Rust-only tool, gated like the category tools it parallels: every
+    // dispatched Stirling operation is mutating, so it requires the write
+    // scope (checked after the operation resolves, matching their order).
+    if !context.has_scope(WRITE_SCOPE) {
+        return tool_error(&format!(
+            "Insufficient scope: this operation requires '{WRITE_SCOPE}'."
         ));
     }
     dispatch_operation(state, context, arguments, operation, operation).await
@@ -968,12 +1121,12 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
 /// `stirling_operation`.
 async fn dispatch_operation(
     state: &McpState,
-    context: &AuthContext,
+    context: &McpCallContext,
     arguments: &Value,
     endpoint_path: &str,
     label: &str,
 ) -> Value {
-    let owner = JobOwner::from_auth_context(Some(context));
+    let owner = JobOwner::from_auth_context(Some(&context.auth));
     let Some((input_path, input_filename, _scratch)) =
         resolve_operation_input(state, owner, arguments).await
     else {
@@ -1014,7 +1167,7 @@ async fn dispatch_operation(
             "{label} failed: could not build the internal request."
         ));
     };
-    request.extensions_mut().insert(context.clone());
+    request.extensions_mut().insert(context.auth.clone());
 
     let response = state
         .dispatch_router
@@ -1370,6 +1523,128 @@ enum AuthFailure {
     Unavailable,
 }
 
+/// Authenticates the request in the mounted mode and returns the per-call
+/// context (identity + granted scopes), or the finished error response.
+async fn authenticate(state: &McpState, headers: &HeaderMap) -> Result<McpCallContext, Response> {
+    match &state.oauth {
+        None => match authenticate_api_key(&state.store, headers).await {
+            Ok(auth) => Ok(McpCallContext::for_api_key(
+                auth,
+                state.config.scopes_enabled,
+            )),
+            Err(AuthFailure::Unauthorized) => Err(unauthorized()),
+            Err(AuthFailure::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        },
+        Some(verifier) => authenticate_oauth(state, verifier, headers).await,
+    }
+}
+
+/// The `OAuth2` resource-server path: bearer-JWT validation through
+/// [`McpOAuthVerifier`], then Java's `McpUserBindingFilter` account binding.
+/// A tokenless request gets the plain RFC 9728 discovery challenge (the
+/// normal handshake, logged at debug in Java); a rejected token adds the
+/// sanitized reason as `error_description`; a validated token whose subject
+/// has no provisioned, enabled Stirling account gets Java's 403
+/// `insufficient_account` body.
+async fn authenticate_oauth(
+    state: &McpState,
+    verifier: &Arc<McpOAuthVerifier>,
+    headers: &HeaderMap,
+) -> Result<McpCallContext, Response> {
+    // RFC 9728's path-inserted canonical location for the /mcp resource.
+    let metadata_path = format!("{PROTECTED_RESOURCE_METADATA_PATH}{MCP_PATH}");
+    let Some(token) = extract_bearer_token(headers) else {
+        return Err(oauth_unauthorized(headers, &metadata_path, None));
+    };
+    let token = Zeroizing::new(token);
+    let worker = Arc::clone(verifier);
+    let granted = match task::spawn_blocking(move || worker.verify(&token)).await {
+        Ok(Ok(granted)) => granted,
+        Ok(Err(rejection)) => {
+            warn!(reason = %rejection.reason, "MCP rejected bearer token");
+            return Err(oauth_unauthorized(
+                headers,
+                &metadata_path,
+                Some(&rejection.reason),
+            ));
+        }
+        Err(error) => {
+            warn!(%error, "MCP bearer token verification worker failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    };
+    let Some(username) = granted
+        .username_claim_value
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(insufficient_account(&format!(
+            "Token is missing the '{}' claim used to map to a Stirling user.",
+            verifier.username_claim()
+        )));
+    };
+    let store = Arc::clone(&state.store);
+    let correlation = mcp_request_id();
+    let subject_for_log = username.replace(['\r', '\n'], " ");
+    let bound =
+        task::spawn_blocking(move || store.bind_mcp_oauth_user(&username, &correlation)).await;
+    let auth = match bound {
+        Ok(Ok(auth)) => auth,
+        Ok(Err(SecurityError::Storage(_) | SecurityError::Poisoned)) | Err(_) => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Ok(Err(_)) => {
+            warn!(
+                subject = subject_for_log,
+                "MCP access denied: token subject has no active Stirling account"
+            );
+            return Err(insufficient_account(
+                "MCP access requires a provisioned, enabled Stirling account for this subject.",
+            ));
+        }
+    };
+    Ok(McpCallContext {
+        auth,
+        scopes_enabled: state.config.scopes_enabled,
+        granted_scopes: granted.scopes,
+    })
+}
+
+/// The bearer access token, when the `Authorization` header carries one with
+/// a case-insensitive `Bearer` scheme. `X-API-KEY` is deliberately ignored in
+/// OAuth mode, matching Java's chain.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let authorization = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = authorization.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then(|| token.to_owned())
+}
+
+/// 401 with the RFC 9728 `WWW-Authenticate` challenge. Java emits the servlet
+/// container's default error body via `sendError`; Rust pins a small JSON body
+/// instead (documented divergence) — the header is the contract surface.
+fn oauth_unauthorized(headers: &HeaderMap, metadata_path: &str, reason: Option<&str>) -> Response {
+    let challenge = mcp_oauth::www_authenticate_challenge(headers, metadata_path, reason);
+    let mut response = json_response(
+        StatusCode::UNAUTHORIZED,
+        json!({"error": "unauthorized", "message": "Unauthorized"}),
+    );
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// Java `McpUserBindingFilter.reject`: 403 with the `insufficient_account`
+/// JSON body.
+fn insufficient_account(message: &str) -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({"error": "insufficient_account", "message": message}),
+    )
+}
+
 async fn authenticate_api_key(
     store: &Arc<SecurityStore>,
     headers: &HeaderMap,
@@ -1504,9 +1779,10 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 mod tests {
     use super::{
         AiCapability, AiCapabilityCatalog, EngineConnection, EngineError, MAX_CAPABILITIES,
-        McpState, PDF_OPERATIONS, PdfCategory, call_category, category_tool_schema,
-        describe_operation, extract_api_key, is_safe_relative_route, operation_allowed,
-        operation_list_error, parse_manifest,
+        McpCallContext, McpState, PDF_OPERATIONS, PdfCategory, call_category, category_tool_schema,
+        describe_operation, download_file, extract_api_key, extract_bearer_token,
+        is_safe_relative_route, operation_allowed, operation_list_error, parse_manifest,
+        run_operation, upload_file,
     };
     use crate::{
         job_manager::JobManager,
@@ -1978,6 +2254,100 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn per_scope_gating_matches_java_tool_checks_and_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let state = stub_state(directory.path(), axum::Router::new(), 1024)?;
+
+        // Every PDF operation is a write; a read-only caller is refused with
+        // Java's AbstractCategoryTool message, AFTER the operation resolves.
+        let read_only = scoped_context(&["mcp.tools.read"]);
+        let refused = call_category(
+            &state,
+            &read_only,
+            PdfCategory::Pages,
+            &json!({"operation": "rotate-pdf"}),
+        )
+        .await;
+        assert_eq!(refused["isError"], true);
+        assert_eq!(
+            refused["content"][0]["text"],
+            "Insufficient scope: this operation requires 'mcp.tools.write'."
+        );
+        // Java's order: an unknown operation reports the operation-list error,
+        // never the scope error, even for an unprivileged caller.
+        let unknown = call_category(
+            &state,
+            &read_only,
+            PdfCategory::Pages,
+            &json!({"operation": "nope"}),
+        )
+        .await;
+        assert!(unknown["content"][0]["text"].as_str().is_some_and(|text| {
+            text.starts_with("Unknown or disabled operation 'nope' for stirling_pages.")
+        }));
+
+        let upload = upload_file(
+            &state,
+            &read_only,
+            &json!({"file": STANDARD.encode(b"bytes")}),
+        )
+        .await;
+        assert_eq!(
+            upload["content"][0]["text"],
+            "Insufficient scope: stirling_upload requires 'mcp.tools.write'."
+        );
+
+        let write_only = scoped_context(&["mcp.tools.write"]);
+        let download = download_file(&state, &write_only, &json!({"fileId": "abc"})).await;
+        assert_eq!(
+            download["content"][0]["text"],
+            "Insufficient scope: stirling_download requires 'mcp.tools.read'."
+        );
+
+        let operation = run_operation(
+            &state,
+            &read_only,
+            &json!({"operation": "/api/v1/general/rotate-pdf"}),
+        )
+        .await;
+        assert_eq!(
+            operation["content"][0]["text"],
+            "Insufficient scope: this operation requires 'mcp.tools.write'."
+        );
+
+        // mcp.scopesEnabled=false disables the gate entirely (Java hasScope).
+        let ungated = McpCallContext {
+            auth: test_auth_context(),
+            scopes_enabled: false,
+            granted_scopes: BTreeSet::new(),
+        };
+        let download = download_file(&state, &ungated, &json!({"fileId": "abc"})).await;
+        assert!(
+            download["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| { text.starts_with("Unknown or inaccessible fileId") })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bearer_token_extraction_ignores_api_key_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-KEY", HeaderValue::from_static("some-api-key"));
+        assert_eq!(extract_bearer_token(&headers), None);
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bEaReR the-token"),
+        );
+        assert_eq!(extract_bearer_token(&headers).as_deref(), Some("the-token"));
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic xyz"));
+        assert_eq!(extract_bearer_token(&headers), None);
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer  "));
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
     fn stub_state(
         directory: &Path,
         dispatch_router: axum::Router,
@@ -2018,10 +2388,15 @@ mod tests {
                 directory.join("settings.yml"),
                 directory.join("local.yml"),
             )),
+            oauth: None,
         })
     }
 
-    fn test_context() -> AuthContext {
+    fn test_context() -> McpCallContext {
+        McpCallContext::for_api_key(test_auth_context(), true)
+    }
+
+    fn test_auth_context() -> AuthContext {
         AuthContext {
             user_id: 7,
             username: "unit@example.test".to_owned(),
@@ -2034,6 +2409,16 @@ mod tests {
             force_password_change: false,
             session_id: "session".to_owned(),
             correlation_id: "correlation".to_owned(),
+        }
+    }
+
+    /// A caller granted exactly `scopes`, as an OAuth token's `scope` claim
+    /// would produce.
+    fn scoped_context(scopes: &[&str]) -> McpCallContext {
+        McpCallContext {
+            auth: test_auth_context(),
+            scopes_enabled: true,
+            granted_scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
         }
     }
 
