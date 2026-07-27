@@ -640,21 +640,24 @@ pub fn pdf_to_json_metadata(
 /// 1/2/4/8/16-bit DeviceRGB/DeviceGray/DeviceCMYK samples are normalized to PNG.
 /// `/Decode` ranges and grayscale `/SMask` alpha are applied; packed 1/2/4/8-bit
 /// `/Indexed` images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
-/// colour spaces are projected both unfiltered and through bounded single Flate/LZW/
-/// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
+/// colour spaces are projected both unfiltered and through bounded Flate/LZW/ASCII85/
+/// `ASCIIHex`/`RunLength` filter chains — honouring PNG and TIFF predictors and per-filter
+/// `DecodeParms` (dictionary or array) — or a single DCT filter. Color-key `/Mask` ranges for
+/// decompressed device/Indexed
 /// samples, native CMYK DCT samples, and explicit 1-bit stencil masks are applied.
 /// `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
-/// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
+/// exponential Type 2, recursively bounded single-input stitching Type 3, or bounded PostScript
+/// Type 4 tint transforms are
 /// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
 /// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
 /// `/Decode`, and then evaluate their tint transforms; four-component `ICCBased` DCT images
 /// decode the same native CMYK planes and convert through the embedded profile.
 /// CalGray/CalRGB/Lab direct images, Indexed
-/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
+/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates (including `ICCBased`
+/// spot-color alternates) convert through bounded
 /// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
-/// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
-/// complex inline filter parameters remain.
+/// four source components and `CCITTFax`/JBIG2/JPX-filtered images remain.
 ///
 /// `lightweight` omits the base64 stream payloads (ports the `omitStreamData`
 /// serialization context) for a smaller preview response.
@@ -750,21 +753,25 @@ fn build_page(
 /// 1/2/4/8/16-bit `DeviceRGB` / `DeviceGray` / `DeviceCMYK` samples to PNG. `/Decode`
 /// ranges and grayscale `/SMask` alpha are applied, and packed 1/2/4/8-bit `/Indexed`
 /// images with Gray/RGB/CMYK palettes are expanded. Inline images with the device
-/// colour spaces are emitted both unfiltered and through bounded single Flate/LZW/
-/// ASCII85/DCT filters. Color-key `/Mask` ranges for decompressed device/Indexed
+/// colour spaces are emitted both unfiltered and through bounded Flate/LZW/ASCII85/
+/// `ASCIIHex`/`RunLength` filter chains — honouring PNG and TIFF predictors and per-filter
+/// `DecodeParms` (dictionary or array) — or a single DCT filter. Color-key `/Mask` ranges for
+/// decompressed device/Indexed
 /// samples, native CMYK DCT samples, and explicit 1-bit stencil masks are applied.
 /// `ICCBased` images and decoded
 /// device-alternate Separation/`DeviceN` samples with bounded sampled Type 0, single-input
-/// exponential Type 2, or recursively bounded single-input stitching Type 3 tint transforms are
+/// exponential Type 2, recursively bounded single-input stitching Type 3, or bounded PostScript
+/// Type 4 tint transforms are
 /// converted to sRGB/device colour. DCT Separation and one-to-four-component DCT `DeviceN` images
 /// retain their JPEG component planes, perform PDF.js-compatible JPEG colour transforms, apply
 /// `/Decode`, and then evaluate their tint transforms; four-component `ICCBased` DCT images
 /// decode the same native CMYK planes and convert through the embedded profile.
 /// CalGray/CalRGB/Lab direct images, Indexed
-/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates convert through bounded
+/// palette bases, ICC fallbacks, and Separation/`DeviceN` alternates (including `ICCBased`
+/// spot-color alternates) convert through bounded
 /// calibrated color math, including Gray/RGB/Lab DCT samples. DCT `DeviceN` images with more than
-/// four source components, PostScript Type 4 functions, `ICCBased` spot-color alternates, and
-/// complex inline filter parameters are skipped rather than serializing an unusable payload.
+/// four source components and `CCITTFax`/JBIG2/JPX-filtered images are skipped rather than
+/// serializing an unusable payload.
 fn extract_image_elements(
     document: &Document,
     page_number: u32,
@@ -979,11 +986,64 @@ fn parse_inline_image(content: &[u8], mut cursor: usize) -> Option<(Option<Strea
 }
 
 fn parse_inline_dictionary_value(content: &[u8], cursor: usize) -> Option<(Object, usize)> {
+    parse_inline_dictionary_value_at_depth(content, cursor, 0)
+}
+
+/// Bounds nested inline-image dictionary/array values so a hostile content
+/// stream (`[[[[…`) cannot recurse without limit. Real inline `/DecodeParms`
+/// nesting is one or two levels deep.
+const MAX_INLINE_DICTIONARY_VALUE_DEPTH: usize = 16;
+
+/// Parses one inline-image dictionary value: names, numbers, booleans, null,
+/// and — for `/Filter` arrays and `/DecodeParms` dictionaries/arrays — nested
+/// arrays and dictionaries. Strings and references stay unsupported; a PDF's
+/// inline image dictionary cannot legally contain indirect references.
+fn parse_inline_dictionary_value_at_depth(
+    content: &[u8],
+    cursor: usize,
+    depth: usize,
+) -> Option<(Object, usize)> {
+    if depth > MAX_INLINE_DICTIONARY_VALUE_DEPTH {
+        return None;
+    }
     let byte = *content.get(cursor)?;
     if byte == b'/' {
         let start = cursor + 1;
         let end = pdf_token_end(content, start);
         return (end > start).then(|| (Object::Name(content[start..end].to_vec()), end));
+    }
+    if byte == b'[' {
+        let mut items = Vec::new();
+        let mut cursor = skip_pdf_space_and_comments(content, cursor + 1);
+        while *content.get(cursor)? != b']' {
+            let (value, next_cursor) =
+                parse_inline_dictionary_value_at_depth(content, cursor, depth + 1)?;
+            items.push(value);
+            cursor = skip_pdf_space_and_comments(content, next_cursor);
+        }
+        return Some((Object::Array(items), cursor + 1));
+    }
+    if byte == b'<' && content.get(cursor + 1) == Some(&b'<') {
+        let mut dictionary = Dictionary::new();
+        let mut cursor = skip_pdf_space_and_comments(content, cursor + 2);
+        loop {
+            if content.get(cursor..cursor + 2) == Some(b">>") {
+                return Some((Object::Dictionary(dictionary), cursor + 2));
+            }
+            if *content.get(cursor)? != b'/' {
+                return None;
+            }
+            let key_start = cursor + 1;
+            let key_end = pdf_token_end(content, key_start);
+            if key_end == key_start {
+                return None;
+            }
+            let value_cursor = skip_pdf_space_and_comments(content, key_end);
+            let (value, next_cursor) =
+                parse_inline_dictionary_value_at_depth(content, value_cursor, depth + 1)?;
+            dictionary.set(content[key_start..key_end].to_vec(), value);
+            cursor = skip_pdf_space_and_comments(content, next_cursor);
+        }
     }
     let end = pdf_token_end(content, cursor);
     let token = std::str::from_utf8(content.get(cursor..end)?).ok()?;
@@ -1120,9 +1180,7 @@ fn decode_filtered_inline_image(
                     .ok()
                     .is_some_and(|image| image.width() == width && image.height() == height)
             } else {
-                stream
-                    .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-                    .ok()
+                decode_image_stream_data(None, &stream, MAX_EDITOR_IMAGE_BYTES)
                     .is_some_and(|decoded| decoded.len() == expected_length)
             };
             if valid {
@@ -1206,6 +1264,492 @@ fn direct_filter_names(dictionary: &Dictionary) -> Option<Vec<String>> {
             })
             .collect(),
         _ => None,
+    }
+}
+
+/// Decodes an image stream's raster payload through its full `/Filter` chain.
+///
+/// This ports the `PDFBox` `Filter` semantics that lopdf's stream decoder lacks:
+/// `RunLengthDecode` and `ASCIIHexDecode` layers, TIFF predictor 2 and PNG
+/// predictors with `PDFBox` row framing (per-row predictor tags, zero-filled
+/// incomplete final row), predictor application after `LZWDecode`, and
+/// per-filter `DecodeParms` given as an ARRAY (`Filter` array + parms array by
+/// index — mixed shapes yield empty parms, matching `Filter.getDecodeParams`).
+/// Flate/LZW/ASCII85 payload decoding itself is delegated to lopdf's bounded
+/// decoders. `DCTDecode` is handled by dedicated caller paths, and
+/// `CCITTFaxDecode`/`JBIG2Decode`/`JPXDecode`/`Crypt` (or any unrecognized
+/// filter) stay deferred: the chain returns `None` rather than an unusable
+/// payload. `document` resolves indirect `/Filter`/`/DecodeParms` values for
+/// `XObject` streams; inline images pass `None` because their dictionaries
+/// are direct by construction.
+///
+/// Every stage is bounded by `limit`, including the unfiltered raw-content
+/// fallback, matching `get_plain_content_with_limit`.
+fn decode_image_stream_data(
+    document: Option<&Document>,
+    stream: &Stream,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let filter_object = stream
+        .dict
+        .get(b"Filter")
+        .or_else(|_| stream.dict.get(b"F"))
+        .ok()
+        .and_then(|object| maybe_resolved(document, object));
+    let (filters, filter_is_single_name): (Vec<Vec<u8>>, bool) = match filter_object {
+        None => (Vec::new(), false),
+        Some(Object::Name(name)) => (vec![normalized_filter_name(name).to_vec()], true),
+        Some(Object::Array(items)) => (
+            items
+                .iter()
+                .map(|item| {
+                    maybe_resolved(document, item)?
+                        .as_name()
+                        .ok()
+                        .map(|name| normalized_filter_name(name).to_vec())
+                })
+                .collect::<Option<Vec<_>>>()?,
+            false,
+        ),
+        Some(_) => return None,
+    };
+    if filters.is_empty() {
+        return (stream.content.len() <= limit).then(|| stream.content.clone());
+    }
+    let parms_object = stream
+        .dict
+        .get(b"DecodeParms")
+        .or_else(|_| stream.dict.get(b"DP"))
+        .ok()
+        .and_then(|object| maybe_resolved(document, object));
+    let mut data = stream.content.clone();
+    for (index, filter) in filters.iter().enumerate() {
+        let parms = filter_decode_parms(document, filter_is_single_name, parms_object, index);
+        data = match filter.as_slice() {
+            b"FlateDecode" | b"LZWDecode" => {
+                let decoded = lopdf_filter_layer(filter, parms, data, limit)?;
+                apply_image_predictor(document, parms, decoded, limit)?
+            }
+            b"ASCII85Decode" => lopdf_filter_layer(filter, None, data, limit)?,
+            b"RunLengthDecode" => decode_run_length(&data, limit)?,
+            b"ASCIIHexDecode" => decode_ascii_hex(&data, limit)?,
+            _ => return None,
+        };
+        if data.len() > limit {
+            return None;
+        }
+    }
+    Some(data)
+}
+
+/// Dereferences `object` when a document is available; inline-image
+/// dictionaries carry no document and cannot legally contain references.
+fn maybe_resolved<'a>(document: Option<&'a Document>, object: &'a Object) -> Option<&'a Object> {
+    match document {
+        Some(document) => resolved_object(document, object),
+        None => Some(object),
+    }
+}
+
+/// Ports `Filter.getDecodeParams`: a single filter NAME pairs with a
+/// DICTIONARY parms value, a filter ARRAY pairs with a parms ARRAY entry at
+/// the same index, and every other combination yields no parameters.
+fn filter_decode_parms<'a>(
+    document: Option<&'a Document>,
+    filter_is_single_name: bool,
+    parms_object: Option<&'a Object>,
+    index: usize,
+) -> Option<&'a Dictionary> {
+    match (filter_is_single_name, parms_object?) {
+        (true, Object::Dictionary(dictionary)) => Some(dictionary),
+        (false, Object::Array(items)) => {
+            maybe_resolved(document, items.get(index)?)?.as_dict().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Decodes one Flate/LZW/ASCII85 layer through lopdf's bounded decoders.
+///
+/// The layer stream carries only the entries lopdf interprets for the payload
+/// itself (`EarlyChange` for LZW); predictors are applied afterwards by
+/// [`apply_image_predictor`] with `PDFBox` semantics, so lopdf's own PNG
+/// predictor pass (dictionary-`DecodeParms`-only, different row framing) is
+/// deliberately bypassed.
+fn lopdf_filter_layer(
+    filter: &[u8],
+    parms: Option<&Dictionary>,
+    data: Vec<u8>,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let mut dictionary = dictionary! { "Filter" => Object::Name(filter.to_vec()) };
+    if filter == b"LZWDecode"
+        && let Some(early_change) = parms.and_then(|parms| parms.get(b"EarlyChange").ok())
+    {
+        dictionary.set(
+            "DecodeParms",
+            dictionary! { "EarlyChange" => early_change.clone() },
+        );
+    }
+    Stream::new(dictionary, data)
+        .get_plain_content_with_limit(limit)
+        .ok()
+}
+
+/// Reads an integer decode parameter, treating a missing or non-numeric value
+/// as `default` (ports `COSDictionary.getInt`).
+fn decode_parms_i64(
+    document: Option<&Document>,
+    parms: &Dictionary,
+    key: &[u8],
+    default: i64,
+) -> i64 {
+    parms
+        .get(key)
+        .ok()
+        .and_then(|value| maybe_resolved(document, value))
+        .and_then(|value| value.as_i64().ok())
+        .unwrap_or(default)
+}
+
+/// Applies the `/Predictor` declared in `parms` to decoded Flate/LZW output.
+///
+/// Ports `Predictor.wrapPredictor` + `PredictorOutputStream`: `Colors` is
+/// clamped to at most 32, PNG predictors (>= 10) read a per-row predictor tag
+/// byte, an incomplete final row is zero-filled before decoding, and TIFF
+/// predictor 2 covers the 8/16-bit, 1-bit single-channel, and packed sub-byte
+/// row variants. Out-of-spec `BitsPerComponent` values and non-positive row
+/// geometry are rejected rather than reproducing `PDFBox`'s undefined-shift
+/// output for such inputs.
+fn apply_image_predictor(
+    document: Option<&Document>,
+    parms: Option<&Dictionary>,
+    data: Vec<u8>,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let Some(parms) = parms else {
+        return Some(data);
+    };
+    let predictor = decode_parms_i64(document, parms, b"Predictor", 1);
+    if predictor <= 1 {
+        return Some(data);
+    }
+    let predictor = i32::try_from(predictor).ok()?;
+    let colors = decode_parms_i64(document, parms, b"Colors", 1).min(32);
+    let bits_per_component = decode_parms_i64(document, parms, b"BitsPerComponent", 8);
+    let columns = decode_parms_i64(document, parms, b"Columns", 1);
+    if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    let colors = usize::try_from(colors).ok().filter(|colors| *colors > 0)?;
+    let bits_per_component = usize::try_from(bits_per_component).ok()?;
+    let columns = usize::try_from(columns)
+        .ok()
+        .filter(|columns| *columns > 0)?;
+    let row_length = columns
+        .checked_mul(colors)?
+        .checked_mul(bits_per_component)?
+        .checked_add(7)?
+        / 8;
+    if row_length == 0 || row_length > limit {
+        return None;
+    }
+    let mut output = Vec::with_capacity(data.len().min(limit));
+    let mut last_row = vec![0_u8; row_length];
+    let mut current_row = vec![0_u8; row_length];
+    let mut offset = 0_usize;
+    while offset < data.len() {
+        let row_predictor = if predictor >= 10 {
+            // PNG framing: each row starts with its own predictor tag; PDFBox
+            // reads the tag as a *signed* byte plus 10 and treats unknown
+            // resulting values as a no-op row.
+            #[allow(clippy::cast_possible_wrap)]
+            let tag = i32::from(data[offset] as i8) + 10;
+            offset += 1;
+            if offset >= data.len() {
+                // Tag with no row bytes: PDFBox's flush emits nothing.
+                break;
+            }
+            tag
+        } else {
+            predictor
+        };
+        let available = row_length.min(data.len() - offset);
+        current_row[..available].copy_from_slice(&data[offset..offset + available]);
+        current_row[available..].fill(0);
+        offset += available;
+        decode_predictor_row(
+            row_predictor,
+            colors,
+            bits_per_component,
+            columns,
+            &mut current_row,
+            &last_row,
+        )?;
+        if output.len().checked_add(row_length)? > limit {
+            return None;
+        }
+        output.extend_from_slice(&current_row);
+        std::mem::swap(&mut current_row, &mut last_row);
+    }
+    Some(output)
+}
+
+/// Ports `Predictor.decodePredictorRow`; unknown predictor values leave the
+/// row untouched, matching `PDFBox`'s `default` branch.
+fn decode_predictor_row(
+    predictor: i32,
+    colors: usize,
+    bits_per_component: usize,
+    columns: usize,
+    row: &mut [u8],
+    last_row: &[u8],
+) -> Option<()> {
+    let bytes_per_pixel = (colors * bits_per_component).div_ceil(8);
+    let row_length = row.len();
+    match predictor {
+        2 => decode_tiff_predictor_row(colors, bits_per_component, columns, row)?,
+        11 => {
+            // PNG SUB.
+            for position in bytes_per_pixel..row_length {
+                row[position] = row[position].wrapping_add(row[position - bytes_per_pixel]);
+            }
+        }
+        12 => {
+            // PNG UP.
+            for (byte, prior) in row.iter_mut().zip(last_row) {
+                *byte = byte.wrapping_add(*prior);
+            }
+        }
+        13 => {
+            // PNG AVERAGE.
+            for position in 0..row_length {
+                let left = position
+                    .checked_sub(bytes_per_pixel)
+                    .map_or(0_u16, |left| u16::from(row[left]));
+                let up = u16::from(*last_row.get(position)?);
+                let average = u8::try_from(u16::midpoint(left, up)).ok()?;
+                row[position] = row[position].wrapping_add(average);
+            }
+        }
+        14 => {
+            // PNG PAETH.
+            for position in 0..row_length {
+                let left = position
+                    .checked_sub(bytes_per_pixel)
+                    .map_or(0_i32, |left| i32::from(row[left]));
+                let up = i32::from(*last_row.get(position)?);
+                let up_left = position
+                    .checked_sub(bytes_per_pixel)
+                    .map_or(0_i32, |left| i32::from(last_row[left]));
+                let value = left + up - up_left;
+                let distance_left = (value - left).abs();
+                let distance_up = (value - up).abs();
+                let distance_up_left = (value - up_left).abs();
+                let paeth = if distance_left <= distance_up && distance_left <= distance_up_left {
+                    left
+                } else if distance_up <= distance_up_left {
+                    up
+                } else {
+                    up_left
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    row[position] = row[position].wrapping_add(paeth as u8);
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// TIFF predictor 2 (`Predictor.decodePredictorRow` case 2): each sample adds
+/// the same-channel sample one pixel to the left, in the 8/16-bit, 1-bit
+/// single-channel, or packed sub-byte row layout.
+fn decode_tiff_predictor_row(
+    colors: usize,
+    bits_per_component: usize,
+    columns: usize,
+    row: &mut [u8],
+) -> Option<()> {
+    let bytes_per_pixel = (colors * bits_per_component).div_ceil(8);
+    let row_length = row.len();
+    match bits_per_component {
+        8 => {
+            for position in bytes_per_pixel..row_length {
+                row[position] = row[position].wrapping_add(row[position - bytes_per_pixel]);
+            }
+        }
+        16 => {
+            let mut position = bytes_per_pixel;
+            while position + 1 < row_length {
+                let sub = u16::from_be_bytes([*row.get(position)?, *row.get(position + 1)?]);
+                let left = u16::from_be_bytes([
+                    *row.get(position - bytes_per_pixel)?,
+                    *row.get(position - bytes_per_pixel + 1)?,
+                ]);
+                let restored = sub.wrapping_add(left).to_be_bytes();
+                row[position] = restored[0];
+                row[position + 1] = restored[1];
+                position += 2;
+            }
+        }
+        1 if colors == 1 => {
+            // Rows are bit-packed high-to-low; each bit adds the previous
+            // bit, crossing byte boundaries via the prior byte's low bit.
+            for position in 0..row_length {
+                for bit in (0..=7).rev() {
+                    if position == 0 && bit == 7 {
+                        continue;
+                    }
+                    let sub = (row[position] >> bit) & 1;
+                    let left = if bit == 7 {
+                        row[position - 1] & 1
+                    } else {
+                        (row[position] >> (bit + 1)) & 1
+                    };
+                    if (sub + left) & 1 == 0 {
+                        row[position] &= !(1 << bit);
+                    } else {
+                        row[position] |= 1 << bit;
+                    }
+                }
+            }
+        }
+        _ => {
+            // Packed 2/4-bit samples: add the same-channel sample one pixel
+            // to the left within the bit-packed row.
+            let elements = columns.checked_mul(colors)?;
+            for position in colors..elements {
+                let byte_position = position * bits_per_component / 8;
+                let bit_position = 8 - position * bits_per_component % 8 - bits_per_component;
+                let left_byte_position = (position - colors) * bits_per_component / 8;
+                let left_bit_position =
+                    8 - (position - colors) * bits_per_component % 8 - bits_per_component;
+                let sub =
+                    get_bit_sequence(*row.get(byte_position)?, bit_position, bits_per_component);
+                let left = get_bit_sequence(
+                    *row.get(left_byte_position)?,
+                    left_bit_position,
+                    bits_per_component,
+                );
+                row[byte_position] = set_bit_sequence(
+                    row[byte_position],
+                    bit_position,
+                    bits_per_component,
+                    sub.wrapping_add(left),
+                );
+            }
+        }
+    }
+    Some(())
+}
+
+/// Ports `Predictor.getBitSeq`.
+fn get_bit_sequence(byte: u8, start_bit: usize, bit_size: usize) -> u8 {
+    let mask = (1_u16 << bit_size) - 1;
+    u8::try_from((u16::from(byte) >> start_bit) & mask).unwrap_or_default()
+}
+
+/// Ports `Predictor.calcSetBitSeq`.
+fn set_bit_sequence(byte: u8, start_bit: usize, bit_size: usize, value: u8) -> u8 {
+    let mask = u8::try_from((1_u16 << bit_size) - 1).unwrap_or(u8::MAX);
+    let truncated = value & mask;
+    (byte & !(mask << start_bit)) | (truncated << start_bit)
+}
+
+/// Ports `RunLengthDecodeFilter.decode`: a length byte of 0..=127 copies the
+/// next `length + 1` literal bytes, 129..=255 repeats the next byte
+/// `257 - length` times, 128 is EOD, and truncated input ends the stream
+/// silently instead of failing.
+fn decode_run_length(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+    const RUN_LENGTH_EOD: u8 = 128;
+    let mut output = Vec::new();
+    let mut offset = 0_usize;
+    while let Some(&length_byte) = data.get(offset) {
+        offset += 1;
+        if length_byte == RUN_LENGTH_EOD {
+            break;
+        }
+        if length_byte <= 127 {
+            let wanted = usize::from(length_byte) + 1;
+            let available = wanted.min(data.len() - offset);
+            if output.len().checked_add(available)? > limit {
+                return None;
+            }
+            output.extend_from_slice(&data[offset..offset + available]);
+            offset += available;
+            if available < wanted {
+                break;
+            }
+        } else {
+            let Some(&value) = data.get(offset) else {
+                break;
+            };
+            offset += 1;
+            let count = 257 - usize::from(length_byte);
+            if output.len().checked_add(count)? > limit {
+                return None;
+            }
+            output.extend(std::iter::repeat_n(value, count));
+        }
+    }
+    Some(output)
+}
+
+/// Ports `ASCIIHexFilter.decode`: whitespace is skipped before the first digit
+/// of each pair, `>` is EOD, an odd trailing digit behaves as if followed by
+/// `0`, and an invalid digit contributes `PDFBox`'s `-1` placeholder value (the
+/// written byte keeps only the low eight bits, exactly like
+/// `OutputStream.write(int)`).
+fn decode_ascii_hex(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        let mut first = None;
+        while let Some(&byte) = data.get(offset) {
+            offset += 1;
+            if is_pdf_whitespace(byte) {
+                continue;
+            }
+            first = Some(byte);
+            break;
+        }
+        let Some(first) = first else {
+            break;
+        };
+        if first == b'>' {
+            break;
+        }
+        let mut value = ascii_hex_digit(first) * 16;
+        let second = data.get(offset).copied();
+        offset += 1;
+        if output.len() >= limit {
+            return None;
+        }
+        match second {
+            None | Some(b'>') => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                output.push((value & 0xff) as u8);
+                break;
+            }
+            Some(second) => {
+                value += ascii_hex_digit(second);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                output.push((value & 0xff) as u8);
+            }
+        }
+    }
+    Some(output)
+}
+
+fn ascii_hex_digit(byte: u8) -> i32 {
+    match byte {
+        b'0'..=b'9' => i32::from(byte - b'0'),
+        b'A'..=b'F' => i32::from(byte - b'A') + 10,
+        b'a'..=b'f' => i32::from(byte - b'a') + 10,
+        _ => -1,
     }
 }
 
@@ -3090,9 +3634,7 @@ fn decode_indexed_raster(
     if expected_bytes > MAX_EDITOR_IMAGE_BYTES {
         return None;
     }
-    let samples = stream
-        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-        .ok()?;
+    let samples = decode_image_stream_data(Some(document), stream, MAX_EDITOR_IMAGE_BYTES)?;
     if samples.len() != expected_bytes {
         return None;
     }
@@ -3242,9 +3784,7 @@ fn decode_device_samples(
     if expected_bytes > MAX_EDITOR_IMAGE_BYTES {
         return None;
     }
-    let content = stream
-        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-        .ok()?;
+    let content = decode_image_stream_data(Some(document), stream, MAX_EDITOR_IMAGE_BYTES)?;
     if content.len() != expected_bytes {
         return None;
     }
@@ -3473,9 +4013,7 @@ fn color_key_samples(
             let row_bits = u64::from(width).checked_mul(u64::from(bits_per_component))?;
             let row_bytes = usize::try_from(row_bits.checked_add(7)?.checked_div(8)?).ok()?;
             let expected = row_bytes.checked_mul(usize::try_from(height).ok()?)?;
-            let content = stream
-                .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-                .ok()?;
+            let content = decode_image_stream_data(Some(document), stream, MAX_EDITOR_IMAGE_BYTES)?;
             if content.len() != expected {
                 return None;
             }
@@ -3494,9 +4032,7 @@ fn color_key_samples(
                 .checked_mul(u64::from(bits_per_component))?;
             let row_bytes = usize::try_from(row_bits.checked_add(7)?.checked_div(8)?).ok()?;
             let expected = row_bytes.checked_mul(usize::try_from(height).ok()?)?;
-            let content = stream
-                .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-                .ok()?;
+            let content = decode_image_stream_data(Some(document), stream, MAX_EDITOR_IMAGE_BYTES)?;
             if content.len() != expected {
                 return None;
             }
@@ -3645,9 +4181,7 @@ fn apply_stencil_mask(
     }
     let row_bytes = usize::try_from(u64::from(width).checked_add(7)?.checked_div(8)?).ok()?;
     let expected = row_bytes.checked_mul(usize::try_from(height).ok()?)?;
-    let content = mask
-        .get_plain_content_with_limit(MAX_EDITOR_IMAGE_BYTES)
-        .ok()?;
+    let content = decode_image_stream_data(Some(document), mask, MAX_EDITOR_IMAGE_BYTES)?;
     if content.len() != expected {
         return None;
     }
@@ -8401,10 +8935,48 @@ fn restore_annotations(
         };
         dictionary.set("Type", Object::Name(b"Annot".to_vec()));
         dictionary.set("P", Object::Reference(page_id));
+        hoist_dictionary_nested_streams(document, &mut dictionary);
         let annotation_id = document.add_object(dictionary);
         append_page_annotation(document, page_id, annotation_id)?;
     }
     Ok(())
+}
+
+/// Hoists every stream nested inside `object` into an indirect document object,
+/// replacing it with a reference.
+///
+/// A PDF stream is only legal as an indirect object, but `cos_value_to_object`
+/// materializes the editor JSON's expanded COS projection verbatim — so a
+/// restored annotation's `/AP` appearance stream (or any other stream-valued
+/// entry) reappears *inside* the dictionary, and lopdf's writer would serialize
+/// it inline, producing an unparseable PDF. `PDFBox` does not hit this because
+/// `PdfJsonCosMapper.deserializeCosValue` creates document-owned `COSStream`s
+/// and its `COSWriter` emits every stream as an indirect object; hoisting on
+/// rebuild mirrors those semantics. Recursion depth is bounded in practice by
+/// `serde_json`'s 128-level nesting limit on the incoming editor JSON.
+fn hoist_nested_streams(document: &mut Document, object: &mut Object) {
+    match object {
+        Object::Array(items) => {
+            for item in items {
+                hoist_nested_streams(document, item);
+            }
+        }
+        Object::Dictionary(dictionary) => hoist_dictionary_nested_streams(document, dictionary),
+        Object::Stream(stream) => {
+            // A stream's own dictionary can nest further streams; hoist those
+            // first so the hoisted object is already legal.
+            hoist_dictionary_nested_streams(document, &mut stream.dict);
+            let hoisted = std::mem::replace(object, Object::Null);
+            *object = Object::Reference(document.add_object(hoisted));
+        }
+        _ => {}
+    }
+}
+
+fn hoist_dictionary_nested_streams(document: &mut Document, dictionary: &mut Dictionary) {
+    for (_, value) in dictionary.iter_mut() {
+        hoist_nested_streams(document, value);
+    }
 }
 
 fn restored_annotation_dictionary(annotation: &PdfJsonAnnotation) -> Option<Dictionary> {
@@ -14191,6 +14763,322 @@ q 20 0 0 10 5 7 cm BI /W 2 /H 1 /CS /RGB /BPC 8 ID\n"
         let encoded = image.image_data.as_deref().ok_or("image data missing")?;
         let decoded = image::load_from_memory(&STANDARD.decode(encoded)?)?;
         assert_eq!(decoded.to_rgb8().as_raw(), &samples);
+        Ok(())
+    }
+
+    /// Wraps `content` in a one-page PDF and projects it to the editor model.
+    fn inline_image_content_model(
+        content: Vec<u8>,
+        file_name: &str,
+    ) -> Result<super::PdfJsonDocument, Box<dyn std::error::Error>> {
+        use super::pdf_to_json;
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let content_id = source.add_object(Stream::new(dictionary! {}, content));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 160.into()],
+            "Resources" => dictionary! {},
+            "Contents" => content_id,
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_object_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(file_name);
+        source.save(&path)?;
+        Ok(pdf_to_json(&path, file_name, false)?)
+    }
+
+    fn single_inline_image_pixels(
+        model: &super::PdfJsonDocument,
+    ) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        assert_eq!(model.pages[0].image_elements.len(), 1);
+        let image = &model.pages[0].image_elements[0];
+        assert_eq!(image.inline_image, Some(true));
+        assert_eq!(image.image_format.as_deref(), Some("png"));
+        let encoded = image.image_data.as_deref().ok_or("image data missing")?;
+        Ok(image::load_from_memory(&STANDARD.decode(encoded)?)?)
+    }
+
+    #[test]
+    fn extracts_run_length_filtered_gray_inline_images() -> Result<(), Box<dyn std::error::Error>> {
+        // PDFBox `RunLengthDecodeFilter`: `3` copies the next four literal
+        // bytes and `128` is EOD.
+        let samples = [10_u8, 200, 60, 250];
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 2 /H 2 /CS /G /BPC 8 /F /RL ID\n".to_vec();
+        content.extend_from_slice(&[3, samples[0], samples[1], samples[2], samples[3], 128]);
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "run-length-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_luma8().as_raw(), &samples);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_ascii_hex_filtered_rgb_inline_images() -> Result<(), Box<dyn std::error::Error>> {
+        // Mixed-case digits, interior whitespace, and the `>` EOD marker all
+        // follow PDFBox `ASCIIHexFilter` semantics.
+        let samples = [1_u8, 2, 3, 250, 128, 7];
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 2 /H 1 /CS /RGB /BPC 8 /F /AHx ID\n".to_vec();
+        content.extend_from_slice(b"01 02 03 fa 80 07 >");
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "ascii-hex-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_rgb8().as_raw(), &samples);
+        Ok(())
+    }
+
+    /// Zlib-compresses fixture bytes unconditionally (`Stream::compress`
+    /// silently skips payloads that do not shrink).
+    fn zlib_fixture(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data)?;
+        Ok(encoder.finish()?)
+    }
+
+    #[test]
+    fn extracts_flate_tiff_predictor_inline_images() -> Result<(), Box<dyn std::error::Error>> {
+        // TIFF predictor 2: every sample after the first pixel stores the
+        // difference from the same channel one pixel to the left.
+        let samples = [
+            10_u8, 20, 30, 110, 140, 160, // row 0
+            50, 60, 70, 40, 30, 20, // row 1
+        ];
+        let differenced = [
+            10_u8, 20, 30, 100, 120, 130, // row 0
+            50, 60, 70, 246, 226, 206, // row 1
+        ];
+        let compressed = zlib_fixture(&differenced)?;
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 2 /H 2 /CS /RGB /BPC 8 /F /Fl \
+/DP << /Predictor 2 /Colors 3 /BitsPerComponent 8 /Columns 2 >> ID\n"
+            .to_vec();
+        content.extend_from_slice(&compressed);
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "flate-tiff-predictor-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_rgb8().as_raw(), &samples);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_flate_png_predictor_inline_images() -> Result<(), Box<dyn std::error::Error>> {
+        // PNG framing: each row carries its own predictor tag (0 = None,
+        // 2 = Up), decoded with PDFBox's row semantics.
+        let samples = [7_u8, 9, 17, 29];
+        let encoded_rows = [0_u8, 7, 9, 2, 10, 20];
+        let compressed = zlib_fixture(&encoded_rows)?;
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 2 /H 2 /CS /G /BPC 8 /F /Fl \
+/DP << /Predictor 15 /Columns 2 >> ID\n"
+            .to_vec();
+        content.extend_from_slice(&compressed);
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "flate-png-predictor-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_luma8().as_raw(), &samples);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_lzw_tiff_predictor_inline_images() -> Result<(), Box<dyn std::error::Error>> {
+        // PDF LZW (MSB, 8-bit codes, EarlyChange default 1) matches weezl's
+        // TIFF size-switch mode; the predictor applies to the LZW output.
+        let samples = [100_u8, 110, 105, 95];
+        let differenced = [100_u8, 10, 251, 246];
+        let compressed = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(&differenced)?;
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 4 /H 1 /CS /G /BPC 8 /F /LZW \
+/DP << /Predictor 2 /Columns 4 >> ID\n"
+            .to_vec();
+        content.extend_from_slice(&compressed);
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "lzw-tiff-predictor-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_luma8().as_raw(), &samples);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_inline_images_with_filter_chain_and_decode_parms_array()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `/F [/AHx /Fl]` with `/DP [null <<...>>]`: per-filter parameters are
+        // selected by index (`Filter.getDecodeParams`), so the predictor
+        // applies to the Flate layer only.
+        let samples = [5_u8, 10, 15, 20, 40, 60];
+        let differenced = [5_u8, 10, 15, 15, 30, 45];
+        let compressed = zlib_fixture(&differenced)?;
+        let mut hex = Vec::new();
+        for byte in &compressed {
+            hex.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        hex.push(b'>');
+        let mut content = b"q 8 0 0 8 2 3 cm BI /W 2 /H 1 /CS /RGB /BPC 8 /F [/AHx /Fl] \
+/DP [null << /Predictor 2 /Colors 3 /Columns 2 >>] ID\n"
+            .to_vec();
+        content.extend_from_slice(&hex);
+        content.extend_from_slice(b"\nEI\nQ");
+
+        let model = inline_image_content_model(content, "decode-parms-array-inline.pdf")?;
+        let decoded = single_inline_image_pixels(&model)?;
+        assert_eq!(decoded.to_rgb8().as_raw(), &samples);
+        Ok(())
+    }
+
+    #[test]
+    fn run_length_decoding_matches_pdfbox_semantics() {
+        use super::decode_run_length;
+
+        // EOD stops the stream even when more data follows.
+        assert_eq!(
+            decode_run_length(&[1, 8, 9, 128, 0, 55], usize::MAX).as_deref(),
+            Some([8_u8, 9].as_slice())
+        );
+        // A repeat run of `257 - length` copies.
+        assert_eq!(
+            decode_run_length(&[254, 65, 128], usize::MAX).as_deref(),
+            Some([65_u8, 65, 65].as_slice())
+        );
+        // A truncated literal run copies what is available and stops silently.
+        assert_eq!(
+            decode_run_length(&[5, 1, 2], usize::MAX).as_deref(),
+            Some([1_u8, 2].as_slice())
+        );
+        // The output bound is enforced.
+        assert_eq!(decode_run_length(&[129, 7, 128], 1), None);
+    }
+
+    #[test]
+    fn ascii_hex_decoding_matches_pdfbox_semantics() {
+        use super::decode_ascii_hex;
+
+        assert_eq!(
+            decode_ascii_hex(b"466f6F>", usize::MAX).as_deref(),
+            Some(b"Foo".as_slice())
+        );
+        // An odd trailing digit behaves as if followed by `0`.
+        assert_eq!(
+            decode_ascii_hex(b"414>", usize::MAX).as_deref(),
+            Some([0x41_u8, 0x40].as_slice())
+        );
+        // Whitespace is skipped only before the first digit of a pair; a
+        // whitespace second digit contributes PDFBox's `-1` placeholder.
+        assert_eq!(
+            decode_ascii_hex(b"4 1", usize::MAX).as_deref(),
+            Some([0x3f_u8, 0x10].as_slice())
+        );
+        assert_eq!(decode_ascii_hex(b"4141", 1), None);
+    }
+
+    #[test]
+    fn tiff_predictor_covers_packed_sub_byte_samples() {
+        use super::apply_image_predictor;
+        use lopdf::dictionary;
+
+        // 4-bit gray, four columns: [3, 5, 4, 5] differenced to [3, 2, 15, 1]
+        // and packed high-to-low into two bytes per row.
+        let parms = dictionary! { "Predictor" => 2, "BitsPerComponent" => 4, "Columns" => 4 };
+        assert_eq!(
+            apply_image_predictor(None, Some(&parms), vec![0x32, 0xF1], usize::MAX).as_deref(),
+            Some([0x35_u8, 0x45].as_slice())
+        );
+    }
+
+    #[test]
+    fn json_round_trip_hoists_annotation_appearance_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{convert_json_to_pdf, pdf_to_json};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let appearance = b"0 1 0 rg 0 0 40 40 re f".to_vec();
+        let mut source = Document::with_version("1.7");
+        let pages_id = source.new_object_id();
+        let appearance_id = source.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 40.into(), 40.into()],
+            },
+            appearance.clone(),
+        ));
+        let annotation_id = source.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![10.into(), 10.into(), 50.into(), 50.into()],
+            "F" => 4,
+            "AP" => dictionary! { "N" => appearance_id },
+        });
+        let content_id = source.add_object(Stream::new(dictionary! {}, b"q Q".to_vec()));
+        let page_object_id = source.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+            "Resources" => dictionary! {},
+            "Contents" => content_id,
+            "Annots" => vec![Object::Reference(annotation_id)],
+        });
+        source.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_object_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id =
+            source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        source.trailer.set("Root", catalog_id);
+        let directory = tempfile::tempdir()?;
+        let source_path = directory.path().join("annotated.pdf");
+        source.save(&source_path)?;
+
+        let model = pdf_to_json(&source_path, "annotated.pdf", false)?;
+        assert_eq!(model.pages[0].annotations.len(), 1);
+        assert!(
+            model.pages[0].annotations[0].raw_data.is_some(),
+            "the full projection must carry the annotation's raw COS data"
+        );
+
+        let output_path = directory.path().join("rebuilt.pdf");
+        convert_json_to_pdf(&model, &output_path)?;
+        let rebuilt = Document::load(&output_path)?;
+        let rebuilt_page_id = *rebuilt.get_pages().values().next().ok_or("missing page")?;
+        let annotations = rebuilt
+            .get_dictionary(rebuilt_page_id)?
+            .get(b"Annots")?
+            .as_array()?
+            .clone();
+        assert_eq!(annotations.len(), 1);
+        let annotation = rebuilt.get_dictionary(annotations[0].as_reference()?)?;
+        assert_eq!(annotation.get(b"Subtype")?.as_name()?, b"Square");
+        let appearance_dictionary = annotation.get(b"AP")?.as_dict()?;
+        let normal = appearance_dictionary.get(b"N")?;
+        let normal_id = normal
+            .as_reference()
+            .map_err(|_| "the /AP /N appearance stream must be hoisted to an indirect object")?;
+        let restored = rebuilt.get_object(normal_id)?.as_stream()?;
+        assert_eq!(restored.content, appearance);
+        assert_eq!(restored.dict.get(b"Subtype")?.as_name()?, b"Form");
         Ok(())
     }
 
