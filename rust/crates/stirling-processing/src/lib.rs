@@ -23,6 +23,7 @@ mod login_agreement_admin;
 mod maintenance;
 pub mod markdown_to_pdf;
 mod mcp;
+mod mcp_oauth;
 pub mod mobile_scanner;
 pub mod ocr_pdf;
 pub mod office_sanitizer;

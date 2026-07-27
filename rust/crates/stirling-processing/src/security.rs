@@ -3188,6 +3188,49 @@ impl SecurityStore {
         Ok(token)
     }
 
+    /// Binds an MCP OAuth-validated token subject to a provisioned Stirling
+    /// account — the Rust port of Java's `McpUserBindingFilter` account check:
+    /// the configured username-claim value must resolve, case-insensitively,
+    /// to an existing **enabled** user, and the returned context carries that
+    /// account's canonical username so audit/metering attribute correctly.
+    ///
+    /// The caller has already verified the JWT (signature, issuer, expiry,
+    /// audience); this method only performs the account lookup, so it must
+    /// never be reachable with an unverified claim value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidToken`] when the subject has no
+    /// enabled account (or the claim value cannot be a username), and a
+    /// storage error when live state cannot be read.
+    pub fn bind_mcp_oauth_user(
+        &self,
+        username_claim_value: &str,
+        correlation_id: &str,
+    ) -> Result<AuthContext, SecurityError> {
+        let username =
+            normalize_username(username_claim_value).map_err(|_| SecurityError::InvalidToken)?;
+        let connection = self.lock()?;
+        let user = connection
+            .query_row(
+                "SELECT user_id, username, password_hash, enabled, authentication_type, team_id,
+                        force_password_change
+                 FROM security_users WHERE username_norm = ?1",
+                [username.normalized.as_str()],
+                stored_user_from_row,
+            )
+            .optional()?
+            .filter(|user| user.enabled)
+            .ok_or(SecurityError::InvalidToken)?;
+        context_for_user(
+            &connection,
+            &user,
+            AuthenticationSource::Oidc,
+            correlation_id.to_owned(),
+            correlation_id,
+        )
+    }
+
     /// Authenticates a hashed API key against its live user and role state.
     ///
     /// # Errors

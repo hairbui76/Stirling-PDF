@@ -95,8 +95,9 @@ const MAX_EMAIL_BYTES: usize = 320;
 /// Generic ceiling for the optional human-readable string claims.
 const MAX_CLAIM_BYTES: usize = 1_024;
 /// Clock-skew leeway for `exp`, matching [`crate::security_jwt`]'s explicit
-/// leeway convention (and `jsonwebtoken`'s own default).
-const CLOCK_SKEW_SECONDS: u64 = 60;
+/// leeway convention (and `jsonwebtoken`'s own default). Shared with
+/// [`crate::mcp_oauth`] so the MCP bearer verifier keeps the same convention.
+pub(crate) const CLOCK_SKEW_SECONDS: u64 = 60;
 /// Lifetime of a cached JWKS entry in [`OidcJwksCache`], matching the discovery
 /// cache's TTL and [`crate::security_jwt`]'s default `jwks_cache_seconds` (both
 /// 5 minutes): staleness after an un-signalled key rotation is bounded by this,
@@ -275,7 +276,8 @@ impl OidcJwksCache {
     ///
     /// Propagates the `fetch` error when a fetch was needed and failed. A
     /// poisoned cache lock is *not* fatal: the set is fetched uncached instead.
-    fn jwks_for(
+    /// `pub(crate)` for [`crate::mcp_oauth`], which shares this cache model.
+    pub(crate) fn jwks_for(
         &self,
         jwks_uri: &str,
         kid: &str,
@@ -380,8 +382,9 @@ fn verify_oidc_id_token_cached_with_fetch(
     verify_id_token_with_jwks(provider, client_id, expected_nonce, id_token, &jwks)
 }
 
-/// Fetches and validates the provider's JWKS via the SSRF-safe GET.
-fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet, OidcIdTokenError> {
+/// Fetches and validates the provider's JWKS via the SSRF-safe GET. Shared
+/// with [`crate::mcp_oauth`], whose bearer verifier resolves keys the same way.
+pub(crate) fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet, OidcIdTokenError> {
     // Every fetch failure — unreachable, timeout, over-cap, and crucially the
     // SSRF BlockedAddress rejection — collapses to JwksUnavailable (fail-closed;
     // no distinction leaked about why the provider-controlled URL was refused).
@@ -503,21 +506,60 @@ impl OidcIdTokenClaims {
     }
 }
 
+/// Which JOSE `typ` header values a verification path accepts. The two paths
+/// deliberately differ: an OIDC **ID token** is always plain `JWT`, while an
+/// `OAuth2` **access token** may be minted as RFC 9068 `at+jwt` (Auth0 and
+/// other conformant identity providers do), and Java's MCP resource server —
+/// Spring's default
+/// `NimbusJwtDecoder` with `NO_TYPE_VERIFIER` — applies no `typ` check at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JwtTypPolicy {
+    /// Absent or `JWT` only (case-insensitive) — the OIDC ID-token paths.
+    IdToken,
+    /// Additionally accepts RFC 9068 `at+jwt` / `application/at+jwt`
+    /// (case-insensitive) — the MCP bearer access-token path.
+    AccessToken,
+}
+
+impl JwtTypPolicy {
+    fn allows(self, token_type: &str) -> bool {
+        token_type.eq_ignore_ascii_case("JWT")
+            || (self == Self::AccessToken
+                && (token_type.eq_ignore_ascii_case("at+jwt")
+                    || token_type.eq_ignore_ascii_case("application/at+jwt")))
+    }
+}
+
 /// Shape-validates the raw compact JWT and returns its decoded header plus the
 /// bounded `kid`, applying the alg-confusion defense: anything that is not a
 /// public-key signature algorithm — critically `alg=HS256`/`HS384`/`HS512` — is
 /// rejected here, BEFORE a `Validation` is built, a key is selected, or (on the
 /// cached path) the cache/network is touched. Shared by
 /// [`verify_id_token_with_jwks`] and [`verify_oidc_id_token_cached_with_fetch`]
-/// so the two paths' pre-key gates cannot drift apart.
-fn validated_header_and_kid(id_token: &str) -> Result<(Header, String), OidcIdTokenError> {
+/// so the two paths' pre-key gates cannot drift apart. Also (via
+/// [`validated_header_and_kid_for`] with [`JwtTypPolicy::AccessToken`]) the
+/// pre-gate of [`crate::mcp_oauth`]'s bearer-JWT verifier.
+pub(crate) fn validated_header_and_kid(
+    id_token: &str,
+) -> Result<(Header, String), OidcIdTokenError> {
+    validated_header_and_kid_for(id_token, JwtTypPolicy::IdToken)
+}
+
+/// [`validated_header_and_kid`] with the `typ` acceptance policy explicit, so
+/// the MCP access-token path can admit RFC 9068 `at+jwt` without loosening the
+/// ID-token paths. Everything else (shape, alg allowlist, bounded `kid`) is
+/// identical across policies.
+pub(crate) fn validated_header_and_kid_for(
+    id_token: &str,
+    typ_policy: JwtTypPolicy,
+) -> Result<(Header, String), OidcIdTokenError> {
     validate_token_shape(id_token)?;
     let header = decode_header(id_token).map_err(|_| OidcIdTokenError::InvalidToken)?;
     if !algorithm_is_allowed(header.alg)
         || header
             .typ
             .as_deref()
-            .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("JWT"))
+            .is_some_and(|token_type| !typ_policy.allows(token_type))
     {
         return Err(OidcIdTokenError::InvalidToken);
     }
@@ -575,8 +617,8 @@ fn validate_token_shape(token: &str) -> Result<(), OidcIdTokenError> {
 
 /// Rejects a selected JWK that is symmetric, or whose declared use/operations/
 /// algorithm are incompatible with verifying a signature with `algorithm`.
-/// Mirrors [`crate::security_jwt`].
-fn validate_jwk(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OidcIdTokenError> {
+/// Mirrors [`crate::security_jwt`]. Shared with [`crate::mcp_oauth`].
+pub(crate) fn validate_jwk(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OidcIdTokenError> {
     if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_))
         || jwk
             .common
@@ -665,7 +707,8 @@ mod tests {
     use serde::Serialize;
 
     use super::{
-        OidcIdTokenError, OidcJwksCache, VerifiedOidcIdentity, algorithm_is_allowed, validate_jwks,
+        JwtTypPolicy, OidcIdTokenError, OidcJwksCache, VerifiedOidcIdentity, algorithm_is_allowed,
+        validate_jwks, validated_header_and_kid, validated_header_and_kid_for,
         verify_id_token_with_jwks, verify_oidc_id_token_cached_with_fetch,
     };
     use crate::oidc_discovery::OidcProviderMetadata;
@@ -1010,6 +1053,43 @@ mod tests {
         )?;
         assert!(matches!(
             fixture.verify(&forged),
+            Err(OidcIdTokenError::InvalidToken)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_token_typ_policy_rejects_at_jwt_while_access_token_policy_accepts_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // RFC 9068 access tokens carry typ "at+jwt". The ID-token paths must
+        // keep refusing them (an access token must never pass as an ID token),
+        // while the MCP access-token policy admits them — and nothing else
+        // beyond the JWT/at+jwt trio.
+        let fixture = Fixture::new()?;
+        for typ in ["at+jwt", "AT+JWT", "application/at+jwt"] {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some(KID.to_owned());
+            header.typ = Some(typ.to_owned());
+            let token = encode(&header, &valid_claims(), &fixture.encoding_key)?;
+            assert!(
+                matches!(
+                    validated_header_and_kid(&token),
+                    Err(OidcIdTokenError::InvalidToken)
+                ),
+                "ID-token policy must reject typ {typ}"
+            );
+            assert!(
+                validated_header_and_kid_for(&token, JwtTypPolicy::AccessToken).is_ok(),
+                "access-token policy must accept typ {typ}"
+            );
+        }
+        // An unknown typ is refused by BOTH policies.
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_owned());
+        header.typ = Some("JOSE".to_owned());
+        let token = encode(&header, &valid_claims(), &fixture.encoding_key)?;
+        assert!(matches!(
+            validated_header_and_kid_for(&token, JwtTypPolicy::AccessToken),
             Err(OidcIdTokenError::InvalidToken)
         ));
         Ok(())

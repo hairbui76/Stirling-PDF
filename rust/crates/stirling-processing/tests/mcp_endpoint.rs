@@ -1031,19 +1031,38 @@ fn minimal_pdf_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn mcp_is_absent_when_disabled_or_configured_for_oauth_and_rejects_disabled_users()
+async fn mcp_is_absent_when_disabled_and_oauth_mode_claims_the_endpoint()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = MockEngine::start().await?;
-    for (enabled, mode) in [(false, "apikey"), (true, "oauth")] {
-        let (_directory, app, api_key) = configured_app(&engine.url, enabled, mode, true, 4096)?;
-        let response = rpc(
-            &app,
-            Some(&api_key),
-            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
-        )
-        .await?;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+    let (_directory, app, api_key) = configured_app(&engine.url, false, "apikey", true, 4096)?;
+    let response = rpc(
+        &app,
+        Some(&api_key),
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Any non-apikey mode mounts the OAuth chain (Java's isApiKeyMode rule):
+    // /mcp exists, ignores API keys, and challenges with the RFC 9728
+    // metadata pointer even while the issuer is unconfigured (fail closed).
+    let (_directory, app, api_key) = configured_app(&engine.url, true, "oauth", true, 4096)?;
+    let response = rpc(
+        &app,
+        Some(&api_key),
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(challenge.starts_with("Bearer error=\"invalid_token\""));
+    assert!(challenge.contains("resource_metadata="));
+    assert!(challenge.contains("/.well-known/oauth-protected-resource/mcp"));
 
     let (directory, app, api_key) = configured_app(&engine.url, true, "apikey", false, 4096)?;
     let store = SecurityStore::open(&directory.path().join("configs/security.db"))?;
@@ -1058,6 +1077,469 @@ async fn mcp_is_absent_when_disabled_or_configured_for_oauth_and_rejects_disable
 
     engine.stop().await?;
     Ok(())
+}
+
+const OAUTH_ISSUER: &str = "https://mcp-issuer.example.test";
+const OAUTH_RESOURCE_ID: &str = "http://localhost:8080/mcp";
+const OAUTH_KID: &str = "mcp-endpoint-test-key";
+const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// End-to-end OAuth mode against the real router — the Rust analogue of
+/// Java's `McpOAuthIntegrationTest`: a real RSA keypair signs JWTs, the
+/// public key is served as JWKS over loopback HTTP, and the resource server
+/// fetches and validates against it.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn mcp_oauth_mode_validates_bearer_jwts_and_binds_accounts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let jwks = JwksFixture::start().await?;
+    let (directory, app, api_key) = oauth_app(&jwks, None)?;
+
+    // Tokenless 401: the RFC 9728 discovery handshake, with the path-inserted
+    // metadata pointer and no error_description.
+    let tokenless = rpc(&app, None, json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await?;
+    assert_eq!(tokenless.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        challenge_header(&tokenless),
+        format!(
+            "Bearer error=\"invalid_token\", resource_metadata=\"http://localhost{METADATA_PATH}/mcp\""
+        )
+    );
+
+    // A Stirling API key is not a credential in OAuth mode (Java parity).
+    let keyed = rpc(
+        &app,
+        Some(&api_key),
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(keyed.status(), StatusCode::UNAUTHORIZED);
+
+    // A valid token whose subject is the provisioned user reaches tools/list.
+    let token = jwks.mint(
+        USERNAME,
+        &json!(OAUTH_RESOURCE_ID),
+        Some("mcp.tools.read mcp.tools.write"),
+        300,
+    )?;
+    let listed = bearer_rpc(
+        &app,
+        &token,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await?;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await?;
+    let tool_names = listed["result"]["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(tool_names.contains(&"stirling_describe_operation".to_owned()));
+
+    // Wrong audience: 401 with Java's McpAudienceValidator text echoed as a
+    // sanitized error_description ("invalid_token - <reason>").
+    let wrong_audience = jwks.mint(
+        USERNAME,
+        &json!("https://someone-else.example.test"),
+        Some("mcp.tools.read"),
+        300,
+    )?;
+    let rejected = bearer_rpc(
+        &app,
+        &wrong_audience,
+        json!({"jsonrpc":"2.0","id":3,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let challenge = challenge_header(&rejected);
+    assert!(challenge.contains(
+        "error_description=\"invalid_token - Token audience does not include this server's \
+         resource id or an accepted audience (http://localhost:8080/mcp).\""
+    ));
+
+    // An expired token and an audience array that misses are both 401.
+    let expired = jwks.mint(USERNAME, &json!(OAUTH_RESOURCE_ID), None, -300)?;
+    let response = bearer_rpc(
+        &app,
+        &expired,
+        json!({"jsonrpc":"2.0","id":4,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let miss = jwks.mint(USERNAME, &json!(["a", "b"]), None, 300)?;
+    let response = bearer_rpc(&app, &miss, json!({"jsonrpc":"2.0","id":5,"method":"ping"})).await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // A valid token with no matching Stirling account: Java's 403
+    // insufficient_account with the exact binding-filter message.
+    let ghost = jwks.mint(
+        "ghost-user@example.test",
+        &json!(OAUTH_RESOURCE_ID),
+        Some("mcp.tools.read mcp.tools.write"),
+        300,
+    )?;
+    let denied = bearer_rpc(
+        &app,
+        &ghost,
+        json!({"jsonrpc":"2.0","id":6,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = response_json(denied).await?;
+    assert_eq!(denied["error"], "insufficient_account");
+    assert_eq!(
+        denied["message"],
+        "MCP access requires a provisioned, enabled Stirling account for this subject."
+    );
+
+    // A token missing the username claim entirely: the other 403 message.
+    let no_subject = jwks.mint_claims(&json!({
+        "iss": OAUTH_ISSUER,
+        "aud": OAUTH_RESOURCE_ID,
+        "exp": epoch_seconds() + 300,
+        "scope": "mcp.tools.read mcp.tools.write",
+    }))?;
+    let denied = bearer_rpc(
+        &app,
+        &no_subject,
+        json!({"jsonrpc":"2.0","id":7,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(denied).await?["message"],
+        "Token is missing the 'sub' claim used to map to a Stirling user."
+    );
+
+    // A disabled account is rejected exactly like a missing one.
+    let store = SecurityStore::open(&directory.path().join("configs/security.db"))?;
+    store.set_user_enabled(USERNAME, false, 1_700_000_000)?;
+    let disabled = bearer_rpc(
+        &app,
+        &token,
+        json!({"jsonrpc":"2.0","id":8,"method":"ping"}),
+    )
+    .await?;
+    assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+
+    jwks.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_oauth_scopes_gate_tools_per_token_and_metadata_is_served()
+-> Result<(), Box<dyn std::error::Error>> {
+    let jwks = JwksFixture::start().await?;
+    let (_directory, app, _api_key) = oauth_app(&jwks, None)?;
+
+    // Read-only token: downloads pass the scope gate, writes are refused with
+    // Java's exact tool message.
+    let read_only = jwks.mint(
+        USERNAME,
+        &json!(OAUTH_RESOURCE_ID),
+        Some("mcp.tools.read"),
+        300,
+    )?;
+    let refused = bearer_rpc(
+        &app,
+        &read_only,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"stirling_upload",
+            "arguments":{"file": base64::engine::general_purpose::STANDARD.encode(b"data")}
+        }}),
+    )
+    .await?;
+    let refused = response_json(refused).await?;
+    assert_eq!(refused["result"]["isError"], true);
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "Insufficient scope: stirling_upload requires 'mcp.tools.write'."
+    );
+    let download_ok_gate = bearer_rpc(
+        &app,
+        &read_only,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"stirling_download","arguments":{"fileId":"missing"}
+        }}),
+    )
+    .await?;
+    // Past the scope gate: the failure is the unknown fileId, not the scope.
+    let download_ok_gate = response_json(download_ok_gate).await?;
+    assert!(
+        download_ok_gate["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Unknown or inaccessible fileId"))
+    );
+
+    // Write-only token: uploads pass, downloads are refused.
+    let write_only = jwks.mint(
+        USERNAME,
+        &json!(OAUTH_RESOURCE_ID),
+        Some("mcp.tools.write"),
+        300,
+    )?;
+    let stored = bearer_rpc(
+        &app,
+        &write_only,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"stirling_upload",
+            "arguments":{"file": base64::engine::general_purpose::STANDARD.encode(b"data")}
+        }}),
+    )
+    .await?;
+    let stored = response_json(stored).await?;
+    assert!(
+        stored["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Stored "))
+    );
+    let refused = bearer_rpc(
+        &app,
+        &write_only,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+            "name":"stirling_download","arguments":{"fileId":"missing"}
+        }}),
+    )
+    .await?;
+    assert_eq!(
+        response_json(refused).await?["result"]["content"][0]["text"],
+        "Insufficient scope: stirling_download requires 'mcp.tools.read'."
+    );
+
+    // The metadata document is served unauthenticated at both RFC 9728 forms.
+    for path in [METADATA_PATH.to_owned(), format!("{METADATA_PATH}/mcp")] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let document = response_json(response).await?;
+        assert_eq!(document["resource"], OAUTH_RESOURCE_ID);
+        assert_eq!(document["authorization_servers"], json!([OAUTH_ISSUER]));
+        assert_eq!(
+            document["scopes_supported"],
+            json!(["mcp.tools.read", "mcp.tools.write"])
+        );
+        assert_eq!(document["bearer_methods_supported"], json!(["header"]));
+    }
+
+    // Documented divergence: non-GET metadata requests are 405 via axum
+    // method routing (Java falls through to authenticated() and returns 401).
+    let response = app
+        .clone()
+        .oneshot(Request::post(METADATA_PATH).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    jwks.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_oauth_scopes_disabled_skips_gating_and_metadata_scopes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let jwks = JwksFixture::start().await?;
+    let (_directory, app, _api_key) = oauth_app(&jwks, Some(false))?;
+
+    // With mcp.scopesEnabled=false a scopeless token passes every gate.
+    let scopeless = jwks.mint(USERNAME, &json!(OAUTH_RESOURCE_ID), None, 300)?;
+    let stored = bearer_rpc(
+        &app,
+        &scopeless,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"stirling_upload",
+            "arguments":{"file": base64::engine::general_purpose::STANDARD.encode(b"data")}
+        }}),
+    )
+    .await?;
+    assert!(
+        response_json(stored).await?["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Stored "))
+    );
+
+    // And the metadata document stops advertising the granular scopes.
+    let response = app
+        .clone()
+        .oneshot(Request::get(METADATA_PATH).body(Body::empty())?)
+        .await?;
+    let document = response_json(response).await?;
+    assert!(document.get("scopes_supported").is_none());
+
+    jwks.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_metadata_is_absent_in_apikey_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, _api_key) = configured_app(&engine.url, true, "apikey", true, 4096)?;
+    let response = app
+        .clone()
+        .oneshot(Request::get(METADATA_PATH).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    engine.stop().await?;
+    Ok(())
+}
+
+fn oauth_app(
+    jwks: &JwksFixture,
+    scopes_enabled: Option<bool>,
+) -> Result<(TempDir, Router, String), Box<dyn std::error::Error>> {
+    configured_app_with(&AppOptions {
+        auth_mode: "oauth",
+        ai_enabled: false,
+        issuer_uri: Some(OAUTH_ISSUER),
+        jwks_uri: Some(&jwks.url),
+        resource_id: Some(OAUTH_RESOURCE_ID),
+        scopes_enabled,
+        ..AppOptions::default()
+    })
+}
+
+fn challenge_header(response: &Response) -> String {
+    response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+async fn bearer_rpc(
+    app: &Router,
+    token: &str,
+    body: Value,
+) -> Result<Response, Box<dyn std::error::Error>> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&body)?))?,
+        )
+        .await?)
+}
+
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// A live loopback JWKS endpoint plus the matching RSA signing key, so the
+/// resource server's real SSRF-safe fetch path is exercised end to end.
+struct JwksFixture {
+    url: String,
+    encoding_key: jsonwebtoken::EncodingKey,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<std::io::Result<()>>,
+}
+
+impl JwksFixture {
+    async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+        use crypto_bigint::Encoding as _;
+        use rsa::{pkcs1::EncodeRsaPrivateKey as _, traits::PublicKeyParts as _};
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::rng(), 2_048)?;
+        let public_key = private_key.to_public_key();
+        let private_der = private_key.to_pkcs1_der()?;
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_der(private_der.as_bytes());
+        let modulus =
+            minimal_unsigned_bytes(public_key.n().to_bytes(crypto_bigint::ByteOrder::BigEndian));
+        let exponent =
+            minimal_unsigned_bytes(public_key.e().to_bytes(crypto_bigint::ByteOrder::BigEndian));
+        let document = json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "kid": OAUTH_KID,
+                "alg": "RS256",
+                "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&modulus),
+                "e": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(exponent)
+            }]
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = Router::new().route(
+            "/jwks",
+            get(move || {
+                let document = document.clone();
+                async move { Json(document) }
+            }),
+        );
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        Ok(Self {
+            url: format!("http://{address}/jwks"),
+            encoding_key,
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+
+    /// Mints an RS256 token with the standard claim layout the tests use.
+    fn mint(
+        &self,
+        subject: &str,
+        audience: &Value,
+        scope: Option<&str>,
+        expiry_offset_seconds: i64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut claims = json!({
+            "iss": OAUTH_ISSUER,
+            "sub": subject,
+            "aud": audience,
+            "iat": epoch_seconds() - 5,
+            "exp": epoch_seconds() + expiry_offset_seconds,
+        });
+        if let (Some(scope), Some(object)) = (scope, claims.as_object_mut()) {
+            object.insert("scope".to_owned(), json!(scope));
+        }
+        self.mint_claims(&claims)
+    }
+
+    /// Mints an RS256 token over an arbitrary claims object.
+    fn mint_claims(&self, claims: &Value) -> Result<String, Box<dyn std::error::Error>> {
+        let mut token_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        token_header.kid = Some(OAUTH_KID.to_owned());
+        Ok(jsonwebtoken::encode(
+            &token_header,
+            claims,
+            &self.encoding_key,
+        )?)
+    }
+
+    async fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.await??;
+        Ok(())
+    }
+}
+
+fn minimal_unsigned_bytes(bytes: impl AsRef<[u8]>) -> Vec<u8> {
+    let bytes = bytes.as_ref();
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    bytes[start..].to_vec()
 }
 
 fn configured_app(
@@ -1095,8 +1577,7 @@ fn configured_app_with_operations(
         max_request_bytes,
         allowed_operations: Some(&allowed_operations),
         blocked_operations: &["blocked-agent"],
-        endpoints_to_remove: &[],
-        max_inline_response_bytes: None,
+        ..AppOptions::default()
     })
 }
 
@@ -1111,6 +1592,12 @@ struct AppOptions<'a> {
     blocked_operations: &'a [&'a str],
     endpoints_to_remove: &'a [&'a str],
     max_inline_response_bytes: Option<u64>,
+    /// `None` omits `mcp.scopesEnabled` (Java default: true).
+    scopes_enabled: Option<bool>,
+    /// OAuth-mode settings; `None` omits the corresponding `mcp.auth.*` key.
+    issuer_uri: Option<&'a str>,
+    jwks_uri: Option<&'a str>,
+    resource_id: Option<&'a str>,
 }
 
 impl Default for AppOptions<'_> {
@@ -1125,6 +1612,10 @@ impl Default for AppOptions<'_> {
             blocked_operations: &[],
             endpoints_to_remove: &[],
             max_inline_response_bytes: None,
+            scopes_enabled: None,
+            issuer_uri: None,
+            jwks_uri: None,
+            resource_id: None,
         }
     }
 }
@@ -1139,9 +1630,22 @@ fn configured_app_with(
     fs::create_dir_all(&config_directory)?;
     let settings_path = config_directory.join("settings.yml");
     let mut settings = format!(
-        "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {}\n  auth:\n    mode: {}\n  maxRequestBytes: {}\n",
-        options.mcp_enabled, options.auth_mode, options.max_request_bytes
+        "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {}\n  auth:\n    mode: {}\n",
+        options.mcp_enabled, options.auth_mode
     );
+    if let Some(issuer_uri) = options.issuer_uri {
+        let _ = writeln!(settings, "    issuerUri: '{issuer_uri}'");
+    }
+    if let Some(jwks_uri) = options.jwks_uri {
+        let _ = writeln!(settings, "    jwksUri: '{jwks_uri}'");
+    }
+    if let Some(resource_id) = options.resource_id {
+        let _ = writeln!(settings, "    resourceId: '{resource_id}'");
+    }
+    let _ = writeln!(settings, "  maxRequestBytes: {}", options.max_request_bytes);
+    if let Some(scopes_enabled) = options.scopes_enabled {
+        let _ = writeln!(settings, "  scopesEnabled: {scopes_enabled}");
+    }
     if let Some(max_inline) = options.max_inline_response_bytes {
         let _ = writeln!(settings, "  maxInlineResponseBytes: {max_inline}");
     }

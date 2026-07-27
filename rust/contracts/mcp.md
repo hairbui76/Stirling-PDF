@@ -3,13 +3,16 @@
 ## Scope
 
 The reviewed-security Rust router exposes a stateless Model Context Protocol endpoint at `POST
-/mcp` only when both of these settings are true:
+/mcp` whenever `mcp.enabled: true`, in **both** of Java's `McpSecurityConfig` authentication
+modes:
 
 ```yaml
 mcp:
   enabled: true
   auth:
-    mode: apikey
+    mode: apikey   # or oauth — and, exactly as in Java, ANY value other than
+                   # the exact case-insensitive string "apikey" (including a
+                   # blank or a near-miss like "api-key") runs the OAuth chain
 ```
 
 Beyond the AI engine's reviewed capability manifest (`stirling_describe_operation`,
@@ -18,18 +21,34 @@ Java's per-category PDF tools (`stirling_pages`, `stirling_convert`, `stirling_m
 `stirling_security` — see "Per-category PDF tools" below), and direct dispatch of a real
 Stirling processing operation (`stirling_operation`, a Rust-only extension), reusing the
 existing owner-scoped async-job store and the same in-process router dispatch the pipeline
-runner uses. It does **not** expose OAuth metadata, OAuth/JWT authentication, or SSE/session
-transport.
+runner uses. OAuth mode additionally serves the RFC 9728 protected-resource metadata routes
+(see "OAuth/JWT mode" below). It does **not** expose SSE/session transport.
 
-### Authorization parity
+### Authorization model
 
-Java's apikey mode (`McpApiKeyAuthFilter`) statically grants **both** `mcp.tools.read` and
-`mcp.tools.write` to every valid, enabled API key — there is no per-key scope store in Java
-either. Granular per-caller scopes exist only in Java's OAuth/JWT mode, via token claims.
-The Rust apikey boundary (a valid API key plus the operation allow/block lists, with every
-mutating operation requiring the write scope Java grants unconditionally) is therefore
-already at **full Java parity on authorization**. OAuth/JWT mode itself remains a documented
-later phase.
+Per-call authorization is Java's `McpCallContext.hasScope`: while `mcp.scopesEnabled` is true
+(default), each tool checks its required scope against the caller's granted set — with Java's
+exact tool messages and Java's exact check order (a tool's operation/argument resolution runs
+before its scope check):
+
+| Tool | Required scope | Refusal message |
+|---|---|---|
+| `stirling_upload` | `mcp.tools.write` | `Insufficient scope: stirling_upload requires 'mcp.tools.write'.` |
+| `stirling_download` | `mcp.tools.read` | `Insufficient scope: stirling_download requires 'mcp.tools.read'.` |
+| category tools | `mcp.tools.write` (every PDF operation) | `Insufficient scope: this operation requires 'mcp.tools.write'.` |
+| `stirling_ai` | the capability's manifest scope | `Insufficient scope: this capability requires '<scope>'.` |
+| `stirling_operation` (Rust-only) | `mcp.tools.write` | `Insufficient scope: this operation requires 'mcp.tools.write'.` |
+| `stirling_describe_operation` | none | — |
+
+Where the grant comes from depends on the mode, matching Java:
+
+- **apikey**: every valid, enabled API key is statically granted both scopes
+  (`McpApiKeyAuthFilter` parity — Java has no per-key scope store either), so the checks all
+  pass and the effective boundary is the key plus the operation allow/block lists.
+- **oauth**: the grant is the validated bearer token's real `scope` claim, so the checks
+  genuinely gate callers per token.
+
+`mcp.scopesEnabled: false` disables every scope check (Java `hasScope` short-circuit).
 
 The endpoint is mounted only by `app_with_reviewed_security`. The normal open router is unchanged,
 and the production binary continues to refuse secure mode until the existing production review
@@ -37,25 +56,32 @@ gate is lifted.
 
 ## Configuration compatibility
 
-Rust resolves the complete Java `mcp.*` tree, including fields reserved for later phases:
+Rust resolves the complete Java `mcp.*` tree:
 
 | Setting | Default | Behavior |
 |---|---:|---|
 | `mcp.enabled` | `false` | Master mount switch |
-| `mcp.scopesEnabled` | `true` | Enforces the manifest's required scope; API keys receive read and write (as in Java's apikey mode) |
+| `mcp.scopesEnabled` | `true` | Enables per-tool scope checks (see "Authorization model") and the metadata document's `scopes_supported` advertisement |
 | `mcp.engineCapabilityRefreshMinutes` | `5` | Minimum one minute |
 | `mcp.allowedOperations` | `[]` | Strict allow-list when non-empty |
 | `mcp.blockedOperations` | `[]` | Deny-list applied after the allow-list |
 | `mcp.maxRequestBytes` | `10485760` | Caps declared and streamed JSON bodies; non-positive values use 256 KiB |
 | `mcp.maxInlineResponseBytes` | `10485760` | Caps `stirling_download`, category-tool, and `stirling_operation` inline (base64) result size; larger results report a `fileId` instead |
-| `mcp.auth.mode` | `oauth` | Only the exact, case-insensitive value `apikey` mounts this surface |
-| OAuth auth fields | Java defaults | Parsed but never advertised or used yet |
+| `mcp.auth.mode` | `oauth` | Exactly `apikey` (case-insensitive) selects the API-key chain; anything else selects the OAuth chain |
+| `mcp.auth.issuerUri` | `""` | OAuth issuer; blank fails closed against every token |
+| `mcp.auth.jwksUri` | `""` | Explicit JWKS URL; blank derives it from the issuer's OpenID discovery document |
+| `mcp.auth.resourceId` | `""` | This server's RFC 8707 resource identifier (primary accepted audience) |
+| `mcp.auth.acceptedAudiences` | `[]` | Additional accepted audiences; with `resourceId` also blank, audience binding fails closed |
+| `mcp.auth.usernameClaim` | `sub` | JWT claim matched (case-insensitively) against a provisioned Stirling username; blank falls back to `sub` |
+| `mcp.auth.requireExistingAccount` | `true` | Parsed; Rust always behaves as `true` (documented fail-closed divergence, see below) |
 | `endpoints.toRemove` / `endpoints.groupsToRemove` | `[]` | Endpoint-disable configuration; disabled operations vanish from category enums and lookups |
 
 Spring-style environment names such as `MCP_SCOPESENABLED` and underscore-friendly aliases such
 as `MCP_SCOPES_ENABLED` are accepted. Lists are comma-separated in environment variables.
 
 ## Authentication and identity
+
+### API-key mode (`mcp.auth.mode: apikey`)
 
 Every mounted MCP request requires a live Stirling per-user API key. A nonblank `X-API-KEY`
 header takes precedence. Otherwise, `Authorization: Bearer <key>` is accepted with a
@@ -68,11 +94,111 @@ WWW-Authenticate: Bearer realm="Stirling MCP (API key)"
 The MCP boundary obtains the canonical username from `SecurityStore`; caller-provided identity
 headers are never trusted. AI calls forward that trusted value as `X-User-Id`. If
 `STIRLING_ENGINE_SHARED_SECRET` is configured, capability pulls and calls also send it as
-`X-Engine-Auth`.
+`X-Engine-Auth`. (The `X-User-Id` / `X-Engine-Auth` forwarding applies identically in OAuth
+mode, using the bound account's canonical username.)
 
 Body-size enforcement runs before authentication so unauthenticated clients cannot force an
-oversized allocation. Both `Content-Length` and chunked bodies are capped. Oversized requests use
-the Java-compatible `413` JSON response.
+oversized allocation (both modes; Java's `McpRequestSizeFilter` also precedes its
+authentication filters). Both `Content-Length` and chunked bodies are capped. Oversized
+requests use the Java-compatible `413` JSON response.
+
+### OAuth/JWT mode (any other `mcp.auth.mode`)
+
+The port of Java's `McpSecurityConfig` OAuth2 resource-server chain. `X-API-KEY` is **not** a
+credential here; only `Authorization: Bearer <jwt>` (case-insensitive scheme) is read.
+
+**RFC 9728 metadata.** `GET /.well-known/oauth-protected-resource` and every subpath —
+including the path-inserted canonical form `/.well-known/oauth-protected-resource/mcp` — are
+served unauthenticated with the document Java's Spring filter + customizer emit:
+`resource` (the configured `mcp.auth.resourceId`, else the request URL with the well-known
+segment removed), `bearer_methods_supported: ["header"]`,
+`tls_client_certificate_bound_access_tokens: true`, `authorization_servers: [<issuerUri>]`
+when the issuer is set, and `scopes_supported: ["mcp.tools.read", "mcp.tools.write"]` only
+while `mcp.scopesEnabled` is true (advertising scopes the IdP cannot mint breaks
+spec-compliant clients). These routes exist only in OAuth mode; in apikey mode they are 404,
+matching Java, where only the MCP chain customizes them.
+
+**401 challenge.** A tokenless request (the normal discovery handshake) returns `401` with
+
+```http
+WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<scheme>://<authority>/.well-known/oauth-protected-resource/mcp"
+```
+
+where scheme/authority come from the client-most `X-Forwarded-Proto` / `X-Forwarded-Host` /
+`X-Forwarded-Port` values (default ports elided), falling back to the request `Host` — the
+port of Java's `McpAuthenticationEntryPoint`. A **presented and rejected** token adds
+`error_description="invalid_token - <reason>"` (CR/LF/quotes sanitized to spaces), and the
+rejection is logged. The audience reasons are byte-identical to Java's `McpAudienceValidator`:
+
+- unconfigured binding: `MCP audience binding is not configured; rejecting all tokens until
+  mcp.auth.resource-id or mcp.auth.accepted-audiences is set.`
+- mismatch: `Token audience does not include this server's resource id or an accepted
+  audience (<accepted list, comma-joined>).`
+
+and the unset-issuer reason carries Java's fail-closed-decoder text
+`mcp.auth.issuer-uri is not configured`. Other reasons are Rust-authored one-liners (Java
+echoes Spring's internal decoder text there, which is not pinned).
+
+**Bearer-JWT validation** reuses the repo's hardened OIDC primitives (`oidc_id_token`'s
+shape/alg-confusion pre-gate and bounded JWKS cache with kid-miss refresh cooldown, the
+SSRF-safe fetch, `oidc_discovery`'s validated issuer discovery): token shape and
+public-key-only algorithm allowlist first (no cache/network reachable by a malformed token),
+JWKS from `mcp.auth.jwksUri` or the issuer's discovery document, signature + `iss` + `exp`
+(60 s leeway) via the selected `kid`, then the RFC 8707 audience check against
+`resourceId` + `acceptedAudiences` (string or array `aud`; empty accepted set fails closed).
+The validated token's `scope` claim (space-split string, or string array) becomes the
+caller's granted scope set — Java's `JwtGrantedAuthoritiesConverter` with the claim name
+pinned to `scope` (`scp` is not consulted, as in Java).
+
+**Account binding** (Java `McpUserBindingFilter`). The configured `mcp.auth.usernameClaim`
+value (default `sub`) must be present and must resolve, case-insensitively, to an existing
+**enabled** Stirling account; the call then runs as that account's canonical username (jobs,
+audit, engine `X-User-Id`). Failures are `403` with Java's exact JSON:
+
+- missing claim: `{"error":"insufficient_account","message":"Token is missing the '<claim>'
+  claim used to map to a Stirling user."}`
+- no enabled account: `{"error":"insufficient_account","message":"MCP access requires a
+  provisioned, enabled Stirling account for this subject."}`
+
+**Documented divergences from Java (all fail-closed or neutral):**
+
+- `mcp.auth.requireExistingAccount=false` is parsed but **not honored**: Java would let any
+  IdP-valid token through bound to its raw claim value, but the Rust job store is
+  account-keyed, so Rust always requires a provisioned, enabled account and logs a startup
+  warning when the flag is false.
+- `exp` is required (Java's `JwtTimestampValidator` accepts a token with no `exp`); `nbf` is
+  not evaluated (Java honors it when present).
+- A `kid` header is required; Spring can select a key without one when the JWKS is
+  unambiguous.
+- The algorithm allowlist is the repo-wide public-key set (RSA/PSS/ES256/ES384/EdDSA);
+  Spring's default is RS256-only. Both reject every HMAC family alg.
+- JWKS and discovery fetches use the SSRF-safe client (https or loopback-http only, with
+  reserved-IP resolve-and-pin rejection); Java fetches whatever URL is configured. Discovery
+  reads only `/.well-known/openid-configuration` (Java also probes the
+  `oauth-authorization-server` form) and requires the document's standard OIDC fields.
+- The 401/403 **bodies** are small Rust-authored JSON objects; Java's 401 body is the servlet
+  container's default error page (`sendError`). The `WWW-Authenticate` header and status
+  codes are the contract surface, not the 401 body.
+- The JOSE `typ` header is checked: absent, `JWT`, or RFC 9068 `at+jwt` /
+  `application/at+jwt` (all case-insensitive) are accepted; any other value is rejected at
+  the pre-gate. Java's decoder (Spring's `NimbusJwtDecoder` builder default,
+  `NO_TYPE_VERIFIER`) applies no `typ` verification at all, so an exotic `typ` passes Java
+  but fails closed here. RFC 9068 access tokens — what conformant IdPs such as Auth0 mint —
+  verify on both sides.
+- The challenge/metadata URL scheme falls back to `http` when `X-Forwarded-Proto` is absent;
+  Java falls back to the request's own scheme (`request.getScheme()`). The Rust server only
+  terminates plain HTTP (TLS belongs to a fronting proxy that sets the forwarded headers),
+  so the fallback is equivalent in practice.
+- IPv6 forwarded-authority edge: Java treats any `X-Forwarded-Host` containing `:`
+  (including a bracketed port-less IPv6 literal like `[::1]`) as already carrying a port and
+  never appends `X-Forwarded-Port`; Rust parses the bracketed form and appends the forwarded
+  port when the literal has none — a byte-level challenge-URL difference only behind
+  IPv6-host-forwarding proxies, in the more-correct direction.
+- Non-GET requests to the metadata routes return `405` (axum method routing); Java falls
+  through to `anyRequest().authenticated()` and returns `401` with the challenge. Cosmetic:
+  RFC 9728 clients only ever GET these paths.
+- As in the shipped apikey surface, the content-type check (415) runs before authentication;
+  Java's filter chain authenticates before Spring MVC's media-type rejection.
 
 ## JSON-RPC behavior
 
