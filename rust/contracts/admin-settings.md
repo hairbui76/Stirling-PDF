@@ -31,9 +31,12 @@ restart. This matches Java's restart-pending semantics.
 | `PUT` | `/api/v1/admin/settings/key/{key}` | `AdminSettingsController.updateSettingValue` | JSON `{ value }`; plain-text success message. |
 | `POST` | `/api/v1/admin/settings/restart` | `AdminSettingsController.restartApplication` | See divergence below. |
 
-That is 6 `.route()` registrations / 8 method+path pairs (PORT_STATUS's
-"delta/section/key (5)" counts the five mutation/read registrations without
-`restart`).
+That is 5 `.route()` registrations / 8 method+path pairs (PORT_STATUS's
+"delta/section/key (5)" counts the same five registrations, `restart`
+included). The sibling read-only
+`GET /api/v1/admin/settings/policies/implied-folder-roots` shares the path
+prefix but is registered in `policy_http.rs` and documented in
+`contracts/policy-config.md`, not here.
 
 **Allowlisting and bounds.** Section names must be one of the 14 canonical
 sections (`security`, `system`, `ui`, `endpoints`, `metrics`, `mail`,
@@ -47,9 +50,11 @@ per string; request bodies at most 256 KiB and the settings file at most
 before serialization — field names matching the sensitive list (`password`,
 `dbpassword`, `mailpassword`, `smtppassword`, `clientsecret`, `apisecret`,
 `secret`, `apikey`, `accesstoken`, `refreshtoken`, `token`, `key`,
-`enterprisekey`, `licensekey`) are masked wherever they appear, including
-inside the pending delta and single-key reads. Secrets are never emitted by
-this module.
+`enterprisekey`, `licensekey`, plus any field name containing `password` or
+`secret`) are masked wherever they appear, including inside the pending delta
+and single-key reads. One deliberate exemption, matching Java: `premium.key`
+is **not** masked, so admins can read back the license key they configured.
+Other secrets are never emitted by this module.
 
 **Write path.** Updates are validated, persisted to the YAML file under a
 serialized write lock (read-modify-write of the on-disk file), and then

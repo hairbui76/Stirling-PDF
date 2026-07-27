@@ -55,7 +55,15 @@ authenticated controller plus its demo-account guards.
 `GET /api/v1/user/users` is the signing-participant roster: enabled users of
 the caller's team with `{ id, username, displayName, teamName, enabled }`.
 Callers in the system `Default`/`Internal` teams (or with no team) see only
-themselves, mirroring Java's team scoping. Administrator password changes for
+themselves, matching Java's team-scoped branch. Two known divergences from
+Java's `listUsers`: (a) Java reads `storage.signing.userListScope` —
+**default `org`**, which opens the roster instance-wide; only a non-`org`
+value fails closed to team scope. Rust does not read that setting and always
+team-scopes, so with Java's default configuration the Rust roster is
+narrower. (b) Java fills `displayName` with the username
+(`UserController.java` `toUserSummaryDTO`), while Rust fills it with the
+user's e-mail. Java also `403`s SaaS anonymous accounts, which have no Rust
+equivalent. Administrator password changes for
 *other* users send mail through the relay described in
 `contracts/send-email.md`.
 
@@ -87,7 +95,7 @@ license-unrestricted — both facts and the Java comparison live in
 
 | Method | Path | Java counterpart |
 | --- | --- | --- |
-| `GET` | `/api/v1/team/list` | `TeamController` list |
+| `GET` | `/api/v1/team/list` | No same-named `TeamController` mapping (see open questions) |
 | `POST` | `/api/v1/team/create` | `TeamController` `POST /create` |
 | `POST` | `/api/v1/team/rename` | `TeamController` `POST /rename` |
 | `POST` | `/api/v1/team/delete` | `TeamController` `POST /delete` |
@@ -129,6 +137,12 @@ cover the end-to-end secured-runtime wiring.
 
 ## Open questions
 
+- `GET /api/v1/team/list` has no mapping in Java's `TeamController` (the
+  premium-gated controller owns only the six mutations —
+  `contracts/license-entitlement.md` records the same fact). Java serves team
+  listings through the proprietary UI-data aggregation instead; the Rust route
+  and its response shape are Rust-defined conveniences for the same frontend
+  need.
 - `GET /api/v1/user/admin/list` has no same-named mapping in Java's
   `UserController`; the Java admin user roster is served through the
   proprietary UI-data aggregation (`admin-settings` view in
