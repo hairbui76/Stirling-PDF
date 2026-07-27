@@ -179,6 +179,24 @@ audit, engine `X-User-Id`). Failures are `403` with Java's exact JSON:
 - The 401/403 **bodies** are small Rust-authored JSON objects; Java's 401 body is the servlet
   container's default error page (`sendError`). The `WWW-Authenticate` header and status
   codes are the contract surface, not the 401 body.
+- The JOSE `typ` header is checked: absent, `JWT`, or RFC 9068 `at+jwt` /
+  `application/at+jwt` (all case-insensitive) are accepted; any other value is rejected at
+  the pre-gate. Java's decoder (Spring's `NimbusJwtDecoder` builder default,
+  `NO_TYPE_VERIFIER`) applies no `typ` verification at all, so an exotic `typ` passes Java
+  but fails closed here. RFC 9068 access tokens — what conformant IdPs such as Auth0 mint —
+  verify on both sides.
+- The challenge/metadata URL scheme falls back to `http` when `X-Forwarded-Proto` is absent;
+  Java falls back to the request's own scheme (`request.getScheme()`). The Rust server only
+  terminates plain HTTP (TLS belongs to a fronting proxy that sets the forwarded headers),
+  so the fallback is equivalent in practice.
+- IPv6 forwarded-authority edge: Java treats any `X-Forwarded-Host` containing `:`
+  (including a bracketed port-less IPv6 literal like `[::1]`) as already carrying a port and
+  never appends `X-Forwarded-Port`; Rust parses the bracketed form and appends the forwarded
+  port when the literal has none — a byte-level challenge-URL difference only behind
+  IPv6-host-forwarding proxies, in the more-correct direction.
+- Non-GET requests to the metadata routes return `405` (axum method routing); Java falls
+  through to `anyRequest().authenticated()` and returns `401` with the challenge. Cosmetic:
+  RFC 9728 clients only ever GET these paths.
 - As in the shipped apikey surface, the content-type check (415) runs before authentication;
   Java's filter chain authenticates before Spring MVC's media-type rejection.
 

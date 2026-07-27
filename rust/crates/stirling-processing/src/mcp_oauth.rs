@@ -42,6 +42,15 @@
 //!   any configured URL.
 //! - The algorithm allowlist is the repo-wide public-key set (RSA/PSS/ECDSA/
 //!   `EdDSA`); Spring's default is RS256-only.
+//! - The JOSE `typ` header is checked: absent, `JWT`, or RFC 9068
+//!   `at+jwt`/`application/at+jwt` (all case-insensitive) are accepted, any
+//!   other value is rejected. Java's Spring decoder applies **no** `typ`
+//!   verification at all, so exotic typs pass Java but fail closed here.
+//! - The challenge/metadata URL scheme falls back to `http` when
+//!   `X-Forwarded-Proto` is absent; Java falls back to the request's own
+//!   scheme. This server only terminates plain HTTP (TLS lives on a fronting
+//!   proxy that sets the forwarded headers), so the two are equivalent in
+//!   practice.
 
 use std::collections::BTreeSet;
 
@@ -52,8 +61,8 @@ use serde_json::{Map, Value};
 use crate::{
     oidc_discovery::OidcDiscoveryCache,
     oidc_id_token::{
-        CLOCK_SKEW_SECONDS, OidcIdTokenError, OidcJwksCache, fetch_jwks, validate_jwk,
-        validated_header_and_kid,
+        CLOCK_SKEW_SECONDS, JwtTypPolicy, OidcIdTokenError, OidcJwksCache, fetch_jwks,
+        validate_jwk, validated_header_and_kid_for,
     },
     runtime_config::McpConfig,
 };
@@ -176,10 +185,14 @@ impl McpOAuthVerifier {
             ));
         }
         // Shape + alg-confusion + kid pre-gate BEFORE any cache or network
-        // interaction, exactly like the OIDC callback path.
-        let (header, kid) = validated_header_and_kid(token).map_err(|_| {
-            McpTokenRejection::new("Bearer token is malformed or uses a disallowed algorithm")
-        })?;
+        // interaction, exactly like the OIDC callback path — but with the
+        // access-token `typ` policy: RFC 9068 access tokens (`typ: at+jwt`,
+        // what conformant IdPs like Auth0 mint) must pass here, since Java's
+        // Spring decoder applies no `typ` verification at all.
+        let (header, kid) = validated_header_and_kid_for(token, JwtTypPolicy::AccessToken)
+            .map_err(|_| {
+                McpTokenRejection::new("Bearer token is malformed or uses a disallowed algorithm")
+            })?;
         let jwks_uri = self.resolve_jwks_uri()?;
         let jwks =
             self.jwks_cache
@@ -329,6 +342,9 @@ pub(crate) fn www_authenticate_challenge(
 /// `McpAuthenticationEntryPoint` helpers. Quotes are stripped so a hostile
 /// forwarded header cannot break out of a quoted header parameter.
 fn external_base_url(headers: &HeaderMap) -> String {
+    // Java falls back to request.getScheme(); this server only terminates
+    // plain HTTP (TLS lives on a fronting proxy that sets X-Forwarded-Proto),
+    // so a literal "http" fallback is the same value.
     let scheme = first_forwarded(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
     let scheme = sanitize_url_part(&scheme);
     let authority = forwarded_authority(headers, &scheme);
@@ -546,8 +562,19 @@ mod tests {
         }
 
         fn sign(&self, claims: &TestClaims) -> Result<String, jsonwebtoken::errors::Error> {
+            self.sign_with_typ(claims, None)
+        }
+
+        fn sign_with_typ(
+            &self,
+            claims: &TestClaims,
+            typ: Option<&str>,
+        ) -> Result<String, jsonwebtoken::errors::Error> {
             let mut header = Header::new(Algorithm::RS256);
             header.kid = Some(KID.to_owned());
+            if let Some(typ) = typ {
+                header.typ = Some(typ.to_owned());
+            }
             encode(&header, claims, &self.encoding_key)
         }
 
@@ -757,6 +784,42 @@ mod tests {
             &fixture.encoding_key,
         )?;
         assert!(fixture.verify(&token).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_rfc9068_at_jwt_access_tokens() -> Result<(), Box<dyn std::error::Error>> {
+        // Conformant IdPs (e.g. Auth0) mint access tokens with header typ
+        // "at+jwt" (RFC 9068). Java's Spring decoder applies no typ check at
+        // all, so these MUST verify here too.
+        let fixture = Fixture::new()?;
+        for typ in ["at+jwt", "AT+JWT", "application/at+jwt", "JWT"] {
+            let token = fixture.sign_with_typ(&valid_claims(), Some(typ))?;
+            let verified = fixture
+                .verify(&token)
+                .map_err(|rejection| format!("typ {typ} must verify: {}", rejection.reason))?;
+            assert_eq!(
+                verified.username_claim_value.as_deref(),
+                Some("mcp-user@example.test")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_unknown_typ_before_any_fetch() -> Result<(), Box<dyn std::error::Error>> {
+        // Anything beyond JWT / RFC 9068 at+jwt stays rejected at the pre-gate
+        // (documented fail-closed divergence: Java checks no typ at all).
+        let fixture = Fixture::new()?;
+        let token = fixture.sign_with_typ(&valid_claims(), Some("JOSE"))?;
+        let rejection = default_verifier()
+            .verify_with_fetch(&token, |_| Err(OidcIdTokenError::JwksUnavailable))
+            .err()
+            .ok_or("unknown typ must be rejected")?;
+        assert_eq!(
+            rejection.reason,
+            "Bearer token is malformed or uses a disallowed algorithm"
+        );
         Ok(())
     }
 
