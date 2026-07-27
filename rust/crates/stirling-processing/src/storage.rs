@@ -21,6 +21,9 @@ const MAX_FOLDER_NAME_LENGTH: usize = 255;
 const MAX_FOLDERS_PER_USER: i64 = 5_000;
 const MAX_FOLDER_DEPTH: usize = 64;
 const MAX_BULK_MOVE_FILES: usize = 1_000;
+/// Java `StorageCleanupService.MAX_CLEANUP_ATTEMPTS`: after this many failed
+/// deletions a queue entry is abandoned instead of retried forever.
+const MAX_CLEANUP_ATTEMPTS: i64 = 10;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
@@ -1326,21 +1329,124 @@ impl StorageService {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (cleanup_id, storage_key) in entries {
-            let path = checked_object_path(&self.base_path, &storage_key)?;
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                    return Err(StorageError::AccessDenied);
-                }
-                Ok(_) => fs::remove_file(path)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(StorageError::Filesystem(error)),
-            }
+            self.remove_stored_object(&storage_key)?;
             self.lock()?.execute(
                 "DELETE FROM storage_cleanup_entries WHERE cleanup_id = ?1",
                 [cleanup_id],
             )?;
         }
         Ok(())
+    }
+
+    /// Removes one stored object from disk. Missing files count as success so
+    /// a retried cleanup converges; anything that is not a regular file is
+    /// refused exactly like the on-access drain.
+    fn remove_stored_object(&self, storage_key: &str) -> Result<(), StorageError> {
+        let path = checked_object_path(&self.base_path, storage_key)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(StorageError::AccessDenied)
+            }
+            Ok(_) => fs::remove_file(path).map_err(StorageError::Filesystem),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StorageError::Filesystem(error)),
+        }
+    }
+
+    /// Periodic cleanup-queue sweep with Java `StorageCleanupService`'s
+    /// attempt-count abandonment: a failing entry has its `attempt_count`
+    /// incremented instead of aborting the pass, and after
+    /// [`MAX_CLEANUP_ATTEMPTS`] failures the row is dropped so one bad key can
+    /// never wedge the queue. Returns the number of reclaimed entries. The
+    /// on-access [`Self::drain_cleanup_queue`] remains unchanged; this sweep is
+    /// additive.
+    pub(crate) fn sweep_cleanup_queue(&self) -> Result<usize, StorageError> {
+        if !self.config.enabled {
+            return Ok(0);
+        }
+        let entries = {
+            let connection = self.lock()?;
+            // Least-attempted first approximates Java's oldest-updated-first
+            // batch of fifty: fresh entries drain before repeat offenders.
+            let mut statement = connection.prepare(
+                "SELECT cleanup_id, storage_key, attempt_count FROM storage_cleanup_entries
+                 ORDER BY attempt_count, cleanup_id LIMIT 50",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut reclaimed = 0;
+        for (cleanup_id, storage_key, previous_attempts) in entries {
+            match self.remove_stored_object(&storage_key) {
+                Ok(()) => {
+                    self.lock()?.execute(
+                        "DELETE FROM storage_cleanup_entries WHERE cleanup_id = ?1",
+                        [cleanup_id],
+                    )?;
+                    reclaimed += 1;
+                }
+                Err(error) => {
+                    let attempts = previous_attempts.saturating_add(1);
+                    if attempts >= MAX_CLEANUP_ATTEMPTS {
+                        tracing::error!(
+                            storage_key,
+                            attempts,
+                            %error,
+                            "abandoning storage cleanup entry; the blob may be orphaned and require manual removal"
+                        );
+                        self.lock()?.execute(
+                            "DELETE FROM storage_cleanup_entries WHERE cleanup_id = ?1",
+                            [cleanup_id],
+                        )?;
+                    } else {
+                        tracing::warn!(
+                            storage_key,
+                            attempts,
+                            max_attempts = MAX_CLEANUP_ATTEMPTS,
+                            %error,
+                            "failed to clean up storage entry"
+                        );
+                        self.lock()?.execute(
+                            "UPDATE storage_cleanup_entries SET attempt_count = ?1
+                             WHERE cleanup_id = ?2",
+                            params![attempts, cleanup_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Deletes expired tokenized share links, mirroring Java
+    /// `StorageCleanupService.cleanupExpiredShareLinks`: only rows that carry a
+    /// share token and whose expiry lies strictly in the past are removed;
+    /// user-to-user shares and never-expiring links are untouched.
+    pub(crate) fn purge_expired_share_links(&self) -> Result<usize, StorageError> {
+        self.purge_share_links_expired_before(Utc::now().timestamp())
+    }
+
+    fn purge_share_links_expired_before(&self, now: i64) -> Result<usize, StorageError> {
+        if !self.config.enabled {
+            return Ok(0);
+        }
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM storage_shares
+                 WHERE share_token IS NOT NULL
+                   AND expires_at IS NOT NULL
+                   AND expires_at < ?1",
+                [now],
+            )
+            .map_err(StorageError::from)
     }
 }
 
@@ -2027,4 +2133,185 @@ fn validate_uuid(value: &str) -> Option<String> {
         }
     }
     Some(value.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    use super::{StorageConfig, StorageService, StorageSharingConfig};
+
+    fn test_config(base: &std::path::Path, enabled: bool) -> StorageConfig {
+        StorageConfig {
+            enabled,
+            provider: "local".to_owned(),
+            base_path: base.join("objects"),
+            database_path: base.join("storage.db"),
+            sharing: StorageSharingConfig {
+                enabled: true,
+                link_enabled: true,
+                email_enabled: false,
+                link_expiration_days: 3,
+            },
+            max_file_bytes: None,
+            max_user_bytes: None,
+            max_total_bytes: None,
+            max_upload_bytes: 1024 * 1024,
+        }
+    }
+
+    fn open_with_owner_table(
+        base: &std::path::Path,
+    ) -> Result<StorageService, Box<dyn std::error::Error>> {
+        let service = StorageService::open(test_config(base, true))?;
+        // The production schema joins security_users owned by the security
+        // store; unit tests provide a minimal stand-in for foreign keys.
+        service.lock()?.execute_batch(
+            "CREATE TABLE IF NOT EXISTS security_users(user_id INTEGER PRIMARY KEY);
+             INSERT INTO security_users(user_id) VALUES (1);",
+        )?;
+        Ok(service)
+    }
+
+    fn queue_entry(
+        service: &StorageService,
+        storage_key: &str,
+        attempts: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        service.lock()?.execute(
+            "INSERT INTO storage_cleanup_entries(storage_key, attempt_count) VALUES (?1, ?2)",
+            params![storage_key, attempts],
+        )?;
+        Ok(())
+    }
+
+    fn queue_len(service: &StorageService) -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(service.lock()?.query_row(
+            "SELECT COUNT(*) FROM storage_cleanup_entries",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    #[test]
+    fn sweep_reclaims_queued_objects_and_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let service = open_with_owner_table(directory.path())?;
+        let owner_directory = service.base_path.join("1");
+        fs::create_dir_all(&owner_directory)?;
+        fs::write(owner_directory.join("blob_a.pdf"), b"a")?;
+        queue_entry(&service, "1/blob_a.pdf", 0)?;
+        queue_entry(&service, "1/already_gone.pdf", 0)?;
+
+        assert_eq!(service.sweep_cleanup_queue()?, 2);
+        assert!(!owner_directory.join("blob_a.pdf").exists());
+        assert_eq!(queue_len(&service)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_counts_attempts_and_abandons_after_the_java_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let service = open_with_owner_table(directory.path())?;
+        // A directory at the object path cannot be removed as a regular file,
+        // so the entry fails deterministically on every attempt.
+        fs::create_dir_all(service.base_path.join("1").join("stuck_entry"))?;
+        queue_entry(&service, "1/stuck_entry", 0)?;
+
+        assert_eq!(service.sweep_cleanup_queue()?, 0);
+        let attempts: i64 = service.lock()?.query_row(
+            "SELECT attempt_count FROM storage_cleanup_entries WHERE storage_key = '1/stuck_entry'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(attempts, 1);
+
+        // At nine prior failures the tenth attempt abandons the row entirely.
+        service
+            .lock()?
+            .execute("UPDATE storage_cleanup_entries SET attempt_count = 9", [])?;
+        assert_eq!(service.sweep_cleanup_queue()?, 0);
+        assert_eq!(queue_len(&service)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_failure_does_not_block_other_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let service = open_with_owner_table(directory.path())?;
+        fs::create_dir_all(service.base_path.join("1").join("stuck_entry"))?;
+        fs::write(service.base_path.join("1").join("fine.pdf"), b"f")?;
+        // The stuck entry sorts first (same attempts, lower id) and must not
+        // wedge the healthy entry behind it.
+        queue_entry(&service, "1/stuck_entry", 0)?;
+        queue_entry(&service, "1/fine.pdf", 0)?;
+
+        assert_eq!(service.sweep_cleanup_queue()?, 1);
+        assert!(!service.base_path.join("1").join("fine.pdf").exists());
+        assert_eq!(queue_len(&service)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_share_link_purge_matches_java_row_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let service = open_with_owner_table(directory.path())?;
+        service.lock()?.execute(
+            "INSERT INTO storage_files(file_id, owner_id, original_filename, size_bytes,
+                                       storage_key, created_at, updated_at)
+             VALUES (1, 1, 'doc.pdf', 3, '1/doc.pdf', 100, 100)",
+            [],
+        )?;
+        let insert_share = "INSERT INTO storage_shares
+                (file_id, shared_with_user_id, share_token, access_role, expires_at, created_at)
+             VALUES (1, ?1, ?2, 'VIEWER', ?3, 100)";
+        let now = 1_000_i64;
+        // Expired tokenized link: purged.
+        service.lock()?.execute(
+            insert_share,
+            params![None::<i64>, Some("expired-token"), Some(now - 1)],
+        )?;
+        // Live tokenized link and never-expiring link: kept.
+        service.lock()?.execute(
+            insert_share,
+            params![None::<i64>, Some("live-token"), Some(now + 60)],
+        )?;
+        service.lock()?.execute(
+            insert_share,
+            params![None::<i64>, Some("eternal-token"), None::<i64>],
+        )?;
+        // User-to-user share without a token: kept even when expired.
+        service.lock()?.execute(
+            insert_share,
+            params![Some(1_i64), None::<&str>, Some(now - 1)],
+        )?;
+
+        assert_eq!(service.purge_share_links_expired_before(now)?, 1);
+        let remaining: i64 =
+            service
+                .lock()?
+                .query_row("SELECT COUNT(*) FROM storage_shares", [], |row| row.get(0))?;
+        assert_eq!(remaining, 3);
+        let gone: i64 = service.lock()?.query_row(
+            "SELECT COUNT(*) FROM storage_shares WHERE share_token = 'expired-token'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(gone, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_storage_sweeps_are_no_ops() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let service = StorageService::open(test_config(directory.path(), false))?;
+        assert_eq!(service.sweep_cleanup_queue()?, 0);
+        assert_eq!(service.purge_expired_share_links()?, 0);
+        Ok(())
+    }
 }
