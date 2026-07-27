@@ -61,8 +61,11 @@
 //! This module still does not verify the `id_token` — its own response's
 //! `id_token` remains an opaque string here; signature/issuer/audience/expiry/
 //! `nonce` verification now lives in the sibling [`crate::oidc_id_token`], which
-//! reuses this module's SSRF-safe GET to fetch the JWKS. No confidential-client
-//! (`client_secret`) authentication, no callback route, no session creation.
+//! reuses this module's SSRF-safe GET to fetch the JWKS. Confidential-client
+//! authentication is carried, not decided, here: when the built
+//! [`OidcTokenRequest`] holds an `authorization` value (the RFC 6749 section
+//! 2.3.1 Basic credentials, assembled in [`crate::oidc_token`]), it is attached
+//! verbatim to the POST. No callback route, no session creation.
 
 use std::{
     io::Read as _,
@@ -70,7 +73,12 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Method, Url, blocking::Client, header::CONTENT_TYPE, redirect::Policy};
+use reqwest::{
+    Method, Url,
+    blocking::Client,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    redirect::Policy,
+};
 use thiserror::Error;
 
 use crate::{
@@ -148,6 +156,12 @@ fn exchange_oidc_token_with_resolver(
         Some(&FetchBody {
             content_type: request.content_type,
             body: &request.form_body,
+            // Confidential-client Basic credentials, when configured; absent
+            // for a public client, byte-identical to the pre-secret request.
+            authorization: request
+                .authorization
+                .as_ref()
+                .map(|authorization| authorization.as_str()),
         }),
         MAX_TOKEN_RESPONSE_BYTES,
         resolve,
@@ -186,11 +200,13 @@ pub(crate) fn ssrf_safe_get(
     )
 }
 
-/// A request body (media type + bytes) for the POST path; [`None`] on the GET
-/// path, where no body or `Content-Type` header is sent.
+/// A request body (media type + bytes, plus the optional client-authentication
+/// `Authorization` header value) for the POST path; [`None`] on the GET path,
+/// where no body, `Content-Type`, or `Authorization` header is sent.
 struct FetchBody<'a> {
     content_type: &'a str,
     body: &'a str,
+    authorization: Option<&'a str>,
 }
 
 /// [`ssrf_safe_get`] with the host-resolution step injected, so the GET path can
@@ -257,10 +273,18 @@ fn ssrf_safe_fetch(
         .map_err(|_| OidcLiveTokenError::Unavailable)?;
 
     let mut builder = client.request(method, url);
-    if let Some(&FetchBody { content_type, body }) = request_body {
+    if let Some(&FetchBody {
+        content_type,
+        body,
+        authorization,
+    }) = request_body
+    {
         builder = builder
             .header(CONTENT_TYPE, content_type)
             .body(body.to_owned());
+        if let Some(authorization) = authorization {
+            builder = builder.header(AUTHORIZATION, authorization);
+        }
     }
     let response = builder
         .send()
@@ -386,6 +410,7 @@ mod tests {
             token_endpoint,
             content_type: FORM_CONTENT_TYPE,
             form_body: "grant_type=authorization_code&code=abc&code_verifier=xyz".to_owned(),
+            authorization: None,
         }
     }
 
@@ -427,6 +452,54 @@ mod tests {
         assert_eq!(response.access_token, "at-abc");
         assert_eq!(response.token_type, "Bearer");
         assert_eq!(response.expires_in, Some(3600));
+        Ok(())
+    }
+
+    // ---- confidential-client Basic credentials reach the wire --------------
+
+    #[test]
+    fn a_confidential_request_sends_its_basic_authorization_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zeroize::Zeroizing;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let body = r#"{"access_token":"at","token_type":"Bearer","id_token":"a.b.c"}"#;
+        let server = serve_once(listener, http_response("200 OK", body));
+
+        let mut request = token_request(format!("http://localhost:{}/token", address.port()));
+        request.authorization = Some(Zeroizing::new(
+            "Basic bXktY2xpZW50OnRoZS1zZWNyZXQ=".to_owned(),
+        ));
+        let resolve = move |_: &str, _: u16| Ok(vec![address]);
+        exchange_oidc_token_with_resolver(&request, resolve)?;
+
+        let received = server.join().map_err(|_| "fixture server panicked")??;
+        assert!(
+            received.lines().any(|line| line
+                .trim_end()
+                .eq_ignore_ascii_case("authorization: Basic bXktY2xpZW50OnRoZS1zZWNyZXQ=")),
+            "the Basic credentials never reached the endpoint: {received}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_public_request_sends_no_authorization_header() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let body = r#"{"access_token":"at","token_type":"Bearer","id_token":"a.b.c"}"#;
+        let server = serve_once(listener, http_response("200 OK", body));
+
+        let request = token_request(format!("http://localhost:{}/token", address.port()));
+        let resolve = move |_: &str, _: u16| Ok(vec![address]);
+        exchange_oidc_token_with_resolver(&request, resolve)?;
+
+        let received = server.join().map_err(|_| "fixture server panicked")??;
+        assert!(
+            !received.to_ascii_lowercase().contains("authorization:"),
+            "a public client must not send client credentials: {received}"
+        );
         Ok(())
     }
 

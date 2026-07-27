@@ -1900,6 +1900,15 @@ fn initialize_policy_ledger(
 /// far more expensive than ordinary traffic and is throttled early.
 const AUTH_ROUTE_PREFIX: &str = "/api/v1/auth";
 
+/// The one route metered against its own, even stricter per-IP bucket (on POST
+/// only — the mounted method). Every successful `/authorize` mints a pending
+/// entry in the bounded OIDC login-state store (capacity 4096, 10-minute TTL),
+/// so at the generic auth rate (5/s) a couple of IPs could keep the store full
+/// and starve honest logins into its refuse-newcomer 503. Matched EXACTLY: a
+/// confusable sibling path (`…/authorizeX`) falls through to the generic auth
+/// bucket rather than borrowing this one's tighter budget.
+const OIDC_AUTHORIZE_ROUTE: &str = "/api/v1/auth/oidc/authorize";
+
 /// How many rate-limit checks pass between opportunistic prunes of the keyed
 /// state stores. Pruning drops fully-replenished per-IP entries so a flood of
 /// distinct source IPs cannot grow the maps without bound.
@@ -1930,6 +1939,12 @@ struct TransportLimits {
     /// Per-IP burst capacity for authentication traffic — deliberately far
     /// smaller so a credential-stuffing / bcrypt flood from one IP is throttled.
     auth_burst: u32,
+    /// Sustained per-IP rate for `POST /api/v1/auth/oidc/authorize` alone.
+    oidc_authorize_per_second: u32,
+    /// Per-IP burst for that route — tighter still than the auth bucket, because
+    /// each admitted request also consumes a slot in the bounded pending-login
+    /// state store (see [`OIDC_AUTHORIZE_ROUTE`]).
+    oidc_authorize_burst: u32,
 }
 
 impl TransportLimits {
@@ -1942,8 +1957,22 @@ impl TransportLimits {
             general_burst: 400,
             auth_per_second: 5,
             auth_burst: 30,
+            oidc_authorize_per_second: 1,
+            oidc_authorize_burst: 10,
         }
     }
+}
+
+/// Which per-IP bucket a request is metered against. Exactly one bucket is
+/// consumed per request: the OIDC-authorize bucket *replaces* (does not stack
+/// on) the generic auth bucket for its one route, so a burst of authorize calls
+/// cannot drain the budget honest `/login` traffic from the same IP relies on,
+/// and vice versa.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RateLimitBucket {
+    General,
+    Auth,
+    OidcAuthorize,
 }
 
 /// Per-IP rate-limit state shared by the enforcement middleware across every
@@ -1951,6 +1980,7 @@ impl TransportLimits {
 struct RateLimitState {
     general: DefaultKeyedRateLimiter<IpAddr>,
     auth: DefaultKeyedRateLimiter<IpAddr>,
+    oidc_authorize: DefaultKeyedRateLimiter<IpAddr>,
     checks_since_prune: AtomicU64,
 }
 
@@ -1962,19 +1992,28 @@ impl RateLimitState {
                 limits.general_burst,
             )),
             auth: RateLimiter::keyed(rate_quota(limits.auth_per_second, limits.auth_burst)),
+            oidc_authorize: RateLimiter::keyed(rate_quota(
+                limits.oidc_authorize_per_second,
+                limits.oidc_authorize_burst,
+            )),
             checks_since_prune: AtomicU64::new(0),
         }
     }
 
-    /// Records one request from `ip` and reports whether it is allowed. Auth
-    /// traffic is metered against the stricter bucket.
-    fn permit(&self, ip: IpAddr, is_auth: bool) -> bool {
+    /// Records one request from `ip` against `bucket` and reports whether it is
+    /// allowed.
+    fn permit(&self, ip: IpAddr, bucket: RateLimitBucket) -> bool {
         if self.checks_since_prune.fetch_add(1, Ordering::Relaxed) >= RATE_LIMIT_PRUNE_INTERVAL {
             self.checks_since_prune.store(0, Ordering::Relaxed);
             self.general.retain_recent();
             self.auth.retain_recent();
+            self.oidc_authorize.retain_recent();
         }
-        let limiter = if is_auth { &self.auth } else { &self.general };
+        let limiter = match bucket {
+            RateLimitBucket::General => &self.general,
+            RateLimitBucket::Auth => &self.auth,
+            RateLimitBucket::OidcAuthorize => &self.oidc_authorize,
+        };
         limiter.check_key(&ip).is_ok()
     }
 }
@@ -1997,14 +2036,28 @@ fn client_ip(request: &Request) -> IpAddr {
         })
 }
 
+/// Selects the per-IP bucket for a request. `POST` to the exact OIDC authorize
+/// route gets its dedicated bucket; any other spelling — a different method, a
+/// confusable path like `…/authorizeX`, or a sub-path — falls through to the
+/// prefix-matched generic auth bucket like every other auth route.
+fn rate_limit_bucket(method: &Method, path: &str) -> RateLimitBucket {
+    if method == Method::POST && path == OIDC_AUTHORIZE_ROUTE {
+        RateLimitBucket::OidcAuthorize
+    } else if path.starts_with(AUTH_ROUTE_PREFIX) {
+        RateLimitBucket::Auth
+    } else {
+        RateLimitBucket::General
+    }
+}
+
 async fn enforce_rate_limits(
     State(state): State<Arc<RateLimitState>>,
     request: Request,
     next: Next,
 ) -> Response {
     let ip = client_ip(&request);
-    let is_auth = request.uri().path().starts_with(AUTH_ROUTE_PREFIX);
-    if state.permit(ip, is_auth) {
+    let bucket = rate_limit_bucket(request.method(), request.uri().path());
+    if state.permit(ip, bucket) {
         next.run(request).await
     } else {
         (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response()
@@ -14073,6 +14126,8 @@ mod tests {
             general_burst: 10_000,
             auth_per_second: 1,
             auth_burst: 3,
+            oidc_authorize_per_second: 10_000,
+            oidc_authorize_burst: 10_000,
         };
         let app = with_test_connect_info(apply_transport_limits(
             Router::new().route("/api/v1/auth/login", post(|| async { StatusCode::OK })),
@@ -14102,6 +14157,156 @@ mod tests {
         Ok(())
     }
 
+    /// Transport wiring shared by the OIDC-authorize rate-limit tests: a tiny
+    /// dedicated OIDC bucket (1/s, burst 3), a roomier-but-bounded generic auth
+    /// bucket (10/s, burst 6), and effectively unlimited general traffic, over
+    /// stub routes for the authorize route, its confusable sibling, and login.
+    fn oidc_rate_limit_app() -> axum::Router {
+        use std::time::Duration;
+
+        use axum::{Router, http::StatusCode, routing::post};
+
+        use super::{TransportLimits, apply_transport_limits, with_test_connect_info};
+
+        let limits = TransportLimits {
+            request_timeout: Duration::from_secs(5),
+            body_read_timeout: Duration::from_secs(5),
+            max_concurrent_requests: 64,
+            general_per_second: 10_000,
+            general_burst: 10_000,
+            auth_per_second: 10,
+            auth_burst: 6,
+            oidc_authorize_per_second: 1,
+            oidc_authorize_burst: 3,
+        };
+        with_test_connect_info(apply_transport_limits(
+            Router::new()
+                .route(
+                    "/api/v1/auth/oidc/authorize",
+                    post(|| async { StatusCode::OK }),
+                )
+                .route(
+                    "/api/v1/auth/oidc/authorizeX",
+                    post(|| async { StatusCode::OK }),
+                )
+                .route("/api/v1/auth/login", post(|| async { StatusCode::OK })),
+            limits,
+        ))
+    }
+
+    async fn flood(
+        app: &axum::Router,
+        path: &str,
+        requests: usize,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        use axum::http::StatusCode;
+        use tower::ServiceExt as _;
+
+        let (mut ok, mut limited) = (0_usize, 0_usize);
+        for _ in 0..requests {
+            let request = build_request(Method::POST, path)?;
+            match app.clone().oneshot(request).await?.status() {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => limited += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        Ok((ok, limited))
+    }
+
+    // (a) A flood of POST /api/v1/auth/oidc/authorize from one IP is throttled
+    // by the dedicated bucket — after its small burst, the rest are 429s.
+    #[tokio::test]
+    async fn oidc_authorize_flood_from_one_ip_is_rate_limited()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = oidc_rate_limit_app();
+        let (ok, limited) = flood(&app, "/api/v1/auth/oidc/authorize", 12).await?;
+        // The burst of 3 (plus at most one cell replenished mid-run) is
+        // admitted; the rest of the flood is rejected.
+        assert!(
+            ok <= 4,
+            "expected the dedicated bucket to cap admits, got {ok}"
+        );
+        assert!(
+            limited >= 7,
+            "expected a throttled authorize flood, got {limited} rejects"
+        );
+        Ok(())
+    }
+
+    // (b) The buckets are independent in both directions: exhausting the
+    // dedicated authorize bucket leaves the generic auth budget for /login
+    // untouched, and exhausting the auth bucket leaves authorize's budget
+    // untouched — one bucket per request, never both.
+    #[tokio::test]
+    async fn the_oidc_authorize_and_generic_auth_buckets_are_independent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Direction one: flood authorize into 429s, then login still has its
+        // full burst of 6 available.
+        let app = oidc_rate_limit_app();
+        let (_, limited) = flood(&app, "/api/v1/auth/oidc/authorize", 12).await?;
+        assert!(limited >= 7, "authorize flood should have been throttled");
+        let (login_ok, login_limited) = flood(&app, "/api/v1/auth/login", 6).await?;
+        assert_eq!(
+            (login_ok, login_limited),
+            (6, 0),
+            "the authorize flood must not have consumed the generic auth budget"
+        );
+
+        // Direction two (fresh app = fresh buckets): drain the auth bucket via
+        // /login, then authorize still has its full burst of 3 available.
+        let app = oidc_rate_limit_app();
+        let (_, limited) = flood(&app, "/api/v1/auth/login", 12).await?;
+        assert!(limited >= 5, "login flood should have been throttled");
+        let (authorize_ok, authorize_limited) =
+            flood(&app, "/api/v1/auth/oidc/authorize", 3).await?;
+        assert_eq!(
+            (authorize_ok, authorize_limited),
+            (3, 0),
+            "the login flood must not have consumed the authorize budget"
+        );
+        Ok(())
+    }
+
+    // (c) A confusable sibling path must NOT ride the dedicated bucket: it is
+    // metered against the generic auth bucket (admitting the auth burst of 6,
+    // beyond the dedicated bucket's burst of 3, before throttling).
+    #[tokio::test]
+    async fn a_confusable_authorize_path_falls_to_the_generic_auth_bucket()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = oidc_rate_limit_app();
+        let (ok, limited) = flood(&app, "/api/v1/auth/oidc/authorizeX", 12).await?;
+        assert!(
+            ok >= 6,
+            "the confusable path must get the auth bucket's larger burst, got {ok} admits"
+        );
+        assert!(
+            limited >= 5,
+            "the confusable path is still auth traffic and must throttle, got {limited} rejects"
+        );
+        Ok(())
+    }
+
+    // (d) The dedicated bucket's rejection is byte-identical to the existing
+    // rate-limit response: 429 with the plain "Too many requests" body.
+    #[tokio::test]
+    async fn the_oidc_authorize_429_matches_the_existing_rate_limit_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{body::to_bytes, http::StatusCode};
+        use tower::ServiceExt as _;
+
+        let app = oidc_rate_limit_app();
+        let (_, limited) = flood(&app, "/api/v1/auth/oidc/authorize", 12).await?;
+        assert!(limited >= 7, "the flood should have produced 429s");
+        let response = app
+            .oneshot(build_request(Method::POST, "/api/v1/auth/oidc/authorize")?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 1024).await?;
+        assert_eq!(&body[..], b"Too many requests");
+        Ok(())
+    }
+
     // FINDING #2 (DoS): a request that outruns the overall timeout is aborted
     // with 408, while a prompt request under the same wiring still succeeds.
     #[tokio::test]
@@ -14123,6 +14328,8 @@ mod tests {
             general_burst: 10_000,
             auth_per_second: 10_000,
             auth_burst: 10_000,
+            oidc_authorize_per_second: 10_000,
+            oidc_authorize_burst: 10_000,
         };
         let app = with_test_connect_info(apply_transport_limits(
             Router::new()

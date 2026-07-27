@@ -45,14 +45,26 @@
 //!
 //! # Scope
 //!
-//! Library functions only. The JWKS is fetched per verification (no caching —
-//! a later refinement could add a bounded cache like [`crate::security_jwt`]'s).
-//! There is no callback route, no session creation, and no `state`/`nonce`
-//! *persistence* here — the caller supplies the `expected_nonce` it stored when
-//! it built the authorization request.
+//! Library functions only. [`verify_oidc_id_token`] fetches the JWKS per
+//! verification; the callback route goes through
+//! [`verify_oidc_id_token_cached`] and an [`OidcJwksCache`] — a bounded TTL
+//! cache modeled on [`crate::oidc_discovery::OidcDiscoveryCache`]'s shape
+//! (`Mutex<HashMap>`, fetch outside the lock, retain-unexpired admission,
+//! poisoned-lock degrades to uncached) plus [`crate::security_jwt`]'s
+//! kid-miss-triggered refresh under a per-entry cooldown, so a signing-key
+//! rotation is picked up promptly while a fabricated `kid` cannot amplify
+//! outbound fetches. There is no callback route, no session creation, and no
+//! `state`/`nonce` *persistence* here — the caller supplies the
+//! `expected_nonce` it stored when it built the authorization request.
+
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, decode, decode_header,
+    Algorithm, DecodingKey, Header, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, Jwk, JwkSet, KeyOperations, PublicKeyUse},
 };
 use serde::Deserialize;
@@ -85,6 +97,22 @@ const MAX_CLAIM_BYTES: usize = 1_024;
 /// Clock-skew leeway for `exp`, matching [`crate::security_jwt`]'s explicit
 /// leeway convention (and `jsonwebtoken`'s own default).
 const CLOCK_SKEW_SECONDS: u64 = 60;
+/// Lifetime of a cached JWKS entry in [`OidcJwksCache`], matching the discovery
+/// cache's TTL and [`crate::security_jwt`]'s default `jwks_cache_seconds` (both
+/// 5 minutes): staleness after an un-signalled key rotation is bounded by this,
+/// and the kid-miss refresh below usually picks a rotation up sooner.
+const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Cap on distinct `jwks_uri` entries held in an [`OidcJwksCache`], matching
+/// the discovery cache's bound. The key comes from admin-trusted discovery
+/// metadata, never request input, so a full cache degrades to uncached fetches
+/// rather than needing eviction.
+const DEFAULT_JWKS_CACHE_MAX_ENTRIES: usize = 64;
+/// Minimum interval between kid-miss-triggered refreshes of one cache entry,
+/// mirroring [`crate::security_jwt`]'s `MIN_REFRESH_INTERVAL` idea: a genuine
+/// key rotation (a fresh `kid` signed by the provider) refreshes at most once
+/// per cooldown, so an attacker fabricating `kid` values cannot turn each
+/// callback into an outbound JWKS fetch.
+const DEFAULT_JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// A verified OIDC end-user identity — every field below has passed signature,
 /// `iss`, `aud`, `exp`, and `nonce` verification. Typed, never a raw JSON value,
@@ -167,6 +195,191 @@ pub fn verify_oidc_id_token(
     verify_id_token_with_jwks(provider, client_id, expected_nonce, id_token, &jwks)
 }
 
+/// One cached key set and when it was fetched (both TTL expiry and the kid-miss
+/// refresh cooldown are measured from `fetched_at`).
+struct CachedJwks {
+    set: JwkSet,
+    fetched_at: Instant,
+}
+
+/// Bounded, TTL'd cache of fetched [`JwkSet`]s, keyed by `jwks_uri`, combining
+/// the two in-repo caching models:
+///
+/// - the [`crate::oidc_discovery::OidcDiscoveryCache`] shape — `Mutex<HashMap>`
+///   with a TTL and an entry cap, the network fetch performed **outside** the
+///   lock, retain-unexpired admission on store, and a poisoned lock degrading
+///   to uncached fetching rather than failing verification; and
+/// - [`crate::security_jwt`]'s kid-miss-triggered refresh — a token whose `kid`
+///   is not in the fresh cached set forces one early refetch (a genuine key
+///   rotation is picked up before the TTL runs out), but at most once per
+///   [`DEFAULT_JWKS_REFRESH_COOLDOWN`] per entry, so a flood of fabricated
+///   `kid`s cannot amplify into an outbound fetch per callback.
+///
+/// **Caching never weakens verification.** Only sets that already passed
+/// [`validate_jwks`] are stored (the fetch path validates before returning),
+/// and every signature/claim check still runs per token against whichever set
+/// is served. Built once and shared behind an `Arc` for the lifetime of the
+/// secured router, like the discovery cache and login-state store beside it.
+pub struct OidcJwksCache {
+    ttl: Duration,
+    max_entries: usize,
+    refresh_cooldown: Duration,
+    entries: Mutex<HashMap<String, CachedJwks>>,
+}
+
+impl Default for OidcJwksCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OidcJwksCache {
+    /// A cache with the default [`DEFAULT_JWKS_CACHE_TTL`],
+    /// [`DEFAULT_JWKS_CACHE_MAX_ENTRIES`], and
+    /// [`DEFAULT_JWKS_REFRESH_COOLDOWN`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_ttl_capacity_and_cooldown(
+            DEFAULT_JWKS_CACHE_TTL,
+            DEFAULT_JWKS_CACHE_MAX_ENTRIES,
+            DEFAULT_JWKS_REFRESH_COOLDOWN,
+        )
+    }
+
+    /// A cache with explicit knobs — a test seam (zero TTL disables caching, a
+    /// zero cooldown makes every kid miss refresh, a tiny capacity exercises
+    /// the bound) as much as a deployment tuning point.
+    #[must_use]
+    pub fn with_ttl_capacity_and_cooldown(
+        ttl: Duration,
+        max_entries: usize,
+        refresh_cooldown: Duration,
+    ) -> Self {
+        Self {
+            ttl,
+            max_entries,
+            refresh_cooldown,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns a validated key set for `jwks_uri` suitable for looking up
+    /// `kid`: a live cached copy when it is fresh and either contains `kid` or
+    /// is inside the kid-miss refresh cooldown; otherwise the result of a fresh
+    /// `fetch` (cached for the next caller). The returned set is *not*
+    /// guaranteed to contain `kid` — a bogus `kid` inside the cooldown is
+    /// served the cached set and fails key selection in the caller, which is
+    /// exactly the no-amplification behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `fetch` error when a fetch was needed and failed. A
+    /// poisoned cache lock is *not* fatal: the set is fetched uncached instead.
+    fn jwks_for(
+        &self,
+        jwks_uri: &str,
+        kid: &str,
+        fetch: impl Fn(&str) -> Result<JwkSet, OidcIdTokenError>,
+    ) -> Result<JwkSet, OidcIdTokenError> {
+        if let Some(cached) = self.cached_set_for(jwks_uri, kid) {
+            return Ok(cached);
+        }
+        // Miss, expiry, or a cooldown-cleared kid miss: fetch OUTSIDE the lock
+        // (blocking network I/O), then admit the validated result.
+        let set = fetch(jwks_uri)?;
+        self.store(jwks_uri, &set);
+        Ok(set)
+    }
+
+    /// The cached set to serve without fetching, if any: fresh AND (contains
+    /// `kid` OR its kid-miss refresh is still cooling down). A poisoned lock is
+    /// treated as a miss (degrade to uncached).
+    fn cached_set_for(&self, jwks_uri: &str, kid: &str) -> Option<JwkSet> {
+        let entries = self.entries.lock().ok()?;
+        let cached = entries.get(jwks_uri)?;
+        let now = Instant::now();
+        if now.duration_since(cached.fetched_at) >= self.ttl {
+            return None;
+        }
+        let kid_present = cached.set.find(kid).is_some();
+        let refresh_allowed = now.duration_since(cached.fetched_at) >= self.refresh_cooldown;
+        (kid_present || !refresh_allowed).then(|| cached.set.clone())
+    }
+
+    /// Records a freshly fetched, already-validated set under `jwks_uri`,
+    /// stamping `fetched_at` and opportunistically dropping expired entries
+    /// first. At capacity a *new* URI is simply not admitted (the next lookup
+    /// re-fetches); refreshing an existing entry is always allowed since it
+    /// does not grow the map. A poisoned lock is a no-op (uncached).
+    fn store(&self, jwks_uri: &str, set: &JwkSet) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let ttl = self.ttl;
+        entries.retain(|_, cached| now.duration_since(cached.fetched_at) < ttl);
+        if entries.contains_key(jwks_uri) || entries.len() < self.max_entries {
+            entries.insert(
+                jwks_uri.to_owned(),
+                CachedJwks {
+                    set: set.clone(),
+                    fetched_at: now,
+                },
+            );
+        }
+    }
+}
+
+/// [`verify_oidc_id_token`] with the JWKS resolved through `cache` instead of
+/// fetched per call — the path the OIDC callback route uses. The token's shape,
+/// algorithm, and `kid` are validated **before** the cache is consulted, so a
+/// malformed or disallowed token can never trigger an outbound fetch.
+///
+/// # Errors
+///
+/// Exactly as [`verify_oidc_id_token`]; a `kid` absent from the (possibly
+/// cooldown-served) key set surfaces as [`OidcIdTokenError::InvalidToken`].
+pub fn verify_oidc_id_token_cached(
+    cache: &OidcJwksCache,
+    provider: &OidcProviderMetadata,
+    client_id: &str,
+    expected_nonce: &str,
+    id_token: &str,
+) -> Result<VerifiedOidcIdentity, OidcIdTokenError> {
+    verify_oidc_id_token_cached_with_fetch(
+        cache,
+        provider,
+        client_id,
+        expected_nonce,
+        id_token,
+        fetch_jwks,
+    )
+}
+
+/// [`verify_oidc_id_token_cached`] with the JWKS fetch injected, so tests can
+/// drive the cache's hit/refresh/cooldown behaviour with a counting stub
+/// instead of a live endpoint — the same injection seam pattern as
+/// [`crate::oidc_live_token`]'s resolver. Production always passes
+/// [`fetch_jwks`].
+fn verify_oidc_id_token_cached_with_fetch(
+    cache: &OidcJwksCache,
+    provider: &OidcProviderMetadata,
+    client_id: &str,
+    expected_nonce: &str,
+    id_token: &str,
+    fetch: impl Fn(&str) -> Result<JwkSet, OidcIdTokenError>,
+) -> Result<VerifiedOidcIdentity, OidcIdTokenError> {
+    // The same fail-closed pre-checks verify_id_token_with_jwks runs, applied
+    // BEFORE any cache/network interaction (they are re-run afterwards inside
+    // it; both orderings must hold, so the shared helpers keep them identical).
+    if expected_nonce.is_empty() || expected_nonce.len() > MAX_NONCE_BYTES {
+        return Err(OidcIdTokenError::NonceMismatch);
+    }
+    let (_, kid) = validated_header_and_kid(id_token)?;
+    let jwks = cache.jwks_for(&provider.jwks_uri, &kid, fetch)?;
+    verify_id_token_with_jwks(provider, client_id, expected_nonce, id_token, &jwks)
+}
+
 /// Fetches and validates the provider's JWKS via the SSRF-safe GET.
 fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet, OidcIdTokenError> {
     // Every fetch failure — unreachable, timeout, over-cap, and crucially the
@@ -198,27 +411,8 @@ fn verify_id_token_with_jwks(
     if expected_nonce.is_empty() || expected_nonce.len() > MAX_NONCE_BYTES {
         return Err(OidcIdTokenError::NonceMismatch);
     }
-    validate_token_shape(id_token)?;
-
-    let header = decode_header(id_token).map_err(|_| OidcIdTokenError::InvalidToken)?;
-    // The alg-confusion defense: reject anything that is not a public-key
-    // signature algorithm BEFORE building a Validation or touching the key, so
-    // an attacker-chosen `alg=HS256` (HMAC) can never be verified against a
-    // public key. This is the first and primary gate.
-    if !algorithm_is_allowed(header.alg)
-        || header
-            .typ
-            .as_deref()
-            .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("JWT"))
-    {
-        return Err(OidcIdTokenError::InvalidToken);
-    }
-    let kid = header
-        .kid
-        .as_deref()
-        .filter(|kid| !kid.is_empty() && kid.len() <= MAX_KEY_ID_BYTES)
-        .ok_or(OidcIdTokenError::InvalidToken)?;
-    let jwk = jwks.find(kid).ok_or(OidcIdTokenError::InvalidToken)?;
+    let (header, kid) = validated_header_and_kid(id_token)?;
+    let jwk = jwks.find(&kid).ok_or(OidcIdTokenError::InvalidToken)?;
     validate_jwk(jwk, header.alg)?;
     let decoding_key = DecodingKey::from_jwk(jwk).map_err(|_| OidcIdTokenError::InvalidToken)?;
 
@@ -231,8 +425,6 @@ fn verify_id_token_with_jwks(
         .map_err(|_| OidcIdTokenError::InvalidToken)?
         .claims;
 
-    // The OIDC check `jsonwebtoken` does not do: the `nonce` must be present,
-    // bounded, and equal (constant-time) to the nonce this login generated.
     // The OIDC check `jsonwebtoken` does not do: the `nonce` must be present,
     // bounded, and equal (constant-time) to the nonce this login generated.
     match claims.nonce.as_deref() {
@@ -309,6 +501,33 @@ impl OidcIdTokenClaims {
             expires_at: self.exp,
         })
     }
+}
+
+/// Shape-validates the raw compact JWT and returns its decoded header plus the
+/// bounded `kid`, applying the alg-confusion defense: anything that is not a
+/// public-key signature algorithm — critically `alg=HS256`/`HS384`/`HS512` — is
+/// rejected here, BEFORE a `Validation` is built, a key is selected, or (on the
+/// cached path) the cache/network is touched. Shared by
+/// [`verify_id_token_with_jwks`] and [`verify_oidc_id_token_cached_with_fetch`]
+/// so the two paths' pre-key gates cannot drift apart.
+fn validated_header_and_kid(id_token: &str) -> Result<(Header, String), OidcIdTokenError> {
+    validate_token_shape(id_token)?;
+    let header = decode_header(id_token).map_err(|_| OidcIdTokenError::InvalidToken)?;
+    if !algorithm_is_allowed(header.alg)
+        || header
+            .typ
+            .as_deref()
+            .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("JWT"))
+    {
+        return Err(OidcIdTokenError::InvalidToken);
+    }
+    let kid = header
+        .kid
+        .as_deref()
+        .filter(|kid| !kid.is_empty() && kid.len() <= MAX_KEY_ID_BYTES)
+        .ok_or(OidcIdTokenError::InvalidToken)?
+        .to_owned();
+    Ok((header, kid))
 }
 
 /// Constant-time `nonce` equality. The nonce is single-use and server-stored, so
@@ -431,6 +650,14 @@ fn valid_email_claim(email: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use crypto_bigint::{ByteOrder, Encoding as _};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, jwk::JwkSet};
@@ -438,8 +665,8 @@ mod tests {
     use serde::Serialize;
 
     use super::{
-        OidcIdTokenError, VerifiedOidcIdentity, algorithm_is_allowed, validate_jwks,
-        verify_id_token_with_jwks,
+        OidcIdTokenError, OidcJwksCache, VerifiedOidcIdentity, algorithm_is_allowed, validate_jwks,
+        verify_id_token_with_jwks, verify_oidc_id_token_cached_with_fetch,
     };
     use crate::oidc_discovery::OidcProviderMetadata;
 
@@ -816,5 +1043,242 @@ mod tests {
             .position(|byte| *byte != 0)
             .unwrap_or(bytes.len().saturating_sub(1));
         bytes[first_nonzero..].to_vec()
+    }
+
+    // ---- JWKS cache (bounded TTL + kid-miss refresh cooldown) --------------
+
+    /// A counting JWKS source: the fetch seam the cache tests inject. `slot`
+    /// is the set "the provider" currently serves (swap it to simulate a key
+    /// rotation); `fetches` counts outbound fetches the cache performed.
+    struct CountingJwksSource {
+        slot: Mutex<JwkSet>,
+        fetches: AtomicUsize,
+    }
+
+    impl CountingJwksSource {
+        fn new(set: JwkSet) -> Self {
+            Self {
+                slot: Mutex::new(set),
+                fetches: AtomicUsize::new(0),
+            }
+        }
+
+        fn rotate_to(&self, set: JwkSet) -> Result<(), Box<dyn std::error::Error>> {
+            *self.slot.lock().map_err(|_| "slot poisoned")? = set;
+            Ok(())
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+
+        /// Verifies `token` through the cache with this source as the fetch.
+        fn verify(
+            &self,
+            cache: &OidcJwksCache,
+            token: &str,
+        ) -> Result<VerifiedOidcIdentity, OidcIdTokenError> {
+            verify_oidc_id_token_cached_with_fetch(
+                cache,
+                &provider(),
+                CLIENT_ID,
+                NONCE,
+                token,
+                |_jwks_uri| {
+                    self.fetches.fetch_add(1, Ordering::SeqCst);
+                    self.slot
+                        .lock()
+                        .map(|set| set.clone())
+                        .map_err(|_| OidcIdTokenError::JwksUnavailable)
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn a_cache_hit_avoids_a_second_jwks_fetch() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        let cache = OidcJwksCache::new();
+
+        // Two verifications inside the TTL: one outbound fetch, both succeed.
+        for _ in 0..2 {
+            let token = fixture.sign(&valid_claims())?;
+            source.verify(&cache, &token)?;
+        }
+        assert_eq!(
+            source.fetches(),
+            1,
+            "the second verification must be served from the cache"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rotated_kid_triggers_exactly_one_refresh() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        // Zero cooldown: a kid miss may always refresh, isolating the rotation
+        // behaviour from the amplification guard tested separately below.
+        let cache = OidcJwksCache::with_ttl_capacity_and_cooldown(
+            Duration::from_secs(300),
+            64,
+            Duration::ZERO,
+        );
+
+        // Prime the cache with the pre-rotation set.
+        let token = fixture.sign(&valid_claims())?;
+        source.verify(&cache, &token)?;
+        assert_eq!(source.fetches(), 1);
+
+        // The provider rotates its signing key (new kid, new key material) and
+        // signs the next token with it. The cached set misses the new kid, so
+        // the cache refreshes ONCE and the token verifies against the new set.
+        let mut rotated = Fixture::new()?;
+        rotated.jwks.keys[0].common.key_id = Some("rotated-oidc-key".to_owned());
+        source.rotate_to(rotated.jwks.clone())?;
+        let token = rotated.sign_rs256_with_kid("rotated-oidc-key", &valid_claims())?;
+        source.verify(&cache, &token)?;
+        assert_eq!(source.fetches(), 2, "the rotation must cost one refresh");
+
+        // The rotated set is now cached: another token on the new kid is a hit.
+        let token = rotated.sign_rs256_with_kid("rotated-oidc-key", &valid_claims())?;
+        source.verify(&cache, &token)?;
+        assert_eq!(source.fetches(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_bogus_kid_inside_the_cooldown_cannot_amplify_fetches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        // The default cooldown (60s) is far longer than this test runs.
+        let cache = OidcJwksCache::new();
+
+        // Prime the cache with one honest verification.
+        let token = fixture.sign(&valid_claims())?;
+        source.verify(&cache, &token)?;
+        assert_eq!(source.fetches(), 1);
+
+        // A flood of tokens with fabricated kids: each is rejected against the
+        // cached set, and NONE triggers an outbound fetch — the amplification
+        // an attacker would otherwise get from a fetch-per-unknown-kid policy.
+        for index in 0..5 {
+            let token =
+                fixture.sign_rs256_with_kid(&format!("bogus-kid-{index}"), &valid_claims())?;
+            assert!(matches!(
+                source.verify(&cache, &token),
+                Err(OidcIdTokenError::InvalidToken)
+            ));
+        }
+        assert_eq!(
+            source.fetches(),
+            1,
+            "bogus kids inside the cooldown must not refetch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_expired_cache_entry_is_refetched() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        // A zero TTL disables caching: every verification refetches — the red
+        // control proving the hit test above is the cache at work.
+        let cache = OidcJwksCache::with_ttl_capacity_and_cooldown(
+            Duration::ZERO,
+            64,
+            Duration::from_secs(60),
+        );
+
+        for _ in 0..2 {
+            let token = fixture.sign(&valid_claims())?;
+            source.verify(&cache, &token)?;
+        }
+        assert_eq!(source.fetches(), 2, "an expired entry must be refetched");
+        Ok(())
+    }
+
+    #[test]
+    fn a_poisoned_cache_lock_degrades_to_uncached_verification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        let cache = OidcJwksCache::new();
+
+        // Poison the cache mutex: a thread panics while holding the lock (the
+        // guard lives inside the held `Result`, so unwinding drops it mid-panic
+        // and marks the mutex poisoned).
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = cache.entries.lock();
+                panic!("deliberately poison the JWKS cache lock");
+            });
+            assert!(
+                poisoner.join().is_err(),
+                "the poisoning thread must have panicked"
+            );
+        });
+
+        // Verification still succeeds — twice, each with its own (uncached)
+        // fetch, proving the degrade path fetches rather than serving nothing.
+        for _ in 0..2 {
+            let token = fixture.sign(&valid_claims())?;
+            source.verify(&cache, &token)?;
+        }
+        assert_eq!(
+            source.fetches(),
+            2,
+            "a poisoned lock must degrade to uncached fetching"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn at_capacity_a_new_jwks_uri_is_served_uncached_not_admitted_by_eviction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let source = CountingJwksSource::new(fixture.jwks.clone());
+        let cache = OidcJwksCache::with_ttl_capacity_and_cooldown(
+            Duration::from_secs(300),
+            1,
+            Duration::from_secs(60),
+        );
+        let second_provider = OidcProviderMetadata {
+            jwks_uri: format!("{ISSUER}/other-jwks.json"),
+            ..provider()
+        };
+        let verify_with = |provider: &OidcProviderMetadata| {
+            let token = fixture.sign(&valid_claims())?;
+            verify_oidc_id_token_cached_with_fetch(
+                &cache,
+                provider,
+                CLIENT_ID,
+                NONCE,
+                &token,
+                |_jwks_uri| {
+                    source.fetches.fetch_add(1, Ordering::SeqCst);
+                    source
+                        .slot
+                        .lock()
+                        .map(|set| set.clone())
+                        .map_err(|_| OidcIdTokenError::JwksUnavailable)
+                },
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        };
+
+        // The first URI takes the single slot; the second is refused admission
+        // (each of its verifications refetches) but still verifies fine, and
+        // the first URI's entry keeps serving hits — bounded, never evicting.
+        verify_with(&provider())?;
+        assert_eq!(source.fetches(), 1);
+        verify_with(&second_provider)?;
+        verify_with(&second_provider)?;
+        assert_eq!(source.fetches(), 3, "an unadmitted URI refetches each time");
+        verify_with(&provider())?;
+        assert_eq!(source.fetches(), 3, "the admitted URI still serves hits");
+        Ok(())
     }
 }
