@@ -549,8 +549,10 @@ now wired (the wrapper is content-type-agnostic, so a plain-JSON POST route need
 entry, no new mechanism); Windows certificate enumeration cannot use it because it's a bodyless GET
 and the wrapper's shared detection is POST-only for the whole allowlist — matching Java's own
 `AutoJobPostMapping` annotation, itself hardcoded POST-only, so this is genuine upstream parity, not
-a Rust-specific limitation. Job/control routes, mobile scanner, and settings mutation remain
-unwired. Generic OIDC/SAML/desktop identity remain (OIDC has its first slice — see below). The
+a Rust-specific limitation. Job/control routes (`general/job/*` plus the admin job
+stats/queue/cleanup trio), the mobile-scanner API, and admin settings mutation are all wired in
+the production routers today (an earlier revision of this paragraph predated them).
+Generic SAML/desktop identity remain (OIDC is ported — see below). The
 opt-in Tauri native-launch path now receives an unconditional ephemeral-port
 handshake, desktop/base-path/login-agreement environment, legacy-workspace
 migration, a bounded startup wait, early-exit reporting, stale-port cleanup,
@@ -686,8 +688,13 @@ pre-validated key sets admitted); and confidential clients are supported via
 `security.oauth2.clientSecret` with the RFC 6749 §2.3.1 Basic header (Appendix B
 form-urlencoding before base64, `Zeroizing` secrets, Debug-redacted, blank ⇒ public client),
 keeping PKCE for confidential clients per RFC 9700 as a deliberate, documented divergence from
-Spring's public-client-only PKCE. Durable cross-process login-flow state and the frontend
-redirect/cookie UX still remain. The discovery document's own returned endpoint URLs
+Spring's public-client-only PKCE. Durable cross-process login-flow state would be
+beyond-Java-parity, not a gap: Java keeps its OAuth2 authorization-request state in per-process
+in-memory HTTP sessions (no persistent session repository is configured), so the Rust in-memory
+single-use TTL store is equivalent; a SQLite-backed store remains an optional enhancement for
+multi-process deployment. The browser-facing callback UX (Java's success handler 302-redirects
+to the SPA with the token in the URL fragment and honors the redirect-path cookie; Rust still
+returns raw JSON) is genuine remaining backend work. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,
