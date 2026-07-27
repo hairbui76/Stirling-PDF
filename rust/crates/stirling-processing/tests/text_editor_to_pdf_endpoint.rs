@@ -215,6 +215,116 @@ async fn rebuilds_editor_form_fields_as_page_widgets() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn rebuilds_annotation_appearance_streams_as_indirect_objects()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A non-widget annotation whose raw COS projection nests its `/AP /N`
+    // appearance stream inside the dictionary. The rebuild must hoist that
+    // stream to an indirect object — a stream is only legal as one — so the
+    // output parses (lopdf + PDFium) and keeps the appearance.
+    let appearance = b"0 1 0 rg 0 0 50 50 re f";
+    let json = serde_json::json!({
+        "pages": [{
+            "pageNumber": 1,
+            "width": 100.0,
+            "height": 100.0,
+            "annotations": [{
+                "subtype": "Square",
+                "rect": [10.0, 10.0, 60.0, 60.0],
+                "rawData": {
+                    "type": "DICTIONARY",
+                    "entries": {
+                        "Subtype": { "type": "NAME", "value": "Square" },
+                        "Rect": { "type": "ARRAY", "items": [
+                            { "type": "INTEGER", "value": 10 },
+                            { "type": "INTEGER", "value": 10 },
+                            { "type": "INTEGER", "value": 60 },
+                            { "type": "INTEGER", "value": 60 }
+                        ] },
+                        "F": { "type": "INTEGER", "value": 4 },
+                        "AP": { "type": "DICTIONARY", "entries": {
+                            "N": { "type": "STREAM", "stream": {
+                                "dictionary": {
+                                    "Type": { "type": "NAME", "value": "XObject" },
+                                    "Subtype": { "type": "NAME", "value": "Form" },
+                                    "BBox": { "type": "ARRAY", "items": [
+                                        { "type": "INTEGER", "value": 0 },
+                                        { "type": "INTEGER", "value": 0 },
+                                        { "type": "INTEGER", "value": 50 },
+                                        { "type": "INTEGER", "value": 50 }
+                                    ] }
+                                },
+                                "rawData": STANDARD.encode(appearance)
+                            } }
+                        } }
+                    }
+                }
+            }]
+        }]
+    });
+    let response = post_json(serde_json::to_vec(&json)?.as_slice()).await?;
+    let bytes = response_bytes(require_status(response, StatusCode::OK).await?).await?;
+
+    let rebuilt = Document::load_mem(&bytes)?;
+    let page_id = *rebuilt.get_pages().values().next().ok_or("no page")?;
+    let annotations = rebuilt
+        .get_dictionary(page_id)?
+        .get(b"Annots")?
+        .as_array()?
+        .clone();
+    assert_eq!(annotations.len(), 1);
+    let annotation = rebuilt.get_dictionary(annotations[0].as_reference()?)?;
+    assert_eq!(annotation.get(b"Subtype")?.as_name()?, b"Square");
+    let normal = annotation.get(b"AP")?.as_dict()?.get(b"N")?;
+    let normal_id = normal
+        .as_reference()
+        .map_err(|_| "the /AP /N appearance stream must be an indirect object")?;
+    assert_eq!(
+        rebuilt.get_object(normal_id)?.as_stream()?.content,
+        appearance
+    );
+
+    let Some(pdfium) = pdfium()? else {
+        return Ok(());
+    };
+    let document = pdfium.load_pdf_from_byte_slice(&bytes, None)?;
+    assert_eq!(document.pages().len(), 1);
+    let page = document.pages().get(0)?;
+    let rendered = page
+        .render_with_config(
+            &pdfium_render::prelude::PdfRenderConfig::new()
+                .set_target_width(200)
+                .render_annotations(true),
+        )?
+        .as_image()?
+        .to_rgba8();
+    assert!(
+        rendered
+            .pixels()
+            .any(|pixel| pixel[1] > 200 && pixel[0] < 100 && pixel[2] < 100),
+        "the restored appearance stream should render its green square"
+    );
+    Ok(())
+}
+
+/// Binds the natively requested `PDFium` library, or `None` when the test run
+/// does not request one. A configured-but-unloadable library is an error so
+/// the render assertion cannot be skipped silently.
+fn pdfium() -> Result<Option<pdfium_render::prelude::Pdfium>, Box<dyn std::error::Error>> {
+    use pdfium_render::prelude::Pdfium;
+
+    let Some(configured) = std::env::var_os("STIRLING_PDFIUM_LIBRARY_PATH") else {
+        return Ok(None);
+    };
+    let configured = std::path::PathBuf::from(configured);
+    let library = if configured.is_dir() {
+        Pdfium::pdfium_platform_library_name_at_path(&configured)
+    } else {
+        configured
+    };
+    Ok(Some(Pdfium::new(Pdfium::bind_to_library(library)?)))
+}
+
+#[tokio::test]
 async fn rejects_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
     let response = post_json(b"not json at all").await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

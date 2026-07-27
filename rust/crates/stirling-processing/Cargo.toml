@@ -94,4 +94,8 @@ schannel = "0.1.29"
 
 [dev-dependencies]
 crypto-bigint = "0.7.5"
+# Zlib and LZW encoders for synthetic inline-image filter fixtures (both
+# already in the dependency graph as lopdf's decoder backends).
+flate2 = "1.0"
 jks = { version = "0.3.3", default-features = false, features = ["rand"] }
+weezl = "0.1.10"
