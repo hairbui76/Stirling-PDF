@@ -7,8 +7,12 @@
 //! over the router: `POST /authorize` yields the authorization URL + `state`
 //! (and sets the login-CSRF browser-binding cookie), the mock's id token echoes
 //! the URL's `nonce`, `GET /callback` — riding that cookie back, as the
-//! initiating browser would — completes the login, and the returned access
-//! token is exercised against `GET /auth/me`.
+//! initiating browser would — completes the login and answers the BROWSER with
+//! a `302` to the SPA (`{origin}{path}#access_token=…`, mirroring Java's
+//! `CustomOAuth2AuthenticationSuccessHandler`); the fragment token is then
+//! exercised against `GET /auth/me`. Failures are `302`s to
+//! `{path}?errorOAuth=oauth2AuthenticationError` (Java's failure handler),
+//! one fixed location for every rejection cause.
 
 use std::{
     fs,
@@ -290,16 +294,67 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+/// The generic browser failure `Location` every genuine callback rejection
+/// collapses to (Java's failure handler with this port's fixed error value).
+const FAILURE_LOCATION: &str = "/auth/callback?errorOAuth=oauth2AuthenticationError";
+
+/// The `Set-Cookie` clearing the SPA redirect-path cookie, sent on every
+/// browser redirect (success and failure) with Java's exact attributes.
+const CLEARED_REDIRECT_COOKIE: &str = "stirling_redirect_path=; Path=/; Max-Age=0; SameSite=Lax";
+
+fn location_header(response: &axum::response::Response) -> Option<String> {
+    Some(
+        response
+            .headers()
+            .get(header::LOCATION)?
+            .to_str()
+            .ok()?
+            .to_owned(),
+    )
+}
+
+/// Asserts the response is the browser redirect shape both callback outcomes
+/// share — `302 Found` plus the redirect-cookie clearing `Set-Cookie` — and
+/// returns its `Location`.
+fn assert_browser_redirect(
+    response: &axum::response::Response,
+) -> Result<String, Box<dyn std::error::Error>> {
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        Some(CLEARED_REDIRECT_COOKIE),
+        "every callback redirect must clear the SPA redirect-path cookie"
+    );
+    location_header(response).ok_or_else(|| "a 302 callback response carried no Location".into())
+}
+
+/// Extracts `access_token` from a success redirect's `#fragment`, the exact
+/// contract `AuthCallback.tsx` consumes (`URLSearchParams` over the hash).
+fn fragment_access_token(location: &str) -> Option<String> {
+    let (_, fragment) = location.split_once('#')?;
+    fragment
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "access_token")
+        .map(|(_, value)| value.to_owned())
+}
+
 /// Runs `POST /authorize`, then mints an id token for the returned `nonce`
 /// (via `nonce_for_token`) and calls `GET /callback` with the issued `state`,
-/// forwarding the browser-binding cookie the authorize response set (as the
-/// initiating browser would). Returns the issued `state`, that cookie pair,
-/// and the raw callback response so callers assert status/body themselves.
-async fn drive_login(
+/// riding ONE `Cookie` header (as a browser would) that carries the
+/// browser-binding cookie the authorize response set plus any `extra_cookies`
+/// (`name=value` pairs, e.g. the SPA's redirect-path cookie). Returns the
+/// issued `state`, the binding cookie pair, and the raw callback response so
+/// callers assert status/headers themselves.
+async fn drive_login_with_cookies(
     app: &Router,
     idp: &MockIdp,
     fixture: &SigningFixture,
     nonce_for_token: impl Fn(&str) -> String,
+    extra_cookies: &[&str],
 ) -> Result<(String, String, axum::response::Response), Box<dyn std::error::Error>> {
     let authorize = oidc_authorize(app).await?;
     assert_eq!(authorize.status(), StatusCode::OK);
@@ -321,13 +376,29 @@ async fn drive_login(
     );
     let nonce = query_param(&authorization_url, "nonce").ok_or("missing nonce in url")?;
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce_for_token(&nonce)))?);
+    let mut cookie_header = binding_cookie.clone();
+    for cookie in extra_cookies {
+        cookie_header.push_str("; ");
+        cookie_header.push_str(cookie);
+    }
     let callback = oidc_callback_with_cookie(
         app,
         &format!("code=auth-code-endpoint&state={state}"),
-        &binding_cookie,
+        &cookie_header,
     )
     .await?;
     Ok((state, binding_cookie, callback))
+}
+
+/// [`drive_login_with_cookies`] with only the binding cookie — the plain
+/// same-browser login.
+async fn drive_login(
+    app: &Router,
+    idp: &MockIdp,
+    fixture: &SigningFixture,
+    nonce_for_token: impl Fn(&str) -> String,
+) -> Result<(String, String, axum::response::Response), Box<dyn std::error::Error>> {
+    drive_login_with_cookies(app, idp, fixture, nonce_for_token, &[]).await
 }
 
 // ---- happy path end-to-end --------------------------------------------------
@@ -340,24 +411,22 @@ async fn oidc_login_issues_a_working_session_end_to_end() -> Result<(), Box<dyn 
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
     let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
-    assert_eq!(callback.status(), StatusCode::OK);
-    let session = response_json(callback).await?;
 
-    // The callback returns the SAME shape as the password login handler:
-    // { user: {...}, session: { access_token, refresh_token, ... } }.
-    assert_eq!(session["user"]["username"], PREFERRED_USERNAME);
-    assert_eq!(session["user"]["authenticationType"], "oauth2");
-    let access_token = session["session"]["access_token"]
-        .as_str()
-        .ok_or("missing access token")?;
-    assert!(access_token.starts_with("spdf_at_"));
-    assert!(
-        session["session"]["refresh_token"]
-            .as_str()
-            .is_some_and(|token| token.starts_with("spdf_rt_"))
+    // The callback answers the BROWSER: a 302 to the SPA callback route with
+    // the access token in the URL FRAGMENT — `{path}#access_token=…`, exactly
+    // what `AuthCallback.tsx` parses. With no redirect cookie and no
+    // forwarded/referer/host context the Location stays context-relative.
+    let location = assert_browser_redirect(&callback)?;
+    let access_token =
+        fragment_access_token(&location).ok_or("missing access_token in redirect fragment")?;
+    assert_eq!(
+        location,
+        format!("/auth/callback#access_token={access_token}")
     );
+    assert!(access_token.starts_with("spdf_at_"));
 
-    // The issued session actually authenticates a subsequent request.
+    // The fragment token is a real session: it authenticates a follow-up
+    // request exactly like a password login's access token.
     let me = app
         .clone()
         .oneshot(
@@ -371,6 +440,131 @@ async fn oidc_login_issues_a_working_session_end_to_end() -> Result<(), Box<dyn 
         response_json(me).await?["user"]["username"],
         PREFERRED_USERNAME
     );
+    Ok(())
+}
+
+// ---- context-aware success redirect (cookie path + forwarded origin) --------
+
+#[tokio::test]
+async fn oidc_success_redirect_honors_redirect_cookie_and_forwarded_origin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = SigningFixture::new()?;
+    let idp = start_mock_idp(fixture.jwks_json.clone())?;
+    let (_guard, app) = build_app(Some(&idp.issuer))?;
+
+    // The browser rides BOTH cookies back (binding + the SPA's redirect path,
+    // written with encodeURIComponent) through a TLS-terminating proxy.
+    let authorize = oidc_authorize(&app).await?;
+    assert_eq!(authorize.status(), StatusCode::OK);
+    let binding_cookie = binding_cookie_pair(&authorize)
+        .ok_or("authorize response set no browser-binding cookie")?;
+    let authorize = response_json(authorize).await?;
+    let authorization_url = authorize["authorizationUrl"]
+        .as_str()
+        .ok_or("missing authorizationUrl")?;
+    let state = authorize["state"].as_str().ok_or("missing state")?;
+    let nonce = query_param(authorization_url, "nonce").ok_or("missing nonce in url")?;
+    idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce))?);
+
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/auth/oidc/callback?code=auth-code-endpoint&state={state}"
+            ))
+            .header(
+                header::COOKIE,
+                format!("{binding_cookie}; stirling_redirect_path=%2Fafter-login"),
+            )
+            .header("x-forwarded-host", "app.example.test")
+            .header("x-forwarded-proto", "https")
+            .header(header::HOST, "127.0.0.1:8080")
+            .body(Body::empty())?,
+        )
+        .await?;
+
+    let location = assert_browser_redirect(&callback)?;
+    let access_token =
+        fragment_access_token(&location).ok_or("missing access_token in redirect fragment")?;
+    // Origin from X-Forwarded-* (beating Host), path from the decoded cookie:
+    // exactly Java's `buildContextAwareRedirectUrl` composition.
+    assert_eq!(
+        location,
+        format!("https://app.example.test/after-login#access_token={access_token}")
+    );
+    Ok(())
+}
+
+// ---- hostile redirect cookie falls back to the default path -----------------
+
+#[tokio::test]
+async fn oidc_redirect_cookie_cannot_escape_the_path() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = SigningFixture::new()?;
+    let idp = start_mock_idp(fixture.jwks_json.clone())?;
+    let (_guard, app) = build_app(Some(&idp.issuer))?;
+
+    for hostile in [
+        "https%3A%2F%2Fevil.example", // absolute URL
+        "%2F%2Fevil.example",         // protocol-relative
+        "relative%2Fpath",            // not an absolute path
+    ] {
+        let (_state, _cookie, callback) = drive_login_with_cookies(
+            &app,
+            &idp,
+            &fixture,
+            str::to_owned,
+            &[&format!("stirling_redirect_path={hostile}")],
+        )
+        .await?;
+        let location = assert_browser_redirect(&callback)?;
+        let access_token =
+            fragment_access_token(&location).ok_or("missing access_token in redirect fragment")?;
+        assert_eq!(
+            location,
+            format!("/auth/callback#access_token={access_token}"),
+            "hostile cookie {hostile:?} must fall back to the default path"
+        );
+    }
+    Ok(())
+}
+
+// ---- header injection via the redirect cookie is impossible -----------------
+
+#[tokio::test]
+async fn oidc_redirect_cookie_cannot_inject_headers_or_control_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = SigningFixture::new()?;
+    let idp = start_mock_idp(fixture.jwks_json.clone())?;
+    let (_guard, app) = build_app(Some(&idp.issuer))?;
+
+    // Decoded cookie values that start with `/` (so they pass the path filter)
+    // but smuggle CR/LF or other control bytes: the composed Location cannot
+    // be a header value, so the redirect must fall back to the bare default
+    // path — dropping the token rather than risking response splitting. No
+    // header other than the expected ones may appear.
+    for hostile in [
+        "%2Fx%0D%0AX-Evil%3A%201", // /x\r\nX-Evil: 1 — classic response splitting
+        "%2Fx%0Ainjected",         // bare \n
+        "%2Fx%00null",             // NUL byte
+    ] {
+        let (_state, _cookie, callback) = drive_login_with_cookies(
+            &app,
+            &idp,
+            &fixture,
+            str::to_owned,
+            &[&format!("stirling_redirect_path={hostile}")],
+        )
+        .await?;
+        let location = assert_browser_redirect(&callback)?;
+        assert_eq!(
+            location, "/auth/callback",
+            "control bytes in cookie {hostile:?} must collapse to the bare default path"
+        );
+        assert!(
+            callback.headers().get("x-evil").is_none(),
+            "no header may be injected through the redirect cookie"
+        );
+    }
     Ok(())
 }
 
@@ -397,14 +591,13 @@ async fn oidc_callback_rejects_a_state_that_was_never_issued()
     idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &nonce))?);
 
     let forged = oidc_callback(&app, "code=auth-code-endpoint&state=attacker-forged-state").await?;
+    // A never-issued state must be rejected at the route — as the browser
+    // failure redirect (Java's failure handler), never a session.
     assert_eq!(
-        forged.status(),
-        StatusCode::UNAUTHORIZED,
-        "a never-issued state must be rejected at the route"
+        assert_browser_redirect(&forged)?,
+        FAILURE_LOCATION,
+        "a never-issued state must land on the generic error location"
     );
-    // No session was minted for the forged callback.
-    let forged = response_json(forged).await?;
-    assert!(forged.get("session").is_none());
     Ok(())
 }
 
@@ -418,7 +611,11 @@ async fn oidc_callback_state_is_single_use_a_replay_is_rejected()
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
     let (state, cookie, first) = drive_login(&app, &idp, &fixture, str::to_owned).await?;
-    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.status(), StatusCode::FOUND);
+    assert!(
+        location_header(&first).is_some_and(|location| location.contains("#access_token=")),
+        "the first callback must succeed"
+    );
 
     // Replay the exact same state+code WITH the same browser-binding cookie.
     // The id token is still available and the binding matches, so if the store
@@ -431,11 +628,10 @@ async fn oidc_callback_state_is_single_use_a_replay_is_rejected()
     )
     .await?;
     assert_eq!(
-        replay.status(),
-        StatusCode::UNAUTHORIZED,
+        assert_browser_redirect(&replay)?,
+        FAILURE_LOCATION,
         "a replayed state must be rejected the second time"
     );
-    assert!(response_json(replay).await?.get("session").is_none());
     Ok(())
 }
 
@@ -449,26 +645,29 @@ async fn oidc_callback_rejects_a_mismatched_nonce_as_generic_auth_failure()
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
     // The id token is otherwise valid but carries the wrong nonce; the callback
-    // must reject it, and with the SAME 401 a bad state produces (no leak of
-    // whether it was a CSRF-state miss or a verification failure).
+    // must reject it, and with the SAME redirect a bad state produces (no leak
+    // of whether it was a CSRF-state miss or a verification failure).
     let (_state, _cookie, callback) = drive_login(&app, &idp, &fixture, |_nonce| {
         "a-different-nonce-not-the-login-one".to_owned()
     })
     .await?;
-    assert_eq!(callback.status(), StatusCode::UNAUTHORIZED);
-    assert!(response_json(callback).await?.get("session").is_none());
+    assert_eq!(assert_browser_redirect(&callback)?, FAILURE_LOCATION);
     Ok(())
 }
 
-// ---- missing query params → 400 ---------------------------------------------
+// ---- missing query params → the same generic error redirect -----------------
 
 #[tokio::test]
-async fn oidc_callback_missing_code_or_state_is_a_bad_request()
+async fn oidc_callback_missing_code_or_state_redirects_to_the_error_location()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = SigningFixture::new()?;
     let idp = start_mock_idp(fixture.jwks_json.clone())?;
     let (_guard, app) = build_app(Some(&idp.issuer))?;
 
+    // Java's OAuth2LoginAuthenticationFilter treats a request that is not a
+    // valid authorization response as an authentication failure, and the
+    // failure handler redirects the browser — indistinguishably from any
+    // other rejection. Same here.
     for query in [
         "",
         "code=only-a-code",
@@ -477,9 +676,9 @@ async fn oidc_callback_missing_code_or_state_is_a_bad_request()
     ] {
         let response = oidc_callback(&app, query).await?;
         assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "missing/empty code or state should be 400 for query {query:?}"
+            assert_browser_redirect(&response)?,
+            FAILURE_LOCATION,
+            "missing/empty code or state should redirect for query {query:?}"
         );
     }
     Ok(())
