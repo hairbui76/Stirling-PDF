@@ -15005,6 +15005,96 @@ q 20 0 0 10 5 7 cm BI /W 2 /H 1 /CS /RGB /BPC 8 ID\n"
     }
 
     #[test]
+    fn png_predictor_zero_fills_partial_final_row() {
+        use super::apply_image_predictor;
+        use lopdf::dictionary;
+
+        // PDFBox `PredictorOutputStream.flush` zero-fills an incomplete final
+        // row before decoding it: tag 2 (UP) rows of four gray columns, the
+        // second row truncated after two bytes.
+        let parms = dictionary! { "Predictor" => 12, "Columns" => 4 };
+        assert_eq!(
+            apply_image_predictor(None, Some(&parms), vec![2, 1, 2, 3, 4, 2, 5, 6], usize::MAX)
+                .as_deref(),
+            Some([1_u8, 2, 3, 4, 6, 8, 3, 4].as_slice())
+        );
+        // A trailing tag with no row bytes emits nothing (PDFBox's flush skips
+        // an empty buffered row).
+        assert_eq!(
+            apply_image_predictor(None, Some(&parms), vec![2, 1, 2, 3, 4, 2], usize::MAX)
+                .as_deref(),
+            Some([1_u8, 2, 3, 4].as_slice())
+        );
+    }
+
+    #[test]
+    fn png_predictor_signed_tag_can_select_tiff_row_decoding() {
+        use super::apply_image_predictor;
+        use lopdf::dictionary;
+
+        // PDFBox reads the per-row tag as a SIGNED byte plus 10, so tag byte
+        // 0xF8 (-8) selects predictor 2 — the TIFF row decoder — inside PNG
+        // framing; unknown resulting values leave the row untouched.
+        let parms = dictionary! { "Predictor" => 15, "Columns" => 2 };
+        assert_eq!(
+            apply_image_predictor(None, Some(&parms), vec![0xF8, 10, 5], usize::MAX).as_deref(),
+            Some([10_u8, 15].as_slice())
+        );
+        assert_eq!(
+            apply_image_predictor(None, Some(&parms), vec![0x77, 10, 5], usize::MAX).as_deref(),
+            Some([10_u8, 5].as_slice())
+        );
+    }
+
+    #[test]
+    fn filter_decode_parms_ignores_mixed_filter_and_parms_shapes() {
+        use super::filter_decode_parms;
+        use lopdf::{Object, dictionary};
+
+        // `Filter.getDecodeParams`: a single filter NAME never pairs with an
+        // ARRAY parms value and a filter ARRAY never pairs with a DICTIONARY,
+        // so both mixed shapes yield no parameters.
+        let parms_array = Object::Array(vec![Object::Dictionary(
+            dictionary! { "Predictor" => 2, "Columns" => 4 },
+        )]);
+        assert!(filter_decode_parms(None, true, Some(&parms_array), 0).is_none());
+        let parms_dictionary = Object::Dictionary(dictionary! { "Predictor" => 2, "Columns" => 4 });
+        assert!(filter_decode_parms(None, false, Some(&parms_dictionary), 0).is_none());
+        // An out-of-range index in the aligned array shape also yields none.
+        assert!(filter_decode_parms(None, false, Some(&parms_array), 5).is_none());
+    }
+
+    #[test]
+    fn inline_dictionary_values_bound_hostile_nesting_and_truncation() {
+        use super::parse_inline_dictionary_value;
+
+        // Hostile nesting beyond the depth cap is rejected instead of
+        // recursing without limit.
+        let mut hostile = vec![b'['; 20];
+        hostile.push(b'1');
+        hostile.extend(std::iter::repeat_n(b']', 20));
+        assert!(parse_inline_dictionary_value(&hostile, 0).is_none());
+        // Nesting within the cap still parses.
+        assert!(parse_inline_dictionary_value(b"[[1]]", 0).is_some());
+        // Truncated dictionaries and arrays fail cleanly.
+        assert!(parse_inline_dictionary_value(b"<< /Predictor", 0).is_none());
+        assert!(parse_inline_dictionary_value(b"[1 2", 0).is_none());
+        assert!(parse_inline_dictionary_value(b"<< 1 2 >>", 0).is_none());
+    }
+
+    #[test]
+    fn run_length_expansion_beyond_the_limit_rejects_the_stream() {
+        use super::decode_run_length;
+
+        // A 2 MiB repeat-run payload expands 128-fold; the decoder must reject
+        // it at the caller's bound instead of allocating the full output.
+        let bomb: Vec<u8> = std::iter::repeat_n([129_u8, 7], 1 << 20)
+            .flatten()
+            .collect();
+        assert_eq!(decode_run_length(&bomb, 16 * 1024 * 1024), None);
+    }
+
+    #[test]
     fn json_round_trip_hoists_annotation_appearance_streams()
     -> Result<(), Box<dyn std::error::Error>> {
         use super::{convert_json_to_pdf, pdf_to_json};
@@ -15080,6 +15170,158 @@ q 20 0 0 10 5 7 cm BI /W 2 /H 1 /CS /RGB /BPC 8 ID\n"
         assert_eq!(restored.content, appearance);
         assert_eq!(restored.dict.get(b"Subtype")?.as_name()?, b"Form");
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // mostly the inline JSON fixture
+    fn annotation_rebuild_hoists_array_nested_and_doubly_nested_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{PdfJsonDocument, convert_json_to_pdf};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use lopdf::{Document, Object};
+
+        // Adversarial COS shapes the editor JSON can legally carry: a stream
+        // inside an ARRAY entry, and an /AP stream whose OWN dictionary nests a
+        // further stream (a /Resources XObject). Every stream must end up
+        // behind an indirect reference or the output is not a legal PDF.
+        let appearance = b"0 0 1 rg 0 0 30 30 re f";
+        let xobject = b"q Q";
+        let extra = b"extra-bytes";
+        // Built from a raw string because the deep nesting exceeds the
+        // `serde_json::json!` macro's compile-time recursion depth.
+        let json = r#"{
+            "pages": [{
+                "pageNumber": 1,
+                "width": 100.0,
+                "height": 100.0,
+                "annotations": [{
+                    "subtype": "Square",
+                    "rect": [5.0, 5.0, 40.0, 40.0],
+                    "rawData": { "type": "DICTIONARY", "entries": {
+                        "Subtype": { "type": "NAME", "value": "Square" },
+                        "Rect": { "type": "ARRAY", "items": [
+                            { "type": "INTEGER", "value": 5 },
+                            { "type": "INTEGER", "value": 5 },
+                            { "type": "INTEGER", "value": 40 },
+                            { "type": "INTEGER", "value": 40 }
+                        ] },
+                        "Extra": { "type": "ARRAY", "items": [
+                            { "type": "STREAM", "stream": {
+                                "dictionary": {},
+                                "rawData": "EXTRA_B64"
+                            } }
+                        ] },
+                        "AP": { "type": "DICTIONARY", "entries": {
+                            "N": { "type": "STREAM", "stream": {
+                                "dictionary": {
+                                    "Type": { "type": "NAME", "value": "XObject" },
+                                    "Subtype": { "type": "NAME", "value": "Form" },
+                                    "BBox": { "type": "ARRAY", "items": [
+                                        { "type": "INTEGER", "value": 0 },
+                                        { "type": "INTEGER", "value": 0 },
+                                        { "type": "INTEGER", "value": 30 },
+                                        { "type": "INTEGER", "value": 30 }
+                                    ] },
+                                    "Resources": { "type": "DICTIONARY", "entries": {
+                                        "XObject": { "type": "DICTIONARY", "entries": {
+                                            "X0": { "type": "STREAM", "stream": {
+                                                "dictionary": {
+                                                    "Type": { "type": "NAME", "value": "XObject" },
+                                                    "Subtype": { "type": "NAME", "value": "Form" },
+                                                    "BBox": { "type": "ARRAY", "items": [
+                                                        { "type": "INTEGER", "value": 0 },
+                                                        { "type": "INTEGER", "value": 0 },
+                                                        { "type": "INTEGER", "value": 1 },
+                                                        { "type": "INTEGER", "value": 1 }
+                                                    ] }
+                                                },
+                                                "rawData": "XOBJECT_B64"
+                                            } }
+                                        } }
+                                    } }
+                                },
+                                "rawData": "APPEARANCE_B64"
+                            } }
+                        } }
+                    } }
+                }]
+            }]
+        }"#
+        .replace("EXTRA_B64", &STANDARD.encode(extra))
+        .replace("XOBJECT_B64", &STANDARD.encode(xobject))
+        .replace("APPEARANCE_B64", &STANDARD.encode(appearance));
+        let model: PdfJsonDocument = serde_json::from_str(&json)?;
+        let directory = tempfile::tempdir()?;
+        let output_path = directory.path().join("hoisted.pdf");
+        convert_json_to_pdf(&model, &output_path)?;
+
+        let rebuilt = Document::load(&output_path)?;
+        let page_id = *rebuilt.get_pages().values().next().ok_or("missing page")?;
+        let annotations = rebuilt
+            .get_dictionary(page_id)?
+            .get(b"Annots")?
+            .as_array()?
+            .clone();
+        assert_eq!(annotations.len(), 1);
+        let annotation = rebuilt.get_dictionary(annotations[0].as_reference()?)?;
+
+        let extra_items = annotation.get(b"Extra")?.as_array()?;
+        let extra_id = extra_items[0]
+            .as_reference()
+            .map_err(|_| "array-nested stream must be hoisted")?;
+        assert_eq!(rebuilt.get_object(extra_id)?.as_stream()?.content, extra);
+
+        let normal_id = annotation
+            .get(b"AP")?
+            .as_dict()?
+            .get(b"N")?
+            .as_reference()
+            .map_err(|_| "/AP /N must be hoisted")?;
+        let normal = rebuilt.get_object(normal_id)?.as_stream()?;
+        assert_eq!(normal.content, appearance);
+        let x0_id = normal
+            .dict
+            .get(b"Resources")?
+            .as_dict()?
+            .get(b"XObject")?
+            .as_dict()?
+            .get(b"X0")?
+            .as_reference()
+            .map_err(|_| "stream nested in a hoisted stream's dictionary must be hoisted")?;
+        assert_eq!(rebuilt.get_object(x0_id)?.as_stream()?.content, xobject);
+
+        // No hoisted object may still contain an inline stream anywhere.
+        for object in rebuilt.objects.values() {
+            if let Object::Dictionary(dictionary) = object {
+                assert!(
+                    dictionary
+                        .iter()
+                        .all(|(_, value)| !contains_inline_stream(value)),
+                    "a dictionary object still nests an inline stream"
+                );
+            }
+            if let Object::Stream(stream) = object {
+                assert!(
+                    stream
+                        .dict
+                        .iter()
+                        .all(|(_, value)| !contains_inline_stream(value)),
+                    "a stream dictionary still nests an inline stream"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn contains_inline_stream(object: &lopdf::Object) -> bool {
+        match object {
+            lopdf::Object::Stream(_) => true,
+            lopdf::Object::Array(items) => items.iter().any(contains_inline_stream),
+            lopdf::Object::Dictionary(dictionary) => dictionary
+                .iter()
+                .any(|(_, value)| contains_inline_stream(value)),
+            _ => false,
+        }
     }
 
     #[test]
