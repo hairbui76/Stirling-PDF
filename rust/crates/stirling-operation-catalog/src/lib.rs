@@ -111,7 +111,25 @@ struct Parameter {
 pub fn generate_catalog(openapi_json: &str) -> Result<BTreeMap<String, Value>, CatalogError> {
     let document: OpenApiDocument = serde_json::from_str(openapi_json)
         .map_err(|error| CatalogError::new(format!("invalid OpenAPI JSON: {error}")))?;
-    CatalogGenerator::new(document).generate()
+    CatalogGenerator::new(document).generate(is_operation_path)
+}
+
+/// Generate the MCP supplement: the flat `POST` operations that
+/// [`generate_catalog`] deliberately excludes for AI-engine reasons but that
+/// Java's `McpToolCatalog` (which has no exclusion list) still indexes into
+/// its category-tool enums, e.g. `cert-sign` or `overlay-pdfs`. Schemas are
+/// produced with exactly the same normalization as the AI catalog.
+///
+/// # Errors
+///
+/// Returns an error when the input is not valid JSON, a required component is
+/// missing, or the supported local-reference/schema shapes are malformed.
+pub fn generate_mcp_supplement(
+    openapi_json: &str,
+) -> Result<BTreeMap<String, Value>, CatalogError> {
+    let document: OpenApiDocument = serde_json::from_str(openapi_json)
+        .map_err(|error| CatalogError::new(format!("invalid OpenAPI JSON: {error}")))?;
+    CatalogGenerator::new(document).generate(is_mcp_supplement_path)
 }
 
 /// Generate stable, pretty-printed catalog bytes with one trailing newline.
@@ -120,8 +138,21 @@ pub fn generate_catalog(openapi_json: &str) -> Result<BTreeMap<String, Value>, C
 ///
 /// Returns an error when catalog generation or JSON serialization fails.
 pub fn generate_catalog_json(openapi_json: &str) -> Result<String, CatalogError> {
-    let catalog = generate_catalog(openapi_json)?;
-    let mut output = serde_json::to_string_pretty(&catalog).map_err(|error| {
+    stable_json(&generate_catalog(openapi_json)?)
+}
+
+/// Generate stable, pretty-printed MCP supplement bytes with one trailing
+/// newline.
+///
+/// # Errors
+///
+/// Returns an error when supplement generation or JSON serialization fails.
+pub fn generate_mcp_supplement_json(openapi_json: &str) -> Result<String, CatalogError> {
+    stable_json(&generate_mcp_supplement(openapi_json)?)
+}
+
+fn stable_json(catalog: &BTreeMap<String, Value>) -> Result<String, CatalogError> {
+    let mut output = serde_json::to_string_pretty(catalog).map_err(|error| {
         CatalogError::new(format!("cannot serialize operation catalog: {error}"))
     })?;
     output.push('\n');
@@ -141,11 +172,14 @@ impl CatalogGenerator {
         }
     }
 
-    fn generate(mut self) -> Result<BTreeMap<String, Value>, CatalogError> {
+    fn generate(
+        mut self,
+        include_path: fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, Value>, CatalogError> {
         let paths = std::mem::take(&mut self.document.paths);
         let mut catalog = BTreeMap::new();
         for (path, path_item) in paths {
-            if !is_operation_path(&path) {
+            if !include_path(&path) {
                 continue;
             }
             let schema = self.operation_schema(&path, &path_item)?;
@@ -495,6 +529,18 @@ fn is_operation_path(path: &str) -> bool {
             .any(|excluded| path == *excluded || path.starts_with(&format!("{excluded}/")))
 }
 
+/// An excluded path Java's MCP catalog still exposes: it must carry a flat
+/// tail (no nesting, no path variables), because Java's `extractOpId` derives
+/// op ids only from flat tails. The nested convert text-editor exclusions are
+/// therefore never part of the supplement.
+fn is_mcp_supplement_path(path: &str) -> bool {
+    EXCLUDED_PATHS.contains(&path)
+        && ALLOWED_PATH_PREFIXES.iter().any(|prefix| {
+            path.strip_prefix(prefix)
+                .is_some_and(|tail| !tail.is_empty() && !tail.contains('/') && !tail.contains('{'))
+        })
+}
+
 fn is_binary_schema(schema: &Value) -> bool {
     schema.get("type").and_then(Value::as_str) == Some("string")
         && schema.get("format").and_then(Value::as_str) == Some("binary")
@@ -633,7 +679,10 @@ fn capitalize(value: &str) -> String {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{canonical_wire_name, generate_catalog, generate_catalog_json};
+    use super::{
+        canonical_wire_name, generate_catalog, generate_catalog_json, generate_mcp_supplement,
+        generate_mcp_supplement_json,
+    };
 
     const FIXTURE: &str = r##"
     {
@@ -653,7 +702,24 @@ mod tests {
             }
           }
         },
-        "/api/v1/security/cert-sign": {"post": {}},
+        "/api/v1/security/cert-sign": {
+          "post": {
+            "requestBody": {
+              "content": {
+                "multipart/form-data": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "fileInput": {"type": "string", "format": "binary"},
+                      "certType": {"type": "string", "enum": ["PEM", "PKCS12"]}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/api/v1/convert/pdf/text-editor": {"post": {}},
         "/api/v1/filter/not-an-agent-tool": {"post": {}}
       },
       "components": {
@@ -721,11 +787,39 @@ mod tests {
     }
 
     #[test]
+    fn mcp_supplement_contains_only_flat_excluded_paths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let supplement = generate_mcp_supplement(FIXTURE)?;
+        assert_eq!(supplement.len(), 1);
+        let schema = supplement
+            .get("/api/v1/security/cert-sign")
+            .ok_or("cert-sign missing from the MCP supplement")?;
+        assert_eq!(schema["type"], "object");
+        // Optional without a default, so the enum is wrapped in a nullable
+        // anyOf exactly like the AI catalog's normalization does.
+        assert_eq!(
+            schema["properties"]["certType"]["anyOf"][0]["enum"],
+            json!(["PEM", "PKCS12"])
+        );
+        assert!(schema["properties"].get("fileInput").is_none());
+        // The AI catalog keeps excluding every one of these paths.
+        assert!(
+            generate_catalog(FIXTURE)?
+                .keys()
+                .all(|path| !supplement.contains_key(path))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn serialization_is_stable_and_newline_terminated() -> Result<(), Box<dyn std::error::Error>> {
         let first = generate_catalog_json(FIXTURE)?;
         let second = generate_catalog_json(FIXTURE)?;
         assert_eq!(first, second);
         assert!(first.ends_with('\n'));
+        let first_supplement = generate_mcp_supplement_json(FIXTURE)?;
+        assert_eq!(first_supplement, generate_mcp_supplement_json(FIXTURE)?);
+        assert!(first_supplement.ends_with('\n'));
         Ok(())
     }
 }

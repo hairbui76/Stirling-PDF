@@ -400,6 +400,7 @@ async fn mcp_operation_dispatches_a_real_stirling_endpoint_via_fileid_and_inline
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn mcp_category_tools_expose_catalog_enums_and_convert_is_empty()
 -> Result<(), Box<dyn std::error::Error>> {
     let engine = MockEngine::start().await?;
@@ -465,8 +466,16 @@ async fn mcp_category_tools_expose_catalog_enums_and_convert_is_empty()
         .iter()
         .filter_map(Value::as_str)
         .collect::<Vec<_>>();
-    for expected in ["merge-pdfs", "rotate-pdf", "split-pages"] {
-        assert!(pages_enum.contains(&expected));
+    // overlay-pdfs and extract-bookmarks come from the MCP supplement: the AI
+    // catalog excludes them, but Java's MCP catalog indexes them.
+    for expected in [
+        "extract-bookmarks",
+        "merge-pdfs",
+        "overlay-pdfs",
+        "rotate-pdf",
+        "split-pages",
+    ] {
+        assert!(pages_enum.contains(&expected), "missing {expected}");
     }
     assert!(pages_enum.windows(2).all(|pair| pair[0] < pair[1]));
     let pages_description = pages["properties"]["operation"]["description"]
@@ -478,17 +487,36 @@ async fn mcp_category_tools_expose_catalog_enums_and_convert_is_empty()
     assert!(pages_description.contains("\n- rotate-pdf - "));
 
     let misc_enum = &schema_for("stirling_misc")["properties"]["operation"]["enum"];
-    assert!(
-        misc_enum
-            .as_array()
-            .is_some_and(|ids| ids.contains(&json!("compress-pdf")))
-    );
+    for expected in [
+        "add-attachments",
+        "add-image",
+        "compress-pdf",
+        "decompress-pdf",
+        "list-attachments",
+        "show-javascript",
+    ] {
+        assert!(
+            misc_enum
+                .as_array()
+                .is_some_and(|ids| ids.contains(&json!(expected))),
+            "missing {expected}"
+        );
+    }
     let security_enum = &schema_for("stirling_security")["properties"]["operation"]["enum"];
-    assert!(
-        security_enum
-            .as_array()
-            .is_some_and(|ids| ids.contains(&json!("add-password")))
-    );
+    for expected in [
+        "add-password",
+        "cert-sign",
+        "get-info-on-pdf",
+        "validate-signature",
+        "verify-pdf",
+    ] {
+        assert!(
+            security_enum
+                .as_array()
+                .is_some_and(|ids| ids.contains(&json!(expected))),
+            "missing {expected}"
+        );
+    }
 
     // Java's stirling_convert enum is genuinely empty: every convert endpoint
     // is nested (e.g. /convert/pdf/word) and extractOpId skips nested tails.
@@ -745,9 +773,10 @@ async fn mcp_category_tool_errors_match_java_operation_list_semantics()
     .await?;
     let no_file = response_json(no_file).await?;
     assert_eq!(no_file["result"]["isError"], true);
+    // Byte-identical to Java's McpOperationExecutor missing-file message.
     assert_eq!(
         no_file["result"]["content"][0]["text"],
-        "This operation needs an input file. Pass 'file' as base64, or 'fileId' from stirling_upload for large files."
+        "This operation needs an input file. Pass 'file' as base64 (recommended for most files), or 'fileId' from stirling_upload for large files."
     );
 
     engine.stop().await?;
