@@ -4,11 +4,12 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-27, after merging the tester-signed OIDC-hardening,
-MCP-category-tool, and PDF-JSON-ICC-CMYK work-items):** `cargo fmt --check` and strict
-locked all-target workspace Clippy (`--workspace --all-targets --locked -- -D warnings`)
-are clean. With PDFium bound via `STIRLING_PDFIUM_LIBRARY_PATH` (as `task rust:test`
-does), `cargo test -p stirling-processing --locked` reports **1395 passed / 0 failed**
+**Latest validation (2026-07-27, after merging the tester-signed batch-2 work-items —
+background maintenance loops, MCP OAuth/JWT mode, OIDC browser callback UX, PDF-JSON
+fidelity slice 2):** `cargo fmt --check` and strict locked all-target workspace Clippy
+(`--workspace --all-targets --locked -- -D warnings`) are clean. With PDFium bound via
+`STIRLING_PDFIUM_LIBRARY_PATH` (as `task rust:test` does),
+`cargo test -p stirling-processing --locked` reports **1459 passed / 0 failed**
 (one pre-existing ignored test) across the library suite and all integration suites, and
 `cargo test -p stirling-ai-engine --locked` reports **147 passed / 0 failed** across
 all targets. Four previously-red areas are now green rather than excused: the
@@ -521,7 +522,13 @@ auto-rename/auto-split, plus:
   — so headless consumers (flatteners, rasterizers, printers) that ignore `NeedAppearances` still
   render the value. `Btn` (checkbox) widgets get a two-state `{on_state, Off}` `/AP/N` appearance
   dictionary matching `/AS`, with a plain `X` mark for the checked state (not a byte-match for
-  Java's own checkbox glyph). Non-widget annotation appearance streams remain `NeedAppearances`-only.
+  Java's own checkbox glyph). Non-widget annotation rebuilds now hoist nested `/AP` appearance
+streams (and any nested stream cos values) to indirect objects, so restored annotations carry
+their real appearances and the writer can never emit an illegal inline stream. Inline images
+additionally decode RunLengthDecode and ASCIIHexDecode, apply TIFF predictor 2 and LZW
+predictors, and accept DecodeParms arrays (CCITTFax/JBIG2/JPX inline data stay deferred; one
+recorded minor divergence: Real-valued decode parameters like `/Predictor 2.0` are treated as
+absent where PDFBox truncates to int).
 - **Advanced text editing parity** (`edit-text`): selected-page content-stream replacements are
   ported; every edited page receives a private clone of its indirect Form graph so shared source
   Forms cannot leak changes across page filters. Every repeated visual invocation on one selected
@@ -692,9 +699,14 @@ Spring's public-client-only PKCE. Durable cross-process login-flow state would b
 beyond-Java-parity, not a gap: Java keeps its OAuth2 authorization-request state in per-process
 in-memory HTTP sessions (no persistent session repository is configured), so the Rust in-memory
 single-use TTL store is equivalent; a SQLite-backed store remains an optional enhancement for
-multi-process deployment. The browser-facing callback UX (Java's success handler 302-redirects
-to the SPA with the token in the URL fragment and honors the redirect-path cookie; Rust still
-returns raw JSON) is genuine remaining backend work. The discovery document's own returned endpoint URLs
+multi-process deployment. The browser-facing callback UX is now ported: the callback
+302-redirects the browser to the SPA with the token in the URL fragment, reproducing Java's
+`CustomOAuth2AuthenticationSuccessHandler` origin-resolution precedence (first
+`X-Forwarded-Host` entry with proto/port rules, `Referer` with IdP-substring exclusion, `Host`
+normalization), the redirect-path cookie decode/trim/leading-slash semantics and clearing, and
+the failure-handler redirect targets; header-injection via the cookie is test-pinned
+impossible (one recorded cosmetic divergence: the clearing `Set-Cookie` is not byte-identical
+to Spring's `Expires` epoch spelling). The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,
@@ -712,6 +724,20 @@ XML-signature/canonicalization foundation exists; it needs a `libxmlsec1` native
 from-scratch C14N/XSW build, a decision left to the maintainers), desktop callbacks, device
 identities, ownership for additional durable proprietary resources, and independent security review
 remain.
+
+The runtime now runs Java's `@Scheduled` background maintenance as jittered tokio
+loops (`maintenance.rs`): audit-retention (daily, `retentionDays <= 0` retains
+indefinitely), job-result cleanup (10-min `TaskManager` cadence), mobile-scanner
+session sweep (5 min), storage cleanup-queue drain + expired share-link purge
+(daily, Java's 50-batch and 10-attempt abandonment), policy run-registry eviction,
+and a conservative startup temp sweep that touches only the runtime's own naming
+patterns. Ticks run via `spawn_blocking` with panic containment (a panicking tick
+is test-pinned to never kill its loop), periods accept
+`STIRLING_MAINTENANCE_<NAME>_SECONDS` overrides that ignore zero/garbage, and the
+existing lazy on-access cleanup paths are unchanged. This batch also fixed a real
+defect: `spawn_license_refresh` was fully implemented but had zero callers, so the
+production binary never re-verified licenses after startup — it is now wired from
+`main.rs` with a regression test.
 
 The standalone Rust runtime now performs bounded startup discovery for its optional
 command-line dependencies, including Java-compatible QPDF and WeasyPrint minimum
@@ -843,8 +869,13 @@ convert path has a nested tail). The scope framing previously recorded here was 
 corrected: Java's `McpApiKeyAuthFilter` statically grants both `mcp.tools.read`/
 `mcp.tools.write` to every valid API key — Java has no per-key scope store either — so
 sharing phase one's authorization boundary is exact parity in apikey mode, and granular
-scopes only become meaningful in the unported OAuth/JWT mode. OAuth/JWT metadata and
-production secured-mode cutover remain explicit later phases. See `contracts/mcp.md`.
+scopes only become meaningful in OAuth/JWT mode — which is now ported: RFC 9728
+protected-resource metadata, Java-format `WWW-Authenticate` challenges (tokenless vs rejected,
+CR/LF/quote-sanitized), bearer-JWT validation through the shared `OidcJwksCache` with the same
+alg-confusion pre-gate, RFC 8707 audience binding that fails closed when unconfigured
+(byte-matching `McpAudienceValidator`), username-claim account binding, and real per-scope
+tool gating (`mcp.tools.read`/`mcp.tools.write` enforced per call in OAuth mode only). Only
+production secured-mode cutover remains. See `contracts/mcp.md`.
 
 The same reviewed router now owns resource-grant administration and encrypted
 S3/MCP/API integration-config CRUD. Ownership, team-leader/default/grant rules,
