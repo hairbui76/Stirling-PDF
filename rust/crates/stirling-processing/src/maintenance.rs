@@ -338,4 +338,79 @@ mod tests {
         assert!(temp.path().join("stirling-pdf-json-dir.pdf").exists());
         Ok(())
     }
+
+    /// Adversarial guard: a symlink planted with the runtime's own naming
+    /// pattern must never cause the sweep to touch the file or directory it
+    /// points at, and reclaiming a genuine stale job directory must unlink any
+    /// symlink inside it rather than traverse into the target.
+    #[cfg(unix)]
+    #[test]
+    fn startup_sweep_never_follows_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let precious = tempdir()?;
+        fs::write(precious.path().join("victim.txt"), b"precious")?;
+        let job_root = temp
+            .path()
+            .join(crate::job_manager::JOB_ROOT_DIRECTORY_NAME);
+        fs::create_dir_all(&job_root)?;
+        // A "job directory" that is really a symlink to a foreign directory.
+        symlink(precious.path(), job_root.join("evil0123456789abcdef0123"))?;
+        // A "cache file" that is really a symlink to a foreign file.
+        symlink(
+            precious.path().join("victim.txt"),
+            temp.path().join("stirling-pdf-json-evil.pdf"),
+        )?;
+        // A genuine stale job directory that smuggles a symlink to a foreign
+        // directory among its contents.
+        let stale = job_root.join("stale0123456789abcdef012");
+        fs::create_dir_all(&stale)?;
+        symlink(precious.path(), stale.join("escape"))?;
+
+        let future = SystemTime::now() + STARTUP_TEMP_MAX_AGE + Duration::from_secs(60);
+        // Only the genuine stale directory is reclaimed; symlink entries are
+        // not even unlinked because they never match the metadata gates.
+        assert_eq!(
+            startup_temp_sweep(temp.path(), STARTUP_TEMP_MAX_AGE, future),
+            1
+        );
+        assert!(!stale.exists());
+        assert!(job_root.join("evil0123456789abcdef0123").exists());
+        assert!(temp.path().join("stirling-pdf-json-evil.pdf").exists());
+        assert_eq!(fs::read(precious.path().join("victim.txt"))?, b"precious");
+        Ok(())
+    }
+
+    /// Kill-the-loop guard: a tick that panics (or errors) must never stop the
+    /// spawned maintenance loop or take the process down with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_tick_never_kills_the_loop() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        super::spawn_maintenance_loop(super::MaintenanceLoop {
+            name: "panicky-test-loop",
+            schedule: MaintenanceSchedule {
+                initial_delay: Duration::ZERO,
+                period: Duration::from_millis(5),
+            },
+            tick: Arc::new(move || match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => panic!("first tick panics"),
+                1 => Err("second tick fails".to_owned()),
+                _ => Ok(1),
+            }),
+        });
+        for _ in 0..400 {
+            if ticks.load(Ordering::SeqCst) >= 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("maintenance loop stopped ticking after a panicking tick");
+    }
 }
