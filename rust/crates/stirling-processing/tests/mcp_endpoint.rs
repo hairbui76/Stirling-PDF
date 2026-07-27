@@ -1328,6 +1328,14 @@ async fn mcp_oauth_scopes_gate_tools_per_token_and_metadata_is_served()
         assert_eq!(document["bearer_methods_supported"], json!(["header"]));
     }
 
+    // Documented divergence: non-GET metadata requests are 405 via axum
+    // method routing (Java falls through to authenticated() and returns 401).
+    let response = app
+        .clone()
+        .oneshot(Request::post(METADATA_PATH).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
     jwks.stop().await?;
     Ok(())
 }

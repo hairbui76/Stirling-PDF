@@ -851,6 +851,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_alg_none_token_before_any_fetch() -> Result<(), Box<dyn std::error::Error>> {
+        // "alg":"none" cannot be minted through jsonwebtoken's encoder, so the
+        // compact form is assembled by hand (with a non-empty bogus signature
+        // so the rejection exercises the algorithm gate, not the shape check).
+        let header = URL_SAFE_NO_PAD.encode(format!(
+            "{{\"alg\":\"none\",\"typ\":\"JWT\",\"kid\":\"{KID}\"}}"
+        ));
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&valid_claims())?);
+        let signature = URL_SAFE_NO_PAD.encode(b"forged");
+        let token = format!("{header}.{claims}.{signature}");
+        let rejection = default_verifier()
+            .verify_with_fetch(&token, |_| Err(OidcIdTokenError::JwksUnavailable))
+            .err()
+            .ok_or("alg=none must be rejected")?;
+        assert_eq!(
+            rejection.reason,
+            "Bearer token is malformed or uses a disallowed algorithm"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn propagates_jwks_fetch_failures_as_unavailable() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
         let token = fixture.sign(&valid_claims())?;
