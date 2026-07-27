@@ -115,13 +115,20 @@ Java splits the PDF operations across four category tools keyed by `/api/v1/` na
 `stirling_misc` (`/misc/`), `stirling_security` (`/security/`). Rust mirrors this exactly.
 
 **Operation catalog.** Java discovers operations from its live Spring handler mappings
-(POST/PUT only). Rust has no reflective route registry, so it derives the same data from the
-generated `operation_catalog.json` in the AI engine crate (compiled in via `include_str!`);
-`task engine:tool-models` remains the only regeneration path. Op ids follow Java's
-`extractOpId` semantics: the id is the **flat** URL tail after the category prefix, and any
-tail containing `/` or `{` is skipped. Because every Java convert endpoint is nested (e.g.
-`/convert/pdf/word`), **the `stirling_convert` enum is genuinely empty in Java, and Rust
-reproduces that faithfully** — the tool exists, lists no operations, and reports "No
+(POST/PUT only). Rust has no reflective route registry, so it derives the same data from two
+generated files compiled in via `include_str!`: the AI engine crate's
+`operation_catalog.json` **plus** `mcp_operation_supplement.json` in the processing crate.
+The supplement exists because the AI catalog is a *curated* subset — its generator excludes
+a fixed list of paths for AI-engine reasons (cert-sign, get-info-on-pdf, verify-pdf,
+validate-signature, list-attachments, show-javascript, decompress-pdf, add-image,
+add-attachments, extract-bookmarks, overlay-pdfs, and the nested convert text-editor pair) —
+while Java's `McpToolCatalog` has **no** exclusion list. The supplement restores exactly the
+excluded *flat* paths, so the union matches Java's id set; both files come from the same
+`task engine:tool-models` run, which remains the only regeneration path. Op ids follow
+Java's `extractOpId` semantics: the id is the **flat** URL tail after the category prefix,
+and any tail containing `/` or `{` is skipped. Because every Java convert endpoint is nested
+(e.g. `/convert/pdf/word`), **the `stirling_convert` enum is genuinely empty in Java, and
+Rust reproduces that faithfully** — the tool exists, lists no operations, and reports "No
 operations are currently available in this category" when called. Summaries come from the
 catalog's request-model description when present, otherwise Java's prettified-id fallback
 (`rotate-pdf` → `rotate pdf`); Java itself prefers the `@Operation` annotation summary, which
@@ -143,10 +150,15 @@ tool's own addressing), then the endpoint-disable configuration exactly as Java 
 "Missing required argument 'operation' for `<tool>`"; an unknown, blocked, endpoint-disabled,
 or wrong-category id returns "Unknown or disabled operation '`<id>`' for `<tool>`"; both then
 list the category's available operations ("`- id - summary`" per line) or state that none are
-available. A valid call dispatches through the same input-resolution → in-process router
-oneshot → result-storage path as `stirling_operation`, with the endpoint reconstructed as
-`prefix + id` and the op id (not the path) naming the operation in result and error messages,
-matching Java's executor.
+available. The `operation` argument is read exactly as Java reads it (`JsonNode.asText()`
+with only a blank check): a padded id such as `" rotate-pdf "` is looked up **untrimmed**
+and fails the lookup, quoted verbatim in the error; `stirling_describe_operation` and
+`stirling_ai` share the same rule. A valid call dispatches through the same
+input-resolution → in-process router oneshot → result-storage path as `stirling_operation`,
+with the endpoint reconstructed as `prefix + id` and the op id (not the path) naming the
+operation in result and error messages, matching Java's executor — including the
+missing-input-file message and the fallback of naming a result file after the op id when the
+upstream response carries no filename.
 
 **Dispatch-time failures.** The catalog is generated from the Java OpenAPI document, so it
 can list an op whose route the Rust router does not implement. Such a call fails at dispatch

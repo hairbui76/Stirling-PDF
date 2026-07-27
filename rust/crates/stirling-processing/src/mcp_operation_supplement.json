@@ -1,0 +1,248 @@
+{
+  "/api/v1/general/extract-bookmarks": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "ExtractBookmarksParams",
+    "type": "object"
+  },
+  "/api/v1/general/overlay-pdfs": {
+    "additionalProperties": false,
+    "properties": {
+      "counts": {
+        "anyOf": [
+          {
+            "description": "An array of integers specifying the number of times each corresponding overlay file should be applied in the 'FixedRepeatOverlay' mode. This should match the length of the overlayFiles array.",
+            "items": {
+              "description": "An array of integers specifying the number of times each corresponding overlay file should be applied in the 'FixedRepeatOverlay' mode. This should match the length of the overlayFiles array.",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "overlayFiles": {
+        "description": "An array of PDF files to be used as overlays on the base PDF. The order in these files is applied based on the selected mode.",
+        "items": {
+          "format": "binary",
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "overlayMode": {
+        "description": "The mode of overlaying: 'SequentialOverlay' for sequential application, 'InterleavedOverlay' for round-robin application, 'FixedRepeatOverlay' for fixed repetition based on provided counts",
+        "enum": [
+          "SequentialOverlay",
+          "InterleavedOverlay",
+          "FixedRepeatOverlay"
+        ],
+        "type": "string"
+      },
+      "overlayPosition": {
+        "description": "Overlay position 0 is Foregound, 1 is Background",
+        "enum": [
+          0,
+          1
+        ],
+        "type": "integer"
+      }
+    },
+    "required": [
+      "overlayFiles",
+      "overlayMode",
+      "overlayPosition"
+    ],
+    "title": "OverlayPdfsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/add-attachments": {
+    "additionalProperties": false,
+    "properties": {
+      "attachments": {
+        "description": "The image file to be overlaid onto the PDF.",
+        "format": "binary",
+        "items": {
+          "format": "binary",
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "convertToPdfA3b": {
+        "default": false,
+        "description": "Convert the resulting PDF to PDF/A-3b format after adding attachments",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "attachments"
+    ],
+    "title": "AddAttachmentsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/add-image": {
+    "additionalProperties": false,
+    "properties": {
+      "everyPage": {
+        "default": false,
+        "description": "Whether to overlay the image onto every page of the PDF.",
+        "type": "boolean"
+      },
+      "x": {
+        "default": 0,
+        "description": "The x-coordinate at which to place the top-left corner of the image.",
+        "type": "number"
+      },
+      "y": {
+        "default": 0,
+        "description": "The y-coordinate at which to place the top-left corner of the image.",
+        "type": "number"
+      }
+    },
+    "title": "AddImageParams",
+    "type": "object"
+  },
+  "/api/v1/misc/decompress-pdf": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "DecompressPdfParams",
+    "type": "object"
+  },
+  "/api/v1/misc/list-attachments": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "ListAttachmentsParams",
+    "type": "object"
+  },
+  "/api/v1/misc/show-javascript": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "ShowJavascriptParams",
+    "type": "object"
+  },
+  "/api/v1/security/cert-sign": {
+    "additionalProperties": false,
+    "properties": {
+      "alias": {
+        "anyOf": [
+          {
+            "description": "The alias of the certificate to sign with. Required for WINDOWS_STORE and recommended for PKCS11 tokens holding multiple certificates.",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "certType": {
+        "description": "The type of the digital certificate. WINDOWS_STORE and PKCS11 are hardware-backed and only available in the desktop app.",
+        "enum": [
+          "PEM",
+          "PKCS12",
+          "PFX",
+          "JKS",
+          "SERVER",
+          "WINDOWS_STORE",
+          "PKCS11"
+        ],
+        "type": "string"
+      },
+      "location": {
+        "default": "SPDF",
+        "description": "The location where the PDF is signed",
+        "type": "string"
+      },
+      "name": {
+        "default": "SPDF",
+        "description": "The name of the signer",
+        "type": "string"
+      },
+      "pageNumber": {
+        "default": 1,
+        "description": "The page number where the signature should be visible. This is required if showSignature is set to true",
+        "type": "integer"
+      },
+      "password": {
+        "anyOf": [
+          {
+            "description": "The password for the keystore / private key, or the token PIN for PKCS11",
+            "format": "password",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "pkcs11LibraryPath": {
+        "anyOf": [
+          {
+            "description": "Absolute path to the PKCS#11 driver library (required for PKCS11 type). Must be an allowed driver - a detected one or configured via STIRLING_PKCS11_LIBRARIES.",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "pkcs11Slot": {
+        "anyOf": [
+          {
+            "description": "Optional PKCS#11 slot index. When omitted the first slot with a token is used.",
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      },
+      "reason": {
+        "default": "Signed by SPDF",
+        "description": "The reason for signing the PDF",
+        "type": "string"
+      },
+      "showLogo": {
+        "default": true,
+        "description": "Whether to visually show a signature logo along with the signature",
+        "type": "boolean"
+      },
+      "showSignature": {
+        "default": false,
+        "description": "Whether to visually show the signature in the PDF file",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "certType"
+    ],
+    "title": "CertSignParams",
+    "type": "object"
+  },
+  "/api/v1/security/get-info-on-pdf": {
+    "additionalProperties": false,
+    "description": "Either upload a file or provide a server-side file ID",
+    "properties": {},
+    "title": "GetInfoOnPdfParams",
+    "type": "object"
+  },
+  "/api/v1/security/validate-signature": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "ValidateSignatureParams",
+    "type": "object"
+  },
+  "/api/v1/security/verify-pdf": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "VerifyPdfParams",
+    "type": "object"
+  }
+}
