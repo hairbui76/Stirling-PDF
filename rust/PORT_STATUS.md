@@ -52,10 +52,14 @@ the packet through xmpbox while Rust returns it verbatim (equivalent content, un
 per-run timestamps). The registry does not blind the gate: a pinned value that drifts, or any unregistered
 field, still fails; a declared difference that disappears is reported STALE.
 
-**Route-count scoping note:** the Rust service registers 321 HTTP routes total
-(production registrations; an earlier 313 figure was an undercount that dropped
-the routes declared after inner `#[cfg(test)]` attributes in
-`server_certificate.rs` and `classification.rs`).
+**Route-count scoping note:** the Rust service registers approximately 321 HTTP
+routes as of 2026-07-26 (production registrations; an earlier 313 figure was an
+undercount that dropped the routes declared after inner `#[cfg(test)]` attributes
+in `server_certificate.rs` and `classification.rs`). This figure is a hand count,
+not test-pinned — no route-census test asserts it, and a fixed total is
+deliberately deferred to the versioned baseline-to-Rust manifest (see `README.md`)
+so nested secured routers and conditional endpoints are counted by method and
+path rather than inferred from source literals.
 Only a subset of those are directly comparable to Java's OSS `controller/api`
 PDF-operation surface (~140 endpoint mappings, several of which are the
 project's composed `@AutoJobPostMapping` annotation rather than the four plain
@@ -69,14 +73,19 @@ raw total as the denominator would understate actual coverage.
 
 ## Ported compatibility endpoints
 
-Most ported surfaces have a `contracts/<name>.md` compatibility document, and all
-have focused unit/integration coverage. Known contract-doc gaps (implemented and
-tested, but no contract file yet): durable storage (`storage_http.rs`, 16 routes),
-collaborative signing beyond the single route `cert-sign.md` covers
-(`workflow_signing_http.rs`, 19 routes), `admin/settings` delta/section/key (5),
-`admin/server-certificate` (6), `admin/job/*` (3), `policies/classify/meter` (1),
-and the `security_http` account/team/invite/MFA-admin routes that
-`account-lifecycle.md` does not enumerate. Coverage spans merge/split/rearrange/remove/rotate,
+Every ported surface now has a `contracts/<name>.md` compatibility document, and
+all have focused unit/integration coverage. The previously listed contract-doc
+gaps are closed: `contracts/durable-storage.md` (`storage_http.rs`),
+`contracts/workflow-signing.md` (`workflow_signing_http.rs`, beyond the single
+route `cert-sign.md` covers), `contracts/admin-settings.md` (settings
+delta/section/key plus `admin/server-certificate`), `contracts/admin-jobs.md`
+(`admin/job/*`), `contracts/classification-meter.md` (`policies/classify/meter`),
+and `contracts/account-admin-routes.md` (the `security_http`
+account/team/invite/user-admin/credential-change/API-key routes that
+`account-lifecycle.md` deliberately does not enumerate — it covers register,
+inviteUsers, settings/initial-setup, OIDC, and MFA recovery codes). Each route in
+those docs was verified against the Rust registrations and the Java counterpart
+controllers, with the residual divergences recorded in the docs themselves. Coverage spans merge/split/rearrange/remove/rotate,
 crop/scale/layout/booklet/poster, page numbers/stamp/watermark/comments/AI comments/attachments,
 metadata/info/analysis/filters, forms (inspect/fill/modify/delete/export), password/
 sanitize/flatten/repair/decompress, image↔PDF, PDF→image/text/vector/comic-book,
@@ -469,8 +478,14 @@ auto-rename/auto-split, plus:
   the represented text or represented-image draws whose element list was actually resubmitted, and
   leaves the other content type's preserved draws/resources untouched — since the page model's
   `textElements`/`imageElements` are plain lists rather than optional, an empty list is read as "not
-  resubmitted," not "delete everything of this type," so a client cannot yet clear just one content
+  resubmitted," not "delete everything of this type," so a client cannot clear just one content
   type on a mixed page through this endpoint (the lazy/partial endpoint already supports that). This
+  is verified PARITY, not a Rust gap: Java behaves identically — `PdfJsonPage` defaults both lists to
+  empty (`@Builder.Default`), `convertJsonToPdf` null-coalesces absent/null/empty to the same state
+  (`PdfJsonConversionService.java:692-707`), with preserved streams an empty list never strips that
+  content type (`:731-772`), and `extractVectorGraphics` strips only image draws whose `objectName`
+  is in the submitted list (`:3163-3172` — empty strips nothing). Clearing one content type on a
+  mixed page would need a shared nullable-list schema decision across Java, Rust, and the frontend. This
   mixed-edit regeneration is now the fallback: for a text-only mixed edit (non-empty `textElements`, no
   image edits) on a simple `Type1`/`TrueType`/`MMType1` font, the full-document rebuild first attempts
   Java's token-preserving in-place `Tj`/`TJ` rewrite (`rewrite_text_operators`, porting
