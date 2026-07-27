@@ -14307,6 +14307,42 @@ mod tests {
         Ok(())
     }
 
+    // (e) The exact-match bucket selection cannot be sidestepped by a
+    // percent-encoded spelling: axum routes on the RAW (undecoded) path — the
+    // same string `rate_limit_bucket` compares — so `%61uthorize` neither
+    // borrows the dedicated bucket nor reaches the authorize handler on the
+    // looser generic auth budget. This pins the raw-path-matching assumption
+    // the exact-match design rests on.
+    #[tokio::test]
+    async fn a_percent_encoded_authorize_spelling_cannot_reach_the_handler_on_the_auth_bucket()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use axum::http::StatusCode;
+        use tower::ServiceExt as _;
+
+        let app = oidc_rate_limit_app();
+        // Well past the dedicated bucket's burst of 3: every request is
+        // admitted by the roomier auth bucket (proving it is NOT metered
+        // against the dedicated bucket) yet none routes to the handler.
+        for _ in 0..4 {
+            let request = build_request(Method::POST, "/api/v1/auth/oidc/%61uthorize")?;
+            let status = app.clone().oneshot(request).await?.status();
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "an encoded spelling must not route to the authorize handler"
+            );
+        }
+        // The dedicated bucket is untouched: the exact spelling still has its
+        // full burst of 3 available.
+        let (ok, limited) = flood(&app, "/api/v1/auth/oidc/authorize", 3).await?;
+        assert_eq!(
+            (ok, limited),
+            (3, 0),
+            "the encoded flood must not have consumed the dedicated budget"
+        );
+        Ok(())
+    }
+
     // FINDING #2 (DoS): a request that outruns the overall timeout is aborted
     // with 408, while a prompt request under the same wiring still succeeds.
     #[tokio::test]
