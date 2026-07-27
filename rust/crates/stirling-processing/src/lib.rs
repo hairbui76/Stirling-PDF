@@ -1550,6 +1550,9 @@ impl ProcessingRuntime {
         });
         let mcp_config = runtime_config.mcp_config();
         let mcp_engine_settings = AiCommentEngineSettings::from_runtime_config(&runtime_config);
+        // Cloned before `runtime_config` moves into `with_runtime_config`: the
+        // MCP category tools re-evaluate endpoint-enabled state per request.
+        let mcp_runtime_config = Arc::new(runtime_config.clone());
         let security_http_config =
             reviewed_security_http_config(&runtime_config, initialized_license.verification)?;
         let admin_settings = Arc::new(admin_settings::AdminSettingsService::new(
@@ -1693,6 +1696,7 @@ impl ProcessingRuntime {
             &mcp_engine_settings,
             Arc::clone(&runtime.job_manager),
             runtime.pipeline_dispatcher.router(),
+            mcp_runtime_config,
         ))
         .merge(
             workflow_signing_http::participant_routes(max_upload_bytes)

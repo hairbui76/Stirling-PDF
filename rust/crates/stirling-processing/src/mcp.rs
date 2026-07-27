@@ -1,21 +1,24 @@
 //! API-key-authenticated MCP JSON-RPC boundary.
 //!
 //! Alongside the Rust AI-engine catalog (`stirling_describe_operation`,
-//! `stirling_ai`), this now owns reusable file artifacts (`stirling_upload`,
-//! `stirling_download`) and direct dispatch of a real Stirling processing
-//! operation (`stirling_operation`), reusing the existing owner-scoped
+//! `stirling_ai`), this owns reusable file artifacts (`stirling_upload`,
+//! `stirling_download`), Java's per-category PDF tools (`stirling_pages`,
+//! `stirling_convert`, `stirling_misc`, `stirling_security`), and direct
+//! dispatch of a real Stirling processing operation (`stirling_operation`, a
+//! Rust-only extension Java does not have), reusing the existing owner-scoped
 //! [`crate::job_manager::JobManager`] for storage and the same in-process
-//! router dispatch [`crate::pipeline`] uses to run a pipeline step. Per-caller
-//! granular scopes (Java's `mcp.tools.read`/`mcp.tools.write`) are not ported:
-//! there is no Rust API-key scope store yet, so these tools share the same
-//! authorization boundary as the existing two (a valid API key plus the
-//! operation allowlist), not a regression versus what was already shipped.
+//! router dispatch [`crate::pipeline`] uses to run a pipeline step.
+//! Authorization matches Java's apikey mode exactly: `McpApiKeyAuthFilter`
+//! statically grants every valid API key BOTH `mcp.tools.read` and
+//! `mcp.tools.write`, so a valid key plus the operation allow/block lists is
+//! full Java parity. Granular per-caller scopes exist only in Java's OAuth/JWT
+//! mode (token claims), which remains a documented later phase.
 
 use std::{
     collections::BTreeMap,
     io::Read as _,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -40,7 +43,7 @@ use crate::{
     job_manager::{JobManager, JobOwner},
     pdf_ai_comments::AiCommentEngineSettings,
     pipeline::{PipelineFile, PipelineOperation, SupportingFiles},
-    runtime_config::McpConfig,
+    runtime_config::{McpConfig, RuntimeConfig},
     runtime_metrics::application_version,
     security::{AuthContext, SecurityError, SecurityStore},
 };
@@ -60,6 +63,112 @@ const MAX_SCOPE_BYTES: usize = 128;
 const MAX_ROUTE_BYTES: usize = 512;
 const MAX_SCHEMA_BYTES: usize = 128 * 1024;
 
+/// The generated per-operation parameter schemas, single-sourced from the AI
+/// engine's catalog file so `task engine:tool-models` stays the only
+/// regeneration path. `include_str!` resolves relative to this source file.
+const OPERATION_CATALOG_JSON: &str =
+    include_str!("../../stirling-ai-engine/src/operation_catalog.json");
+
+/// Java's `OperationCategory`: maps an `/api/v1/` namespace to a category
+/// tool. The AI category is handled separately by `stirling_ai`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PdfCategory {
+    Convert,
+    Pages,
+    Misc,
+    Security,
+}
+
+impl PdfCategory {
+    const ALL: [Self; 4] = [Self::Convert, Self::Pages, Self::Misc, Self::Security];
+
+    fn url_prefix(self) -> &'static str {
+        match self {
+            Self::Convert => "/api/v1/convert/",
+            Self::Pages => "/api/v1/general/",
+            Self::Misc => "/api/v1/misc/",
+            Self::Security => "/api/v1/security/",
+        }
+    }
+
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::Convert => "stirling_convert",
+            Self::Pages => "stirling_pages",
+            Self::Misc => "stirling_misc",
+            Self::Security => "stirling_security",
+        }
+    }
+
+    /// Tool descriptions, verbatim from Java's category tool classes.
+    fn tool_description(self) -> &'static str {
+        match self {
+            Self::Convert => {
+                "Convert files between PDF and other formats (PDF<->Word, PDF<->image, HTML->PDF, etc.). Inspect the `operation` enum, then call stirling_describe_operation with the chosen op to get its parameters JSON Schema before calling this tool."
+            }
+            Self::Pages => {
+                "Manipulate PDF pages: merge, split, rotate, rearrange, crop, delete, overlay, add blank pages. Call stirling_describe_operation with the chosen op to get its parameters schema before invoking this tool."
+            }
+            Self::Misc => {
+                "Miscellaneous PDF operations: compress, OCR, stamp / watermark, edit metadata, flatten, repair, and similar utilities. Call stirling_describe_operation with the chosen op to get its parameters schema before invoking this tool."
+            }
+            Self::Security => {
+                "Security-related PDF operations: password add/remove, redact, sanitize, certify / sign with cert, validate signature, add watermark. Call stirling_describe_operation with the chosen op to get its parameters schema before invoking this tool."
+            }
+        }
+    }
+}
+
+/// One MCP-exposable PDF operation derived from the generated catalog, the
+/// Rust analogue of Java's `OperationMeta` for `JAVA_ENDPOINT` targets.
+#[derive(Debug)]
+struct PdfOperation {
+    id: String,
+    category: PdfCategory,
+    endpoint_path: String,
+    summary: String,
+    parameters_schema: Value,
+}
+
+/// PDF operations keyed by id, derived once from the compiled-in catalog with
+/// Java's `extractOpId` semantics: the op id is the flat URL tail only, so
+/// nested or parametrised tails are skipped. Every Java convert endpoint is
+/// nested (`/convert/pdf/word`), so - exactly as in Java - the
+/// `stirling_convert` enum is genuinely empty. Java's `putIfAbsent`
+/// (first-handler-wins) duplicate rule maps to first-wins in catalog path
+/// order; catalog ids are currently unique so it never triggers.
+static PDF_OPERATIONS: LazyLock<BTreeMap<String, PdfOperation>> = LazyLock::new(|| {
+    let Ok(catalog) = serde_json::from_str::<BTreeMap<String, Value>>(OPERATION_CATALOG_JSON)
+    else {
+        return BTreeMap::new();
+    };
+    let mut operations = BTreeMap::new();
+    for (path, schema) in catalog {
+        let Some((category, id)) = PdfCategory::ALL.iter().find_map(|category| {
+            let tail = path.strip_prefix(category.url_prefix())?;
+            (!tail.trim().is_empty() && !tail.contains('/') && !tail.contains('{'))
+                .then(|| (*category, tail.to_owned()))
+        }) else {
+            continue;
+        };
+        // Java prefers the `@Operation` summary; the generated catalog does
+        // not carry it, so use the request-model description when present and
+        // fall back to Java's prettified id otherwise.
+        let summary = schema
+            .get("description")
+            .and_then(Value::as_str)
+            .map_or_else(|| id.replace('-', " "), str::to_owned);
+        operations.entry(id.clone()).or_insert(PdfOperation {
+            id,
+            category,
+            endpoint_path: path,
+            summary,
+            parameters_schema: schema,
+        });
+    }
+    operations
+});
+
 #[derive(Clone)]
 struct McpState {
     config: McpConfig,
@@ -67,6 +176,7 @@ struct McpState {
     catalog: Arc<AiCapabilityCatalog>,
     job_manager: Arc<JobManager>,
     dispatch_router: Router,
+    runtime_config: Arc<RuntimeConfig>,
 }
 
 #[derive(Clone)]
@@ -192,6 +302,7 @@ pub(crate) fn routes(
     engine_settings: &AiCommentEngineSettings,
     job_manager: Arc<JobManager>,
     dispatch_router: Router,
+    runtime_config: Arc<RuntimeConfig>,
 ) -> Router {
     if !config.enabled || !config.auth.mode.trim().eq_ignore_ascii_case("apikey") {
         return Router::new();
@@ -206,6 +317,7 @@ pub(crate) fn routes(
         catalog,
         job_manager,
         dispatch_router,
+        runtime_config,
     });
     Router::new()
         .route(MCP_PATH, post(handle))
@@ -281,7 +393,7 @@ async fn dispatch(state: &McpState, context: &AuthContext, request: &RpcRequest)
         ),
         "tools/list" => {
             let operations = visible_operations(state).await;
-            rpc_success(request.id.clone(), tools_list_result(&operations))
+            rpc_success(request.id.clone(), tools_list_result(state, &operations))
         }
         "tools/call" => handle_tools_call(state, context, request).await,
         "ping" | "notifications/initialized" => {
@@ -325,16 +437,119 @@ async fn handle_tools_call(state: &McpState, context: &AuthContext, request: &Rp
         .unwrap_or_else(|| Value::Object(Map::new()));
     let operations = visible_operations(state).await;
     let result = match name {
-        "stirling_describe_operation" => describe_operation(&arguments, &operations),
+        "stirling_describe_operation" => describe_operation(state, &arguments, &operations),
         "stirling_ai" => call_ai(state, context, &arguments, &operations).await,
         "stirling_upload" => upload_file(state, context, &arguments).await,
         "stirling_download" => download_file(state, context, &arguments).await,
+        "stirling_pages" => call_category(state, context, PdfCategory::Pages, &arguments).await,
+        "stirling_convert" => call_category(state, context, PdfCategory::Convert, &arguments).await,
+        "stirling_misc" => call_category(state, context, PdfCategory::Misc, &arguments).await,
+        "stirling_security" => {
+            call_category(state, context, PdfCategory::Security, &arguments).await
+        }
         "stirling_operation" => run_operation(state, context, &arguments).await,
         _ => {
             return rpc_failure(request.id.clone(), -32602, &format!("Unknown tool: {name}"));
         }
     };
     rpc_success(request.id.clone(), result)
+}
+
+/// The category's operations as currently visible: allow/block-list filtered
+/// (by op id, matching Java) and endpoint-enabled filtered the way Java uses
+/// `EndpointConfiguration.isEndpointEnabledForUri`; sorted by id.
+fn enabled_pdf_operations(state: &McpState, category: PdfCategory) -> Vec<&'static PdfOperation> {
+    PDF_OPERATIONS
+        .values()
+        .filter(|operation| operation.category == category)
+        .filter(|operation| operation_allowed(&state.config, &operation.id))
+        .filter(|operation| {
+            state
+                .runtime_config
+                .is_endpoint_enabled_for_uri(&operation.endpoint_path)
+        })
+        .collect()
+}
+
+/// Java `McpToolCatalog.findByOperationId` for the PDF slice: a blocked or
+/// endpoint-disabled PDF operation is `Hidden`, never absent - it must not
+/// fall through to a same-id AI capability.
+enum PdfLookup {
+    Enabled(&'static PdfOperation),
+    Hidden,
+    Unknown,
+}
+
+fn find_pdf_operation(state: &McpState, id: &str) -> PdfLookup {
+    let Some(operation) = PDF_OPERATIONS.get(id) else {
+        return PdfLookup::Unknown;
+    };
+    if operation_allowed(&state.config, id)
+        && state
+            .runtime_config
+            .is_endpoint_enabled_for_uri(&operation.endpoint_path)
+    {
+        PdfLookup::Enabled(operation)
+    } else {
+        PdfLookup::Hidden
+    }
+}
+
+/// Runs one category tool call with Java `AbstractCategoryTool.call` semantics:
+/// a missing, unknown, wrong-category, blocked, or endpoint-disabled operation
+/// returns the category's operation-list error. Every PDF operation requires
+/// `mcp.tools.write`, which Java's apikey filter statically grants to every
+/// valid key, so no per-call scope check is needed in apikey mode.
+async fn call_category(
+    state: &McpState,
+    context: &AuthContext,
+    category: PdfCategory,
+    arguments: &Value,
+) -> Value {
+    let Some(operation_id) = text_argument(arguments, "operation") else {
+        return operation_list_error(state, category, None);
+    };
+    let operation = match find_pdf_operation(state, operation_id) {
+        PdfLookup::Enabled(operation) if operation.category == category => operation,
+        _ => return operation_list_error(state, category, Some(operation_id)),
+    };
+    dispatch_operation(
+        state,
+        context,
+        arguments,
+        &operation.endpoint_path,
+        &operation.id,
+    )
+    .await
+}
+
+/// Java `AbstractCategoryTool.operationListError`: the error for a missing or
+/// unknown operation, listing this category's available ids and summaries.
+fn operation_list_error(state: &McpState, category: PdfCategory, bad_op_id: Option<&str>) -> Value {
+    let mut message = match bad_op_id {
+        None => format!(
+            "Missing required argument 'operation' for {}",
+            category.tool_name()
+        ),
+        Some(bad_op_id) => format!(
+            "Unknown or disabled operation '{bad_op_id}' for {}",
+            category.tool_name()
+        ),
+    };
+    let operations = enabled_pdf_operations(state, category);
+    if operations.is_empty() {
+        message.push_str(". No operations are currently available in this category.");
+    } else {
+        message.push_str(". Available operations:");
+        for operation in &operations {
+            message.push_str("\n- ");
+            message.push_str(&operation.id);
+            message.push_str(" - ");
+            message.push_str(&operation.summary);
+        }
+        message.push_str("\nRe-call this tool with a valid 'operation'.");
+    }
+    tool_error(&message)
 }
 
 async fn visible_operations(state: &McpState) -> BTreeMap<String, AiCapability> {
@@ -362,35 +577,87 @@ fn operation_allowed(config: &McpConfig, id: &str) -> bool {
             .any(|allowed| allowed == id)
 }
 
-fn tools_list_result(operations: &BTreeMap<String, AiCapability>) -> Value {
+fn tools_list_result(state: &McpState, operations: &BTreeMap<String, AiCapability>) -> Value {
+    let mut tools = vec![
+        json!({
+            "name": "stirling_describe_operation",
+            "description": "Return the full JSON Schema for one Stirling operation's parameters. Call this before invoking a category tool to learn the exact shape of `parameters`. Argument: { operation: <op-id> } where <op-id> appears in the enum of any category tool (stirling_convert, _pages, _misc, _security, _ai).",
+            "inputSchema": describe_schema(),
+        }),
+        json!({
+            "name": "stirling_ai",
+            "description": "Invoke a Stirling AI agent capability. Call stirling_describe_operation with the chosen capability id before invoking this tool.",
+            "inputSchema": ai_tool_schema(operations),
+        }),
+        json!({
+            "name": "stirling_upload",
+            "description": "Store a file server-side and get back a fileId to reuse across operations. Recommended only for large files or multi-step workflows; for a single operation on a typical file, pass the file inline via the operation's `file` argument instead. Argument: { file: <base64>, fileName?: <name> }.",
+            "inputSchema": upload_tool_schema(),
+        }),
+        json!({
+            "name": "stirling_download",
+            "description": "Fetch a stored file's content by fileId (e.g. an operation result), returned inline as base64. Recommended only when a result was too large to be returned inline. Argument: { fileId: <id> }.",
+            "inputSchema": download_tool_schema(),
+        }),
+    ];
+    for category in PdfCategory::ALL {
+        tools.push(json!({
+            "name": category.tool_name(),
+            "description": category.tool_description(),
+            "inputSchema": category_tool_schema(state, category),
+        }));
+    }
+    // Rust-only extension: Java has no path-addressed dispatch tool.
+    tools.push(json!({
+        "name": "stirling_operation",
+        "description": "Run a real Stirling PDF processing operation (e.g. split, merge, compress, convert) by its API path, not an AI capability. Pass the input file inline as base64 via `file`, or a `fileId` from stirling_upload or a prior operation's result.",
+        "inputSchema": operation_tool_schema(),
+    }));
+    json!({ "tools": tools })
+}
+
+/// Java `AbstractCategoryTool.inputSchema`, shape-for-shape: `operation`
+/// (enum with an id-and-summary description), free-form `parameters`, and the
+/// `file`/`fileName`/`fileId` input trio; only `operation` is required.
+fn category_tool_schema(state: &McpState, category: PdfCategory) -> Value {
+    let operations = enabled_pdf_operations(state, category);
+    let ids = operations
+        .iter()
+        .map(|operation| Value::String(operation.id.clone()))
+        .collect::<Vec<_>>();
+    let mut description = String::from(
+        "Operation id from this category. Call stirling_describe_operation first to learn the exact parameters schema. Available operations:",
+    );
+    for operation in &operations {
+        description.push_str("\n- ");
+        description.push_str(&operation.id);
+        description.push_str(" - ");
+        description.push_str(&operation.summary);
+    }
     json!({
-        "tools": [
-            {
-                "name": "stirling_describe_operation",
-                "description": "Return the full JSON Schema for one Stirling operation's parameters. Call this before invoking stirling_ai to learn the exact shape of `parameters`.",
-                "inputSchema": describe_schema(),
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "operation": {"type": "string", "enum": ids, "description": description},
+            "parameters": {
+                "type": "object",
+                "description": "Per-operation parameters. Schema available via stirling_describe_operation.",
+                "additionalProperties": true,
             },
-            {
-                "name": "stirling_ai",
-                "description": "Invoke a Stirling AI agent capability. Call stirling_describe_operation with the chosen capability id before invoking this tool.",
-                "inputSchema": ai_tool_schema(operations),
+            "file": {
+                "type": "string",
+                "description": "Base64-encoded file content to process. The recommended way to provide a file for most uses. Bounded by the MCP request size limit; for very large files use 'fileId' instead.",
             },
-            {
-                "name": "stirling_upload",
-                "description": "Store a file server-side and get back a fileId to reuse across operations. Recommended only for large files or multi-step workflows; for a single operation on a typical file, pass the file inline via stirling_operation's `file` argument instead.",
-                "inputSchema": upload_tool_schema(),
+            "fileName": {
+                "type": "string",
+                "description": "Optional original filename (with extension) for the input; helps operations that key off file type.",
             },
-            {
-                "name": "stirling_download",
-                "description": "Fetch a stored file's content by fileId (e.g. an operation result), returned inline as base64. Recommended only when a result was too large to be returned inline.",
-                "inputSchema": download_tool_schema(),
+            "fileId": {
+                "type": "string",
+                "description": "Reference to a file already stored via stirling_upload. Recommended only for large files or multi-step workflows; most users should pass the file inline via 'file' instead.",
             },
-            {
-                "name": "stirling_operation",
-                "description": "Run a real Stirling PDF processing operation (e.g. split, merge, compress, convert) by its API path, not an AI capability. Pass the input file inline as base64 via `file`, or a `fileId` from stirling_upload or a prior operation's result.",
-                "inputSchema": operation_tool_schema(),
-            }
-        ]
+        },
+        "required": ["operation"],
     })
 }
 
@@ -448,7 +715,7 @@ fn describe_schema() -> Value {
         "properties": {
             "operation": {
                 "type": "string",
-                "description": "AI capability id from the stirling_ai operation enum."
+                "description": "Operation id (e.g. compress-pdf, pdf-to-word, q-and-a). See category tool enums."
             }
         },
         "required": ["operation"]
@@ -484,10 +751,36 @@ fn ai_tool_schema(operations: &BTreeMap<String, AiCapability>) -> Value {
     })
 }
 
-fn describe_operation(arguments: &Value, operations: &BTreeMap<String, AiCapability>) -> Value {
+/// Describes one operation, PDF operations first (matching Java's catalog
+/// lookup order): a blocked or endpoint-disabled PDF operation reports
+/// "unknown or disabled" and never falls through to a same-id AI capability.
+fn describe_operation(
+    state: &McpState,
+    arguments: &Value,
+    operations: &BTreeMap<String, AiCapability>,
+) -> Value {
     let Some(operation_id) = text_argument(arguments, "operation") else {
         return tool_error("Missing required argument: operation");
     };
+    match find_pdf_operation(state, operation_id) {
+        PdfLookup::Enabled(operation) => {
+            return tool_text(
+                &json!({
+                    "operation": operation.id,
+                    "category": operation.category.tool_name(),
+                    "summary": operation.summary,
+                    "endpoint": operation.endpoint_path,
+                    "requiredScope": WRITE_SCOPE,
+                    "parametersSchema": operation.parameters_schema,
+                })
+                .to_string(),
+            );
+        }
+        PdfLookup::Hidden => {
+            return tool_error(&format!("Unknown or disabled operation: {operation_id}"));
+        }
+        PdfLookup::Unknown => {}
+    }
     let Some(operation) = operations.get(operation_id) else {
         return tool_error(&format!("Unknown or disabled operation: {operation_id}"));
     };
@@ -635,7 +928,8 @@ async fn download_file(state: &McpState, context: &AuthContext, arguments: &Valu
 /// Dispatches a real Stirling processing operation (identified by its own API
 /// path, e.g. `/api/v1/general/split-pages`) in-process through the same
 /// router `pipeline` uses to run a step, with an input resolved from an
-/// uploaded `fileId` or inline base64.
+/// uploaded `fileId` or inline base64. This tool is a Rust-only extension:
+/// Java addresses PDF operations exclusively through the category tools.
 async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Value) -> Value {
     let Some(operation) = text_argument(arguments, "operation") else {
         return tool_error(
@@ -649,6 +943,22 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
             "Operation '{operation}' is not permitted for MCP dispatch."
         ));
     }
+    dispatch_operation(state, context, arguments, operation, operation).await
+}
+
+/// The shared dispatch path behind the category tools and `stirling_operation`:
+/// resolves the input (`fileId` or inline base64), builds the internal request,
+/// runs it through the in-process router, and stores or inlines the result.
+/// `label` names the operation in caller-facing messages - the op id for a
+/// category tool (matching Java's executor), the full API path for
+/// `stirling_operation`.
+async fn dispatch_operation(
+    state: &McpState,
+    context: &AuthContext,
+    arguments: &Value,
+    endpoint_path: &str,
+    label: &str,
+) -> Value {
     let owner = JobOwner::from_auth_context(Some(context));
     let Some((input_path, input_filename, _scratch)) =
         resolve_operation_input(state, owner, arguments).await
@@ -669,7 +979,7 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
         .map(|map| map.into_iter().collect::<BTreeMap<_, _>>())
         .unwrap_or_default();
     let pipeline_operation = PipelineOperation {
-        operation: operation.to_owned(),
+        operation: endpoint_path.to_owned(),
         parameters,
         file_parameters: BTreeMap::new(),
     };
@@ -687,7 +997,7 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
     .await
     else {
         return tool_error(&format!(
-            "{operation} failed: could not build the internal request."
+            "{label} failed: could not build the internal request."
         ));
     };
     request.extensions_mut().insert(context.clone());
@@ -708,9 +1018,9 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
 
     if !status.is_success() {
         let message = crate::pipeline::response_error_message(response).await;
-        warn!(operation, %status, "MCP operation dispatch failed");
+        warn!(operation = label, %status, "MCP operation dispatch failed");
         return tool_error(&format!(
-            "{operation} failed: HTTP {status}. {}",
+            "{label} failed: HTTP {status}. {}",
             truncate_message(&message, 300)
         ));
     }
@@ -719,13 +1029,13 @@ async fn run_operation(state: &McpState, context: &AuthContext, arguments: &Valu
         let limit = usize::try_from(MAX_ENGINE_RESULT_BYTES).unwrap_or(usize::MAX);
         let Ok(body) = to_bytes(response.into_body(), limit).await else {
             return tool_error(&format!(
-                "{operation} returned a response that was too large or unreadable."
+                "{label} returned a response that was too large or unreadable."
             ));
         };
         return tool_text(&String::from_utf8_lossy(&body));
     }
 
-    store_operation_result(state, owner, operation, &content_type, headers, response).await
+    store_operation_result(state, owner, label, &content_type, headers, response).await
 }
 
 /// Resolves `stirling_operation`'s input file, either from an owner-scoped
@@ -1165,16 +1475,24 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 mod tests {
     use super::{
         AiCapability, AiCapabilityCatalog, EngineConnection, EngineError, MAX_CAPABILITIES,
-        extract_api_key, is_safe_relative_route, operation_allowed, parse_manifest,
+        McpState, PDF_OPERATIONS, PdfCategory, call_category, category_tool_schema,
+        extract_api_key, is_safe_relative_route, operation_allowed, operation_list_error,
+        parse_manifest,
     };
-    use crate::runtime_config::{McpAuthConfig, McpConfig};
+    use crate::{
+        job_manager::JobManager,
+        runtime_config::{McpAuthConfig, McpConfig, RuntimeConfig},
+        security::{AuthContext, AuthenticationSource, SecurityStore},
+    };
     use axum::http::{HeaderMap, HeaderValue, header};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         io::{self, Read, Write},
         net::TcpListener,
-        sync::mpsc,
+        path::Path,
+        sync::{Arc, mpsc},
         thread,
         time::Duration,
     };
@@ -1363,6 +1681,230 @@ mod tests {
                 .unwrap_or(false)
         );
         Ok(())
+    }
+
+    #[test]
+    fn pdf_operation_catalog_matches_java_extract_op_id_semantics() {
+        assert!(!PDF_OPERATIONS.is_empty());
+        // Op ids are flat URL tails only: nested and parametrised tails are
+        // skipped, exactly like Java's extractOpId.
+        assert!(
+            PDF_OPERATIONS
+                .values()
+                .all(|operation| !operation.id.contains('/') && !operation.id.contains('{'))
+        );
+        // Every convert endpoint is nested, so the convert category is empty.
+        assert!(
+            !PDF_OPERATIONS
+                .values()
+                .any(|operation| operation.category == PdfCategory::Convert)
+        );
+        let rotate = PDF_OPERATIONS.get("rotate-pdf");
+        assert_eq!(
+            rotate.map(|operation| operation.category),
+            Some(PdfCategory::Pages)
+        );
+        assert_eq!(
+            rotate.map(|operation| operation.endpoint_path.as_str()),
+            Some("/api/v1/general/rotate-pdf")
+        );
+        // No model description in the catalog: Java's prettified-id fallback.
+        assert_eq!(
+            rotate.map(|operation| operation.summary.as_str()),
+            Some("rotate pdf")
+        );
+        assert_eq!(
+            PDF_OPERATIONS.get("compress-pdf").map(|op| op.category),
+            Some(PdfCategory::Misc)
+        );
+        assert_eq!(
+            PDF_OPERATIONS.get("add-password").map(|op| op.category),
+            Some(PdfCategory::Security)
+        );
+    }
+
+    #[test]
+    fn category_schema_and_operation_list_error_match_java_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let state = stub_state(directory.path(), axum::Router::new(), 1024)?;
+
+        let pages = category_tool_schema(&state, PdfCategory::Pages);
+        assert_eq!(pages["type"], "object");
+        assert_eq!(pages["additionalProperties"], false);
+        assert_eq!(pages["required"], json!(["operation"]));
+        let description = pages["properties"]["operation"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.starts_with(
+            "Operation id from this category. Call stirling_describe_operation first to learn the exact parameters schema. Available operations:\n- "
+        ));
+        assert!(description.contains("\n- rotate-pdf - rotate pdf"));
+        assert!(
+            pages["properties"]["operation"]["enum"]
+                .as_array()
+                .is_some_and(|ids| ids
+                    .windows(2)
+                    .all(|pair| pair[0].as_str().unwrap_or_default()
+                        < pair[1].as_str().unwrap_or_default()))
+        );
+
+        // An empty category keeps the base text with no trailing newline.
+        let convert = category_tool_schema(&state, PdfCategory::Convert);
+        assert_eq!(convert["properties"]["operation"]["enum"], json!([]));
+        assert!(
+            convert["properties"]["operation"]["description"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("Available operations:"))
+        );
+
+        let unknown = operation_list_error(&state, PdfCategory::Pages, Some("nope"));
+        assert_eq!(unknown["isError"], true);
+        let unknown_text = unknown["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(unknown_text.starts_with(
+            "Unknown or disabled operation 'nope' for stirling_pages. Available operations:\n- "
+        ));
+        assert!(unknown_text.ends_with("\nRe-call this tool with a valid 'operation'."));
+
+        let missing = operation_list_error(&state, PdfCategory::Convert, None);
+        assert_eq!(
+            missing["content"][0]["text"],
+            "Missing required argument 'operation' for stirling_convert. No operations are currently available in this category."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn category_dispatch_reports_json_file_oversized_and_unrouted_results()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use axum::routing::post;
+        let context = test_context();
+        let arguments = json!({
+            "operation": "rotate-pdf",
+            "file": STANDARD.encode(b"fake input bytes"),
+        });
+
+        // A JSON response is a structured report returned inline as text.
+        let directory = tempfile::tempdir()?;
+        let json_router = axum::Router::new().route(
+            "/api/v1/general/rotate-pdf",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"report":true}"#,
+                )
+            }),
+        );
+        let state = stub_state(directory.path(), json_router, 1024 * 1024)?;
+        let result = call_category(&state, &context, PdfCategory::Pages, &arguments).await;
+        assert_eq!(result.get("isError"), None);
+        assert_eq!(result["content"][0]["text"], r#"{"report":true}"#);
+
+        // A small binary response is stored and inlined as a resource block.
+        let directory = tempfile::tempdir()?;
+        let file_router = axum::Router::new().route(
+            "/api/v1/general/rotate-pdf",
+            post(|| async { ([(header::CONTENT_TYPE, "application/pdf")], vec![7_u8; 64]) }),
+        );
+        let state = stub_state(directory.path(), file_router.clone(), 1024 * 1024)?;
+        let result = call_category(&state, &context, PdfCategory::Pages, &arguments).await;
+        assert_eq!(result.get("isError"), None);
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.starts_with("rotate-pdf succeeded. Result: "));
+        assert!(text.contains("The file is included inline below."));
+        assert_eq!(
+            result["content"][1]["resource"]["mimeType"],
+            "application/pdf"
+        );
+        let blob = result["content"][1]["resource"]["blob"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(STANDARD.decode(blob)?, vec![7_u8; 64]);
+
+        // Over the inline limit: fileId-only message, no resource block.
+        let directory = tempfile::tempdir()?;
+        let state = stub_state(directory.path(), file_router, 8)?;
+        let result = call_category(&state, &context, PdfCategory::Pages, &arguments).await;
+        assert_eq!(result.get("isError"), None);
+        assert_eq!(result["content"].as_array().map(Vec::len), Some(1));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text
+                    .contains("Large result - fetch it with stirling_download"))
+        );
+
+        // A catalog op whose route the Rust router does not implement fails
+        // at dispatch with the op's HTTP status (documented in the contract).
+        let directory = tempfile::tempdir()?;
+        let state = stub_state(directory.path(), axum::Router::new(), 1024)?;
+        let result = call_category(&state, &context, PdfCategory::Pages, &arguments).await;
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("rotate-pdf failed: HTTP 404"))
+        );
+        Ok(())
+    }
+
+    fn stub_state(
+        directory: &Path,
+        dispatch_router: axum::Router,
+        max_inline_response_bytes: u64,
+    ) -> Result<McpState, Box<dyn std::error::Error>> {
+        Ok(McpState {
+            config: McpConfig {
+                enabled: true,
+                scopes_enabled: true,
+                engine_capability_refresh_minutes: 5,
+                allowed_operations: Vec::new(),
+                blocked_operations: Vec::new(),
+                max_request_bytes: 1024 * 1024,
+                max_inline_response_bytes,
+                auth: McpAuthConfig {
+                    mode: "apikey".to_owned(),
+                    issuer_uri: String::new(),
+                    jwks_uri: String::new(),
+                    resource_id: String::new(),
+                    accepted_audiences: Vec::new(),
+                    username_claim: "sub".to_owned(),
+                    require_existing_account: true,
+                },
+            },
+            store: Arc::new(SecurityStore::open(&directory.join("security.db"))?),
+            catalog: Arc::new(AiCapabilityCatalog::new(
+                EngineConnection {
+                    enabled: false,
+                    base_url: "http://127.0.0.1:1".to_owned(),
+                    timeout: Duration::from_secs(1),
+                    shared_secret: None,
+                },
+                1,
+            )),
+            job_manager: Arc::new(JobManager::new()),
+            dispatch_router,
+            runtime_config: Arc::new(RuntimeConfig::from_files(
+                directory.join("settings.yml"),
+                directory.join("local.yml"),
+            )),
+        })
+    }
+
+    fn test_context() -> AuthContext {
+        AuthContext {
+            user_id: 7,
+            username: "unit@example.test".to_owned(),
+            authentication_source: AuthenticationSource::ApiKey,
+            authentication_type: "apikey".to_owned(),
+            roles: BTreeSet::new(),
+            team_id: None,
+            permissions: BTreeSet::new(),
+            external_subject: None,
+            force_password_change: false,
+            session_id: "session".to_owned(),
+            correlation_id: "correlation".to_owned(),
+        }
     }
 
     fn mock_http_response(

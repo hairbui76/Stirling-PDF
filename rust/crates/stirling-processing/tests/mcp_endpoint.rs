@@ -133,7 +133,7 @@ async fn mcp_lists_only_the_ai_slice_and_forwards_only_parameters_with_trusted_i
     let tools = listed["result"]["tools"]
         .as_array()
         .ok_or("tools result was not an array")?;
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 9);
     assert_eq!(tools[0]["name"], "stirling_describe_operation");
     assert_eq!(tools[1]["name"], "stirling_ai");
     assert_eq!(
@@ -148,16 +148,9 @@ async fn mcp_lists_only_the_ai_slice_and_forwards_only_parameters_with_trusted_i
     for present in ["stirling_upload", "stirling_download", "stirling_operation"] {
         assert!(tools.iter().any(|tool| tool["name"] == present));
     }
-    // The per-category tool split (stirling_pages/convert/misc/security) is a
-    // documented future increment, not yet implemented.
-    for omitted in [
-        "stirling_pages",
-        "stirling_convert",
-        "stirling_misc",
-        "stirling_security",
-    ] {
-        assert!(!tools.iter().any(|tool| tool["name"] == omitted));
-    }
+    // This app's allow-list names only AI capabilities, so every category
+    // tool is present with an empty operation enum.
+    assert_category_enums_empty(tools)?;
 
     let described = tool_call(
         &app,
@@ -406,6 +399,583 @@ async fn mcp_operation_dispatches_a_real_stirling_endpoint_via_fileid_and_inline
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_category_tools_expose_catalog_enums_and_convert_is_empty()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        ..AppOptions::default()
+    })?;
+
+    let listed = rpc(
+        &app,
+        Some(&api_key),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    )
+    .await?;
+    let listed = response_json(listed).await?;
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .ok_or("tools result was not an array")?;
+    assert_eq!(tools.len(), 9);
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "stirling_describe_operation",
+            "stirling_ai",
+            "stirling_upload",
+            "stirling_download",
+            "stirling_convert",
+            "stirling_pages",
+            "stirling_misc",
+            "stirling_security",
+            "stirling_operation",
+        ]
+    );
+
+    let schema_for = |name: &str| -> Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["inputSchema"].clone())
+            .unwrap_or_default()
+    };
+
+    // Java's exact category-tool schema shape.
+    let pages = schema_for("stirling_pages");
+    assert_eq!(pages["type"], "object");
+    assert_eq!(pages["additionalProperties"], false);
+    assert_eq!(pages["required"], json!(["operation"]));
+    for property in ["operation", "parameters", "file", "fileName", "fileId"] {
+        assert!(pages["properties"].get(property).is_some());
+    }
+    assert_eq!(
+        pages["properties"]["parameters"]["additionalProperties"],
+        true
+    );
+
+    let pages_enum = pages["properties"]["operation"]["enum"]
+        .as_array()
+        .ok_or("pages enum was not an array")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for expected in ["merge-pdfs", "rotate-pdf", "split-pages"] {
+        assert!(pages_enum.contains(&expected));
+    }
+    assert!(pages_enum.windows(2).all(|pair| pair[0] < pair[1]));
+    let pages_description = pages["properties"]["operation"]["description"]
+        .as_str()
+        .ok_or("pages description was not text")?;
+    assert!(pages_description.starts_with(
+        "Operation id from this category. Call stirling_describe_operation first to learn the exact parameters schema. Available operations:\n- "
+    ));
+    assert!(pages_description.contains("\n- rotate-pdf - "));
+
+    let misc_enum = &schema_for("stirling_misc")["properties"]["operation"]["enum"];
+    assert!(
+        misc_enum
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!("compress-pdf")))
+    );
+    let security_enum = &schema_for("stirling_security")["properties"]["operation"]["enum"];
+    assert!(
+        security_enum
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!("add-password")))
+    );
+
+    // Java's stirling_convert enum is genuinely empty: every convert endpoint
+    // is nested (e.g. /convert/pdf/word) and extractOpId skips nested tails.
+    let convert = schema_for("stirling_convert");
+    assert_eq!(convert["properties"]["operation"]["enum"], json!([]));
+    assert!(
+        convert["properties"]["operation"]["description"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("Available operations:"))
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_category_enums_and_calls_respect_allow_and_block_lists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+
+    // A non-empty allow-list is a strict whitelist across PDF and AI ids.
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        allowed_operations: Some(&["rotate-pdf", "agent-draft"]),
+        ..AppOptions::default()
+    })?;
+    let tools = tools_by_name(&app, &api_key).await?;
+    assert_eq!(
+        tools["stirling_pages"]["properties"]["operation"]["enum"],
+        json!(["rotate-pdf"])
+    );
+    assert_eq!(
+        tools["stirling_misc"]["properties"]["operation"]["enum"],
+        json!([])
+    );
+    let empty_category = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_misc",
+        json!({"operation":"compress-pdf"}),
+    )
+    .await?;
+    let empty_category = response_json(empty_category).await?;
+    assert_eq!(empty_category["result"]["isError"], true);
+    assert_eq!(
+        empty_category["result"]["content"][0]["text"],
+        "Unknown or disabled operation 'compress-pdf' for stirling_misc. No operations are currently available in this category."
+    );
+
+    // The block-list removes single ids without an allow-list.
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        blocked_operations: &["merge-pdfs"],
+        ..AppOptions::default()
+    })?;
+    let tools = tools_by_name(&app, &api_key).await?;
+    let pages_enum = tools["stirling_pages"]["properties"]["operation"]["enum"]
+        .as_array()
+        .ok_or("pages enum was not an array")?;
+    assert!(pages_enum.contains(&json!("rotate-pdf")));
+    assert!(!pages_enum.contains(&json!("merge-pdfs")));
+    let blocked = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_pages",
+        json!({"operation":"merge-pdfs"}),
+    )
+    .await?;
+    let blocked = response_json(blocked).await?;
+    assert_eq!(blocked["result"]["isError"], true);
+    let blocked_text = blocked["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("blocked result was not text")?;
+    assert!(blocked_text.starts_with(
+        "Unknown or disabled operation 'merge-pdfs' for stirling_pages. Available operations:\n- "
+    ));
+    assert!(blocked_text.contains("\n- rotate-pdf - "));
+    assert!(blocked_text.ends_with("\nRe-call this tool with a valid 'operation'."));
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_endpoint_disabled_operations_vanish_and_never_fall_through_to_ai()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+
+    // Endpoint-disabled ops disappear from the enum, are rejected on call, and
+    // never fall through to a same-id AI capability on describe.
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        endpoints_to_remove: &["rotate-pdf"],
+        ..AppOptions::default()
+    })?;
+    let tools = tools_by_name(&app, &api_key).await?;
+    let pages_enum = tools["stirling_pages"]["properties"]["operation"]["enum"]
+        .as_array()
+        .ok_or("pages enum was not an array")?;
+    assert!(!pages_enum.contains(&json!("rotate-pdf")));
+    assert!(pages_enum.contains(&json!("merge-pdfs")));
+    // The AI impostor with the same id is visible through stirling_ai...
+    assert!(
+        tools["stirling_ai"]["properties"]["operation"]["enum"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!("rotate-pdf")))
+    );
+    // ...but the disabled PDF operation still wins the describe lookup.
+    let described = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_describe_operation",
+        json!({"operation":"rotate-pdf"}),
+    )
+    .await?;
+    let described = response_json(described).await?;
+    assert_eq!(described["result"]["isError"], true);
+    assert_eq!(
+        described["result"]["content"][0]["text"],
+        "Unknown or disabled operation: rotate-pdf"
+    );
+    let disabled_call = tool_call(
+        &app,
+        &api_key,
+        3,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf"}),
+    )
+    .await?;
+    let disabled_call = response_json(disabled_call).await?;
+    assert_eq!(disabled_call["result"]["isError"], true);
+    assert!(
+        disabled_call["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text
+                .starts_with("Unknown or disabled operation 'rotate-pdf' for stirling_pages."))
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_describe_prefers_pdf_operations_over_same_id_ai_capabilities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        ..AppOptions::default()
+    })?;
+
+    // rotate-pdf exists both as a PDF operation and as an AI capability in
+    // the mock manifest; the PDF operation must win.
+    let described = tool_call(
+        &app,
+        &api_key,
+        1,
+        "stirling_describe_operation",
+        json!({"operation":"rotate-pdf"}),
+    )
+    .await?;
+    let described = response_json(described).await?;
+    assert_eq!(described["result"]["isError"], Value::Null);
+    let payload: Value = serde_json::from_str(
+        described["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or("describe result was not text")?,
+    )?;
+    assert_eq!(payload["operation"], "rotate-pdf");
+    assert_eq!(payload["category"], "stirling_pages");
+    assert_eq!(payload["endpoint"], "/api/v1/general/rotate-pdf");
+    assert_eq!(payload["requiredScope"], "mcp.tools.write");
+    assert_eq!(payload["parametersSchema"]["title"], "RotatePdfParams");
+    assert!(
+        payload["parametersSchema"]["properties"]
+            .get("angle")
+            .is_some()
+    );
+
+    // AI capabilities without a PDF twin still describe as before.
+    let described = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_describe_operation",
+        json!({"operation":"agent-draft"}),
+    )
+    .await?;
+    let described = response_json(described).await?;
+    let payload: Value = serde_json::from_str(
+        described["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or("describe result was not text")?,
+    )?;
+    assert_eq!(payload["category"], "stirling_ai");
+    assert_eq!(payload["endpoint"], "/api/v1/agents/draft");
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_category_tool_errors_match_java_operation_list_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        ..AppOptions::default()
+    })?;
+    let pdf_base64 = base64::engine::general_purpose::STANDARD.encode(minimal_pdf_bytes()?);
+
+    // Missing operation: Java lists the category's operations.
+    let missing = tool_call(&app, &api_key, 1, "stirling_pages", json!({})).await?;
+    let missing = response_json(missing).await?;
+    assert_eq!(missing["result"]["isError"], true);
+    let missing_text = missing["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("missing-operation result was not text")?;
+    assert!(missing_text.starts_with(
+        "Missing required argument 'operation' for stirling_pages. Available operations:\n- "
+    ));
+    assert!(missing_text.ends_with("\nRe-call this tool with a valid 'operation'."));
+
+    // Wrong category: the op id exists, but not in this category.
+    let wrong_category = tool_call(
+        &app,
+        &api_key,
+        2,
+        "stirling_security",
+        json!({"operation":"rotate-pdf","file":pdf_base64}),
+    )
+    .await?;
+    let wrong_category = response_json(wrong_category).await?;
+    assert_eq!(wrong_category["result"]["isError"], true);
+    assert!(
+        wrong_category["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(
+                "Unknown or disabled operation 'rotate-pdf' for stirling_security. Available operations:\n- add-password - "
+            ))
+    );
+
+    // Missing input file.
+    let no_file = tool_call(
+        &app,
+        &api_key,
+        3,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf"}),
+    )
+    .await?;
+    let no_file = response_json(no_file).await?;
+    assert_eq!(no_file["result"]["isError"], true);
+    assert_eq!(
+        no_file["result"]["content"][0]["text"],
+        "This operation needs an input file. Pass 'file' as base64, or 'fileId' from stirling_upload for large files."
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_category_tool_dispatches_via_inline_and_fileid()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        ..AppOptions::default()
+    })?;
+    let pdf_base64 = base64::engine::general_purpose::STANDARD.encode(minimal_pdf_bytes()?);
+
+    // Inline base64 input through the category tool.
+    let inline_result = tool_call(
+        &app,
+        &api_key,
+        4,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf","file":pdf_base64,"parameters":{"angle":90}}),
+    )
+    .await?;
+    let inline_result = response_json(inline_result).await?;
+    assert_eq!(inline_result["result"]["isError"], Value::Null);
+    let inline_text = inline_result["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("inline result was not text")?;
+    assert!(inline_text.starts_with("rotate-pdf succeeded. Result: "));
+    assert!(inline_text.contains("The file is included inline below."));
+    assert_eq!(
+        inline_result["result"]["content"][1]["resource"]["mimeType"],
+        "application/pdf"
+    );
+
+    // fileId input, uploaded first.
+    let uploaded = tool_call(
+        &app,
+        &api_key,
+        5,
+        "stirling_upload",
+        json!({"file": pdf_base64, "fileName": "input.pdf"}),
+    )
+    .await?;
+    let uploaded = response_json(uploaded).await?;
+    let summary = uploaded["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("upload result was not text")?;
+    let file_id = summary
+        .split("fileId=")
+        .nth(1)
+        .and_then(|rest| rest.split(['.', ' ']).next())
+        .ok_or("upload result did not include a fileId")?
+        .to_owned();
+    let by_file_id = tool_call(
+        &app,
+        &api_key,
+        6,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf","fileId":file_id,"parameters":{"angle":90}}),
+    )
+    .await?;
+    let by_file_id = response_json(by_file_id).await?;
+    assert_eq!(by_file_id["result"]["isError"], Value::Null);
+    assert!(
+        by_file_id["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("rotate-pdf succeeded."))
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_category_tool_keeps_foreign_and_missing_file_ids_indistinguishable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        ..AppOptions::default()
+    })?;
+    let pdf_base64 = base64::engine::general_purpose::STANDARD.encode(minimal_pdf_bytes()?);
+
+    let uploaded = tool_call(
+        &app,
+        &api_key,
+        1,
+        "stirling_upload",
+        json!({"file": pdf_base64, "fileName": "input.pdf"}),
+    )
+    .await?;
+    let uploaded = response_json(uploaded).await?;
+    let summary = uploaded["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("upload result was not text")?;
+    let file_id = summary
+        .split("fileId=")
+        .nth(1)
+        .and_then(|rest| rest.split(['.', ' ']).next())
+        .ok_or("upload result did not include a fileId")?
+        .to_owned();
+
+    // A foreign owner's real fileId and a nonexistent fileId must remain
+    // indistinguishable through the category tools too.
+    let store = SecurityStore::open(&directory.path().join("configs/security.db"))?;
+    let other_user_id =
+        store.create_local_user("Other.User@Example.Test", PASSWORD, ["ROLE_USER"], None)?;
+    let other_api_key = store
+        .create_api_key(other_user_id, 1_700_000_000)?
+        .to_string();
+    let foreign = tool_call(
+        &app,
+        &other_api_key,
+        7,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf","fileId":file_id}),
+    )
+    .await?;
+    let foreign = response_json(foreign).await?;
+    assert_eq!(foreign["result"]["isError"], true);
+    let foreign_text = foreign["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("foreign result was not text")?
+        .to_owned();
+    let missing_id = tool_call(
+        &app,
+        &other_api_key,
+        8,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf","fileId":"does-not-exist"}),
+    )
+    .await?;
+    let missing_id = response_json(missing_id).await?;
+    let missing_id_text = missing_id["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("missing-id result was not text")?;
+    assert_eq!(
+        foreign_text.replace(&file_id, "does-not-exist"),
+        missing_id_text
+    );
+
+    engine.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_category_tool_reports_oversized_results_by_file_id_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = MockEngine::start().await?;
+    let (_directory, app, api_key) = configured_app_with(&AppOptions {
+        engine_url: &engine.url,
+        max_inline_response_bytes: Some(16),
+        ..AppOptions::default()
+    })?;
+    let pdf_base64 = base64::engine::general_purpose::STANDARD.encode(minimal_pdf_bytes()?);
+
+    let result = tool_call(
+        &app,
+        &api_key,
+        1,
+        "stirling_pages",
+        json!({"operation":"rotate-pdf","file":pdf_base64,"parameters":{"angle":90}}),
+    )
+    .await?;
+    let result = response_json(result).await?;
+    assert_eq!(result["result"]["isError"], Value::Null);
+    let content = result["result"]["content"]
+        .as_array()
+        .ok_or("result content was not an array")?;
+    assert_eq!(content.len(), 1);
+    let text = content[0]["text"]
+        .as_str()
+        .ok_or("oversized result was not text")?;
+    assert!(text.starts_with("rotate-pdf succeeded. Result: "));
+    assert!(text.contains("Large result - fetch it with stirling_download"));
+
+    engine.stop().await?;
+    Ok(())
+}
+
+fn assert_category_enums_empty(tools: &[Value]) -> Result<(), Box<dyn std::error::Error>> {
+    for category in [
+        "stirling_pages",
+        "stirling_convert",
+        "stirling_misc",
+        "stirling_security",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == category)
+            .ok_or("category tool missing from tools/list")?;
+        assert_eq!(
+            tool["inputSchema"]["properties"]["operation"]["enum"],
+            json!([])
+        );
+    }
+    Ok(())
+}
+
+async fn tools_by_name(
+    app: &Router,
+    api_key: &str,
+) -> Result<BTreeMap<String, Value>, Box<dyn std::error::Error>> {
+    let listed = rpc(
+        app,
+        Some(api_key),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    )
+    .await?;
+    let listed = response_json(listed).await?;
+    Ok(listed["result"]["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool["name"]
+                        .as_str()
+                        .map(|name| (name.to_owned(), tool["inputSchema"].clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 fn minimal_pdf_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     use lopdf::{Object, dictionary};
 
@@ -486,19 +1056,89 @@ fn configured_app_with_operations(
     max_request_bytes: usize,
     extra_allowed_operations: &[&str],
 ) -> Result<(TempDir, Router, String), Box<dyn std::error::Error>> {
+    let mut allowed_operations = vec!["agent-draft", "blocked-agent"];
+    allowed_operations.extend(extra_allowed_operations);
+    configured_app_with(&AppOptions {
+        engine_url,
+        mcp_enabled,
+        auth_mode,
+        ai_enabled,
+        max_request_bytes,
+        allowed_operations: Some(&allowed_operations),
+        blocked_operations: &["blocked-agent"],
+        endpoints_to_remove: &[],
+        max_inline_response_bytes: None,
+    })
+}
+
+struct AppOptions<'a> {
+    engine_url: &'a str,
+    mcp_enabled: bool,
+    auth_mode: &'a str,
+    ai_enabled: bool,
+    max_request_bytes: usize,
+    /// `None` omits the allow-list entirely (Java's default: everything allowed).
+    allowed_operations: Option<&'a [&'a str]>,
+    blocked_operations: &'a [&'a str],
+    endpoints_to_remove: &'a [&'a str],
+    max_inline_response_bytes: Option<u64>,
+}
+
+impl Default for AppOptions<'_> {
+    fn default() -> Self {
+        Self {
+            engine_url: "",
+            mcp_enabled: true,
+            auth_mode: "apikey",
+            ai_enabled: true,
+            max_request_bytes: 1024 * 1024,
+            allowed_operations: None,
+            blocked_operations: &[],
+            endpoints_to_remove: &[],
+            max_inline_response_bytes: None,
+        }
+    }
+}
+
+fn configured_app_with(
+    options: &AppOptions<'_>,
+) -> Result<(TempDir, Router, String), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+
     let directory = tempdir()?;
     let config_directory = directory.path().join("configs");
     fs::create_dir_all(&config_directory)?;
     let settings_path = config_directory.join("settings.yml");
-    let mut allowed_operations = vec!["agent-draft".to_owned(), "blocked-agent".to_owned()];
-    allowed_operations.extend(extra_allowed_operations.iter().map(|op| (*op).to_owned()));
-    let allowed_operations = allowed_operations.join(", ");
-    fs::write(
-        &settings_path,
-        format!(
-            "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {mcp_enabled}\n  auth:\n    mode: {auth_mode}\n  maxRequestBytes: {max_request_bytes}\n  allowedOperations: [{allowed_operations}]\n  blockedOperations: [blocked-agent]\naiEngine:\n  enabled: {ai_enabled}\n  url: '{engine_url}'\n  timeoutSeconds: 5\n"
-        ),
-    )?;
+    let mut settings = format!(
+        "security:\n  initialLogin:\n    username: admin@example.test\n    password: test-only-password\nmcp:\n  enabled: {}\n  auth:\n    mode: {}\n  maxRequestBytes: {}\n",
+        options.mcp_enabled, options.auth_mode, options.max_request_bytes
+    );
+    if let Some(max_inline) = options.max_inline_response_bytes {
+        let _ = writeln!(settings, "  maxInlineResponseBytes: {max_inline}");
+    }
+    if let Some(allowed) = options.allowed_operations {
+        let _ = writeln!(settings, "  allowedOperations: [{}]", allowed.join(", "));
+    }
+    if !options.blocked_operations.is_empty() {
+        let _ = writeln!(
+            settings,
+            "  blockedOperations: [{}]",
+            options.blocked_operations.join(", ")
+        );
+    }
+    let _ = write!(
+        settings,
+        "aiEngine:\n  enabled: {}\n  url: '{}'\n  timeoutSeconds: 5\n",
+        options.ai_enabled, options.engine_url
+    );
+    if !options.endpoints_to_remove.is_empty() {
+        let _ = writeln!(
+            settings,
+            "endpoints:\n  toRemove: [{}]",
+            options.endpoints_to_remove.join(", ")
+        );
+    }
+    fs::write(&settings_path, settings)?;
     let database_path = config_directory.join("security.db");
     let config = RuntimeConfig::from_files(settings_path, config_directory.join("missing.yml"));
     let app = app_with_reviewed_security(1024 * 1024, TimestampSettings::default(), config)?;
@@ -731,6 +1371,14 @@ async fn manifest() -> Json<Value> {
                 "id":"unsafe-agent",
                 "input_schema":{"type":"object"},
                 "route":"https://example.test/steal"
+            },
+            {
+                // Same id as the PDF operation: a disabled or enabled PDF op
+                // must never fall through to this AI capability.
+                "id":"rotate-pdf",
+                "description":"AI impostor that must never shadow the PDF operation",
+                "input_schema":{"type":"object"},
+                "route":"/api/v1/agents/draft"
             }
         ]
     }))
