@@ -1255,6 +1255,12 @@ impl RuntimeConfig {
     /// `scopes` accepts both a YAML sequence and the Java template's scalar
     /// comma-separated string (e.g. `openid, profile, email`); the `openid`
     /// scope is added by the authorization-request builder even if omitted.
+    ///
+    /// `clientSecret` (env `SECURITY_OAUTH2_CLIENTSECRET`, mirroring how the
+    /// sibling keys are sourced) selects the confidential-client token
+    /// exchange; blank means a public client, exactly like Java, where an
+    /// unset `security.oauth2.clientSecret` leaves Spring's registration on
+    /// the public-client method.
     #[must_use]
     pub fn oidc_login_provider_config(&self) -> Option<OidcLoginProviderConfig> {
         let issuer = self.string(
@@ -1287,11 +1293,21 @@ impl RuntimeConfig {
                 listed
             }
         };
+        let client_secret = {
+            let secret = self.string(
+                &["security", "oauth2", "clientSecret"],
+                "SECURITY_OAUTH2_CLIENTSECRET",
+                "",
+            );
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| Zeroizing::new(secret.to_owned()))
+        };
         Some(OidcLoginProviderConfig {
             issuer: issuer.trim().to_owned(),
             client_id,
             redirect_uri,
             scopes,
+            client_secret,
         })
     }
 
@@ -2915,12 +2931,13 @@ mod tests {
         assert!(config.oidc_login_provider_config().is_none());
 
         // Issuer present ⇒ a typed config, with scopes accepted as the Java
-        // template's scalar comma-separated string form.
+        // template's scalar comma-separated string form. No clientSecret ⇒ a
+        // public client.
         fs::write(
             &settings,
             "security:\n  oauth2:\n    issuer: https://issuer.example.com\n    clientId: my-client-id\n    redirectUri: https://app.example.com/login/oauth2/code/oidc\n    scopes: openid, profile, email\n",
         )?;
-        let config = RuntimeConfig::from_files(settings, directory.path().join("missing.yml"));
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
         let provider = config
             .oidc_login_provider_config()
             .ok_or("expected a configured OIDC provider")?;
@@ -2931,8 +2948,40 @@ mod tests {
             "https://app.example.com/login/oauth2/code/oidc"
         );
         assert_eq!(provider.scopes, ["openid", "profile", "email"]);
+        assert_eq!(provider.client_secret, None);
         // The shaped config passes the login boundary's fail-closed validation.
         assert!(provider.validate().is_ok());
+
+        // A configured clientSecret (Java's security.oauth2.clientSecret) is
+        // carried through, trimmed, for the confidential-client token exchange;
+        // a blank one degrades to None (public client), matching the "blank
+        // means unset" convention of the sibling keys.
+        fs::write(
+            &settings,
+            "security:\n  oauth2:\n    issuer: https://issuer.example.com\n    clientId: my-client-id\n    clientSecret: '  top-secret-value  '\n    redirectUri: https://app.example.com/login/oauth2/code/oidc\n    scopes: openid\n",
+        )?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        let provider = config
+            .oidc_login_provider_config()
+            .ok_or("expected a configured OIDC provider")?;
+        assert_eq!(
+            provider
+                .client_secret
+                .as_ref()
+                .map(|secret| secret.as_str()),
+            Some("top-secret-value")
+        );
+        assert!(provider.validate().is_ok());
+
+        fs::write(
+            &settings,
+            "security:\n  oauth2:\n    issuer: https://issuer.example.com\n    clientId: my-client-id\n    clientSecret: '   '\n    redirectUri: https://app.example.com/login/oauth2/code/oidc\n    scopes: openid\n",
+        )?;
+        let config = RuntimeConfig::from_files(&settings, directory.path().join("missing.yml"));
+        let provider = config
+            .oidc_login_provider_config()
+            .ok_or("expected a configured OIDC provider")?;
+        assert_eq!(provider.client_secret, None);
         Ok(())
     }
 

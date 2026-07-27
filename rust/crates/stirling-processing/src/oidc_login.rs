@@ -46,7 +46,9 @@ use crate::{
         OidcAuthorizationError, build_oidc_authorization_request, random_url_safe_token,
     },
     oidc_discovery::{OidcDiscoveryCache, OidcDiscoveryError, OidcProviderMetadata},
-    oidc_id_token::{OidcIdTokenError, VerifiedOidcIdentity, verify_oidc_id_token},
+    oidc_id_token::{
+        OidcIdTokenError, OidcJwksCache, VerifiedOidcIdentity, verify_oidc_id_token_cached,
+    },
     oidc_live_token::{OidcLiveTokenError, exchange_oidc_token},
     oidc_token::build_oidc_token_request,
     security::{
@@ -81,12 +83,17 @@ const DEFAULT_MAX_LOGIN_STATE_ENTRIES: usize = 4_096;
 const MAX_ISSUER_BYTES: usize = 2_048;
 const MAX_CLIENT_ID_BYTES: usize = 512;
 const MAX_REDIRECT_URI_BYTES: usize = 2_048;
+const MAX_CLIENT_SECRET_BYTES: usize = 512;
 
-/// A single generic-OIDC provider's login configuration, for the public-client
-/// PKCE case (no `client_secret` in this slice). Mirrors the fields of Java's
-/// `ClientRegistration` that the discovery-driven `oidcClientRegistration()`
-/// path uses: an `issuer` to discover, a public `client_id`, the `redirect_uri`
-/// the provider will call back, and the requested `scopes`.
+/// A single generic-OIDC provider's login configuration. Mirrors the fields of
+/// Java's `ClientRegistration` that the discovery-driven
+/// `oidcClientRegistration()` path uses: an `issuer` to discover, a
+/// `client_id`, the `redirect_uri` the provider will call back, the requested
+/// `scopes`, and — for a confidential client — the optional `client_secret`
+/// (Java's `security.oauth2.clientSecret`), sent as RFC 6749 section 2.3.1
+/// Basic credentials on the token exchange. `None` is the public-client PKCE
+/// case; PKCE stays on in *both* cases (RFC 9700), where Spring would drop it
+/// for a confidential client.
 ///
 /// [`crate::runtime_config::RuntimeConfig::oidc_login_provider_config`] builds
 /// this from the crate's usual env/YAML config, returning `None` when no issuer
@@ -94,12 +101,34 @@ const MAX_REDIRECT_URI_BYTES: usize = 2_048;
 /// present-but-invalid ⇒ rejected at the boundary" convention the Supabase JWT
 /// config follows. Here the fail-closed boundary is [`Self::validate`], called
 /// at the top of [`initiate_oidc_login`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OidcLoginProviderConfig {
     pub issuer: String,
     pub client_id: String,
     pub redirect_uri: String,
     pub scopes: Vec<String>,
+    /// The confidential-client secret, or [`None`] for a public client.
+    /// Zeroized on drop, like every comparable credential in this crate.
+    pub client_secret: Option<Zeroizing<String>>,
+}
+
+/// Manual so the derived output can never print the client secret — `Zeroizing`
+/// zeroes memory on drop but its `Debug` passes straight through to the inner
+/// value.
+impl std::fmt::Debug for OidcLoginProviderConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OidcLoginProviderConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scopes", &self.scopes)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl OidcLoginProviderConfig {
@@ -133,6 +162,12 @@ impl OidcLoginProviderConfig {
                 .scopes
                 .iter()
                 .any(|scope| scope.trim().is_empty() || scope.contains(char::is_whitespace))
+            // A configured-but-blank or over-long secret is a broken config,
+            // not a public client — reject rather than silently downgrade the
+            // client to unauthenticated token exchanges.
+            || self.client_secret.as_ref().is_some_and(|secret| {
+                secret.trim().is_empty() || secret.len() > MAX_CLIENT_SECRET_BYTES
+            })
         {
             return Err(OidcLoginError::InvalidProviderConfig);
         }
@@ -162,8 +197,12 @@ struct PendingLogin {
     /// the exact `token_endpoint`/`jwks_uri`/`issuer` discovered at initiation,
     /// not a re-discovery that could differ.
     provider: OidcProviderMetadata,
-    /// The public client id this login was started for.
+    /// The client id this login was started for.
     client_id: String,
+    /// The confidential-client secret captured at initiation ([`None`] for a
+    /// public client), so the callback's token exchange authenticates with the
+    /// secret that was configured when this login began.
+    client_secret: Option<Zeroizing<String>>,
     /// Wall-clock-independent expiry (monotonic [`Instant`]). Set by
     /// [`OidcLoginStateStore::store`]; a placeholder at construction.
     expires_at: Instant,
@@ -412,6 +451,7 @@ pub fn initiate_oidc_login(
             redirect_uri: provider.redirect_uri.clone(),
             provider: metadata,
             client_id: provider.client_id.clone(),
+            client_secret: provider.client_secret.clone(),
             // Overwritten by `store` with the TTL-stamped expiry.
             expires_at: Instant::now(),
         },
@@ -430,10 +470,13 @@ pub fn initiate_oidc_login(
 /// single-use defense), requires `browser_binding` (the value of the cookie set
 /// at initiation) to equal the one stored for this login — the login-CSRF
 /// defense (RFC 9700) — then exchanges `code` at the stored `token_endpoint`
-/// using the stored PKCE verifier, verifies the returned id token against the
-/// stored provider metadata and the stored `nonce`, authenticates the resulting
-/// identity through [`SecurityStore::authenticate_oidc_identity`], and issues an
-/// opaque session with the crate's default access/refresh TTLs.
+/// using the stored PKCE verifier (plus the stored `client_secret` as Basic
+/// credentials, when this login's provider is a confidential client), verifies
+/// the returned id token against the stored provider metadata and the stored
+/// `nonce` — resolving the provider's JWKS through `jwks_cache` rather than
+/// refetching per callback — authenticates the resulting identity through
+/// [`SecurityStore::authenticate_oidc_identity`], and issues an opaque session
+/// with the crate's default access/refresh TTLs.
 ///
 /// `browser_binding` is [`None`] when the callback carried no such cookie, which
 /// is treated exactly like a wrong value: rejected.
@@ -446,11 +489,13 @@ pub fn initiate_oidc_login(
 /// exchange fails, [`OidcLoginError::IdToken`] if the id token (or its `nonce`)
 /// fails verification, [`OidcLoginError::Identity`] if authentication or session
 /// issuance fails, and [`OidcLoginError::StateUnavailable`] on a poisoned store.
+#[allow(clippy::too_many_arguments)]
 pub fn complete_oidc_login(
     state: &str,
     code: &str,
     browser_binding: Option<&str>,
     store: &OidcLoginStateStore,
+    jwks_cache: &OidcJwksCache,
     security: &SecurityStore,
     now: i64,
     correlation_id: &str,
@@ -469,12 +514,14 @@ pub fn complete_oidc_login(
     let token_request = build_oidc_token_request(
         &pending.provider.token_endpoint,
         &pending.client_id,
+        pending.client_secret.as_ref().map(|secret| secret.as_str()),
         code,
         &pending.redirect_uri,
         &pending.code_verifier,
     );
     let token_response = exchange_oidc_token(&token_request)?;
-    let identity = verify_oidc_id_token(
+    let identity = verify_oidc_id_token_cached(
+        jwks_cache,
         &pending.provider,
         &pending.client_id,
         &pending.nonce,
@@ -525,7 +572,7 @@ mod tests {
     };
     use crate::{
         oidc_discovery::{OidcDiscoveryCache, OidcProviderMetadata},
-        oidc_id_token::OidcIdTokenError,
+        oidc_id_token::{OidcIdTokenError, OidcJwksCache},
         security::AuthenticationSource,
     };
 
@@ -609,6 +656,7 @@ mod tests {
         issuer: String,
         id_token_slot: Arc<Mutex<String>>,
         discovery_hits: Arc<AtomicUsize>,
+        token_authorization: Arc<Mutex<Option<String>>>,
         _handle: JoinHandle<()>,
     }
 
@@ -624,6 +672,16 @@ mod tests {
         /// prove the discovery cache collapses repeat initiations to one fetch.
         fn discovery_hits(&self) -> usize {
             self.discovery_hits.load(Ordering::SeqCst)
+        }
+
+        /// The `Authorization` header value the most recent `/token` request
+        /// carried, if any — used to prove a confidential client's Basic
+        /// credentials actually reach the token endpoint.
+        fn last_token_authorization(&self) -> Option<String> {
+            self.token_authorization
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
         }
     }
 
@@ -646,6 +704,8 @@ mod tests {
         let slot_for_server = Arc::clone(&id_token_slot);
         let discovery_hits = Arc::new(AtomicUsize::new(0));
         let hits_for_server = Arc::clone(&discovery_hits);
+        let token_authorization = Arc::new(Mutex::new(None));
+        let authorization_for_server = Arc::clone(&token_authorization);
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -655,6 +715,7 @@ mod tests {
                     &jwks_json,
                     &slot_for_server,
                     &hits_for_server,
+                    &authorization_for_server,
                 );
             }
         });
@@ -662,6 +723,7 @@ mod tests {
             issuer,
             id_token_slot,
             discovery_hits,
+            token_authorization,
             _handle: handle,
         })
     }
@@ -672,6 +734,7 @@ mod tests {
         jwks: &str,
         id_token_slot: &Arc<Mutex<String>>,
         discovery_hits: &Arc<AtomicUsize>,
+        token_authorization: &Arc<Mutex<Option<String>>>,
     ) -> std::io::Result<()> {
         // Read until the request quiesces (short read timeout) so a POST body is
         // fully drained before the response — avoids a mid-request reset. Mirrors
@@ -698,6 +761,17 @@ mod tests {
         } else if first_line.starts_with("GET /jwks.json ") {
             jwks.to_owned()
         } else if first_line.starts_with("POST /token ") {
+            // Record the Authorization header (if any) this token request
+            // carried, so a test can assert confidential-client credentials.
+            let authorization = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            if let Ok(mut slot) = token_authorization.lock() {
+                *slot = authorization;
+            }
             let id_token = id_token_slot
                 .lock()
                 .map(|slot| slot.clone())
@@ -737,6 +811,7 @@ mod tests {
                 "profile".to_owned(),
                 "email".to_owned(),
             ],
+            client_secret: None,
         }
     }
 
@@ -781,6 +856,7 @@ mod tests {
             // cases directly instead of through this happy-path helper.
             Some(&initiated.browser_binding),
             store,
+            &OidcJwksCache::new(),
             security,
             NOW,
             "corr-oidc",
@@ -829,6 +905,50 @@ mod tests {
         Ok(())
     }
 
+    // ---- confidential client (client_secret) end-to-end --------------------
+
+    #[test]
+    fn a_secret_configured_provider_completes_and_authenticates_with_basic_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = SigningFixture::new()?;
+        let idp = start_mock_idp(fixture.jwks_json.clone())?;
+        let store = OidcLoginStateStore::new();
+        let discovery = OidcDiscoveryCache::new();
+        let security = crate::security::SecurityStore::in_memory()?;
+
+        let mut provider = provider_config(&idp.issuer);
+        provider.client_secret = Some(Zeroizing::new("the client secret".to_owned()));
+
+        let initiated = initiate_oidc_login(&provider, &store, &discovery)?;
+        let login_nonce = query_param(&initiated.authorization_url, "nonce")
+            .ok_or("authorization url has no nonce")?;
+        idp.set_id_token(fixture.sign(&id_token_claims(&idp.issuer, &login_nonce))?);
+        let completed = complete_oidc_login(
+            &initiated.state,
+            "auth-code-xyz",
+            Some(&initiated.browser_binding),
+            &store,
+            &OidcJwksCache::new(),
+            &security,
+            NOW,
+            "corr-oidc-confidential",
+        )?;
+        assert_eq!(completed.identity.subject, SUBJECT);
+
+        // The token exchange authenticated as a confidential client: the /token
+        // request carried the RFC 6749 section 2.3.1 Basic credentials, with
+        // id and secret form-urlencoded (space -> '+') BEFORE base64.
+        // base64("oidc-login-test-client:the+client+secret")
+        let authorization = idp
+            .last_token_authorization()
+            .ok_or("the token request carried no Authorization header")?;
+        assert_eq!(
+            authorization,
+            "Basic b2lkYy1sb2dpbi10ZXN0LWNsaWVudDp0aGUrY2xpZW50K3NlY3JldA=="
+        );
+        Ok(())
+    }
+
     // ---- single-use (red/green target) -------------------------------------
 
     #[test]
@@ -852,6 +972,7 @@ mod tests {
             "auth-code-xyz",
             Some(&initiated.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -867,6 +988,7 @@ mod tests {
             "auth-code-xyz",
             Some(&initiated.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW + 1,
             "corr-oidc-replay",
@@ -902,6 +1024,7 @@ mod tests {
             "auth-code-xyz",
             None,
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc-forged",
@@ -929,6 +1052,7 @@ mod tests {
             "auth-code-xyz",
             Some(&initiated.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -966,6 +1090,7 @@ mod tests {
             // No cookie ⇒ no binding presented.
             None,
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc-csrf",
@@ -1007,6 +1132,7 @@ mod tests {
             // A binding value from some other browser — not the one stored.
             Some("some-other-browsers-binding-value-000000000"),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc-csrf",
@@ -1053,6 +1179,7 @@ mod tests {
             "auth-code-xyz",
             Some(&initiated.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -1089,6 +1216,7 @@ mod tests {
             "auth-code-xyz",
             Some(&first.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -1120,6 +1248,7 @@ mod tests {
             "auth-code-xyz",
             Some(&initiated.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -1141,6 +1270,7 @@ mod tests {
             browser_binding: "browser-binding".to_owned(),
             nonce: "nonce".to_owned(),
             code_verifier: Zeroizing::new("code-verifier".to_owned()),
+            client_secret: None,
             redirect_uri: "http://127.0.0.1/login/oauth2/code/oidc".to_owned(),
             provider: OidcProviderMetadata {
                 issuer: "https://issuer.example.test".to_owned(),
@@ -1220,6 +1350,7 @@ mod tests {
             "auth-code-xyz",
             Some(&first.browser_binding),
             &store,
+            &OidcJwksCache::new(),
             &security,
             NOW,
             "corr-oidc",
@@ -1347,5 +1478,17 @@ mod tests {
             bad_scope.validate(),
             Err(OidcLoginError::InvalidProviderConfig)
         ));
+        // A configured-but-blank secret is a broken config, not a silent
+        // downgrade to a public client.
+        let mut blank_secret = provider_config("https://issuer.example.com");
+        blank_secret.client_secret = Some(Zeroizing::new("   ".to_owned()));
+        assert!(matches!(
+            blank_secret.validate(),
+            Err(OidcLoginError::InvalidProviderConfig)
+        ));
+        // A well-formed secret keeps the config valid.
+        let mut with_secret = provider_config("https://issuer.example.com");
+        with_secret.client_secret = Some(Zeroizing::new("a-real-secret".to_owned()));
+        assert!(with_secret.validate().is_ok());
     }
 }

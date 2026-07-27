@@ -32,6 +32,7 @@ use zeroize::Zeroizing;
 use crate::{
     license::LicenseError,
     oidc_discovery::OidcDiscoveryCache,
+    oidc_id_token::OidcJwksCache,
     oidc_login::{
         OidcLoginError, OidcLoginProviderConfig, OidcLoginStateStore, complete_oidc_login,
         initiate_oidc_login,
@@ -337,6 +338,17 @@ pub fn secure_router_with_config(
     secure_router_with_mail(router, store, config, None)
 }
 
+/// Everything the OIDC login routes share, built once per secured router: the
+/// provider config plus the three `Arc`'d singletons (pending-login state
+/// store, discovery-metadata cache, and JWKS cache) the authorize/callback
+/// handlers receive via request extensions.
+type OidcLoginRuntime = (
+    OidcLoginProviderConfig,
+    Arc<OidcLoginStateStore>,
+    Arc<OidcDiscoveryCache>,
+    Arc<OidcJwksCache>,
+);
+
 pub(crate) fn secure_router_with_mail(
     router: Router,
     store: Arc<SecurityStore>,
@@ -362,13 +374,16 @@ pub(crate) fn secure_router_with_mail(
     // A single shared state store, created once here so the authorize and
     // callback routes correlate against the same pending-login table, plus a
     // single shared discovery cache so repeated `/authorize` calls reuse one
-    // provider-metadata fetch instead of re-hitting the IdP each time. `None`
-    // provider config leaves the OIDC login routes unmounted (fail-closed off).
+    // provider-metadata fetch instead of re-hitting the IdP each time, plus a
+    // single shared JWKS cache so repeated callbacks reuse one signing-key
+    // fetch (bounded TTL + kid-miss refresh cooldown). `None` provider config
+    // leaves the OIDC login routes unmounted (fail-closed off).
     let oidc_login = config.oidc_login_provider.clone().map(|provider| {
         (
             provider,
             Arc::new(OidcLoginStateStore::new()),
             Arc::new(OidcDiscoveryCache::new()),
+            Arc::new(OidcJwksCache::new()),
         )
     });
     router
@@ -382,13 +397,7 @@ pub(crate) fn secure_router_with_mail(
         .layer(Extension(SecurityMailState { smtp }))
 }
 
-fn auth_routes(
-    oidc_login: Option<(
-        OidcLoginProviderConfig,
-        Arc<OidcLoginStateStore>,
-        Arc<OidcDiscoveryCache>,
-    )>,
-) -> Router {
+fn auth_routes(oidc_login: Option<OidcLoginRuntime>) -> Router {
     let mut router = Router::new()
         .merge(crate::security_audit_http::routes())
         .merge(crate::portal_audit::routes())
@@ -471,13 +480,14 @@ fn auth_routes(
     // from a request extension, mirroring how every other handler reaches the
     // `SecurityStore`. Both routes are public (the browser has no session yet);
     // `is_public_auth` in `security_policy` classifies them accordingly.
-    if let Some((provider, store, discovery)) = oidc_login {
+    if let Some((provider, store, discovery, jwks_cache)) = oidc_login {
         router = router
             .route("/api/v1/auth/oidc/authorize", post(oidc_authorize))
             .route("/api/v1/auth/oidc/callback", get(oidc_callback))
             .layer(Extension(provider))
             .layer(Extension(store))
-            .layer(Extension(discovery));
+            .layer(Extension(discovery))
+            .layer(Extension(jwks_cache));
     }
     router.layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
 }
@@ -1099,6 +1109,7 @@ fn oidc_binding_cookie_value(headers: &HeaderMap) -> Option<String> {
 /// check tripped.
 async fn oidc_callback(
     Extension(store): Extension<Arc<OidcLoginStateStore>>,
+    Extension(jwks_cache): Extension<Arc<OidcJwksCache>>,
     Extension(security): Extension<Arc<SecurityStore>>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: HeaderMap,
@@ -1122,6 +1133,7 @@ async fn oidc_callback(
             &code,
             browser_binding.as_deref(),
             &store,
+            &jwks_cache,
             &security,
             Utc::now().timestamp(),
             &correlation_id,
@@ -4845,6 +4857,7 @@ mod tests {
                     client_id: "test-client".to_owned(),
                     redirect_uri: "https://app.example.test/login/oauth2/code/oidc".to_owned(),
                     scopes: vec!["openid".to_owned()],
+                    client_secret: None,
                 }),
             },
         );

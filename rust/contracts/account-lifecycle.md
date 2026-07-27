@@ -242,8 +242,19 @@ Given the discovered `OidcProviderMetadata` (for `jwks_uri` + `issuer`), the
 `id_token`, `verify_oidc_id_token`:
 
 - fetches the JWKS from `provider.jwks_uri` via the SSRF-safe GET above (bounded
-  to 256 KiB; fetched per verification — a bounded cache like `security_jwt`'s is
-  a noted later refinement);
+  to 256 KiB). `verify_oidc_id_token` fetches per verification; the callback
+  path goes through `verify_oidc_id_token_cached` and a shared `OidcJwksCache` —
+  a bounded `Mutex<HashMap<jwks_uri, CachedJwks>>` combining the discovery
+  cache's shape (**5-min TTL**, **64-entry** cap, fetch *outside* the lock,
+  retain-unexpired admission, poisoned lock degrades to uncached fetching, at
+  capacity a new URI is served uncached rather than evicting) with
+  `security_jwt`'s kid-miss-triggered refresh under a per-entry **60-second
+  cooldown**: a token whose `kid` misses the fresh cached set forces one early
+  refetch (prompt pickup of a genuine signing-key rotation), but at most once
+  per cooldown, so a flood of fabricated `kid`s cannot amplify into outbound
+  JWKS fetches. The token's shape/algorithm/`kid` are validated **before** the
+  cache or network is touched, so a malformed token can never trigger a fetch,
+  and only sets that already passed the JWKS validation below are ever cached;
 - rejects any non-public-key algorithm **before** decoding, via a public-key-only
   allowlist (RSA PKCS#1-v1.5/PSS, ECDSA, `EdDSA`; **no HMAC**) identical to
   `security_jwt`'s — this is the primary defense against the `alg=HS256`-against-a-
@@ -273,23 +284,31 @@ existing session and external-identity machinery rather than forking parallel
 systems.
 
 - **Provider config.** `RuntimeConfig::oidc_login_provider_config()` resolves an
-  optional `OidcLoginProviderConfig { issuer, client_id, redirect_uri, scopes }`
-  from the crate's usual env/YAML config (`security.oauth2.*` /
+  optional `OidcLoginProviderConfig { issuer, client_id, redirect_uri, scopes,
+  client_secret }` from the crate's usual env/YAML config (`security.oauth2.*` /
   `SECURITY_OAUTH2_*`, mirroring the fields of Java's discovery-driven
-  `ClientRegistration`), public-client PKCE only (no `client_secret` in this
-  slice). The `issuer` is the on/off switch — absent ⇒ `None` (provider
-  disabled), exactly like `security_supabase_jwt_config`; a present-but-invalid
-  config is not second-guessed at load but rejected fail-closed at the login
-  boundary by `OidcLoginProviderConfig::validate` (empty/over-long issuer/client
-  id, empty/unparseable redirect URI, or a whitespace-bearing scope), called at
-  the top of `initiate_oidc_login`.
+  `ClientRegistration`). `security.oauth2.clientSecret` /
+  `SECURITY_OAUTH2_CLIENTSECRET` selects the **confidential-client** token
+  exchange (see the orchestration bullet); blank/absent means a public client,
+  matching Java, where an unset `clientSecret` leaves Spring's registration on
+  the public-client method. The secret is held in a `Zeroizing<String>` (the
+  crate's convention for comparable credential material) and is excluded from
+  the config's `Debug` output. The `issuer` is the on/off switch — absent ⇒
+  `None` (provider disabled), exactly like `security_supabase_jwt_config`; a
+  present-but-invalid config is not second-guessed at load but rejected
+  fail-closed at the login boundary by `OidcLoginProviderConfig::validate`
+  (empty/over-long issuer/client id, empty/unparseable redirect URI, a
+  whitespace-bearing scope, or a configured-but-blank/over-long secret — a
+  broken secret is rejected, never silently downgraded to a public client),
+  called at the top of `initiate_oidc_login`.
 
 - **Single-use, TTL-bounded, size-capped `state` store.** `OidcLoginStateStore`
   is an in-memory `Mutex<HashMap>` over a monotonic `Instant` clock, modeled on
   `mobile_scanner`'s session store, keyed by the CSPRNG `state` and holding one
   pending login's `nonce`, PKCE `code_verifier`, `redirect_uri`, the discovered
   `OidcProviderMetadata` (so the callback uses the exact endpoints discovered at
-  initiation), and `client_id`, for a bounded few minutes
+  initiation), `client_id`, and the optional `client_secret` captured at
+  initiation, for a bounded few minutes
   (`DEFAULT_LOGIN_STATE_TTL`, 10 min). Lookup is **delete-on-lookup**: `consume`
   `remove`s the entry, so it is handed out at most once. An unknown `state`
   (never issued, or already consumed) is rejected as `UnknownState`; a
@@ -329,15 +348,32 @@ systems.
   the config, resolves the provider metadata through `discovery` (see the
   discovery cache below), builds the authorization request (`state`/`nonce`/PKCE),
   **stores** the state entry, and returns the authorization redirect URL +
-  `state`. `complete_oidc_login(state, code, store,
+  `state`. `complete_oidc_login(state, code, browser_binding, store, jwks_cache,
   security, now, correlation_id)` **consumes** the state entry (rejecting
   unknown/expired before any network call — the CSRF/single-use gate), exchanges
   the code at the stored `token_endpoint` with the stored PKCE verifier, verifies
-  the id token against the stored provider metadata and the stored `nonce`,
-  authenticates via `authenticate_oidc_identity`, and issues an opaque session
-  through the same `issue_session` every other login path uses (default
-  access/refresh TTLs) — returning the session tokens, the `AuthContext`, and the
-  verified identity.
+  the id token against the stored provider metadata and the stored `nonce`
+  (resolving the JWKS through the shared `OidcJwksCache` rather than refetching
+  per callback), authenticates via `authenticate_oidc_identity`, and issues an
+  opaque session through the same `issue_session` every other login path uses
+  (default access/refresh TTLs) — returning the session tokens, the
+  `AuthContext`, and the verified identity.
+
+- **Confidential-client token exchange.** When `client_secret` is configured,
+  the token request carries HTTP Basic credentials per RFC 6749 §2.3.1 — the
+  `client_secret_basic` method Spring's `ClientRegistration` infers from Java's
+  `security.oauth2.clientSecret` — assembled with the Appendix B subtlety:
+  `client_id` and `client_secret` are each `application/x-www-form-urlencoded`
+  encoded (space → `+`, reserved bytes percent-encoded, the same algorithm as
+  Java's `URLEncoder.encode`) **before** `base64(id:secret)`, so an embedded
+  `:` can never masquerade as the separator. The form body is byte-identical
+  with and without a secret (the secret moves only into the `Authorization`
+  header, attached by the SSRF-safe live POST); the header value is `Zeroizing`
+  and redacted from `Debug`. **Deliberate divergence from Java:** Spring
+  applies PKCE only to public clients and drops it once a secret is set; this
+  port keeps the PKCE `code_verifier` in every token exchange, per RFC 9700's
+  recommendation of PKCE for all clients — strictly additive, and every
+  mainstream IdP accepts PKCE from confidential clients.
 
 - **Discovery metadata cache.** `OidcDiscoveryCache` (in `oidc_discovery`) is a
   bounded, TTL'd `Mutex<HashMap>` of `OidcProviderMetadata` keyed by issuer,
@@ -355,10 +391,12 @@ systems.
   (64) issuer cap; both are tunable via `with_ttl_and_capacity`. **Staleness
   tradeoff:** if a provider rotates an `authorization_endpoint`/`token_endpoint`/
   `jwks_uri` within the window, logins started during it use the previous
-  metadata until the entry expires (≤ TTL); signing-**key** rotation is
-  unaffected, since JWKS material is fetched fresh at id-token verification time,
-  not cached here. The issuer key comes from admin config, never request input,
-  so an attacker cannot push the issuer cap.
+  metadata until the entry expires (≤ TTL); signing-**key** rotation is handled
+  separately by the id-token verifier's `OidcJwksCache` (5-min TTL plus the
+  kid-miss refresh under a 60-second cooldown, see above), so a rotated key is
+  picked up on the first token that uses it rather than waiting out a TTL. The
+  issuer key comes from admin config, never request input, so an attacker
+  cannot push the issuer cap.
 
 - **HTTP routes.** `security_http` now exposes the two routes that put
   `initiate_oidc_login`/`complete_oidc_login` on the wire, inside the opt-in
@@ -383,11 +421,31 @@ systems.
     retryable `503`s.
   Both routes are **public** (the browser has no session yet), classified in
   `security_policy::endpoint_policy` — `authorize` on `POST`, `callback` on
-  `GET`, on those verbs only. The single-use `OidcLoginStateStore` and the
-  `OidcDiscoveryCache` are each one shared `Arc` built once when the secured
-  router is assembled and handed to the routes via a request extension (alongside
-  the existing `SecurityStore`) — so the state `authorize` persists is the state
-  `callback` consumes, and repeated `authorize` calls reuse one discovery fetch.
+  `GET`, on those verbs only. The single-use `OidcLoginStateStore`, the
+  `OidcDiscoveryCache`, and the id-token verifier's `OidcJwksCache` are each one
+  shared `Arc` built once when the secured router is assembled and handed to the
+  routes via a request extension (alongside the existing `SecurityStore`) — so
+  the state `authorize` persists is the state `callback` consumes, repeated
+  `authorize` calls reuse one discovery fetch, and repeated callbacks reuse one
+  JWKS fetch.
+
+- **Dedicated per-IP rate limit on `POST /api/v1/auth/oidc/authorize`.** At the
+  transport boundary (`apply_transport_limits` in `lib.rs`, the same outermost
+  middleware that meters all traffic), that one method+path — matched
+  **exactly**, so a confusable sibling like `…/authorizeX` falls to the generic
+  auth bucket — is metered against its own keyed bucket of **1 req/s sustained,
+  burst 10, per IP**, stricter than the generic auth bucket (5/s, burst 30) that
+  covers every other `/api/v1/auth/*` route. Rationale: each admitted authorize
+  also mints a pending entry in the 4 096-capacity, 10-min-TTL login-state
+  store, so at the generic auth rate two IPs could keep the store full and
+  starve honest logins into its refuse-newcomer `503`; at 1/s an IP mints at
+  most ~610 entries per TTL, so filling the store needs ~7 cooperating IPs
+  instead of two. Exactly **one** bucket is consumed per request — the dedicated
+  bucket *replaces* the auth bucket for its route (never both), so an authorize
+  burst cannot drain the budget the same IP's `/login` traffic relies on, and
+  vice versa. The bucket is pruned alongside the others on the same
+  `RATE_LIMIT_PRUNE_INTERVAL` cadence, and its `429` response is byte-identical
+  to the existing "Too many requests" shape.
   The provider config
   rides on `SecurityHttpConfig::oidc_login_provider`
   (`RuntimeConfig::oidc_login_provider_config()`); when it is `None` (no
@@ -405,10 +463,11 @@ Out of scope here, and noted as follow-ups: the **frontend redirect/cookie UX**
 (the callback returning the session tokens as JSON is the backend boundary; a
 browser-facing flow that issues a `302` to the provider, then sets the session
 in a cookie on callback, is a separate frontend concern). Also still out of
-scope: confidential-client (`client_secret`) authentication, a bounded JWKS
-cache in the id-token verifier, and durable (cross-process) `state` storage —
-the store is in-memory, so pending logins do not survive a restart, which is
-acceptable for the short bounded TTL of an in-flight login handshake.
+scope: durable (cross-process) `state` storage — the store is in-memory, so
+pending logins do not survive a restart, which is acceptable for the short
+bounded TTL of an in-flight login handshake. (Two earlier follow-ups have since
+landed: confidential-client `client_secret` authentication and the bounded JWKS
+cache in the id-token verifier — see the bullets above.)
 
 ## MFA recovery codes (backup codes)
 

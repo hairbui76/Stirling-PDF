@@ -4,8 +4,16 @@
 //! [`crate::oidc_authorization`] (which builds the authorization redirect and
 //! the PKCE `code_verifier`).
 //!
-//! Targets the public-client PKCE case (no `client_secret`); confidential-client
-//! authentication is a follow-up.
+//! Covers both client shapes: the public-client PKCE case (no `client_secret`)
+//! and the confidential-client case, where the configured `client_secret` is
+//! carried as an HTTP Basic `Authorization` header per RFC 6749 section 2.3.1 —
+//! the `client_secret_basic` method Spring's `ClientRegistration` infers when
+//! Java's `security.oauth2.clientSecret` is set. Note the Appendix B subtlety:
+//! the client id and secret are each `application/x-www-form-urlencoded`
+//! encoded **before** the `id:secret` pair is base64'd. PKCE is kept for
+//! confidential clients too (RFC 9700 section 2.1.1 recommends PKCE for all
+//! clients) — a deliberate divergence from Spring, which applies PKCE only to
+//! public clients.
 //!
 //! This is construction + parsing ONLY (verified against the RFC 6749, RFC 7636,
 //! and `OpenID` Connect Core 1.0 spec text directly, not assumed). It does NOT:
@@ -17,9 +25,11 @@
 //!   signature/issuer/audience/expiry/`nonce` validation is a later slice;
 //! - create a session or wire any route.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use thiserror::Error;
 use url::form_urlencoded;
+use zeroize::Zeroizing;
 
 /// The request body media type for the token endpoint (RFC 6749 section 4.1.3:
 /// "The client makes a request to the token endpoint by sending the following
@@ -29,7 +39,7 @@ const FORM_URLENCODED_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 /// The components of an RFC 6749 section 4.1.3 (plus RFC 7636 section 4.5
 /// `code_verifier`) access-token request, ready for a later live-fetch slice to
 /// POST. Constructed here, not sent.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OidcTokenRequest {
     /// The URL to POST to — the provider's `token_endpoint`, passed through
     /// unchanged (the request parameters go in the body, not the URL). A later
@@ -39,6 +49,28 @@ pub struct OidcTokenRequest {
     pub content_type: &'static str,
     /// The `application/x-www-form-urlencoded` request body.
     pub form_body: String,
+    /// The `Authorization` header value for a confidential client — the RFC
+    /// 6749 section 2.3.1 `client_secret_basic` credentials — or [`None`] for a
+    /// public client (no header sent). Zeroized on drop: the base64 payload is
+    /// trivially reversible to the raw `client_secret`.
+    pub authorization: Option<Zeroizing<String>>,
+}
+
+/// Manual so the derived output can never leak the `authorization` credentials
+/// (base64 of the client secret) into logs or test failure dumps.
+impl std::fmt::Debug for OidcTokenRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OidcTokenRequest")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("content_type", &self.content_type)
+            .field("form_body", &self.form_body)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// A successfully-parsed OIDC token response for the public-client PKCE case
@@ -87,9 +119,10 @@ pub enum OidcTokenError {
     Malformed,
 }
 
-/// Builds the public-client PKCE authorization-code-for-token request
-/// components. Infallible: `token_endpoint` is passed through untouched (the
-/// parameters go in the body, not the URL), so there is nothing to fail on.
+/// Builds the PKCE authorization-code-for-token request components, for a
+/// public client (`client_secret: None`) or a confidential one (`Some`).
+/// Infallible: `token_endpoint` is passed through untouched (the parameters go
+/// in the body, not the URL), so there is nothing to fail on.
 ///
 /// The body is encoded with the `url` crate's `form_urlencoded::Serializer` —
 /// the same machinery `reqwest::Url::query_pairs_mut()` (used by
@@ -99,10 +132,20 @@ pub enum OidcTokenError {
 /// a `redirect_uri` carrying its own query string round-trips without
 /// corrupting or colliding with the body's other parameters. The serializer
 /// takes no URL and cannot fail, keeping this function infallible.
+///
+/// With a secret, the request additionally carries the RFC 6749 section 2.3.1
+/// HTTP Basic `Authorization` header (see [`basic_client_authorization`]); the
+/// form body is byte-identical in both cases. Keeping `client_id` in the body
+/// alongside the header is permitted (section 2.3.1 constrains duplicating
+/// *authentication* mechanisms; the bare `client_id` parameter is not one) and
+/// keeps the two shapes diffable. The PKCE `code_verifier` is always sent —
+/// RFC 9700's all-clients PKCE stance — even though Spring would drop PKCE for
+/// a confidential client.
 #[must_use]
 pub fn build_oidc_token_request(
     token_endpoint: &str,
     client_id: &str,
+    client_secret: Option<&str>,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
@@ -119,7 +162,26 @@ pub fn build_oidc_token_request(
         token_endpoint: token_endpoint.to_owned(),
         content_type: FORM_URLENCODED_CONTENT_TYPE,
         form_body,
+        authorization: client_secret
+            .map(|client_secret| basic_client_authorization(client_id, client_secret)),
     }
+}
+
+/// The RFC 6749 section 2.3.1 `client_secret_basic` header value:
+/// `Basic base64(urlencode(client_id) ":" urlencode(client_secret))`.
+///
+/// The Appendix B subtlety, easy to get wrong: the id and secret are each
+/// `application/x-www-form-urlencoded` encoded (space becomes `+`, reserved
+/// bytes percent-encoded — the same algorithm Java's `URLEncoder.encode` /
+/// Spring's converter applies) **before** base64, so a `:` inside either value
+/// can never be confused with the id/secret separator, and any octet sequence
+/// round-trips.
+fn basic_client_authorization(client_id: &str, client_secret: &str) -> Zeroizing<String> {
+    let encoded_id: String = form_urlencoded::byte_serialize(client_id.as_bytes()).collect();
+    let encoded_secret: String =
+        form_urlencoded::byte_serialize(client_secret.as_bytes()).collect();
+    let credentials = Zeroizing::new(format!("{encoded_id}:{encoded_secret}"));
+    Zeroizing::new(format!("Basic {}", STANDARD.encode(credentials.as_bytes())))
 }
 
 /// The union of the RFC 6749 section 5.1 success shape and the section 5.2 error
@@ -232,6 +294,7 @@ mod tests {
         let request = build_oidc_token_request(
             "https://issuer.example.com/token",
             "my client id",
+            None,
             "code+with/special=chars",
             "https://app.example.com/callback?a=1&b=2",
             "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
@@ -239,6 +302,8 @@ mod tests {
 
         assert_eq!(request.token_endpoint, "https://issuer.example.com/token");
         assert_eq!(request.content_type, FORM_URLENCODED_CONTENT_TYPE);
+        // Public client: no client authentication header.
+        assert_eq!(request.authorization, None);
 
         let params = form_params(&request.form_body)?;
         assert_eq!(params["grant_type"], "authorization_code");
@@ -263,6 +328,82 @@ mod tests {
                 .contains("code=code%2Bwith%2Fspecial%3Dchars")
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_confidential_client_carries_the_exact_rfc6749_basic_header() {
+        // A worked RFC 6749 section 2.3.1 + Appendix B example, with characters
+        // in both id and secret that need form-urlencoding: each value is
+        // encoded FIRST (space -> '+', reserved bytes -> %XX, so the embedded
+        // ':' can't masquerade as the separator), THEN "id:secret" is base64'd.
+        //   "client id:with/special" -> "client+id%3Awith%2Fspecial"
+        //   "s3cr&t +/:="            -> "s3cr%26t+%2B%2F%3A%3D"
+        //   base64("client+id%3Awith%2Fspecial:s3cr%26t+%2B%2F%3A%3D")
+        let request = build_oidc_token_request(
+            "https://issuer.example.com/token",
+            "client id:with/special",
+            Some("s3cr&t +/:="),
+            "code-abc",
+            "https://app.example.com/callback",
+            "verifier",
+        );
+        assert_eq!(
+            request.authorization.as_ref().map(|value| value.as_str()),
+            Some("Basic Y2xpZW50K2lkJTNBd2l0aCUyRnNwZWNpYWw6czNjciUyNnQrJTJCJTJGJTNBJTNE"),
+        );
+    }
+
+    #[test]
+    fn with_and_without_a_secret_the_form_body_is_byte_identical() {
+        // The secret moves ONLY into the Authorization header: the form body —
+        // including the always-present PKCE code_verifier (RFC 9700 keeps PKCE
+        // for confidential clients; Spring drops it, a deliberate divergence) —
+        // must not change byte-for-byte, so a public-client request today is
+        // exactly yesterday's request.
+        let build = |secret: Option<&str>| {
+            build_oidc_token_request(
+                "https://issuer.example.com/token",
+                "my-client",
+                secret,
+                "code-abc",
+                "https://app.example.com/callback",
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            )
+        };
+        let public = build(None);
+        let confidential = build(Some("the-secret"));
+        assert_eq!(
+            public.form_body,
+            "grant_type=authorization_code&code=code-abc\
+             &redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback\
+             &code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\
+             &client_id=my-client"
+        );
+        assert_eq!(public.form_body, confidential.form_body);
+        assert_eq!(public.authorization, None);
+        assert!(confidential.authorization.is_some());
+    }
+
+    #[test]
+    fn the_debug_representation_never_leaks_the_client_credentials() {
+        let request = build_oidc_token_request(
+            "https://issuer.example.com/token",
+            "my-client",
+            Some("super-secret-value"),
+            "code-abc",
+            "https://app.example.com/callback",
+            "verifier",
+        );
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret-value"));
+        // Not even the base64 form (trivially reversible) may appear.
+        let encoded = request
+            .authorization
+            .as_ref()
+            .map(|value| value.trim_start_matches("Basic ").to_owned())
+            .unwrap_or_default();
+        assert!(!debug.contains(&encoded));
     }
 
     #[test]
