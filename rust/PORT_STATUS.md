@@ -4,11 +4,12 @@ Tracks the Java → Rust port of the Stirling-PDF backend (UI excluded). The Rus
 service lives in this `rust/` workspace as the `stirling-processing` crate — an
 axum HTTP service mirroring the Java `/api/v1/...` endpoints.
 
-**Latest validation (2026-07-26, post-batch):** `cargo fmt --check` and strict locked
-all-target workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) are
-clean. With PDFium bound via `STIRLING_PDFIUM_LIBRARY_PATH` (as `task rust:test` does),
-`cargo test -p stirling-processing --locked --no-fail-fast` reports **1360 passed /
-0 failed** across the library suite and all 107 integration suites, and
+**Latest validation (2026-07-27, after merging the tester-signed OIDC-hardening,
+MCP-category-tool, and PDF-JSON-ICC-CMYK work-items):** `cargo fmt --check` and strict
+locked all-target workspace Clippy (`--workspace --all-targets --locked -- -D warnings`)
+are clean. With PDFium bound via `STIRLING_PDFIUM_LIBRARY_PATH` (as `task rust:test`
+does), `cargo test -p stirling-processing --locked` reports **1395 passed / 0 failed**
+(one pre-existing ignored test) across the library suite and all integration suites, and
 `cargo test -p stirling-ai-engine --locked` reports **147 passed / 0 failed** across
 all targets. Four previously-red areas are now green rather than excused: the
 `pdf_markdown` heading test (it required PDFium — earlier snapshots ran without the
@@ -446,9 +447,12 @@ auto-rename/auto-split, plus:
   images are extracted. Color-key `/Mask` arrays and explicit 1-bit stencil masks are applied
   for bounded supported rasters. ICCBased Gray/RGB/CMYK XObjects and ICCBased Indexed palette bases
   now use their bounded embedded profiles for pure-Rust conversion to sRGB, including Gray/RGB DCT
-  images, with compatible declared device-`/Alternate` fallback for invalid profiles. Complex inline
-  filter parameters, external ICC conversion after DCT CMYK decoder projection, and DCT CMYK
-  color-key masks remain. Device-alternate Separation and one-to-eight-component DeviceN XObjects
+  images, with compatible declared device-`/Alternate` fallback for invalid profiles. Four-channel
+  ICCBased DCT images (including YCCK/Adobe-marker variants) now decode natively and convert
+  through their bounded embedded profile to sRGB instead of silently keeping the decoder's device
+  projection, and DCT CMYK color-key `/Mask` ranges are applied against the pre-`/Decode` decoder
+  output per PDF 32000-1 §8.9.6.4; rasters above the editor byte bound deliberately keep the
+  bounded device fallback. Complex inline filter parameters remain. Device-alternate Separation and one-to-eight-component DeviceN XObjects
   with bounded order-1 sampled Type 0, single-input exponential Type 2, recursively bounded
   single-input stitching Type 3, or bounded PostScript calculator Type 4 tint transforms are
   evaluated into Gray/RGB/CMYK, including
@@ -672,11 +676,18 @@ closed in production). The public `/authorize` route is now DoS-hardened: the lo
 an absolute size cap (4096 entries; a new login is refused with a generic 503 when full, never
 evicting a pending honest login), and OIDC discovery is cached per issuer (5-min TTL, bounded)
 instead of refetched per call — so an unauthenticated flood can neither grow memory unboundedly nor
-amplify outbound fetches at the IdP. One residual before production exposure: with refuse-newcomer,
-a sustained flood that keeps the store full can make legitimate logins return a retryable 503 until
-entries expire, so a `/authorize` rate-limit is still a pre-production follow-up. Confidential-client
-`client_secret` auth, a JWKS cache, durable cross-process login-flow state, and the frontend
-redirect/cookie UX also remain. The discovery document's own returned endpoint URLs
+amplify outbound fetches at the IdP. The pre-production hardening trio has landed:
+`POST /api/v1/auth/oidc/authorize` now has its own per-IP governor bucket (production 1 req/s,
+burst 10 — stricter than the generic auth bucket, selected by exact raw-path match so encoded
+spellings fall to the generic bucket instead of bypassing it), closing the refuse-newcomer flood
+residual; ID-token verification uses a bounded `OidcJwksCache` (5-min TTL, 64 entries, kid-miss
+refresh under a 60-second per-entry cooldown, poisoned-lock degrades to uncached, only
+pre-validated key sets admitted); and confidential clients are supported via
+`security.oauth2.clientSecret` with the RFC 6749 §2.3.1 Basic header (Appendix B
+form-urlencoding before base64, `Zeroizing` secrets, Debug-redacted, blank ⇒ public client),
+keeping PKCE for confidential clients per RFC 9700 as a deliberate, documented divergence from
+Spring's public-client-only PKCE. Durable cross-process login-flow state and the frontend
+redirect/cookie UX still remain. The discovery document's own returned endpoint URLs
 (`authorization_endpoint`/`token_endpoint`/`jwks_uri` — untrusted, provider-controlled values,
 unlike the admin-configured issuer itself) are now hardened against SSRF: rejected when the literal
 host is a private/reserved IPv4 or IPv6 address, including RFC 1918/loopback/link-local, CGNAT,
@@ -813,11 +824,20 @@ manifest caching/filtering, and the two executable AI tools. It also now owns re
 file artifacts (`stirling_upload`/`stirling_download`, reusing the existing owner-scoped
 async-job store verbatim) and direct dispatch of a real Stirling processing operation by
 its API path (`stirling_operation`, reusing the pipeline runner's own in-process router
-dispatch). Per-caller granular scopes (`mcp.tools.read`/`mcp.tools.write`) are not ported —
-there is no Rust API-key scope store yet, so these tools share phase one's existing
-authorization boundary rather than a narrower one. OAuth/JWT metadata, a per-category tool
-split (`stirling_pages`/`convert`/`misc`/`security`), and production secured-mode cutover
-remain explicit later phases. See `contracts/mcp.md`.
+dispatch — a Rust-only convenience; Java's server exposes eight tools without it). Phase two
+has landed: Java's four per-category tools (`stirling_pages`/`stirling_convert`/
+`stirling_misc`/`stirling_security`) and `stirling_describe_operation` are ported with
+byte-matched `operationListError`, input-schema, and describe texts. Their operation-id sets
+reproduce Java's `McpToolCatalog.extractOpId` exactly: because the curated AI operation
+catalog deliberately excludes eleven flat POST paths, a generated
+`mcp_operation_supplement.json` restores them and an enum-completeness test pins the union
+against Java's id set (the empty `stirling_convert` enum is genuine Java behavior — every
+convert path has a nested tail). The scope framing previously recorded here was wrong and is
+corrected: Java's `McpApiKeyAuthFilter` statically grants both `mcp.tools.read`/
+`mcp.tools.write` to every valid API key — Java has no per-key scope store either — so
+sharing phase one's authorization boundary is exact parity in apikey mode, and granular
+scopes only become meaningful in the unported OAuth/JWT mode. OAuth/JWT metadata and
+production secured-mode cutover remain explicit later phases. See `contracts/mcp.md`.
 
 The same reviewed router now owns resource-grant administration and encrypted
 S3/MCP/API integration-config CRUD. Ownership, team-leader/default/grant rules,
